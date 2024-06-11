@@ -1,13 +1,7 @@
 # Databricks notebook source
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import rand
 from pyspark.sql.utils import AnalysisException
 import time
-
-# Create a SparkSession
-spark = SparkSession.builder \
-    .appName("CopyDeltaTables") \
-    .getOrCreate()
 
 # Specify the source and target catalogues and schema
 source_catalogue = "4_prod"
@@ -74,6 +68,3 @@ for table in tables:
             else:
                 print(f"Error writing table {table_name} after {max_retries} attempts. Skipping...")
                 continue
-
-# Stop the SparkSession
-spark.stop()
