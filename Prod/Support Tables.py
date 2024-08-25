@@ -54,3 +54,7 @@ def lookup_address():
         .filter(col("row") == 1)
         .select("PARENT_ENTITY_ID", "ZIPCODE", "CITY", "ADC_UPDT")
     )
+
+# COMMAND ----------
+
+
