@@ -2,32 +2,52 @@
 import dlt
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
-from delta.tables import DeltaTable
 from datetime import datetime
-from datetime import datetime, timedelta
+from pyspark.sql.utils import AnalysisException
+from pyspark.sql.types import *
+
 
 # COMMAND ----------
-
 
 def get_max_adc_updt(table_name):
     try:
-        result = spark.sql(f"SELECT MAX(ADC_UPDT) FROM {table_name}").collect()[0][0]
-        if result is not None:
-            return result - timedelta(days=1)
-        else:
-            return datetime(1980, 1, 1)
+        default_date = lit(datetime(1980, 1, 1)).cast(DateType())
+        result = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}")
+        max_date = result.select(max("max_date").alias("max_date")).first()["max_date"]
+        return max_date if max_date is not None else default_date
     except:
-        return datetime(1980, 1, 1)
+        return lit(datetime(1980, 1, 1)).cast(DateType())
+    
+
+def table_exists(table_name):
+    try:
+        result = spark.sql(f"SELECT 1 FROM {table_name} LIMIT 1")
+        return result.first() is not None
+    except:
+        return False
+    
+def table_exists_with_rows(table_name):
+    try:
+        result = spark.sql(f"SELECT COUNT(*) AS row_count FROM {table_name}")
+        row_count = result.first()["row_count"]
+        return row_count > 0
+    except:
+        return False
+    
 
 # COMMAND ----------
 
-@dlt.table(name="rde_patient_demographics_stream_two", temporary=True)
+
+@dlt.table(name="rde_patient_demographics_stream_two", #temporary=True,
+        table_properties={
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
+    })
 def patient_demographics_stream_two():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_patient_demographics")
+    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_patient_demographics_two")
     
     # Load tables
-    pat = spark.table("4_prod.raw.mill_dir_person_patient").alias("Pat").filter(col("active_ind") == 1)
-    pers = spark.table("4_prod.raw.mill_dir_person").alias("Pers").filter(col("active_ind") == 1)
+    pat = spark.table("4_prod.raw.mill_dir_person_patient_2").alias("Pat").filter(col("active_ind") == 1)
+    pers = spark.table("4_prod.raw.mill_dir_person_2").alias("Pers").filter(col("active_ind") == 1)
     address_lookup = spark.table("4_prod.support_tables.current_address").alias("A")
     nhs_lookup = spark.table("4_prod.support_tables.patient_nhs").alias("NHS")
     mrn_lookup = spark.table("4_prod.support_tables.patient_mrn").alias("MRN")
@@ -52,7 +72,7 @@ def patient_demographics_stream_two():
     # Filter pat based on collected PERSON_IDs
     pat_final = pat.join(person_ids, "PERSON_ID", "inner")
     
-    new_data = (
+    updated_rows = (
         pat_final
         .join(pers, col("Pat.person_id") == col("Pers.person_id"), "left")
         .join(address_lookup, col("A.PARENT_ENTITY_ID") == col("Pat.PERSON_ID"), "left")
@@ -90,31 +110,44 @@ def patient_demographics_stream_two():
             ).alias("ADC_UPDT")
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
-    if not DeltaTable.isDeltaTable(spark, "rde_patient_demographics_two"):
-        return new_data
-    else:
-        # Merge new_data with existing patient_demographics
-        existing_data = spark.table("4_prod.rde.rde_patient_demographics_two")
-        #existing_data = dlt.read("rde_patient_demographics_two")
+    return updated_rows
+
     
-        merged_data = existing_data.alias("existing").merge(
-            new_data.alias("new"),
-            "existing.PERSON_ID = new.PERSON_ID"
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll()
 
-        return merged_data
 
-@dlt.table(
-    name="rde_patient_demographics_two",
+
+@dlt.table(name="demographics_incr")
+def demographics_incr():
+    return (
+        spark.readStream
+        #.option("skipChangeCommits", "true")
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_patient_demographics_stream_two")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_patient_demographics_two",
     comment="Incrementally updated patient demographics",
     table_properties={
-        "delta.autoOptimize.optimizeWrite": "true",
-        "delta.autoOptimize.autoCompact": "true"
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID",
+        "skipChangeCommits": "true"
     }
 )
-def patient_demographics_two():
-    return dlt.read("rde_patient_demographics_stream_two")
 
+
+dlt.apply_changes(
+  target = "rde_patient_demographics_two",
+  source = "demographics_incr",
+   keys = ["PERSON_ID"],
+        sequence_by = "ADC_UPDT",
+        apply_as_deletes = None,
+        except_column_list = [],
+        stored_as_scd_type = 1
+)
 
 
 

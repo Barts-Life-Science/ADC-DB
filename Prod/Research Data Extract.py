@@ -2,25 +2,46 @@
 import dlt
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
-from delta.tables import DeltaTable
 from datetime import datetime
+from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 
-
 # COMMAND ----------
 
-# Function to get the max ADC_UPDT or return a default date if the table doesn't exist
 def get_max_adc_updt(table_name):
     try:
-        result = spark.sql(f"SELECT MAX(ADC_UPDT) FROM {table_name}").collect()[0][0]
-        return result if result is not None else datetime(1980, 1, 1)
+        default_date = lit(datetime(1980, 1, 1)).cast(DateType())
+        result = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}")
+        max_date = result.select(max("max_date").alias("max_date")).first()["max_date"]
+        return max_date if max_date is not None else default_date
     except:
-        return datetime(1980, 1, 1)
+        return lit(datetime(1980, 1, 1)).cast(DateType())
+    
+
+def table_exists(table_name):
+    try:
+        result = spark.sql(f"SELECT 1 FROM {table_name} LIMIT 1")
+        return result.first() is not None
+    except:
+        return False
+    
+def table_exists_with_rows(table_name):
+    try:
+        result = spark.sql(f"SELECT COUNT(*) AS row_count FROM {table_name}")
+        row_count = result.first()["row_count"]
+        return row_count > 0
+    except:
+        return False
+    
 
 # COMMAND ----------
 
-@dlt.table(name="rde_patient_demographics_stream", temporary=True)
-def patient_demographics_stream():
+@dlt.table(name="rde_patient_demographics_incr", temporary=True,
+        table_properties={
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID",
+        "skipChangeCommits": "true"
+    })
+def patient_demographics_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_patient_demographics")
     
     # Load tables
@@ -30,6 +51,7 @@ def patient_demographics_stream():
     nhs_lookup = spark.table("4_prod.support_tables.patient_nhs").alias("NHS")
     mrn_lookup = spark.table("4_prod.support_tables.patient_mrn").alias("MRN")
     code_value_lookup = spark.table("4_prod.support_tables.code_value").alias("CV")
+    
     
     # Filter tables based on ADC_UPDT
     pat_filtered = pat.filter(col("ADC_UPDT") > max_adc_updt)
@@ -50,7 +72,7 @@ def patient_demographics_stream():
     # Filter pat based on collected PERSON_IDs
     pat_final = pat.join(person_ids, "PERSON_ID", "inner")
     
-    new_data = (
+    return (
         pat_final
         .join(pers, col("Pat.person_id") == col("Pers.person_id"), "left")
         .join(address_lookup, col("A.PARENT_ENTITY_ID") == col("Pat.PERSON_ID"), "left")
@@ -61,7 +83,7 @@ def patient_demographics_stream():
         .join(code_value_lookup.alias("Mart"), col("Pers.MARITAL_TYPE_CD") == col("Mart.CODE_VALUE"), "left")
         .join(code_value_lookup.alias("lang"), col("Pers.LANGUAGE_CD") == col("lang.CODE_VALUE"), "left")
         .join(code_value_lookup.alias("Reli"), col("Pers.RELIGION_CD") == col("Reli.CODE_VALUE"), "left")
-        .select(
+              .select(
             col("Pat.PERSON_ID").alias("PERSON_ID"),
             col("NHS.ALIAS").alias("NHS_Number"),
             col("MRN.ALIAS").alias("MRN"),
@@ -88,35 +110,47 @@ def patient_demographics_stream():
             ).alias("ADC_UPDT")
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
-    if not DeltaTable.isDeltaTable(spark, "rde_patient_demographics"):
-        return new_data
-    else:
-        # Merge new_data with existing patient_demographics
-        existing_data = dlt.read("rde_patient_demographics")
-    
-        merged_data = existing_data.alias("existing").merge(
-            new_data.alias("new"),
-            "existing.PERSON_ID = new.PERSON_ID"
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll()
 
-        return merged_data
+@dlt.view(name="demographics_update")
+def demographics_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_patient_demographics_incr")
+    )
 
-@dlt.table(
-    name="rde_patient_demographics",
+  
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_patient_demographics",
     comment="Incrementally updated patient demographics",
     table_properties={
-        "delta.autoOptimize.optimizeWrite": "true",
-        "delta.autoOptimize.autoCompact": "true"
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID",
+        "skipChangeCommits": "true"
     }
 )
-def patient_demographics():
-    return dlt.read("rde_patient_demographics_stream")
+
+dlt.apply_changes(
+  target = "rde_patient_demographics",
+  source = "demographics_update",
+   keys = ["PERSON_ID"],
+        sequence_by = "ADC_UPDT",
+        apply_as_deletes = None,
+        except_column_list = [],
+        stored_as_scd_type = 1
+)
 
 # COMMAND ----------
 
 
-@dlt.table(name="rde_encounter_stream", temporary=True)
-def encounter_stream():
+@dlt.table(name="rde_encounter_incr", table_properties={
+        "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID",
+        "skipChangeCommits": "true"
+    }, temporary=True)
+def encounter_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_encounter")
 
     encounter = spark.table("4_prod.raw.mill_dir_encounter")
@@ -183,35 +217,47 @@ def encounter_stream():
         )
     )
 
-@dlt.table(
-    name="rde_encounter",
+    
+@dlt.view(name="encounter_update")
+def encounter_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_encounter_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_encounter",
     comment="Incrementally updated encounter data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def encounter():
-    if not DeltaTable.isDeltaTable(spark, "rde_encounter"):
-        # If the table doesn't exist, create it from the stream
-        return dlt.read("rde_encounter_stream")
-    else:
-        # If the table exists, apply changes
-        return dlt.apply_changes(
-            target = "rde_encounter",
-            source = "rde_encounter_stream",
-            keys = ["ENCNTR_ID"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
+dlt.apply_changes(
+    target = "rde_encounter",
+    source = "encounter_update",
+    keys = ["ENCNTR_ID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 
 # COMMAND ----------
 
-@dlt.table(name="rde_apc_diagnosis_stream", temporary=True)
-def apc_diagnosis_stream():
+@dlt.table(name="rde_apc_diagnosis_incr", table_properties={
+        "skipChangeCommits": "true"
+    }, temporary=True)
+def apc_diagnosis_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_apc_diagnosis")
 
     cds_apc_icd_diag = spark.table("4_prod.raw.cds_apc_icd_diag")
@@ -247,36 +293,45 @@ def apc_diagnosis_stream():
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_apc_diagnosis",
+@dlt.view(name="apc_diagnosis_update")
+def apc_diagnosis_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_apc_diagnosis_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_apc_diagnosis",
     comment="Incrementally updated APC diagnosis data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_APC_ID,ICD_Diagnosis_Num",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def apc_diagnosis():
-    if not DeltaTable.isDeltaTable(spark, "rde_apc_diagnosis"):
-        return dlt.read("rde_apc_diagnosis_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_apc_diagnosis",
-            source = "rde_apc_diagnosis_stream",
-            keys = ["CDS_APC_ID", "ICD_Diagnosis_Num"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
-
-
+dlt.apply_changes(
+    target = "rde_apc_diagnosis",
+    source = "apc_diagnosis_update",
+    keys = ["CDS_APC_ID", "ICD_Diagnosis_Num"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 
 # COMMAND ----------
 
-@dlt.table(name="rde_apc_opcs_stream", temporary=True)
-def apc_opcs_stream():
+@dlt.table(name="rde_apc_opcs_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def apc_opcs_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_apc_opcs")
 
     cds_apc_opcs_proc = spark.table("4_prod.raw.cds_apc_opcs_proc")
@@ -314,34 +369,45 @@ def apc_opcs_stream():
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_apc_opcs",
+@dlt.view(name="apc_opcs_update")
+def apc_opcs_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_apc_opcs_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_apc_opcs",
     comment="Incrementally updated APC OPCS data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_APC_ID,OPCS_Proc_Num",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def apc_opcs():
-    if not DeltaTable.isDeltaTable(spark, "rde_apc_opcs"):
-        return dlt.read("rde_apc_opcs_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_apc_opcs",
-            source = "rde_apc_opcs_stream",
-            keys = ["CDS_APC_ID", "OPCS_Proc_Num"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
+dlt.apply_changes(
+    target = "rde_apc_opcs",
+    source = "apc_opcs_update",
+    keys = ["CDS_APC_ID", "OPCS_Proc_Num"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 
 # COMMAND ----------
 
-@dlt.table(name="rde_op_diagnosis_stream", temporary=True)
-def op_diagnosis_stream():
+@dlt.table(name="rde_op_diagnosis_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def op_diagnosis_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_op_diagnosis")
 
     cds_opa_icd_diag = spark.table("4_prod.raw.cds_opa_icd_diag")
@@ -378,34 +444,45 @@ def op_diagnosis_stream():
         .filter(col("Icd.ICD_Diag_Cd").isNotNull())
     )
 
-@dlt.table(
-    name="rde_op_diagnosis",
+@dlt.view(name="op_diagnosis_update")
+def op_diagnosis_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_op_diagnosis_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_op_diagnosis",
     comment="Incrementally updated OP diagnosis data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_OPA_ID,ICD_Diagnosis_Num",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def op_diagnosis():
-    if not DeltaTable.isDeltaTable(spark, "rde_op_diagnosis"):
-        return dlt.read("rde_op_diagnosis_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_op_diagnosis",
-            source = "rde_op_diagnosis_stream",
-            keys = ["CDS_OPA_ID", "ICD_Diagnosis_Num"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
+dlt.apply_changes(
+    target = "rde_op_diagnosis",
+    source = "op_diagnosis_update",
+    keys = ["CDS_OPA_ID", "ICD_Diagnosis_Num"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 
 # COMMAND ----------
 
-@dlt.table(name="rde_opa_opcs_stream", temporary=True)
-def opa_opcs_stream():
+@dlt.table(name="rde_opa_opcs_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def opa_opcs_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_opa_opcs")
 
     cds_opa_opcs_proc = spark.table("4_prod.raw.cds_opa_opcs_proc")
@@ -442,35 +519,45 @@ def opa_opcs_stream():
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_opa_opcs",
+@dlt.view(name="opa_opcs_update")
+def opa_opcs_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_opa_opcs_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_opa_opcs",
     comment="Incrementally updated OPA OPCS data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_OPA_ID,OPCS_Proc_Num",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def opa_opcs():
-    if not DeltaTable.isDeltaTable(spark, "rde_opa_opcs"):
-        return dlt.read("rde_opa_opcs_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_opa_opcs",
-            source = "rde_opa_opcs_stream",
-            keys = ["CDS_OPA_ID", "OPCS_Proc_Num"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
-
+dlt.apply_changes(
+    target = "rde_opa_opcs",
+    source = "opa_opcs_update",
+    keys = ["CDS_OPA_ID", "OPCS_Proc_Num"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 
 # COMMAND ----------
 
-@dlt.table(name="rde_cds_apc_stream", temporary=True)
-def cds_apc_stream():
+@dlt.table(name="rde_cds_apc_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def cds_apc_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_cds_apc")
 
     slam_apc_hrg_v4 = spark.table("4_prod.raw.slam_apc_hrg_v4")
@@ -540,35 +627,45 @@ def cds_apc_stream():
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_cds_apc",
+@dlt.view(name="cds_apc_update")
+def cds_apc_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_cds_apc_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_cds_apc",
     comment="Incrementally updated CDS APC data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_APC_ID",
         "delta.autoOptimize.optimizeWrite": "true",
-        "delta.autoOptimize.autoCompact": "true"
+        "delta.autoOptimize.autoCompact": "true",
+        "skipChangeCommits": "true"
     }
 )
-def cds_apc():
-    if not DeltaTable.isDeltaTable(spark, "rde_cds_apc"):
-        return dlt.read("rde_cds_apc_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_cds_apc",
-            source = "rde_cds_apc_stream",
-            keys = ["CDS_APC_ID"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
-
+dlt.apply_changes(
+    target = "rde_cds_apc",
+    source = "cds_apc_update",
+    keys = ["CDS_APC_ID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
        
 
 # COMMAND ----------
 
-@dlt.table(name="rde_cds_opa_stream", temporary=True)
-def cds_opa_stream():
+@dlt.table(name="rde_cds_opa_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def cds_opa_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_cds_opa")
 
     cds_op_all = spark.table("4_prod.raw.cds_op_all")
@@ -671,36 +768,46 @@ def cds_opa_stream():
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_cds_opa",
+@dlt.view(name="cds_opa_update")
+def cds_opa_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_cds_opa_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_cds_opa",
     comment="Incrementally updated CDS OPA data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "CDS_OPA_ID",
         "delta.autoOptimize.optimizeWrite": "true",
-        "delta.autoOptimize.autoCompact": "true"
+        "delta.autoOptimize.autoCompact": "true",
+        "skipChangeCommits": "true"
     }
 )
-def cds_opa():
-    if not DeltaTable.isDeltaTable(spark, "rde_cds_opa"):
-        return dlt.read("rde_cds_opa_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_cds_opa",
-            source = "rde_cds_opa_stream",
-            keys = ["CDS_OPA_ID"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
-
+dlt.apply_changes(
+    target = "rde_cds_opa",
+    source = "cds_opa_update",
+    keys = ["CDS_OPA_ID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
  
 
 # COMMAND ----------
 
 
-@dlt.table(name="rde_pathology_stream", temporary=True)
-def pathology_stream():
+@dlt.table(name="rde_pathology_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def pathology_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pathology")
 
     orders = spark.table("4_prod.raw.mill_dir_orders").alias("ORD")
@@ -762,40 +869,46 @@ def pathology_stream():
         )
         .filter(col("ADC_UPDT") > max_adc_updt)
     )
+    
+@dlt.view(name="pathology_update")
+def pathology_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_pathology_incr")
+    )
 
-@dlt.table(
-    name="rde_pathology",
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_pathology",
     comment="Incrementally updated pathology data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID,EventID",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def pathology():
-    if not DeltaTable.isDeltaTable(spark, "rde_pathology"):
-        return dlt.read("rde_pathology_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_pathology",
-            source = "rde_pathology_stream",
-            keys = ["ENCNTR_ID", "EventID"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
-
-
-
-
-
-
+dlt.apply_changes(
+    target = "rde_pathology",
+    source = "pathology_update",
+    keys = ["ENCNTR_ID", "EventID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 # COMMAND ----------
 
 
-@dlt.table(name="rde_raw_pathology_stream", temporary=True)
-def raw_pathology_stream():
+@dlt.table(name="rde_raw_pathology_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def raw_pathology_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_raw_pathology")
     
     # Load source tables
@@ -866,35 +979,47 @@ def raw_pathology_stream():
         .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_raw_pathology",
+@dlt.view(name="raw_pathology_update")
+def raw_pathology_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_raw_pathology_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_raw_pathology",
     comment="Incrementally updated raw pathology data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "LabNo,TFCCode,ResultIDNo",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def raw_pathology():
-    if not DeltaTable.isDeltaTable(spark, "rde_raw_pathology"):
-        return dlt.read("rde_raw_pathology_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_raw_pathology",
-            source = "rde_raw_pathology_stream",
-            keys = ["LabNo", "TFCCode", "ResultIDNo"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
 
+dlt.apply_changes(
+    target = "rde_raw_pathology",
+    source = "raw_pathology_update",
+    keys = ["LabNo", "TFCCode", "ResultIDNo"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
      
 
 # COMMAND ----------
 
 
-@dlt.table(name="rde_ariapharmacy_stream", temporary=True)
-def ariapharmacy_stream():
+@dlt.table(name="rde_ariapharmacy_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def ariapharmacy_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_ariapharmacy")
     
     pt_inst_key = spark.table("4_prod.raw.aria_pt_inst_key").alias("Ptkey")
@@ -930,32 +1055,45 @@ def ariapharmacy_stream():
         .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_ariapharmacy",
+@dlt.view(name="ariapharmacy_update")
+def ariapharmacy_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_ariapharmacy_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_ariapharmacy",
     comment="Incrementally updated ARIA pharmacy data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "pt_inst_key_id",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def ariapharmacy():
-    if not DeltaTable.isDeltaTable(spark, "rde_ariapharmacy"):
-        return dlt.read("rde_ariapharmacy_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_ariapharmacy",
-            source = "rde_ariapharmacy_stream",
-            keys = ["pt_inst_key_id"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
-        )
+
+dlt.apply_changes(
+    target = "rde_ariapharmacy",
+    source = "ariapharmacy_update",
+    keys = ["pt_inst_key_id"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
 
 # COMMAND ----------
 
 
-@dlt.table(name="rde_iqemo_stream", temporary=True)
-def iqemo_stream():
+@dlt.table(name="rde_iqemo_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def iqemo_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_iqemo")
     
     treatment_cycle = spark.table("4_prod.raw.iqemo_treatment_cycle").alias("TC")
@@ -989,23 +1127,212 @@ def iqemo_stream():
         .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
-@dlt.table(
-    name="rde_iqemo",
+@dlt.view(name="iqemo_update")
+def iqemo_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_iqemo_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_iqemo",
     comment="Incrementally updated iQEMO data",
     table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "TreatmentCycleID",
+        "skipChangeCommits": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true"
     }
 )
-def iqemo():
-    if not DeltaTable.isDeltaTable(spark, "rde_iqemo"):
-        return dlt.read("rde_iqemo_stream")
-    else:
-        return dlt.apply_changes(
-            target = "rde_iqemo",
-            source = "rde_iqemo_stream",
-            keys = ["TreatmentCycleID"],
-            sequence_by = "ADC_UPDT",
-            apply_as_deletes = None,
-            except_column_list = []
+
+dlt.apply_changes(
+    target = "rde_iqemo",
+    source = "iqemo_update",
+    keys = ["TreatmentCycleID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
+
+# COMMAND ----------
+
+
+@dlt.table(name="rde_powerforms_incr", table_properties={
+        "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID",
+        "skipChangeCommits": "true"
+    }, temporary=True)
+def powerforms_incr():
+    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_powerforms")
+
+    # Filter clinical_event based on max_adc_updt
+#    filtered_clinical_event = (
+#        spark.table("4_prod.raw.mill_dir_clinical_event")
+#        .filter(F.col("ADC_UPDT") > max_adc_updt)
+#        .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+#    )
+    filtered_clinical_event = (
+    spark.table("4_prod.raw.mill_dir_clinical_event")
+    .filter((F.year(F.col("UPDT_DT_TM")) > 1900) & (F.year(F.col("UPDT_DT_TM")) < 2010))
+    .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+    )
+
+    # FormTemp
+    form_temp = (
+        spark.table("4_prod.raw.mill_dir_dcp_forms_activity")
+        .join(
+            spark.table("4_prod.raw.mill_dir_dcp_forms_ref"),
+            "DCP_FORMS_REF_ID"
         )
+        .join(
+            filtered_clinical_event,
+            (F.col("mill_dir_dcp_forms_activity.ENCNTR_ID") == filtered_clinical_event.ENCNTR_ID) &
+            (F.col("mill_dir_dcp_forms_activity.DCP_FORMS_ACTIVITY_ID").cast("integer") == 
+             F.when(filtered_clinical_event.REFERENCE_NBR.contains("!"),
+                    F.split(filtered_clinical_event.REFERENCE_NBR, "!").getItem(0).cast("float").cast("integer"))
+             .otherwise(filtered_clinical_event.REFERENCE_NBR.cast("float").cast("integer"))),
+            "left_semi"
+        )
+        .select(
+            F.col("mill_dir_dcp_forms_activity.DCP_FORMS_ACTIVITY_ID"),
+            F.col("mill_dir_dcp_forms_activity.ENCNTR_ID"),
+            F.col("mill_dir_dcp_forms_activity.FORM_STATUS_CD"),
+            F.col("mill_dir_dcp_forms_ref.DCP_FORM_INSTANCE_ID")
+        )
+    )
+
+    # DocResponseTemp
+    doc_response_temp = (
+        filtered_clinical_event.alias("CE")
+        .join(form_temp, 
+            (F.col("CE.ENCNTR_ID") == form_temp.ENCNTR_ID) &
+            (F.when(F.col("CE.REFERENCE_NBR").contains("!"),
+                    F.split(F.col("CE.REFERENCE_NBR"), "!").getItem(0).cast("float").cast("integer"))
+             .otherwise(F.col("CE.REFERENCE_NBR").cast("float").cast("integer"))
+             == form_temp.DCP_FORMS_ACTIVITY_ID.cast("integer")),
+            "inner"
+        )
+        .join(spark.table("4_prod.raw.mill_dir_ce_date_result").alias("CEDR"), 
+            F.col("CE.EVENT_ID") == F.col("CEDR.EVENT_ID"), "left")
+        .join(spark.table("4_prod.raw.mill_dir_ce_string_result").alias("CESR"), 
+            F.col("CE.EVENT_ID") == F.col("CESR.EVENT_ID"), "left")
+        .join(spark.table("4_prod.raw.mill_dir_ce_coded_result").alias("CECR"), 
+            F.col("CE.EVENT_ID") == F.col("CECR.EVENT_ID"), "left")
+        .join(spark.table("3_lookup.dwh.mill_dir_code_value").alias("CV"), 
+            (F.col("CECR.RESULT_CD") == F.col("CV.CODE_VALUE")) & (F.col("CV.ACTIVE_IND") == 1), "left")
+        .join(filtered_clinical_event.alias("CE1"), 
+            (F.col("CE.PARENT_EVENT_ID") == F.col("CE1.EVENT_ID")), "left")
+        .filter(F.col("CE.TASK_ASSAY_CD") != 0)
+        .select(
+            F.col("CE.EVENT_ID").alias("DOC_RESPONSE_KEY"),
+            F.col("CE.ENCNTR_ID"),
+            F.col("CE.PERFORMED_DT_TM"),
+            F.col("CE.EVENT_ID").alias("ELEMENT_EVENT_ID"),
+            F.col("CE.PARENT_EVENT_ID").alias("SECTION_EVENT_ID"),
+            F.col("CE.EVENT_ID").alias("FORM_EVENT_ID"),
+            form_temp.DCP_FORM_INSTANCE_ID.alias("DOC_INPUT_ID"),
+            form_temp.FORM_STATUS_CD,
+            F.coalesce(F.col("CEDR.RESULT_DT_TM"), F.col("CESR.STRING_RESULT_TEXT"), F.col("CECR.DESCRIPTOR"), F.col("CV.DISPLAY")).alias("RESPONSE_VALUE_TXT"),
+            F.when(F.col("CE1.EVENT_TITLE_TEXT").isin("TRACKING CONTROL", "Discrete Grid"), F.col("CE1.EVENT_ID")).otherwise("0").alias("GRID_EVENT_ID")
+        )
+    )
+
+    # DocRefTemp
+    doc_ref_temp = (
+        spark.table("4_prod.raw.mill_dir_dcp_forms_ref").alias("FREF")
+        .join(spark.table("4_prod.raw.mill_dir_dcp_forms_def").alias("FDEF"), 
+            F.col("FREF.DCP_FORM_INSTANCE_ID") == F.col("FDEF.DCP_FORM_INSTANCE_ID"))
+        .join(spark.table("4_prod.raw.mill_dir_dcp_section_ref").alias("SREF"), 
+            F.col("FDEF.DCP_SECTION_REF_ID") == F.col("SREF.DCP_SECTION_REF_ID"))
+        .join(spark.table("4_prod.raw.mill_dir_dcp_input_ref").alias("DIREF"), 
+            F.col("SREF.DCP_SECTION_REF_ID") == F.col("DIREF.DCP_SECTION_REF_ID"))
+        .join(spark.table("4_prod.raw.mill_dir_name_value_prefs").alias("NVP"), 
+            (F.col("DIREF.DCP_INPUT_REF_ID") == F.col("NVP.PARENT_ENTITY_ID")) &
+            (F.col("NVP.PARENT_ENTITY_NAME") == "DCP_INPUT_REF") &
+            (F.col("NVP.PVC_NAME").like("discrete_task_assay%")), "left")
+        .join(spark.table("4_prod.raw.mill_dir_discrete_task_array").alias("DTA"), 
+            F.col("NVP.MERGE_ID") == F.col("DTA.TASK_ASSAY_CD"), "left")
+        .join(spark.table("4_prod.raw.mill_dir_name_value_prefs").alias("NVP2"), 
+            (F.col("DIREF.DCP_INPUT_REF_ID") == F.col("NVP2.PARENT_ENTITY_ID")) &
+            (F.col("NVP2.PARENT_ENTITY_NAME") == "DCP_INPUT_REF") &
+            (F.col("NVP2.PVC_NAME") == "grid_event_cd"), "left")
+        .join(spark.table("3_lookup.dwh.mill_dir_code_value").alias("CV"), 
+            (F.col("NVP2.MERGE_ID") == F.col("CV.CODE_VALUE")) & (F.col("CV.ACTIVE_IND") == 1), "left")
+        .select(
+            F.col("FREF.DCP_FORM_INSTANCE_ID").alias("DOC_INPUT_KEY"),
+            F.col("FREF.DESCRIPTION").alias("FORM_DESC_TXT"),
+            F.col("SREF.DESCRIPTION").alias("SECTION_DESC_TXT"),
+            F.col("DTA.MNEMONIC").alias("ELEMENT_LABEL_TXT"),
+            F.col("CV.DISPLAY").alias("GRID_NAME_TXT"),
+            F.col("DTA.DESCRIPTION").alias("GRID_COLUMN_DESC_TXT")
+        )
+    )
+
+    return (
+        doc_response_temp
+        .join(dlt.read("rde_encounter").alias("ENC"), 
+            doc_response_temp.ENCNTR_ID == F.col("ENC.ENCNTR_ID"))
+        .join(doc_ref_temp, 
+            doc_response_temp.DOC_INPUT_ID == doc_ref_temp.DOC_INPUT_KEY, "left")
+        .join(spark.table("3_lookup.dwh.mill_dir_code_value").alias("CV"), 
+            doc_response_temp.FORM_STATUS_CD == F.col("CV.CODE_VALUE"), "left")
+        .select(
+            F.col("ENC.NHS_Number").cast("string").alias("NHS_Number"),
+            F.col("ENC.MRN").cast("string").alias("MRN"),
+            F.col("doc_response_temp.ENCNTR_ID").cast("string").alias("ENCNTR_ID"),
+            F.date_format(F.col("doc_response_temp.PERFORMED_DT_TM"), "yyyy-MM-dd HH:mm").alias("PerformDate"),
+            F.col("doc_response_temp.DOC_RESPONSE_KEY").cast("string").alias("DOC_RESPONSE_KEY"),
+            F.col("doc_ref_temp.FORM_DESC_TXT").cast("string").alias("Form"),
+            F.col("doc_response_temp.FORM_EVENT_ID").cast("long").alias("FormID"),
+            F.col("doc_ref_temp.SECTION_DESC_TXT").cast("string").alias("Section"),
+            F.col("doc_response_temp.SECTION_EVENT_ID").cast("long").alias("SectionID"),
+            F.col("doc_ref_temp.ELEMENT_LABEL_TXT").cast("string").alias("Element"),
+            F.col("doc_response_temp.ELEMENT_EVENT_ID").cast("long").alias("ElementID"),
+            F.col("doc_ref_temp.GRID_NAME_TXT").cast("string").alias("Component"),
+            F.col("doc_ref_temp.GRID_COLUMN_DESC_TXT").cast("string").alias("ComponentDesc"),
+            F.col("doc_response_temp.GRID_EVENT_ID").cast("long").alias("ComponentID"),
+            F.col("doc_response_temp.RESPONSE_VALUE_TXT").cast("string").alias("Response"),
+            F.when(F.col("doc_response_temp.RESPONSE_VALUE_TXT").rlike("^[0-9.]+$"), F.lit(1)).otherwise(F.lit(0)).cast("boolean").alias("ResponseNumeric"),
+            F.col("CV.DESCRIPTION").cast("string").alias("Status"),
+            F.greatest(F.col("CE.ADC_UPDT"), F.col("ENC.ADC_UPDT")).alias("ADC_UPDT")
+        )
+        #.filter(F.col("ADC_UPDT") > max_adc_updt)
+    )
+
+@dlt.view(name="powerforms_update")
+def powerforms_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .table("LIVE.rde_powerforms_incr")
+    )
+
+# Declare the target table
+dlt.create_target_table(
+    name = "rde_powerforms",
+    comment="Incrementally updated powerforms data",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID,DOC_RESPONSE_KEY",
+        "skipChangeCommits": "true",
+        "delta.autoOptimize.optimizeWrite": "true",
+        "delta.autoOptimize.autoCompact": "true"
+    }
+)
+
+dlt.apply_changes(
+    target = "rde_powerforms",
+    source = "powerforms_update",
+    keys = ["ENCNTR_ID", "DOC_RESPONSE_KEY"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
