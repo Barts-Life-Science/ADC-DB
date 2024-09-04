@@ -6,7 +6,12 @@ from pyspark.sql.window import Window
 
 @dlt.table(
     name="code_value",
-    comment="Code Value Table"
+    comment="Code Value Table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "CODE_VALUE"
+    }
 )
 def lookup_code_value():
     return (
@@ -15,7 +20,12 @@ def lookup_code_value():
 
 @dlt.table(
     name="patient_nhs",
-    comment="NHS table"
+    comment="NHS table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
+    }
 )
 def lookup_nhs_number():
     window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
@@ -29,7 +39,12 @@ def lookup_nhs_number():
 
 @dlt.table(
     name="patient_mrn",
-    comment="MRN table"
+    comment="MRN table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
+    }
 )
 def lookup_mrn():
     window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
@@ -43,13 +58,25 @@ def lookup_mrn():
 
 @dlt.table(
     name="current_address",
-    comment="Address table"
+    comment="Address table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PARENT_ENTITY_ID"
+    }
 )
 def lookup_address():
-    window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
+    current_date_val = current_date()
+    
+    window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(desc("BEG_EFFECTIVE_DT_TM"))
+    
     return (
         spark.table("4_prod.raw.mill_dir_address")
-        .filter((col("PARENT_ENTITY_NAME") == "PERSON") & (col("ACTIVE_IND") == 1))
+        .filter(
+            (col("PARENT_ENTITY_NAME") == "PERSON") & 
+            (col("ACTIVE_IND") == 1) & 
+            (col("END_EFFECTIVE_DT_TM") > current_date_val)
+        )
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
         .select("PARENT_ENTITY_ID", "ZIPCODE", "CITY", "ADC_UPDT")

@@ -6,6 +6,7 @@
 
 import dlt
 from pyspark.sql.functions import *
+from pyspark.sql.functions import max as spark_max
 from pyspark.sql.window import Window
 from datetime import datetime
 from pyspark.sql.utils import AnalysisException
@@ -661,7 +662,7 @@ dlt.create_target_table(
 dlt.apply_changes(
     target = "rde_cds_apc",
     source = "cds_apc_update",
-    keys = ["CDS_APC_ID", "PERSONID", "EP_Num", "Adm_Dt"],
+    keys = ["CDS_APC_ID"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
@@ -1120,8 +1121,9 @@ def iqemo_incr():
         .join(regimen, col("CC.RegimenID") == col("RG.RegimenID"), "left")
         .join(iqemo_patient, col("TC.PatientID") == col("PT.PatientID"), "left")
         .join(
-            person_alias.filter(col("PERSON_ALIAS_TYPE_CD") == 10),
-            col("PT.PrimaryIdentifier") == col("PA.ALIAS"),
+            person_alias,
+            (trim(iqemo_patient.PrimaryIdentifier) == trim(person_alias.ALIAS)) & 
+             (person_alias.PERSON_ALIAS_TYPE_CD == 10),
             "left"
         )
         .join(patient_demographics, col("PA.PERSON_ID") == col("DEM.PERSON_ID"), "left")
@@ -1349,7 +1351,7 @@ dlt.create_target_table(
 dlt.apply_changes(
     target = "rde_family_history",
     source = "family_history_update",
-    keys = ["PERSON_ID", "REL_ID"],
+    keys = ["PERSON_ID", "REL_ID", "RELATION_CD", "RELATION_TYPE", "RelationDesc", "ACTIVITY_NOMEN", "NomenVal"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
@@ -1450,7 +1452,12 @@ def pc_procedures_incr():
 
     return (
         pc_procedures.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(person_alias, (pc_procedures.MRN == person_alias.ALIAS) & (person_alias.PERSON_ALIAS_TYPE_CD == 10), "inner")
+        .join(
+        person_alias,
+        (trim(pc_procedures.MRN) == trim(person_alias.ALIAS)) & 
+        (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+        "inner"
+        )
         .join(patient_demographics, person_alias.PERSON_ID == patient_demographics.PERSON_ID, "inner")
         .select(
             col("PA.PERSON_ID").cast(StringType()).alias("PERSON_ID"),
@@ -1578,7 +1585,12 @@ def pc_diagnosis_incr():
 
     return (
         pc_diagnoses.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(person_alias, (pc_diagnoses.MRN == person_alias.ALIAS) & (person_alias.PERSON_ALIAS_TYPE_CD == 10), "inner")
+        .join(
+        person_alias,
+        (trim(pc_diagnoses.MRN) == trim(person_alias.ALIAS)) & 
+        (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+        "inner"
+        )
         .join(patient_demographics, person_alias.PERSON_ID == patient_demographics.PERSON_ID, "inner")
         .select(
             col("PR.Diagnosis_Id").cast(StringType()).alias("DiagID"),
@@ -1644,7 +1656,12 @@ def pc_problems_incr():
 
     return (
         pc_problems.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(person_alias, (pc_problems.MRN == person_alias.ALIAS) & (person_alias.PERSON_ALIAS_TYPE_CD == 10), "inner")
+        .join(
+        person_alias,
+        (trim(pc_problems.MRN) == trim(person_alias.ALIAS)) & 
+        (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+        "inner"
+        )
         .join(patient_demographics, person_alias.PERSON_ID == patient_demographics.PERSON_ID, "inner")
         .select(
             col("PCP.Problem_Id").cast(StringType()).alias("ProbID"),
@@ -1707,10 +1724,23 @@ dlt.apply_changes(
 def msds_booking_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_msds_booking")
 
-    mat_pregnancy = spark.table("4_prod.raw.mat_pregnancy").alias("PREG")
+    mat_pregnancy = spark.table("4_prod.raw.mat_pregnancy").alias("PREG").filter((col("DELETE_IND") == 0))
     patient_demographics = dlt.read("rde_patient_demographics").alias("DEM")
     msd101pregbook = spark.table("4_prod.raw.msds101pregbook").alias("MSDS")
-    person_patient_address = spark.table("4_prod.raw.mill_dir_address").filter((col("PARENT_ENTITY_NAME") == "PERSON")).alias("ADDR")
+
+    current_date_val = current_date()
+
+    person_patient_address = (
+        spark.table("4_prod.raw.mill_dir_address")
+        .filter((col("PARENT_ENTITY_NAME") == "PERSON") & (col("END_EFFECTIVE_DT_TM") > current_date_val))
+        .withColumn("max_beg_effective_dt_tm", 
+                spark_max("BEG_EFFECTIVE_DT_TM").over(Window.partitionBy("PARENT_ENTITY_ID")))
+        .filter(col("BEG_EFFECTIVE_DT_TM") == col("max_beg_effective_dt_tm"))
+        .drop("max_beg_effective_dt_tm")
+        .alias("ADDR")
+    )
+    
+
 
 
     filtered_mat_pregnancy = mat_pregnancy.filter(col("ADC_UPDT") > max_adc_updt)
@@ -2077,7 +2107,7 @@ dlt.create_target_table(
 dlt.apply_changes(
     target = "rde_msds_diagnosis",
     source = "msds_diagnosis_update",
-    keys = ["PERSON_ID", "DiagPregID"],
+    keys = ["PERSON_ID", "DiagPregID", "Diagnosis", "LocalFetalID"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
@@ -2195,6 +2225,7 @@ def scr_demographics_incr():
               "inner")
         .select(
             col("SCR.PATIENT_ID").cast(StringType()).alias("PATIENTID"),
+            col("PAT.PERSON_ID").cast(StringType()).alias("PERSON_ID"),
             col("PAT.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("PAT.MRN").cast(StringType()).alias("MRN"),
             col("SCR.N15_1_DATE_DEATH").cast(StringType()).alias("DeathDate"),
@@ -2232,7 +2263,7 @@ dlt.create_target_table(
 dlt.apply_changes(
     target = "rde_scr_demographics",
     source = "scr_demographics_update",
-    keys = ["PATIENTID"],
+    keys = ["PATIENTID", "PERSON_ID"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
