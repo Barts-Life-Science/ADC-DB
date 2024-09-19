@@ -15,7 +15,7 @@ from pyspark.sql.window import Window
 )
 def lookup_code_value():
     return (
-        spark.table("3_lookup.dwh.mill_dir_code_value").filter(col("ACTIVE_IND") > 0)
+        spark.table("3_lookup.mill.mill_code_value").filter(col("ACTIVE_IND") > 0)
 )
 
 @dlt.table(
@@ -30,7 +30,7 @@ def lookup_code_value():
 def lookup_nhs_number():
     window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
     return (
-        spark.table("4_prod.raw.mill_dir_person_alias")
+        spark.table("4_prod.raw.mill_person_alias")
         .filter((col("PERSON_ALIAS_TYPE_CD") == 18) & (col("ACTIVE_IND") == 1))
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
@@ -49,7 +49,7 @@ def lookup_nhs_number():
 def lookup_mrn():
     window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
     return (
-        spark.table("4_prod.raw.mill_dir_person_alias")
+        spark.table("4_prod.raw.mill_person_alias")
         .filter((col("PERSON_ALIAS_TYPE_CD") == 10) & (col("ACTIVE_IND") == 1))
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
@@ -68,10 +68,14 @@ def lookup_mrn():
 def lookup_address():
     current_date_val = current_date()
     
-    window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(desc("BEG_EFFECTIVE_DT_TM"))
+
+    window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(
+        when(col("ZIPCODE").isNotNull() & (trim(col("ZIPCODE")) != ""), 0).otherwise(1),
+        desc("BEG_EFFECTIVE_DT_TM")
+    )
     
     return (
-        spark.table("4_prod.raw.mill_dir_address")
+        spark.table("4_prod.raw.mill_address")
         .filter(
             (col("PARENT_ENTITY_NAME") == "PERSON") & 
             (col("ACTIVE_IND") == 1) & 

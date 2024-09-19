@@ -47,8 +47,8 @@ def patient_demographics_incr():
     max_adc_updt = get_max_adc_updt("8_dev.rde.rde_patient_demographics")
     
     # Load tables
-    pat = spark.table("4_prod.raw.mill_dir_person_patient").alias("Pat").filter(col("active_ind") == 1)
-    pers = spark.table("4_prod.raw.mill_dir_person").alias("Pers").filter(col("active_ind") == 1)
+    pat = spark.table("4_prod.raw.mill_person_patient").alias("Pat").filter(col("active_ind") == 1)
+    pers = spark.table("4_prod.raw.mill_person").alias("Pers").filter(col("active_ind") == 1)
     address_lookup = spark.table("4_prod.support_tables.current_address").alias("A")
     nhs_lookup = spark.table("4_prod.support_tables.patient_nhs").alias("NHS")
     mrn_lookup = spark.table("4_prod.support_tables.patient_mrn").alias("MRN")
@@ -159,10 +159,10 @@ dlt.apply_changes(
 def encounter_incr():
     max_adc_updt = get_max_adc_updt("8_dev.rde.rde_encounter")
 
-    encounter = spark.table("4_prod.raw.mill_dir_encounter")
+    encounter = spark.table("4_prod.raw.mill_encounter")
     patient_demographics = dlt.read("rde_patient_demographics").alias("D")
     code_value_lookup = spark.table("4_prod.support_tables.code_value").alias("CV")
-    encounter_alias = spark.table("4_prod.raw.mill_dir_encntr_alias")
+    encounter_alias = spark.table("4_prod.raw.mill_encntr_alias")
 
     person_ids = (
       encounter.filter(col("ADC_UPDT") > max_adc_updt).select("PERSON_ID")
@@ -268,7 +268,7 @@ def ariapharmacy_incr():
     agt_rx = spark.table("4_prod.raw.aria_agt_rx").alias("Arx")
     rx = spark.table("4_prod.raw.aria_rx").alias("Rx")
     patient_demographics = dlt.read("rde_patient_demographics").alias("D")
-    person_alias = spark.table("4_prod.raw.mill_dir_person_alias").alias("PA")
+    person_alias = spark.table("4_prod.raw.mill_person_alias").alias("PA")
 
     return (
         pt_inst_key.filter(col("ADC_UPDT") > max_adc_updt)
@@ -344,10 +344,10 @@ dlt.apply_changes(
 def allergydetails_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_allergydetails")
 
-    allergy = spark.table("4_prod.raw.mill_dir_allergy").alias("A")
+    allergy = spark.table("4_prod.raw.mill_allergy").alias("A")
     encounter = dlt.read("rde_encounter").alias("ENC")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
-    nomenclature_ref = spark.table("3_lookup.dwh.mill_dir_nomenclature").alias("Det")
+    nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("Det")
 
     return (
         allergy.filter(col("ADC_UPDT") > max_adc_updt)
@@ -428,74 +428,7 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
-@dlt.table(name="rde_mill_powertrials_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
-def mill_powertrials_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_mill_powertrials")
 
-    mill_pt_prot_reg = spark.table("4_prod.raw.mill_dir_prot_reg").alias("RES")
-    mill_pt_prot_master = spark.table("4_prod.raw.mill_dir_prot_master").alias("STUDYM")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("LOOK")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("PDEM")
-
-    # Window function to get the latest record for each patient and study
-    window_spec = Window.partitionBy("RES.PROT_MASTER_ID", "RES.PERSON_ID").orderBy(desc("RES.BEG_EFFECTIVE_DT_TM"))
-
-    return (
-        mill_pt_prot_reg
-        .join(patient_demographics, col("RES.PERSON_ID") == col("PDEM.PERSON_ID"), "inner")
-        .join(mill_pt_prot_master, col("RES.PROT_MASTER_ID") == col("STUDYM.PROT_MASTER_ID"), "left")
-        .join(code_value_ref, col("RES.REMOVAL_REASON_CD").cast("string") == col("LOOK.CODE_VALUE_CD").cast("string"), "left")
-        .withColumn("row_num", row_number().over(window_spec))
-        .filter(col("row_num") == 1)
-        .filter((col("RES.ADC_UPDT") > max_adc_updt) | (col("PDEM.ADC_UPDT") > max_adc_updt) | (col("STUDYM.ADC_UPDT") > max_adc_updt))
-        .select(
-            col("PDEM.PERSON_ID").cast(StringType()).alias("PERSONID"),
-            col("PDEM.MRN").cast(StringType()).alias("MRN"),
-            col("PDEM.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
-            col("RES.PROT_MASTER_ID").cast(StringType()).alias("Study_Code"),
-            col("STUDYM.PRIMARY_MNEMONIC").cast(StringType()).alias("Study_Name"),
-            col("RES.PROT_ACCESSION_NBR").cast(StringType()).alias("Study_Participant_ID"),
-            col("RES.ON_STUDY_DT_TM").cast(StringType()).alias("On_Study_Date"),
-            col("RES.OFF_STUDY_DT_TM").cast(StringType()).alias("Off_Study_Date"),
-            col("RES.REMOVAL_REASON_CD").cast(StringType()).alias("Off_Study_Code"),
-            col("LOOK.CODE_DESC_TXT").cast(StringType()).alias("Off_Study_Reason"),
-            col("RES.REMOVAL_REASON_DESC").cast(StringType()).alias("Off_Study_Comment"),
-            greatest(col("RES.ADC_UPDT"), col("PDEM.ADC_UPDT"), col("STUDYM.ADC_UPDT")).alias("ADC_UPDT")
-        )
-    )
-
-@dlt.view(name="mill_powertrials_update")
-def mill_powertrials_update():
-    return (
-        spark.readStream
-        .option("forceDeleteReadCheckpoint", "true")
-        .option("ignoreDeletes", "true")
-        .option("ignoreChanges", "true")
-        .table("LIVE.rde_mill_powertrials_incr")
-    )
-
-# Declare the target table
-dlt.create_target_table(
-    name = "rde_mill_powertrials",
-    comment="Incrementally updated Powertrials data",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,Study_Code"
-    }
-)
-
-dlt.apply_changes(
-    target = "rde_mill_powertrials",
-    source = "mill_powertrials_update",
-    keys = ["PERSONID", "Study_Code"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
 
 # COMMAND ----------
 
@@ -563,333 +496,162 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
-@dlt.table(name="rde_critperiod_incr", table_properties={
+
+@dlt.table(name="rde_pharmacyorders_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
-def critperiod_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_critperiod")
+def pharmacyorders_incr():
+    max_adc_updt = get_max_adc_updt("8_dev.rde.rde_pharmacyorders")
 
-    crit_care_period = spark.table("4_prod.raw.crit_care_period").alias("a")
-    nhs_data_dict_ref = spark.table("3_lookup.dwh.nhs_data_dct_ref_deprecated").alias("ref")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("DEM")
-
-    return (
-        crit_care_period
-        .join(patient_demographics, col("a.mrn") == col("DEM.MRN"), "inner")
-        .join(nhs_data_dict_ref, 
-              (col("a.CC_Disch_Dest_Cd") == col("ref.NHS_DATA_DICT_NHS_CD_ALIAS")) & 
-              (col("ref.NHS_DATA_DICT_ELEMENT_NAME_KEY_TXT") == 'CRITICALCAREDISCHDESTINATION'),
-              "left")
-        .filter((col("a.ADC_UPDT") > max_adc_updt) | (col("DEM.ADC_UPDT") > max_adc_updt))
-        .select(
-            col("DEM.PERSON_ID").cast(StringType()).alias("PERSONID"),
-            col("DEM.MRN").cast(StringType()).alias("MRN"),
-            col("DEM.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
-            col("a.CC_Period_Local_Id").cast(StringType()).alias("Period_ID"),
-            col("a.CC_Period_Start_Dt_Tm").cast(StringType()).alias("StartDate"),
-            col("a.CC_Period_Disch_Dt_Tm").cast(StringType()).alias("DischargeDate"),
-            col("a.CC_Level2_Days").cast(IntegerType()).alias("Level_2_Days"),
-            col("a.CC_Level3_Days").cast(IntegerType()).alias("Level_3_Days"),
-            col("a.CC_Disch_Dest_Cd").cast(IntegerType()).alias("Dischage_Dest_CD"),
-            col("ref.NHS_DATA_DICT_DESCRIPTION_TXT").cast(StringType()).alias("Discharge_destination"),
-            col("a.CC_Adv_Cardio_Days").cast(IntegerType()).alias("Adv_Cardio_Days"),
-            col("a.CC_Basic_Cardio_Days").cast(IntegerType()).alias("Basic_Cardio_Days"),
-            col("a.CC_Adv_Resp_Days").cast(IntegerType()).alias("Adv_Resp_Days"),
-            col("a.CC_Basic_Resp_Days").cast(IntegerType()).alias("Basic_Resp_Days"),
-            col("a.CC_Renal_Days").cast(IntegerType()).alias("Renal_Days"),
-            col("a.CC_Neuro_Days").cast(IntegerType()).alias("Neuro_Days"),
-            col("a.CC_Gastro_Days").cast(IntegerType()).alias("Gastro_Days"),
-            col("a.CC_Derm_Days").cast(IntegerType()).alias("Derm_Days"),
-            col("a.CC_Liver_Days").cast(IntegerType()).alias("Liver_Days"),
-            col("a.CC_No_Organ_Systems").cast(IntegerType()).alias("No_Organ_Systems"),
-            greatest(col("a.ADC_UPDT"), col("DEM.ADC_UPDT")).alias("ADC_UPDT")
-        )
-    )
-
-@dlt.view(name="critperiod_update")
-def critperiod_update():
-    return (
-        spark.readStream
-        .option("forceDeleteReadCheckpoint", "true")
-        .option("ignoreDeletes", "true")
-        .option("ignoreChanges", "true")
-        .table("LIVE.rde_critperiod_incr")
-    )
-
-# Declare the target table
-dlt.create_target_table(
-    name = "rde_critperiod",
-    comment="Incrementally updated critical care period data",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,Period_ID"
-    }
-)
-
-dlt.apply_changes(
-    target = "rde_critperiod",
-    source = "critperiod_update",
-    keys = ["PERSONID", "Period_ID"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
-
-# COMMAND ----------
-
-@dlt.table(name="rde_critopcs_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
-def critopcs_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_critopcs")
-
-    crit_care_opcs = spark.table("4_prod.raw.crit_care_opcs").alias("a")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("DEM")
-
-    return (
-        crit_care_opcs
-        .join(patient_demographics, col("a.mrn") == col("DEM.MRN"), "inner")
-        .filter((col("a.ADC_UPDT") > max_adc_updt) | (col("DEM.ADC_UPDT") > max_adc_updt))
-        .select(
-            col("DEM.PERSON_ID").cast(StringType()).alias("PERSONID"),
-            col("DEM.MRN").cast(StringType()).alias("MRN"),
-            col("DEM.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
-            col("a.CC_Period_Local_Id").cast(StringType()).alias("Period_ID"),
-            col("a.OPCS_Proc_Dt").cast(StringType()).alias("ProcDate"),
-            col("a.OPCS_Proc_Code").cast(StringType()).alias("ProcCode"),
-            greatest(col("a.ADC_UPDT"), col("DEM.ADC_UPDT")).alias("ADC_UPDT")
-        )
-        .distinct()  # Ensure uniqueness of records
-    )
-
-@dlt.view(name="critopcs_update")
-def critopcs_update():
-    return (
-        spark.readStream
-        .option("forceDeleteReadCheckpoint", "true")
-        .option("ignoreDeletes", "true")
-        .option("ignoreChanges", "true")
-        .table("LIVE.rde_critopcs_incr")
-    )
-
-# Declare the target table
-dlt.create_target_table(
-    name = "rde_critopcs",
-    comment="Incrementally updated critical care OPCS data",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,Period_ID,ProcDate,ProcCode"
-    }
-)
-
-dlt.apply_changes(
-    target = "rde_critopcs",
-    source = "critopcs_update",
-    keys = ["PERSONID", "Period_ID", "ProcDate", "ProcCode"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
-
-# COMMAND ----------
-
-@dlt.table(name="rde_emergencyd_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
-def emergencyd_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_emergencyd")
-
-    cds_aea = spark.table("4_prod.raw.cds_aea").alias("AEA")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("DEM")
-    discharge_destination = spark.table("3_lookup.dwh.cds_ecd_ref_discharge_destination").alias("e")
-    discharge_status = spark.table("3_lookup.dwh.cds_ecd_map_att_disp_disch_stat").alias("d")
-    treatment_site = spark.table("3_lookup.dwh.site").alias("ts")
-    cds_aea_diag = spark.table("4_prod.raw.cds_aea_diag").alias("DIA")
-    ecd_ref_diagnosis = spark.table("3_lookup.dwh.cds_ecd_ref_diagnosis").alias("REF")
-
-    return (
-        cds_aea
-        .join(patient_demographics, col("AEA.mrn") == col("DEM.MRN"), "inner")
-        .join(discharge_destination, col("AEA.Discharge_Destination_Cd") == col("e.Discharge_Destination_Snomed_Cd"), "left")
-        .join(discharge_status, col("AEA.Discharge_Status_Cd") == col("d.Discharge_Status_ECD_Cd"), "left")
-        .join(treatment_site, col("AEA.treatment_site_code") == col("ts.site_cd"), "left")
-        .join(cds_aea_diag, col("AEA.cds_aea_id") == col("DIA.cds_aea_id"), "left")
-        .join(ecd_ref_diagnosis, col("DIA.Diag_ECD_Cd") == col("REF.diagnosis_Snomed_cd"), "left")
-        .filter((col("AEA.ADC_UPDT") > max_adc_updt) | (col("DEM.ADC_UPDT") > max_adc_updt))
-        .select(
-            col("DEM.PERSON_ID").cast(StringType()).alias("PERSONID"),
-            col("DEM.MRN").cast(StringType()).alias("MRN"),
-            col("DEM.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
-            col("AEA.ARRIVAL_DT_TM").cast(StringType()).alias("Arrival_Dt_Tm"),
-            col("AEA.DEPARTURE_TM").cast(StringType()).alias("Departure_Dt_Tm"),
-            col("AEA.DISCHARGE_STATUS_CD").cast(StringType()).alias("Dischage_Status_CD"),
-            col("d.DISCHARGE_STATUS_DESC").cast(StringType()).alias("Discharge_Status_Desc"),
-            col("AEA.Discharge_destination_Cd").cast(StringType()).alias("Discharge_Dest_CD"),
-            col("e.DISCHARGE_DESTINATION_DESC").cast(StringType()).alias("Discharge_Dest_Desc"),
-            col("DIA.DIAG_CD").cast(StringType()).alias("Diag_Code"),
-            col("REF.Diagnosis_Snomed_Cd").cast(StringType()).alias("SNOMED_CD"),
-            col("REF.Diagnosis_Snomed_Desc").cast(StringType()).alias("SNOMED_Desc"),
-            greatest(col("AEA.ADC_UPDT"), col("DEM.ADC_UPDT"), col("DIA.ADC_UPDT")).alias("ADC_UPDT")
-        )
-    )
-
-@dlt.view(name="emergencyd_update")
-def emergencyd_update():
-    return (
-        spark.readStream
-        .option("forceDeleteReadCheckpoint", "true")
-        .option("ignoreDeletes", "true")
-        .option("ignoreChanges", "true")
-        .table("LIVE.rde_emergencyd_incr")
-    )
-
-# Declare the target table
-dlt.create_target_table(
-    name = "rde_emergencyd",
-    comment="Incrementally updated emergency department data",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,Arrival_Dt_Tm,Diag_Code"
-    }
-)
-
-dlt.apply_changes(
-    target = "rde_emergencyd",
-    source = "emergencyd_update",
-    keys = ["PERSONID", "Arrival_Dt_Tm", "Diag_Code"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
-
-# COMMAND ----------
-
-@dlt.table(name="rde_medadmin_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
-def medadmin_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_medadmin")
-
-    clinical_event = spark.table("4_prod.raw.mill_dir_clinical_event").alias("CE")
-    med_admin_event = spark.table("4_prod.raw.mill_dir_med_admin_event").alias("MAE")
+    orders = spark.table("4_prod.raw.mill_orders").alias("O")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    ce_med_result = spark.table("4_prod.raw.mill_dir_ce_med_result").alias("MR")
-    order_ingredient = spark.table("4_prod.raw.mill_dir_order_ingredient").alias("OI")
-    order_catalog_synonym = spark.table("3_lookup.dwh.mill_dir_order_catalog_synonym").alias("OSYN")
-    order_catalog = spark.table("3_lookup.dwh.mill_dir_order_catalog").alias("OCAT")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    order_detail = spark.table("4_prod.raw.mill_order_detail").alias("OD")
+    order_comment = spark.table("4_prod.raw.mill_order_comment").alias("COM")
+    long_text = spark.table("4_prod.raw.mill_long_text").alias("LNG")
+    order_action = spark.table("4_prod.raw.mill_order_action").alias("ACT")
 
-    window_spec = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
+    # Window specs for order_detail
+    window_spec = Window.partitionBy("ORDER_ID", "OE_FIELD_ID").orderBy(col("ACTION_SEQUENCE").desc())
 
-    return (
-        clinical_event.filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
-        .join(med_admin_event, col("CE.EVENT_ID") == col("MAE.EVENT_ID"), "inner")
-        .join(encounter, col("CE.ENCNTR_ID") == col("ENC.ENCNTR_ID"), "inner")
-        .join(ce_med_result.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1), 
-              col("MAE.EVENT_ID") == col("MR.EVENT_ID"), "left")
-        .join(order_ingredient.withColumn("rn", row_number().over(Window.partitionBy("ORDER_ID").orderBy(asc("ACTION_SEQUENCE")))).filter(col("rn") == 1), 
-              col("MAE.TEMPLATE_ORDER_ID") == col("OI.ORDER_ID"), "left")
-        .join(order_catalog_synonym.alias("OSYN"), col("OI.SYNONYM_ID") == col("OSYN.SYNONYM_ID"), "left")
-        .join(order_catalog_synonym.alias("ASYN"), col("MR.SYNONYM_ID") == col("ASYN.SYNONYM_ID"), "left")
-        .join(order_catalog.alias("OCAT"), col("OSYN.CATALOG_CD") == col("OCAT.CATALOG_CD"), "left")
-        .join(order_catalog.alias("ACAT"), col("ASYN.CATALOG_CD") == col("ACAT.CATALOG_CD"), "left")
-        .join(code_value_ref.alias("EVENT_TYPE"), col("MAE.EVENT_TYPE_CD") == col("EVENT_TYPE.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_ROUTE"), col("MR.ADMIN_ROUTE_CD") == col("ADMIN_ROUTE.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_METHOD"), col("MR.ADMIN_METHOD_CD") == col("ADMIN_METHOD.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_DOSAGE_UNIT"), col("MR.DOSAGE_UNIT_CD") == col("ADMIN_DOSAGE_UNIT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_DILUENT_TYPE"), col("MR.DILUENT_TYPE_CD") == col("ADMIN_DILUENT_TYPE.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_INFUSION_UNIT"), col("MR.INFUSION_UNIT_CD") == col("ADMIN_INFUSION_UNIT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_INFUSION_TIME"), col("MR.INFUSION_TIME_CD") == col("ADMIN_INFUSION_TIME.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_MEDICATION_FORM"), col("MR.MEDICATION_FORM_CD") == col("ADMIN_MEDICATION_FORM.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_STRENGTH_UNIT"), col("MR.ADMIN_STRENGTH_UNIT_CD") == col("ADMIN_STRENGTH_UNIT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_INFUSED_VOLUME_UNIT"), col("MR.INFUSED_VOLUME_UNIT_CD") == col("ADMIN_INFUSED_VOLUME_UNIT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_REMAINING_VOLUME_UNIT"), col("MR.REMAINING_VOLUME_UNIT_CD") == col("ADMIN_REMAINING_VOLUME_UNIT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_IMMUNIZATION_TYPE"), col("MR.IMMUNIZATION_TYPE_CD") == col("ADMIN_IMMUNIZATION_TYPE.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_REFUSAL"), col("MR.REFUSAL_CD") == col("ADMIN_REFUSAL.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMIN_IV_EVENT"), col("MR.IV_EVENT_CD") == col("ADMIN_IV_EVENT.CODE_VALUE_CD"), "left")
-        .join(code_value_ref.alias("ADMINISTRATOR"), col("MAE.POSITION_CD") == col("ADMINISTRATOR.CODE_VALUE_CD"), "left")
-        .filter((col("CE.ADC_UPDT") > max_adc_updt) | (col("ENC.ADC_UPDT") > max_adc_updt) | (col("MAE.ADC_UPDT") > max_adc_updt))
-        .filter(col("MAE.EVENT_ID") > 0)
+    priority_detail = (
+        order_detail.filter(col("OE_FIELD_ID") == 12657)
+        .withColumn("row", row_number().over(window_spec))
+        .filter(col("row") == 1)
+        .select(col("ORDER_ID").alias("PRIORITY_ORDER_ID"), col("OE_FIELD_VALUE").alias("PRIORITY_CD"))
+    )
+
+    canceled_reason_detail = (
+        order_detail.filter(col("OE_FIELD_ID") == 12664)
+        .withColumn("row", row_number().over(window_spec))
+        .filter(col("row") == 1)
+        .select(col("ORDER_ID").alias("CANCELED_ORDER_ID"), col("OE_FIELD_VALUE").alias("CANCELED_REASON_CD"))
+    )
+
+    # Window spec for order comments
+    comment_window_spec = Window.partitionBy("COM.ORDER_ID").orderBy(col("COM.ACTION_SEQUENCE").desc(), col("LNG.UPDT_DT_TM").desc())
+
+    order_comments = (
+        order_comment
+        .join(long_text, (col("COM.ORDER_ID") == col("LNG.PARENT_ENTITY_ID")) & (col("COM.LONG_TEXT_ID") == col("LNG.LONG_TEXT_ID")))
+        .filter((col("LNG.PARENT_ENTITY_NAME") == "ORDER_COMMENT") & (col("LNG.ACTIVE_IND") == 1) & (col("COM.COMMENT_TYPE_CD") == 66))
+        .withColumn("row", row_number().over(comment_window_spec))
+        .filter(col("row") == 1)
+        .select(col("COM.ORDER_ID").alias("COMMENT_ORDER_ID"), col("LNG.LONG_TEXT"))
+    )
+
+    cancel_dt = (
+    order_action.filter(col("ACTION_TYPE_CD") == 2526)  # Cancel Order
+    .join(orders, col("ACT.ORDER_ID") == col("O.ORDER_ID"))
+    .withColumn("row_num", row_number().over(Window.partitionBy("O.ORDER_ID").orderBy(col("ACT.ACTION_SEQUENCE").desc())))
+    .filter(col("row_num") == 1)
+    .select(
+        col("O.ORDER_ID").alias("CANCEL_ORDER_ID"),
+        col("ACT.ACTION_DT_TM").alias("CANCELED_DT_TM"),
+        col("ACT.ACTION_PERSONNEL_ID").alias("CANCELED_TRAN_PRSNL_ID")
+    )
+)
+
+    completed_dt = (
+        order_action.filter(col("ACTION_TYPE_CD") == 2529)  # Completed Order
+        .join(orders, col("ACT.ORDER_ID") == col("O.ORDER_ID"))
+        .withColumn("row_num", row_number().over(Window.partitionBy("O.ORDER_ID").orderBy(col("ACT.ACTION_SEQUENCE").desc())))
+        .filter(col("row_num") == 1)
         .select(
-            col("ENC.PERSON_ID").cast(StringType()).alias("PERSONID"),
-            col("ENC.MRN").cast(StringType()).alias("MRN"),
-            col("ENC.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
-            col("CE.EVENT_ID").cast(StringType()).alias("EVENT_ID"),
-            col("CE.ORDER_ID").cast(StringType()).alias("ORDER_ID"),
-            col("EVENT_TYPE.CODE_DESC_TXT").cast(StringType()).alias("EVENT_TYPE"),
-            col("OI.SYNONYM_ID").cast(StringType()).alias("ORDER_SYNONYM_ID"),
-            substring(col("OCAT.CKI"), -6, 6).cast(StringType()).alias("ORDER_MULTUM"),
-            col("OSYN.MNEMONIC").cast(StringType()).alias("Order_Desc"),
-            col("OI.ORDER_DETAIL_DISPLAY_LINE").cast(StringType()).alias("Order_Detail"),
-            col("OI.STRENGTH").cast(FloatType()).alias("ORDER_STRENGTH"),
-            col("OI.STRENGTH_UNIT").cast(StringType()).alias("ORDER_STRENGTH_UNIT"),
-            col("OI.VOLUME").cast(FloatType()).alias("ORDER_VOLUME"),
-            col("OI.VOLUME_UNIT").cast(StringType()).alias("ORDER_VOLUME_UNIT"),
-            col("OI.ACTION_SEQUENCE").cast(IntegerType()).alias("ORDER_ACTION_SEQUENCE"),
-            col("ADMIN_ROUTE.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_ROUTE"),
-            col("ADMIN_METHOD.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_METHOD"),
-            col("MR.INITIAL_DOSAGE").cast(FloatType()).alias("ADMIN_INITIAL_DOSAGE"),
-            col("MR.ADMIN_DOSAGE").cast(FloatType()).alias("ADMIN_DOSAGE"),
-            col("ADMIN_DOSAGE_UNIT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_DOSAGE_UNIT"),
-            col("MR.INITIAL_VOLUME").cast(FloatType()).alias("ADMIN_INITIAL_VOLUME"),
-            col("MR.TOTAL_INTAKE_VOLUME").cast(FloatType()).alias("ADMIN_TOTAL_INTAKE_VOLUME"),
-            col("ADMIN_DILUENT_TYPE.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_DILUENT_TYPE"),
-            col("MR.INFUSION_RATE").cast(FloatType()).alias("ADMIN_INFUSION_RATE"),
-            col("ADMIN_INFUSION_UNIT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_INFUSION_UNIT"),
-            col("ADMIN_INFUSION_TIME.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_INFUSION_TIME"),
-            col("ADMIN_MEDICATION_FORM.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_MEDICATION_FORM"),
-            col("MR.ADMIN_STRENGTH").cast(FloatType()).alias("ADMIN_STRENGTH"),
-            col("ADMIN_STRENGTH_UNIT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_STRENGTH_UNIT"),
-            col("MR.INFUSED_VOLUME").cast(FloatType()).alias("ADMIN_INFUSED_VOLUME"),
-            col("ADMIN_INFUSED_VOLUME_UNIT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_INFUSED_VOLUME_UNIT"),
-            col("MR.REMAINING_VOLUME").cast(FloatType()).alias("ADMIN_REMAINING_VOLUME"),
-            col("ADMIN_REMAINING_VOLUME_UNIT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_REMAINING_VOLUME_UNIT"),
-            col("ADMIN_IMMUNIZATION_TYPE.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_IMMUNIZATION_TYPE"),
-            col("ADMIN_REFUSAL.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_REFUSAL"),
-            col("ADMIN_IV_EVENT.CODE_DESC_TXT").cast(StringType()).alias("ADMIN_IV_EVENT"),
-            col("MR.SYNONYM_ID").cast(StringType()).alias("ADMIN_SYNONYM_ID"),
-            substring(col("ACAT.CKI"), -6, 6).cast(StringType()).alias("ADMIN_MULTUM"),
-            col("ASYN.MNEMONIC").cast(StringType()).alias("Admin_Desc"),
-            col("ADMINISTRATOR.CODE_DESC_TXT").cast(StringType()).alias("ADMINISTRATOR"),
-            col("CE.EVENT_TAG").cast(StringType()).alias("EVENT_DESC"),
-            col("CE.CLINSIG_UPDT_DT_TM").cast(StringType()).alias("EVENT_DATE"),
-            col("MR.ADMIN_START_DT_TM").cast(StringType()).alias("ADMIN_START_DATE"),
-            col("MR.ADMIN_END_DT_TM").cast(StringType()).alias("ADMIN_END_DATE"),
-            greatest(col("CE.ADC_UPDT"), col("ENC.ADC_UPDT"), col("MAE.ADC_UPDT"), col("MR.ADC_UPDT"), col("OI.ADC_UPDT")).alias("ADC_UPDT")
+            col("O.ORDER_ID").alias("COMPLETED_ORDER_ID"),
+            col("ACT.ACTION_DT_TM").alias("COMPLETED_DT_TM")
         )
     )
 
-@dlt.view(name="medadmin_update")
-def medadmin_update():
+    # New subquery for DISCONTINUE_DT_TM
+    discontinue_dt = (
+        order_action.filter(col("ACTION_TYPE_CD") == 2532)  # Discontinue Order
+        .join(orders, col("ACT.ORDER_ID") == col("O.ORDER_ID"))
+        .withColumn("row_num", row_number().over(Window.partitionBy("O.ORDER_ID").orderBy(col("ACT.ACTION_SEQUENCE").desc())))
+        .filter(col("row_num") == 1)
+        .select(
+            col("O.ORDER_ID").alias("DISCONTINUE_ORDER_ID"),
+            col("ACT.ACTION_DT_TM").alias("DISCONTINUE_DT_TM")
+        )
+    )
+
+    return (
+        orders
+        .join(encounter, col("O.ENCNTR_ID") == col("ENC.ENCNTR_ID"), "inner")
+        .join(code_value_ref.alias("Activity"), col("O.ACTIVITY_TYPE_CD") == col("Activity.CODE_VALUE_CD"), "left")
+        .join(priority_detail, col("O.ORDER_ID") == col("PRIORITY_ORDER_ID"), "left")
+        .join(canceled_reason_detail, col("O.ORDER_ID") == col("CANCELED_ORDER_ID"), "left")
+        .join(code_value_ref.alias("Cancel"), col("CANCELED_REASON_CD") == col("Cancel.CODE_VALUE_CD"), "left")
+        .join(code_value_ref.alias("ClinicCat"), col("O.DCP_CLIN_CAT_CD") == col("ClinicCat.CODE_VALUE_CD"), "left")
+        .join(code_value_ref.alias("OrderTyp"), col("O.CATALOG_TYPE_CD") == col("OrderTyp.CODE_VALUE_CD"), "left")
+        .join(code_value_ref.alias("LastOStat"), col("O.ORDER_STATUS_CD") == col("LastOStat.CODE_VALUE_CD"), "left")
+        .join(code_value_ref.alias("Prio"), col("PRIORITY_CD") == col("Prio.CODE_VALUE_CD"), "left")
+        .join(order_comments, col("O.ORDER_ID") == col("COMMENT_ORDER_ID"), "left")
+        .join(cancel_dt, col("O.ORDER_ID") == col("CANCEL_ORDER_ID"), "left")
+        .join(completed_dt, col("O.ORDER_ID") == col("COMPLETED_ORDER_ID"), "left")
+        .join(discontinue_dt, col("O.ORDER_ID") == col("DISCONTINUE_ORDER_ID"), "left")
+        .filter((col("O.ADC_UPDT") > max_adc_updt) | (col("ENC.ADC_UPDT") > max_adc_updt))
+        .filter((col("O.CATALOG_TYPE_CD") == 2516) & 
+                #(col("O.ORDER_STATUS_CD").isin("2543", "2545", "2547", "2548", "2550", "2552", "643466")) &
+                (col("O.ORDER_STATUS_CD").isin(2543, 2545, 2547, 2548, 2550, 2552, 643466)) &
+                (col("O.DCP_CLIN_CAT_CD") == 10577) & 
+                (col("O.ACTIVITY_TYPE_CD") == "705") &
+                (col("O.ACTIVE_IND") == 1))
+        .select(
+            col("O.ORDER_ID").cast(StringType()).alias("OrderID"),
+            col("ENC.MRN").cast(StringType()).alias("MRN"),
+            col("ENC.NHS_Number").cast(StringType()).alias("NHS_Number"),
+            col("O.ENCNTR_ID").cast(StringType()).alias("ENCNTRID"),
+            col("ENC.ENC_TYPE").cast(StringType()).alias("EncType"),
+            col("ENC.PERSON_ID").cast(StringType()).alias("PERSONID"),
+            col("O.ORIG_ORDER_DT_TM").cast(StringType()).alias("OrderDate"),
+            col("O.STATUS_DT_TM").cast(StringType()).alias("LastOrderStatusDateTime"),
+            col("O.CURRENT_START_DT_TM").cast(StringType()).alias("ReqStartDateTime"),
+            col("O.ORDER_MNEMONIC").cast(StringType()).alias("OrderText"),
+            col("LNG.LONG_TEXT").cast(StringType()).alias("Comments"),
+            col("O.ORDER_DETAIL_DISPLAY_LINE").cast(StringType()).alias("OrderDetails"),
+            col("LastOStat.CODE_DESC_TXT").cast(StringType()).alias("LastOrderStatus"),
+            col("ClinicCat.CODE_DESC_TXT").cast(StringType()).alias("ClinicalCategory"),
+            col("Activity.CODE_DESC_TXT").cast(StringType()).alias("ActivityDesc"),
+            col("OrderTyp.CODE_DESC_TXT").cast(StringType()).alias("OrderableType"),
+            col("Prio.CODE_DESC_TXT").cast(StringType()).alias("PriorityDesc"),
+            col("Cancel.CODE_DESC_TXT").cast(StringType()).alias("CancelledReason"),
+            col("CANCELED_DT_TM").cast(StringType()).alias("CancelledDT"),
+            coalesce(col("COMPLETED_DT_TM"), col("O.CLIN_RELEVANT_UPDT_DT_TM")).cast(StringType()).alias("CompletedDT"),
+            col("DISCONTINUE_DT_TM").cast(StringType()).alias("DiscontinuedDT"),
+            col("O.CKI").cast(StringType()).alias("ConceptIdent"),
+            col("PRIORITY_CD").cast(StringType()).alias("PRIORITY_CD"),
+            greatest(col("O.ADC_UPDT"), col("ENC.ADC_UPDT")).alias("ADC_UPDT")
+        )
+    )
+
+
+
+@dlt.view(name="pharmacyorders_update")
+def pharmacyorders_update():
     return (
         spark.readStream
         .option("forceDeleteReadCheckpoint", "true")
         .option("ignoreDeletes", "true")
         .option("ignoreChanges", "true")
-        .table("LIVE.rde_medadmin_incr")
+        .table("LIVE.rde_pharmacyorders_incr")
     )
 
 # Declare the target table
 dlt.create_target_table(
-    name = "rde_medadmin",
-    comment="Incrementally updated medication administration data",
+    name = "rde_pharmacyorders",
+    comment="Incrementally updated pharmacy orders data",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,EVENT_ID"
+        "pipelines.autoOptimize.zOrderCols": "PERSONID,OrderID"
     }
 )
 
 dlt.apply_changes(
-    target = "rde_medadmin",
-    source = "medadmin_update",
-    keys = ["EVENT_ID"],
+    target = "rde_pharmacyorders",
+    source = "pharmacyorders_update",
+    keys = ["OrderID"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
