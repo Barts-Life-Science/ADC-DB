@@ -43,6 +43,30 @@ def table_exists_with_rows(table_name):
 
 # COMMAND ----------
 
+demographics_comment = "Contains the basic demographic details of each patient included in the extract." 
+
+schema_rde_patient_demographics = StructType([
+        StructField("PERSON_ID", DoubleType(), True, metadata={"comment": "This is the value of the unique primary identifier of the PERSON table. It is an internal system assigned number."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Hospital number, another unique identifier"}),
+        StructField("Date_of_Birth", TimestampType(), True, metadata={"comment": "The date on which a PERSON was born or is officially deemed to have been born."}),
+        StructField("GENDER_CD", DoubleType(), True, metadata={"comment": "Gender CD"}),
+        StructField("Gender", StringType(), True, metadata={"comment": "Gender of the patient as text"}),
+        StructField("ETHNIC_CD", DoubleType(), True, metadata={"comment": "Ethnicity CD"}),
+        StructField("Ethnicity", StringType(), True, metadata={"comment": "The ethnicity of a PERSON, as specified by the PERSON."}),
+        StructField("Date_of_Death", TimestampType(), True, metadata={"comment": "*Date of death of the patient  if deceased. May not be up to date if patient record has not been updated since the last spine lookup and patient died out of trust."}),
+        StructField("Postcode", StringType(), True, metadata={"comment": "A code that is used to assist with finding or navigating to a specific location or delivery point. In some countries, this may provide better resolution than the standard postal address."}),
+        StructField("City", StringType(), True, metadata={"comment": "The city field is the text name of the city associated with the address row."}),
+        StructField("MARITAL_STATUS_CD", DoubleType(), True, metadata={"comment": "Marital status CD"}),
+        StructField("MARITAL_STATUS", StringType(), True, metadata={"comment": "This field identifies the status of the person with regard to being married."}),
+        StructField("LANGUAGE_CD", DoubleType(), True, metadata={"comment": "Language CD"}),
+        StructField("LANGUAGE", StringType(), True, metadata={"comment": "The primary language spoken by the person."}),
+        StructField("RELIGION_CD", DoubleType(), True, metadata={"comment": "Religion CD"}),
+        StructField("RELIGION", StringType(), True, metadata={"comment": "A particular integrated system of belief in a supernatural power."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+
+
 @dlt.table(name="rde_patient_demographics_incr", temporary=True,
         table_properties={
         "pipelines.autoOptimize.zOrderCols": "PERSON_ID",
@@ -132,14 +156,15 @@ def demographics_update():
 
 dlt.create_target_table(
     name = "rde_patient_demographics",
-    comment="Incrementally updated patient demographics",
+    comment=demographics_comment,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
         "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
 
-    }
+    },
+    schema = schema_rde_patient_demographics
 )
 
 dlt.apply_changes(
@@ -154,6 +179,27 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+
+encounter_comment = "Each encounter is a contact with a specific patient and clinical context"
+schema_rde_encounter = StructType([
+        StructField("PERSON_ID", DoubleType(), True, metadata={"comment": "Unique identifier for a person."}),
+        StructField("ENCNTR_ID", DoubleType(), True, metadata={"comment": "Unique identifier for the encounter"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "Patient NHS Number"}),
+        StructField("REASON_FOR_VISIT_TXT", StringType(), True, metadata={"comment": "The free text description of reason for visit. Otherwise known as admitting symptom, presenting symptom, etc."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Patient Hospital Identifier"}),
+        StructField("ENCNTR_TYPE_CD", DoubleType(), True, metadata={"comment": "Categorizes the encounter into a logical group or type. Examples may include inpatient, outpatient, etc."}),
+        StructField("ENC_TYPE", StringType(), True, metadata={"comment": "Lookup text for the ENCNTR_TYPE_CD"}),
+        StructField("ENC_STATUS_CD", DoubleType(), True, metadata={"comment": "Encounter status identifies the state of a particular encounter type from the time it is initiated until it is complete. (i.e., temporary, preliminary, active, discharged (complete), cancelled)."}),
+        StructField("ENC_STATUS", StringType(), True, metadata={"comment": "Lookup text for the ENCNTR_STATUS_CD"}),
+        StructField("FIN_NBR_ID", StringType(), True, metadata={"comment": "Financial Identifier for the encounter"}),
+        StructField("ADMIN_CATEGORY_CD", DoubleType(), True, metadata={"comment": "Service category code."}),
+        StructField("ADMIN_DESC", StringType(), True, metadata={"comment": "Lookup text for the ADMIN_CATEGORY_CD"}),
+        StructField("TREATMENT_FUNCTION_CD", DoubleType(), True, metadata={"comment": "The type or category of medical service that the patient is receiving in relation to their encounter. The category may be of treatment type, surgery, general resources, or others."}),
+        StructField("TFC_DESC", StringType(), True, metadata={"comment": "Lookup text for the TREATMENT_FUNCTION_CD"}),
+        StructField("VISIT_ID", StringType(), True, metadata={"comment": "Linked visit ID for the encounter"}),
+        StructField("CREATE_DT_TM", TimestampType(), True, metadata={"comment": "Date at which encounter was created."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_encounter_incr", table_properties={
         "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID",
@@ -240,14 +286,15 @@ def encounter_update():
 
 dlt.create_target_table(
     name = "rde_encounter",
-    comment="Incrementally updated encounter data",
+    comment=encounter_comment,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
         "pipelines.autoOptimize.zOrderCols": "ENCNTR_ID"
 
-    }
+    },
+    schema = schema_rde_encounter
 )
 
 dlt.apply_changes(
@@ -262,6 +309,20 @@ dlt.apply_changes(
 
 
 # COMMAND ----------
+
+apc_comment = "Diagnoses made in inpatient encounters"
+schema_rde_apc_diagnosis = StructType([
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Patient unique identifier"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Patient Local hospital number"}),
+        StructField("ICD_Diagnosis_Num", IntegerType(), True, metadata={"comment": "Sequential index of the diagnosis"}),
+        StructField("ICD_Diagnosis_Cd", StringType(), True, metadata={"comment": "ICD10 Code for the diagnosis."}),
+        StructField("ICD_Diag_Desc", StringType(), True, metadata={"comment": "Text description of the diagnosis."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Activity_date", StringType(), True, metadata={"comment": "Spell start date and time"}),
+        StructField("CDS_Activity_Dt", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_apc_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"
@@ -315,7 +376,8 @@ def apc_diagnosis_update():
 
 dlt.create_target_table(
     name = "rde_apc_diagnosis",
-    comment="Incrementally updated APC diagnosis data",
+    comment=apc_comment,
+    schema = schema_rde_apc_diagnosis,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -338,6 +400,22 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+apc_opcs_comment = "Procedures from inpatient encounters"
+schema_rde_apc_opcs = StructType([
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies the patient."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier"}),
+        StructField("OPCS_Proc_Num", IntegerType(), True, metadata={"comment": "Sequential index of the procedures"}),
+        StructField("OPCS_Proc_Scheme_Cd", StringType(), True, metadata={"comment": "CDS Procedure scheme in use."}),
+        StructField("OPCS_Proc_Cd", StringType(), True, metadata={"comment": "OPCS Procedure code."}),
+        StructField("Proc_Desc", StringType(), True, metadata={"comment": "Description of the procedure."}),
+        StructField("OPCS_Proc_Dt", StringType(), True, metadata={"comment": "Date procedure occurred."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Activity_date", StringType(), True, metadata={"comment": "Spell start date and time"}),
+        StructField("CDS_Activity_Dt", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+    
 @dlt.table(name="rde_apc_opcs_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def apc_opcs_incr():
@@ -391,7 +469,8 @@ def apc_opcs_update():
 
 dlt.create_target_table(
     name = "rde_apc_opcs",
-    comment="Incrementally updated APC OPCS data",
+    comment=apc_opcs_comment,
+    schema = schema_rde_apc_opcs,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -413,6 +492,20 @@ dlt.apply_changes(
 
 
 # COMMAND ----------
+
+rde_op_diag_comment = "Diagnosis from outpatient encounters"
+schema_rde_op_diagnosis = StructType([
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Unique identifier of the patient"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("ICD_Diagnosis_Num", IntegerType(), True, metadata={"comment": "Sequential number for the diagnoses"}),
+        StructField("ICD_Diagnosis_Cd", StringType(), True, metadata={"comment": "ICD10 code for the diagnosis."}),
+        StructField("ICD_Diag_Desc", StringType(), True, metadata={"comment": "Text description of the diagnosis"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Activity_date", StringType(), True, metadata={"comment": "Date of appointment"}),
+        StructField("CDS_Activity_Dt", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_op_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -466,7 +559,8 @@ def op_diagnosis_update():
 
 dlt.create_target_table(
     name = "rde_op_diagnosis",
-    comment="Incrementally updated OP diagnosis data",
+    comment = rde_op_diag_comment,
+    schema = schema_rde_op_diagnosis,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -489,6 +583,20 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+opa_opcs_comment = "Procedures from outpatient appointments"
+schema_rde_opa_opcs = StructType([
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Unique identifier for the patient."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("OPCS_Proc_Num", IntegerType(), True, metadata={"comment": "Sequential number of the procedure for the patient."}),
+        StructField("OPCS_Proc_Scheme_Cd", StringType(), True, metadata={"comment": "CDS Procedure schema in use."}),
+        StructField("OPCS_Proc_Cd", StringType(), True, metadata={"comment": "OPCS code for the procedure."}),
+        StructField("Proc_Desc", StringType(), True, metadata={"comment": "Text description of the procedure."}),
+        StructField("OPCS_Proc_Dt", StringType(), True, metadata={"comment": "Date of the procedure."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("CDS_Activity_Dt", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 @dlt.table(name="rde_opa_opcs_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def opa_opcs_incr():
@@ -541,7 +649,8 @@ def opa_opcs_update():
 
 dlt.create_target_table(
     name = "rde_opa_opcs",
-    comment="Incrementally updated OPA OPCS data",
+    comment = opa_opcs_comment,
+    schema = schema_rde_opa_opcs,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -564,6 +673,38 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+cds_apc_comment = "Details of an inpatient attendence"
+schema_rde_cds_apc = StructType([
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Unique identifier for the person."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Adm_Dt", StringType(), True, metadata={"comment": "The Start Date of the Hospital Provider Spell is the date of admission"}),
+        StructField("Disch_Dt", StringType(), True, metadata={"comment": "DISCHARGE DATE (HOSPITAL PROVIDER SPELL) is the date a PATIENT was discharged from a Hospital Provider Spell.\
+"}),
+        StructField("LOS", StringType(), True, metadata={"comment": "A derived column from spell start and end date"}),
+        StructField("Priority_Cd", StringType(), True, metadata={"comment": "CDS Priority code"}),
+        StructField("Priority_Desc", StringType(), True, metadata={"comment": "Text description of the CDS Priority code"}),
+        StructField("Treat_Func_Cd", StringType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION.\
+"}),
+        StructField("Spell_HRG_Cd", StringType(), True, metadata={"comment": " Hospital provider spell healthcare resource group. This is derived from the Reference cost HRG grouper for completed spell activity. "}),
+        StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
+        StructField("Patient_Class_Desc", StringType(), True, metadata={"comment": "A detailed description of the  classification of PATIENTS who have been admitted to a Hospital Provider Spell. "}),
+        StructField("PatClass_Desc", StringType(), True, metadata={"comment": "A  description of the  of the patient classification code"}),
+        StructField("Admin_Cat_Cd", StringType(), True, metadata={"comment": "Administrative category code"}),
+        StructField("Admin_Cat_Desc", StringType(), True, metadata={"comment": "ADMINISTRATIVE CATEGORY CODE (ON ADMISSION) is used to record the ADMINISTRATIVE CATEGORY CODE at the start of the Hospital Provider Spell."}),
+        StructField("Admiss_Srce_Cd", StringType(), True, metadata={"comment": "ADMISSION SOURCE (HOSPITAL PROVIDER SPELL) is the source of admission to a Hospital Provider Spell in a Hospital Site"}),
+        StructField("Admiss_Source_Desc", StringType(), True, metadata={"comment": "ADMISSION SOURCE (HOSPITAL PROVIDER SPELL) is the source of admission to a Hospital Provider Spell in a Hospital Site"}),
+        StructField("Disch_Dest", StringType(), True, metadata={"comment": "The destination of a PATIENT on completion of a Hospital Provider Spell"}),
+        StructField("Disch_Dest_Desc", StringType(), True, metadata={"comment": "The destination of a PATIENT on completion of a Hospital Provider Spell"}),
+        StructField("Ep_Num", StringType(), True, metadata={"comment": "A unique number or set of characters that is applicable to only one ACTIVITY for a PATIENT within an ORGANISATION"}),
+        StructField("Ep_Start_Dt", StringType(), True, metadata={"comment": "Start date of the episode."}),
+        StructField("Ep_End_Dt", StringType(), True, metadata={"comment": "End date of the episode."}),
+        StructField("CDS_Activity_Dt", StringType(), True, metadata={"comment": "Date of the base cds activity."}),
+        StructField("ENC_DESC", StringType(), True, metadata={"comment": "Text label for the type of encounter."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+    
 @dlt.table(name="rde_cds_apc_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def cds_apc_incr():
@@ -650,7 +791,8 @@ def cds_apc_update():
 
 dlt.create_target_table(
     name = "rde_cds_apc",
-    comment="Incrementally updated CDS APC data",
+    comment=cds_apc_comment,
+    schema = schema_rde_cds_apc,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -671,6 +813,33 @@ dlt.apply_changes(
        
 
 # COMMAND ----------
+
+cds_opa_comment = "Details for each outpatient attendence"
+schema_rde_cds_opa = StructType([
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("AttendanceType", StringType(), True, metadata={"comment": "Type of attendance, Referall, pre-registration etc."}),
+        StructField("CDSDate", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
+        StructField("Att_Dt", StringType(), True, metadata={"comment": "Date of appointment"}),
+        StructField("HRG_Cd", StringType(), True, metadata={"comment": "HRG Code for this outpatient attendance"}),
+        StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
+        StructField("Treat_Func_Cd", StringType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION.\
+"}),
+        StructField("Att_Type", StringType(), True, metadata={"comment": "First attendance  type description "}),
+        StructField("Attended_Desc", StringType(), True, metadata={"comment": "This indicates whether or not a patient attended for an appointment."}),
+        StructField("Attendance_Outcome_Desc", StringType(), True, metadata={"comment": "Describes the outcome of an outpatient attendance."}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Unique identifier of the person."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("APPT_DT_TM", StringType(), True, metadata={"comment": "Date and time of the appointment"}),
+        StructField("APPT_LOCATION_CD", StringType(), True, metadata={"comment": "Location code for the appointment."}),
+        StructField("REASON_FOR_VISIT_TXT", StringType(), True, metadata={"comment": "Free text given reason for the encounter."}),
+        StructField("APPT_TYPE_CD", StringType(), True, metadata={"comment": "Code for appointment type."}),
+        StructField("FIN_NBR_ID", StringType(), True, metadata={"comment": "Financial ID for the appointment."}),
+        StructField("ATTENDED_DNA_NHS_CD_ALIAS", StringType(), True, metadata={"comment": "attendance outcome code."}),
+        StructField("EXPECTED_DUR_OF_APPT_NBR", IntegerType(), True, metadata={"comment": "Expected duration of appointment in minutes."}),
+        StructField("ACTIVITY_LOC_TYPE_NHS_CD_ALIAS", StringType(), True, metadata={"comment": "Code for location type of the appointment."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_cds_opa_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -792,7 +961,8 @@ def cds_opa_update():
 
 dlt.create_target_table(
     name = "rde_cds_opa",
-    comment="Incrementally updated CDS OPA data",
+    comment=cds_opa_comment,
+    schema = schema_rde_cds_opa,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -814,6 +984,33 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+
+pathology_comment = "Details of results and reports from pathology systems."
+schema_rde_pathology = StructType([
+        StructField("ENCNTR_ID", StringType(), True, metadata={"comment": "Unique identifier for the Encounter table."}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("RequestDate", StringType(), True, metadata={"comment": "Pathology order requested date"}),
+        StructField("TestCode", StringType(), True, metadata={"comment": "Any short code: like GLU for glucose or any arbitrary numeric id for the same.    This field has some shortcode related to text-not decoded"}),
+        StructField("TestName", StringType(), True, metadata={"comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."}),
+        StructField("TestDesc", StringType(), True, metadata={"comment": "Description of the test"}),
+        StructField("Result_nbr", DoubleType(), True, metadata={"comment": "Numeric test result value "}),
+        StructField("ResultTxt", StringType(), True, metadata={"comment": "Text test result  "}),
+        StructField("ResultNumeric", IntegerType(), True, metadata={"comment": "A binary digit with 1 indicating that EVENT_RESULT_TXT is numeric; 0 otherwise."}),
+        StructField("ResultUnit", StringType(), True, metadata={"comment": "This filed holds the unit "}),
+        StructField("ResUpper", StringType(), True, metadata={"comment": "Normal High value"}),
+        StructField("ResLower", StringType(), True, metadata={"comment": "Normal low value"}),
+        StructField("Resultfinding", StringType(), True, metadata={"comment": "\"States whether the result is normal.  This can be used to determine whether to  display the event tag in different color on the flowsheet. For group results, this represents an \"\"overall\"\" normalcy. i.e. Is any result in the group     abnormal?  Also allows different purge criteria to be applied based on result."}),
+        StructField("ReportDate", StringType(), True, metadata={"comment": "Optional clinical date time for the start of the event."}),
+        StructField("Report", StringType(), True, metadata={"comment": "Detailed report from blob table "}),
+        StructField("OrderStatus", StringType(), True, metadata={"comment": "Status of the order"}),
+        StructField("ResStatus", StringType(), True, metadata={"comment": "Result status "}),
+        StructField("SnomedCode", StringType(), True, metadata={"comment": "Snomed code for the pathology event if one exists."}),
+        StructField("EventID", StringType(), True, metadata={"comment": "A unique ID that can be used to map with the blob report"}),
+        StructField("LabNo", StringType(), True, metadata={"comment": "Reference number from pathology system"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_pathology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -893,7 +1090,8 @@ def pathology_update():
 
 dlt.create_target_table(
     name = "rde_pathology",
-    comment="Incrementally updated pathology data",
+    comment=pathology_comment,
+    schema = schema_rde_pathology,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -914,6 +1112,37 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+
+raw_pathology_comment = "Pathology data direct from the pathology system's data warehouse"
+
+schema_rde_raw_pathology = StructType([
+        StructField("PERSON_ID", DoubleType(), True, metadata={"comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("LabNo", StringType(), True, metadata={"comment": "Reference number from pathology system"}),
+        StructField("TLCCode", StringType(), True, metadata={"comment": "TLCCode"}),
+        StructField("Specimen", StringType(), True, metadata={"comment": "Type of specimen"}),
+        StructField("TLCSnomed", StringType(), True, metadata={"comment": "TLCSnomed"}),
+        StructField("TLCDesc", StringType(), True, metadata={"comment": "Description of TLCCode"}),
+        StructField("TFCCode", StringType(), True, metadata={"comment": "TFCCode"}),
+        StructField("Subcode", StringType(), True, metadata={"comment": "TFCCode subcode"}),
+        StructField("WkgCode", StringType(), True, metadata={"comment": "WkgCode"}),
+        StructField("Processed", IntegerType(), True, metadata={"comment": "1 indicates that NotProcessed is 0; 0 when NotProcessed is 1"}),
+        StructField("Result", StringType(), True, metadata={"comment": "Pathology result"}),
+        StructField("ResultNumeric", IntegerType(), True, metadata={"comment": "1 indicates that TFCValue is numeric, not null, and not [.]; 0 otherwise. Note that in some cases where the value is for example [4.3  37%], it is identified as non-numeric. "}),
+        StructField("ResultIDNo", LongType(), True, metadata={"comment": "ID number from external system(s)"}),
+        StructField("SectionCode", StringType(), True, metadata={"comment": "SectionCode"}),
+        StructField("TFCDesc", StringType(), True, metadata={"comment": "Description of TFCCode"}),
+        StructField("RequestDT", TimestampType(), True, metadata={"comment": "Request datetime"}),
+        StructField("SampleDT", TimestampType(), True, metadata={"comment": "Sample datetime"}),
+        StructField("ReportDate", TimestampType(), True, metadata={"comment": "Report datetime"}),
+        StructField("Fasting", StringType(), True, metadata={"comment": "Fasting status"}),
+        StructField("Pregnant", StringType(), True, metadata={"comment": "Pregnancy status"}),
+        StructField("RefClinCode", StringType(), True, metadata={"comment": "RefClinCode"}),
+        StructField("RefSourceCode", StringType(), True, metadata={"comment": "RefSourceCode"}),
+        StructField("ClinicalDetails", StringType(), True, metadata={"comment": "Clinical information, or reason for requesting test"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_raw_pathology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -964,11 +1193,11 @@ def raw_pathology_incr():
             filtered_pres.LegTFCCode.alias("Subcode"),
             filtered_pres.WkgCode,
             when(filtered_pres.NotProcessed == 1, 0).otherwise(1).alias("Processed"),
-            filtered_pres.Result1stLine.alias("Result"),
+            filtered_pres.TFCValue.alias("Result"),
             when(
-                filtered_pres.Result1stLine.isNotNull() & 
-                (filtered_pres.Result1stLine != '.') & 
-                filtered_pres.Result1stLine.cast("double").isNotNull(), 
+                filtered_pres.TFCValue.isNotNull() & 
+                (filtered_pres.TFCValue != '.') & 
+                filtered_pres.TFCValue.cast("double").isNotNull(), 
                 1
             ).otherwise(0).alias("ResultNumeric"),
             filtered_pres.ResultIDNo,
@@ -1000,7 +1229,8 @@ def raw_pathology_update():
 
 dlt.create_target_table(
     name = "rde_raw_pathology",
-    comment="Incrementally updated raw pathology data",
+    comment=raw_pathology_comment,
+    schema=schema_rde_raw_pathology,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1024,6 +1254,26 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+aria_pharmacy_comment = "Data from the ARIA chemotherapy database, no longer in active use."
+
+schema_rde_ariapharmacy = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifier for the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("AdmnStartDate", StringType(), True, metadata={"comment": "Date on which the first administration of the course is to be done."}),
+        StructField("TreatPlan", StringType(), True, metadata={"comment": "Name of a treatment plan.  Combined with tp_vers_no, uniquely identifies a treatment plan."}),
+        StructField("ProductDesc", StringType(), True, metadata={"comment": "Name of the agent."}),
+        StructField("DosageForm", StringType(), True, metadata={"comment": "Code used to identify the dosage form of the agent."}),
+        StructField("RxDose", IntegerType(), True, metadata={"comment": "The amount of the agent in this prescription to order from the pharmacy with the intent of administering it."}),
+        StructField("RxTotal", IntegerType(), True, metadata={"comment": "The total amount of the agent which will be ordered for the patient according to the frequency and amount for this agent item."}),
+        StructField("SetDateTPInit", StringType(), True, metadata={"comment": "Date of when the patient was registered on the plan, if the agent is part of a treatment plan."}),
+        StructField("DoseLevel", IntegerType(), True, metadata={"comment": "Code to identify the dose level of the agent.  The field is used to create many forms of a specific agent normally based on the dosage to be given.  i.e. a pediatric form, high, medium, low, etc."}),
+        StructField("AdmnDosageUnit", IntegerType(), True, metadata={"comment": "Dosage unit admninsterd"}),
+        StructField("AdmnRoute", IntegerType(), True, metadata={"comment": "Code to identify the route which should be used to administer the agent."}),
+        StructField("Pharmacist_Approved", StringType(), True, metadata={"comment": "pharmacist approved date time details"}),
+        StructField("pt_inst_key_id", StringType(), True, metadata={"comment": "ID number for particular patient instance."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_ariapharmacy_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1080,7 +1330,8 @@ def ariapharmacy_update():
 
 dlt.create_target_table(
     name = "rde_ariapharmacy",
-    comment="Incrementally updated ARIA pharmacy data",
+    comment=aria_pharmacy_comment,
+    schema=schema_rde_ariapharmacy,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1102,6 +1353,26 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+iqemo_comment="Data from the IQEMO chemotherapy system, replaced ARIA."
+
+schema_rde_iqemo = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the PERSON table. It is an internal system assigned number."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Primary identifier of PERSON in iQEMO system; joined with BHResearch Demographics table on MRN"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("TreatmentCycleID", StringType(), True, metadata={"comment": "Unique ID in iQemo TreatmentCycle table"}),
+        StructField("PrescribedDate", StringType(), True, metadata={"comment": "Date on which the treatment was prescribed"}),
+        StructField("TemplateName", StringType(), True, metadata={"comment": "Treatment cycle template name"}),
+        StructField("Name", StringType(), True, metadata={"comment": "Name for this Regimen. Must be unique within the organisation."}),
+        StructField("DefaultCycles", IntegerType(), True, metadata={"comment": "The default number of cycles to create when booking a course of this regimen."}),
+        StructField("ChemoRadiation", BooleanType(), True, metadata={"comment": "indicates if given with radiotherapy."}),
+        StructField("OPCSProcurementCode", StringType(), True, metadata={"comment": "The NHS OPCS procurement code for this item.\
+"}),
+        StructField("OPCSDeliveryCode", StringType(), True, metadata={"comment": "The NHS OPCS delivery code for this item.\
+"}),
+        StructField("SactName", StringType(), True, metadata={"comment": "Name for the regimen matching those defined in the national SACT dataset."}),
+        StructField("Indication", StringType(), True, metadata={"comment": "A free text description of the Indication for this regimen. Used to detail appropriate usage and displayed when booking courses of this regimen."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_iqemo_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1161,7 +1432,8 @@ def iqemo_update():
 
 dlt.create_target_table(
     name = "rde_iqemo",
-    comment="Incrementally updated iQEMO data",
+    comment=iqemo_comment,
+    schema=schema_rde_iqemo,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1185,6 +1457,34 @@ dlt.apply_changes(
 
 
 # COMMAND ----------
+
+radiology_comment = "Results and reports from the radiology system."
+schema_rde_radiology = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("ENCNTR_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the encounter table."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Acitvity_Type", StringType(), True, metadata={"comment": "Inpatient/Outpatient/ED"}),
+        StructField("TFCode", StringType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION.\
+"}),
+        StructField("TFCdesc", StringType(), True, metadata={"comment": "Detailed description of the associated TFC code"}),
+        StructField("ExamName", StringType(), True, metadata={"comment": "Name of the radiology exam"}),
+        StructField("EventName", StringType(), True, metadata={"comment": "Description of event CD"}),
+        StructField("EVENT_TAG_TXT", StringType(), True, metadata={"comment": "Brief text string to describe the event and to be displayed on the flowsheet. Calculated based on event class and status"}),
+        StructField("ResultNumeric", IntegerType(), True, metadata={"comment": "1 indicates EVENT_RESULT_TXT is numeric; 0 otherwise"}),
+        StructField("ExamStart", StringType(), True, metadata={"comment": "Optional clinical date time for the start of the event."}),
+        StructField("ExamEnd", StringType(), True, metadata={"comment": "Clinical date time for the end of the event.  In the cases where results do not associate an Event Time range, then the event_start_dt_tm = event_end_dt_tm."}),
+        StructField("ReportText", StringType(), True, metadata={"comment": "Detailed reoprt of the radiology examination "}),
+        StructField("LastOrderStatus", StringType(), True, metadata={"comment": "Status code for the latest order associated with this event."}),
+        StructField("RecordStatus", StringType(), True, metadata={"comment": "The lastest status of the order placed eg:Completed, cancelled etc"}),
+        StructField("ResultStatus", StringType(), True, metadata={"comment": "This column is the decoded description of result status code.  Valid values: authenticated, unauthenticated, unknown, canceled, pending, in lab, active, modified, superseded, transcribed, not done."}),
+        StructField("ExaminationTypecode", StringType(), True, metadata={"comment": "code used to uniquely identify examination "}),
+        StructField("Modality", StringType(), True, metadata={"comment": "Medical imaging modalities, for example, includes magnetic resonance imaging (MRI), ultrasound, medical radiation, angiography and computed tomography (CT) scanning etc"}),
+        StructField("SubModality", StringType(), True, metadata={"comment": "Submodalities are fine distinctions or the subsets of the Modalities "}),
+        StructField("ExaminationTypeName", StringType(), True, metadata={"comment": "name of the examination"}),
+        StructField("EventID", StringType(), True, metadata={"comment": "EventID is added to map to blob reports"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_radiology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1263,7 +1563,8 @@ def radiology_update():
 
 dlt.create_target_table(
     name = "rde_radiology",
-    comment="Incrementally updated radiology data",
+    comment=radiology_comment,
+    schema=schema_rde_radiology,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1283,6 +1584,29 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+family_history_comment = "Details on family history such as family health conditions."
+
+schema_rde_family_history = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifier for the patient."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of patient."}),
+        StructField("RELATION_CD", StringType(), True, metadata={"comment": "Code for the type of relationship. e.g. Grandchild"}),
+        StructField("RelationDesc", StringType(), True, metadata={"comment": "Text description of the relation_CD"}),
+        StructField("RELATION_TYPE", StringType(), True, metadata={"comment": "Code for the type of relationship. e.g. family history"}),
+        StructField("RelationType", StringType(), True, metadata={"comment": "Text description for RELATION_TYPE"}),
+        StructField("ACTIVITY_NOMEN", StringType(), True, metadata={"comment": "Code for the nomenclature category."}),
+        StructField("NomenDesc", StringType(), True, metadata={"comment": "Description of the condition."}),
+        StructField("NomenVal", StringType(), True, metadata={"comment": "Code for the condition."}),
+        StructField("VOCABULARY_CD", StringType(), True, metadata={"comment": "Code for the vocabulary being used."}),
+        StructField("VocabDesc", StringType(), True, metadata={"comment": "Description of the vocabulary being used. e.g. SNOMED"}),
+        StructField("TYPE", StringType(), True, metadata={"comment": "Type of family history event, e.g. condition."}),
+        StructField("BegEffectDate", StringType(), True, metadata={"comment": "Start date."}),
+        StructField("EndEffectDate", StringType(), True, metadata={"comment": "End date if applicable."}),
+        StructField("FHX_VALUE_FLG", StringType(), True, metadata={"comment": "Indicates weather the condition for a Family member is positive, negative or unknown.  0 = Negative; 1 = Positive; 2 = Unknown;  3 = Unable to Obtain; 4 = Patient Adopted"}),
+        StructField("REL_ID", StringType(), True, metadata={"comment": "Internal lookup ID for the relationship."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_family_history_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1339,7 +1663,8 @@ def family_history_update():
 
 dlt.create_target_table(
     name = "rde_family_history",
-    comment="Incrementally updated family history data",
+    comment=family_history_comment,
+    schema= schema_rde_family_history,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1359,6 +1684,31 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+blob_comment = "Table containing all free text items for a given patient and encounter."
+
+schema_rde_blobdataset = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique Identifier for the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("ClinicalSignificantDate", StringType(), True, metadata={"comment": "Date clinical event flagged as clinically significant, generally the date the event was created."}),
+        StructField("MainEventDesc", StringType(), True, metadata={"comment": "Main event description(eg:ED Assessments, Coding Summary, Ophthalmology Clinic letter, ED Department Summary etc)"}),
+        StructField("MainTitleText", StringType(), True, metadata={"comment": "Main event title"}),
+        StructField("MainTagText", StringType(), True, metadata={"comment": "Main event tag text"}),
+        StructField("ChildEvent", StringType(), True, metadata={"comment": "child event title"}),
+        StructField("ChildTagText", StringType(), True, metadata={"comment": "child event tag text"}),
+        StructField("BlobContents", StringType(), True, metadata={"comment": "Detailed description or report about the clinical event"}),
+        StructField("EventDesc", StringType(), True, metadata={"comment": "Event description"}),
+        StructField("EventResultText", StringType(), True, metadata={"comment": "Event result as text"}),
+        StructField("EventResultNBR", DoubleType(), True, metadata={"comment": "Event result as numbers for numeric values"}),
+        StructField("EventReltnDesc", StringType(), True, metadata={"comment": "event relation description like Child, root"}),
+        StructField("Status", StringType(), True, metadata={"comment": "status of the record"}),
+        StructField("SourceSys", StringType(), True, metadata={"comment": "details of the source system (eg: PowerChart, BLT none RAD or LAB , BLT_TIE_RAD etc)"}),
+        StructField("ClassDesc", StringType(), True, metadata={"comment": "event class description(eg: Document)"}),
+        StructField("ParentEventID", StringType(), True, metadata={"comment": "Lookup ID for the parent event of this one if any."}),
+        StructField("EventID", StringType(), True, metadata={"comment": "EventID to map to radiology and pathology events."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_blobdataset_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1420,7 +1770,8 @@ def blobdataset_update():
 
 dlt.create_target_table(
     name = "rde_blobdataset",
-    comment="Incrementally updated BLOB dataset",
+    comment=blob_comment,
+    schema=schema_rde_blobdataset,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1440,6 +1791,26 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+pc_procedures_comment = "Table of all procedures recorded in powerchart"
+
+schema_rde_pc_procedures = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifier for the patient"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("AdmissionDT", StringType(), True, metadata={"comment": "date of admission"}),
+        StructField("DischargeDT", StringType(), True, metadata={"comment": "date of discharge"}),
+        StructField("TreatmentFunc", StringType(), True, metadata={"comment": "treatment function description"}),
+        StructField("Specialty", StringType(), True, metadata={"comment": "Main speciality"}),
+        StructField("ProcDt", StringType(), True, metadata={"comment": "Date of procedure"}),
+        StructField("ProcDetails", StringType(), True, metadata={"comment": "deatiled description of the procedure"}),
+        StructField("ProcCD", StringType(), True, metadata={"comment": "ProcCD"}),
+        StructField("ProcType", StringType(), True, metadata={"comment": "procedure type"}),
+        StructField("EncType", StringType(), True, metadata={"comment": "Encounter type"}),
+        StructField("Comment", StringType(), True, metadata={"comment": "Comments specific to the procedure if any"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+
 
 @dlt.table(name="rde_pc_procedures_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1491,7 +1862,8 @@ def pc_procedures_update():
 
 dlt.create_target_table(
     name = "rde_pc_procedures",
-    comment="Incrementally updated PC procedures data",
+    comment=pc_procedures_comment,
+    schema=schema_rde_pc_procedures,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1511,6 +1883,21 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+all_proc_comment = "Table of all procedures recorded in millenium procedure table."
+
+schema_rde_all_procedures = StructType([
+        StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
+        StructField("Person_ID", StringType(), True, metadata={"comment": "Unique identifier for the patient."}),
+        StructField("Procedure_code", StringType(), True, metadata={"comment": "OPCS code for the procedure."}),
+        StructField("Catalogue", StringType(), True, metadata={"comment": "Catalogue for the code, e.g. OPCS"}),
+        StructField("Code_text", StringType(), True, metadata={"comment": "Text description of the procedure."}),
+        StructField("Procedure_note", StringType(), True, metadata={"comment": "Any free text notes attached to the procedure."}),
+        StructField("Procedure_ID", StringType(), True, metadata={"comment": "Internal ID for the procedure."}),
+        StructField("Procedure_date", StringType(), True, metadata={"comment": "Date the procedure took place."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_all_procedures_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1553,7 +1940,8 @@ def all_procedures_update():
 
 dlt.create_target_table(
     name = "rde_all_procedures",
-    comment="Incrementally updated all procedures data",
+    comment=all_proc_comment,
+    schema=schema_rde_all_procedures,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1573,6 +1961,26 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+pc_diagnosis_comment = "Table of all diagnoses recorded in powerchart."
+
+schema_rde_pc_diagnosis = StructType([
+        StructField("DiagID", StringType(), True, metadata={"comment": "Unique identifier to identify the diagnosis"}),
+        StructField("Person_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("Diagnosis", StringType(), True, metadata={"comment": "Description of the diagnosis"}),
+        StructField("Confirmation", StringType(), True, metadata={"comment": "Confirmation status"}),
+        StructField("DiagDt", StringType(), True, metadata={"comment": "Date of diagnosis"}),
+        StructField("Classification", StringType(), True, metadata={"comment": "Any classification flags applied to the diagnosis."}),
+        StructField("ClinService", StringType(), True, metadata={"comment": "Any details on the clinical service wherin the diagnosis was made."}),
+        StructField("DiagType", StringType(), True, metadata={"comment": "type of diagnosis e.g. Discharge"}),
+        StructField("DiagCode", StringType(), True, metadata={"comment": "Diagnosis code"}),
+        StructField("Vocab", StringType(), True, metadata={"comment": "Vocabulary of the code, e.g. SNOMED"}),
+        StructField("Axis", StringType(), True, metadata={"comment": "Axis of the diagnosis, e.g. Finding, DIagnosis"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+
 
 @dlt.table(name="rde_pc_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1624,7 +2032,8 @@ def pc_diagnosis_update():
 
 dlt.create_target_table(
     name = "rde_pc_diagnosis",
-    comment="Incrementally updated PC diagnosis data",
+    comment=pc_diagnosis_comment,
+    schema=schema_rde_pc_diagnosis,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1644,6 +2053,34 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+pc_problems_comment = "Table of all problems recored in powerchart."
+
+schema_rde_pc_problems = StructType([
+        StructField("ProbID", StringType(), True, metadata={"comment": "Uniquely defines a problem within the problem table.  The problem_id can be  associated with multiple problem instances."}),
+        StructField("Person_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Problem", StringType(), True, metadata={"comment": "Description of the problem"}),
+        StructField("Annot_Disp", StringType(), True, metadata={"comment": "A de-normalized or annotated description of the problem.  This is defaulted from the display term of the selected codified problem, and can be extended (annotated) by the clinician.\
+"}),
+        StructField("Confirmation", StringType(), True, metadata={"comment": "Confirmation status eg:Complaining of ,Complaint of,      \
+"}),
+        StructField("Classification", StringType(), True, metadata={"comment": "Identifies the kind of problem.  Used to categorize the problem so that it may be managed and viewed independently within different applications.\
+"}),
+        StructField("OnsetDate", StringType(), True, metadata={"comment": "The date and time that the problem began.\
+"}),
+        StructField("StatusDate", StringType(), True, metadata={"comment": "Status last updated"}),
+        StructField("Stat_LifeCycle", StringType(), True, metadata={"comment": "Indicate to what level of accuracy the life_cycle_dt_tm has been set\
+"}),
+        StructField("LifeCycleCancReson", StringType(), True, metadata={"comment": "reason for cancellation"}),
+        StructField("Vocab", StringType(), True, metadata={"comment": "Vocabulary code identifier for the source concept"}),
+        StructField("Axis", StringType(), True, metadata={"comment": "Axis of the concept, e.g. Finding, Body structure."}),
+        StructField("SecDesc", StringType(), True, metadata={"comment": "secondary description"}),
+        StructField("ProbCode", StringType(), True, metadata={"comment": "Problem code"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+
 
 @dlt.table(name="rde_pc_problems_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1698,7 +2135,8 @@ def pc_problems_update():
 
 dlt.create_target_table(
     name = "rde_pc_problems",
-    comment="Incrementally updated PC problems data",
+    comment=pc_problems_comment,
+    schema=schema_rde_pc_problems,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1718,6 +2156,50 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+msds_booking_comment = "Table containing basic details about a pregnancy and delivery."
+schema_rde_msds_booking = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "The unique identifier for each patient"}),
+        StructField("PregnancyID", StringType(), True, metadata={"comment": "The unique identifier allocated to each Pregnancy Episode.\
+"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Unique local identifier to identify the person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("FirstAntenatalAPPTDate", StringType(), True, metadata={"comment": "Date of first antenatal appointment."}),
+        StructField("AlcoholUnitsPerWeek", IntegerType(), True, metadata={"comment": "Units of alcohol per week."}),
+        StructField("SmokingStatusBooking", StringType(), True, metadata={"comment": "Smoking status at booking"}),
+        StructField("SmokingStatusDelivery", StringType(), True, metadata={"comment": "Smoking status at delivery"}),
+        StructField("SubstanceUse", StringType(), True, metadata={"comment": "Description of substance use"}),
+        StructField("DeliveryDate", StringType(), True, metadata={"comment": "Expected delivery date."}),
+        StructField("PostCode", StringType(), True, metadata={"comment": "Home address post code."}),
+        StructField("Height_CM", FloatType(), True, metadata={"comment": "Height in cm."}),
+        StructField("Weight_KG", FloatType(), True, metadata={"comment": "Weight in kg."}),
+        StructField("BMI", FloatType(), True, metadata={"comment": "BMI"}),
+        StructField("LaborOnsetMethod", StringType(), True, metadata={"comment": "Method for labor onset."}),
+        StructField("Augmentation", StringType(), True, metadata={"comment": "If labor was augmented."}),
+        StructField("AnalgesiaDelivery", StringType(), True, metadata={"comment": "Details of analgesia used during delivery"}),
+        StructField("AnalgesiaLabour", StringType(), True, metadata={"comment": "Details of analgesia used during labor"}),
+        StructField("AnaesthesiaDelivery", StringType(), True, metadata={"comment": "Details of anaesthesia used during delivery"}),
+        StructField("AnaesthesiaLabour", StringType(), True, metadata={"comment": "Details of Anaesthesia used during labor."}),
+        StructField("PerinealTrauma", StringType(), True, metadata={"comment": "Details of any perineal trauma from delivery."}),
+        StructField("EpisiotomyDesc", StringType(), True, metadata={"comment": "Details of any episiotomy performed."}),
+        StructField("BloodLoss", FloatType(), True, metadata={"comment": "Amount of blood lost."}),
+        StructField("MSDS_AntenatalAPPTDate", StringType(), True, metadata={"comment": "Referred to as the Booking Appointment, the date on which the assessment for health and social care needs, risks and choices and arrangements made for antenatal care as part of the pregnancy episode was completed."}),
+        StructField("MSDS_CompSocialFactor", StringType(), True, metadata={"comment": "Indicates if the mother is deemed to be subject to complex social factors, as defined by NICE guidance (CG110)."}),
+        StructField("MSDS_DisabilityMother", StringType(), True, metadata={"comment": "An indication of whether a PERSON has been diagnosed as having a DISABILITY or perceives themselves to be disabled."}),
+        StructField("MSDS_MatDischargeDate", StringType(), True, metadata={"comment": "Date on which mother ceased to be cared for in maternity services"}),
+        StructField("MSDS_DischReason", StringType(), True, metadata={"comment": "The reason that the mother was discharged from maternity services."}),
+        StructField("MSDS_EST_DELIVERYDATE_AGREED", StringType(), True, metadata={"comment": "The Estimated Date of Delivery, as agreed by ultrasound scan, LMP or Clinical Assessment."}),
+        StructField("MSDS_METH_OF_EST_DELIVERY_DATE_AGREED", StringType(), True, metadata={"comment": "The method by which the Agreed Estimated Date of Delivery was calculated."}),
+        StructField("MSDS_FolicAcidSupplement", StringType(), True, metadata={"comment": "Code for if mother given folic acid supplement."}),
+        StructField("MSDS_LastMensturalPeriodDate", StringType(), True, metadata={"comment": "Date on which last menstrual period began"}),
+        StructField("MSDS_PregConfirmed", StringType(), True, metadata={"comment": "Date pregenancy confirmed"}),
+        StructField("MSDS_PrevC_Sections", StringType(), True, metadata={"comment": "The number of previous pregnancies where a baby was delivered via a caesarean (this is not the same as number of babies delivered via caesarean)."}),
+        StructField("MSDS_PrevLiveBirths", StringType(), True, metadata={"comment": "The number live births from previous pregnancies"}),
+        StructField("MSDS_PrevLossesLessThan24Weeks", StringType(), True, metadata={"comment": "The number of terminations and losses before 24 weeks of pregnancy (i.e. within <=23 weeks + 6 days)"}),
+        StructField("MSDS_PrevStillBirths", StringType(), True, metadata={"comment": "The number stillbirths from previous pregnancies"}),
+        StructField("MSDS_MothSuppStatusIND", StringType(), True, metadata={"comment": "As identified at the Booking Appointment, whether or not the mother feels she is supported in pregnancy and looking after a baby, from partner, family or friends."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_msds_booking_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1819,7 +2301,8 @@ def msds_booking_update():
 
 dlt.create_target_table(
     name = "rde_msds_booking",
-    comment="Incrementally updated MSDS booking data",
+    comment=msds_booking_comment,
+    schema=schema_rde_msds_booking,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1839,6 +2322,29 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+msds_carecontact_comment="Table containing details of each contact with care services for given pregnant person."
+schema_rde_msds_carecontact = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Uniquely identifies the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Unique local identifier to identify the person"}),
+        StructField("PregnancyID", StringType(), True, metadata={"comment": "The unique identifier allocated to each Pregnancy Episode.\
+"}),
+        StructField("CareConID", StringType(), True, metadata={"comment": "The CARE CONTACT IDENTIFIER is used to uniquely identify the CARE CONTACT within the Health Care Provider."}),
+        StructField("CareConDate", StringType(), True, metadata={"comment": "The date on which a Care Contact took place, or, if cancelled, was scheduled to take place.\
+"}),
+        StructField("AdminCode", StringType(), True, metadata={"comment": "The PATIENT's ADMINISTRATIVE CATEGORY CODE may change during an episode or spell."}),
+        StructField("Duration", StringType(), True, metadata={"comment": "CLINICAL CONTACT DURATION OF CARE CONTACT includes the time spent on the different CARE ACTIVITIES that may be performed in a single CARE CONTACT. The duration of each CARE ACTIVITY is recorded in CLINICAL CONTACT DURATION OF CARE ACTIVITY."}),
+        StructField("ConsultType", StringType(), True, metadata={"comment": "This indicates the type of consultation for a SERVICE."}),
+        StructField("Subject", StringType(), True, metadata={"comment": "The person who was the subject of the Care Contact."}),
+        StructField("Medium", StringType(), True, metadata={"comment": "Identifies the communication mechanism used to relay information between the CARE PROFESSIONAL and the PERSON who is the subject of the consultation, during a CARE ACTIVITY."}),
+        StructField("GPTherapyIND", StringType(), True, metadata={"comment": "An indicator of whether a Care Activity was delivered as Group Therapy."}),
+        StructField("AttendCode", StringType(), True, metadata={"comment": "Indicates whether an APPOINTMENT for a CARE CONTACT took place and if the APPOINTMENT did not take place it whether advanced warning was given."}),
+        StructField("CancelReason", StringType(), True, metadata={"comment": "The reason that a Care Contact was cancelled."}),
+        StructField("CancelDate", StringType(), True, metadata={"comment": "The date that a Care Contact was cancelled by the Provider or Patient."}),
+        StructField("RepAppOffDate", StringType(), True, metadata={"comment": "The replacement appointment date offered by the provider to the patient following the cancellation of an appointment by the SERVICE."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_msds_carecontact_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -1892,7 +2398,8 @@ def msds_carecontact_update():
 
 dlt.create_target_table(
     name = "rde_msds_carecontact",
-    comment="Incrementally updated MSDS care contact data",
+    comment=msds_carecontact_comment,
+    schema=schema_rde_msds_carecontact,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -1912,6 +2419,58 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+msds_comment = "Details of a specific birth/delivery"
+
+schema_rde_msds_delivery = StructType([
+        StructField("Person_ID", StringType(), True, metadata={"comment": "The internal identifier for the person"}),
+        StructField("PregnancyID", StringType(), True, metadata={"comment": "The unique identifier allocated to each Pregnancy Episode.\
+"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Unique local identifier to identify the person"}),
+        StructField("BabyPerson_ID", StringType(), True, metadata={"comment": "Internal identifier for the baby."}),
+        StructField("Baby_MRN", StringType(), True, metadata={"comment": "MRN for the baby."}),
+        StructField("Baby_NHS", StringType(), True, metadata={"comment": "NHS Number for the baby."}),
+        StructField("BirthOrder", IntegerType(), True, metadata={"comment": "Order in which this baby was born for this labor."}),
+        StructField("BirthNumber", IntegerType(), True, metadata={"comment": "Total number of babies born this labor."}),
+        StructField("BirthLocation", StringType(), True, metadata={"comment": "Location code for the birth."}),
+        StructField("BirthDateTime", StringType(), True, metadata={"comment": "Date and time of the birth."}),
+        StructField("DeliveryMethod", StringType(), True, metadata={"comment": "Method of delivery."}),
+        StructField("DeliveryOutcome", StringType(), True, metadata={"comment": "Outcome of delivery."}),
+        StructField("NeonatalOutcome", StringType(), True, metadata={"comment": "Outcome of neonatal care."}),
+        StructField("PregOutcome", StringType(), True, metadata={"comment": "Outcome of pregnancy."}),
+        StructField("PresDelDesc", StringType(), True, metadata={"comment": "Description of the presentation at delivery, e.g. vertex."}),
+        StructField("BirthWeight", FloatType(), True, metadata={"comment": "Weight of baby."}),
+        StructField("BirthSex", StringType(), True, metadata={"comment": "Sex of baby."}),
+        StructField("APGAR1Min", IntegerType(), True, metadata={"comment": "APGAR score at 1 minute."}),
+        StructField("APGAR5Min", IntegerType(), True, metadata={"comment": "APGAR score at 1 minute."}),
+        StructField("FeedingMethod", StringType(), True, metadata={"comment": "Method of feeding."}),
+        StructField("MotherComplications", StringType(), True, metadata={"comment": "Details of any complications for the mother."}),
+        StructField("FetalComplications", StringType(), True, metadata={"comment": "Details of any comlplications of the baby."}),
+        StructField("NeonatalComplications", StringType(), True, metadata={"comment": "Details of any neonatal complications."}),
+        StructField("ResMethod", StringType(), True, metadata={"comment": "Resusitation method if applicatble."}),
+        StructField("MSDS_LabourDelID", StringType(), True, metadata={"comment": "The unique identifier for a specific labour/ delivery. "}),
+        StructField("MSDS_DeliverySite", StringType(), True, metadata={"comment": "Site code for the delivery."}),
+        StructField("MSDS_BirthSetting", StringType(), True, metadata={"comment": "Code for place of birth."}),
+        StructField("MSDS_BabyFirstFeedCode", StringType(), True, metadata={"comment": "Code for details of baby's first feeding."}),
+        StructField("MSDS_SettingIntraCare", StringType(), True, metadata={"comment": "Code for intra care setting."}),
+        StructField("MSDS_ReasonChangeDelSettingLab", StringType(), True, metadata={"comment": "Season for changing setting if applicable."}),
+        StructField("MSDS_LabourOnsetMeth", StringType(), True, metadata={"comment": "Labour onset method"}),
+        StructField("MSDS_LabOnsetDate", StringType(), True, metadata={"comment": "Date when established labour is confirmed - regular painful contractions and progressive cervical dilatation"}),
+        StructField("MSDS_CSectionDate", StringType(), True, metadata={"comment": "The date of the caesarean section (i.e. date of Knife to skin)"}),
+        StructField("MSDS_DecDeliveryDate", StringType(), True, metadata={"comment": "The date on which the decision was made to deliver the baby (where an emergency caesarean or other assisted delivery is required)."}),
+        StructField("MSDS_AdmMethCodeMothDelHSP", StringType(), True, metadata={"comment": ""}),
+        StructField("MSDS_DischDate", StringType(), True, metadata={"comment": "Date on which mother was discharged from hospital following completion of labour and delivery."}),
+        StructField("MSDS_DischMeth", StringType(), True, metadata={"comment": "Discharge method"}),
+        StructField("MSDS_DischDest", StringType(), True, metadata={"comment": "discharge destination"}),
+        StructField("MSDS_RomDate", StringType(), True, metadata={"comment": "Rupture of membranes date if applicable."}),
+        StructField("MSDS_RomMeth", StringType(), True, metadata={"comment": "Method for rupture of membranes."}),
+        StructField("MSDS_RomReason", StringType(), True, metadata={"comment": "Text for reason for rupture of membranes."}),
+        StructField("MSDS_EpisiotomyReason", StringType(), True, metadata={"comment": "Any reason provided for sugical episiotomy."}),
+        StructField("MSDS_PlancentaDelMeth", StringType(), True, metadata={"comment": "Whether placenta was removed through physiological, active or manual means.  Where more than one method is used, the final method is used"}),
+        StructField("MSDS_LabOnsetPresentation", StringType(), True, metadata={"comment": "The presentation of the fetus at onset of labour"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_msds_delivery_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2009,7 +2568,8 @@ def msds_delivery_update():
 
 dlt.create_target_table(
     name = "rde_msds_delivery",
-    comment="Incrementally updated MSDS delivery data",
+    comment=msds_comment,
+    schema=schema_rde_msds_delivery,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2029,6 +2589,23 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+msds_diagnosis_comment="Table containing details of any diagnosis of the mother."
+schema_rde_msds_diagnosis = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifier of the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Unique local identifier to identify the person"}),
+        StructField("DiagPregID", StringType(), True, metadata={"comment": "The unique identifier allocated to each Pregnancy Episode.\
+"}),
+        StructField("DiagScheme", StringType(), True, metadata={"comment": "The code scheme basis of a diagnosis."}),
+        StructField("Diagnosis", StringType(), True, metadata={"comment": "This is the DIAGNOSIS of the person, from a specific classification or clinical terminology, for the main condition treated or investigated during the relevant episode of healthcare."}),
+        StructField("DiagDate", StringType(), True, metadata={"comment": "The date of the primary diagnosis."}),
+        StructField("LocalFetalID", StringType(), True, metadata={"comment": "The unique identifier allocated to a fetus, which remains consistent throughout the pregnancy."}),
+        StructField("FetalOrder", StringType(), True, metadata={"comment": "The order or sequence in which the Fetus was assessed. The FETAL ORDER is represented by a single numeric value, with 1 indicating the first or only Fetus assessed in the sequence, 2 indicating the second, and so on."}),
+        StructField("SnomedCD", StringType(), True, metadata={"comment": "Snomed diagnosis code"}),
+        StructField("DiagDesc", StringType(), True, metadata={"comment": "Description of primary diagnosis"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_msds_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2095,7 +2672,8 @@ def msds_diagnosis_update():
 
 dlt.create_target_table(
     name = "rde_msds_diagnosis",
-    comment="Incrementally updated MSDS diagnosis data",
+    comment=msds_diagnosis_comment,
+    schema=schema_rde_msds_diagnosis,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2116,6 +2694,37 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+allergy_comment = "Table containing any known allergies of the patient."
+
+schema_rde_allergydetails = StructType([
+        StructField("AllergyID", StringType(), True, metadata={"comment": "Uniquely defines an allergy/adverse reaction within the allergy table. The allergy_id can be associated with multiple allergy instances. When  allergy is added to the allergy table the allergy_id is assigned to allergy_instance_id"}),
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifier of the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("SubstanceFTDesc", StringType(), True, metadata={"comment": "A free text description of the substance decoded on SUBSTANCE_NOM_ID"}),
+        StructField("SubstanceDesc", StringType(), True, metadata={"comment": "A free text description of the substance"}),
+        StructField("SubstanceDispTxt", StringType(), True, metadata={"comment": "A free display text of the substance "}),
+        StructField("SubstanceValueTxt", StringType(), True, metadata={"comment": "value/code of  substance "}),
+        StructField("SubstanceType", StringType(), True, metadata={"comment": "Identifies the type of substance, eg. drug, food, contrast, environment"}),
+        StructField("ReactionType", StringType(), True, metadata={"comment": "Identifies the type of reaction, eg. Allergy, adverse drug reaction."}),
+        StructField("Severity", StringType(), True, metadata={"comment": "Indicates the general severity of the allergy or reaction."}),
+        StructField("SourceInfo", StringType(), True, metadata={"comment": "Identifies the source of the information regarding the reaction, eg. Provider, parent, chart, interface."}),
+        StructField("OnsetDT", StringType(), True, metadata={"comment": "The date that the reaction was identified."}),
+        StructField("ReactionStatus", StringType(), True, metadata={"comment": "The status of the reaction, eg. confirmed, cancelled, proposed, working, suspected."}),
+        StructField("CreatedDT", StringType(), True, metadata={"comment": "The date and time that the allergy/adverse reaction was entered on the allergy profile."}),
+        StructField("CancelReason", StringType(), True, metadata={"comment": "Identifies the reason why a reaction has been cancelled."}),
+        StructField("CancelDT", StringType(), True, metadata={"comment": "The date and time that the allergy was set to a status of cancelled."}),
+        StructField("ActiveStatus", StringType(), True, metadata={"comment": "Indicates the status of the row itself (not the data in the row) such as active, inactive, combined away, pending purge,etc."}),
+        StructField("ActiveDT", StringType(), True, metadata={"comment": "The date and time that the active_status_cd was set."}),
+        StructField("BegEffecDT", StringType(), True, metadata={"comment": "The date and time for which this table row becomes effective. Normally, this will be the date and time the row is added, but could be a past or date and time."}),
+        StructField("EndEffecDT", StringType(), True, metadata={"comment": "The date/time after which the row is no longer valid as active current data. This may be valued with the date that the row became inactive. The date that the reaction was identified."}),
+        StructField("DataStatus", StringType(), True, metadata={"comment": "Data status indicates a level of authenticity of the row data. Typically this will either be AUTHENTICATED or UNAUTHENTICATED."}),
+        StructField("DataStatusDT", StringType(), True, metadata={"comment": "The date and time that the data_status_cd was set."}),
+        StructField("VocabDesc", StringType(), True, metadata={"comment": "Original source vocabulary that the allergy was received with from an interface."}),
+        StructField("PrecisionDesc", StringType(), True, metadata={"comment": "Indicates to what precision (not entered, age, about, before, after, unknown) the onset_dt_tm has been set."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+    
 @dlt.table(name="rde_allergydetails_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def allergydetails_incr():
@@ -2184,7 +2793,8 @@ def allergydetails_update():
 
 dlt.create_target_table(
     name = "rde_allergydetails",
-    comment="Incrementally updated allergy details data",
+    comment=allergy_comment,
+    schema=schema_rde_allergydetails,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2204,6 +2814,19 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_demo_comment = "Table containing demographic details of individuals in the Sommerset Cancer Registry"
+schema_rde_scr_demographics = StructType([
+        StructField("PATIENTID", StringType(), True, metadata={"comment": "Unique identifier for patients used in SCR."}),
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of the patient."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier for the patient."}),
+        StructField("DeathDate", StringType(), True, metadata={"comment": "Date of death if applicable."}),
+        StructField("DeathCause", StringType(), True, metadata={"comment": "Text on cause of death if known."}),
+        StructField("PT_AT_RISK", StringType(), True, metadata={"comment": "True false if patient considered at risk."}),
+        StructField("REASON_RISK", StringType(), True, metadata={"comment": "If patient at risk, free text comment as to reason."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_demographics_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2251,7 +2874,8 @@ def scr_demographics_update():
 
 dlt.create_target_table(
     name = "rde_scr_demographics",
-    comment="Incrementally updated SCR demographics data",
+    comment=scr_demo_comment,
+    schema=schema_rde_scr_demographics,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2271,6 +2895,55 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_referrals_comment = "Referrals for individuals in the Sommerset Cancer Registry"
+schema_rde_scr_referrals = StructType([
+        StructField("CareID", StringType(), True, metadata={"comment": "Unique SCR identifier for care pathway."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital number."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "Patient NHS Number"}),
+        StructField("PATIENT_ID", StringType(), True, metadata={"comment": "Unique Barts Patient ID"}),
+        StructField("CancerSite", StringType(), True, metadata={"comment": "Site of the cancer, e.g. skin"}),
+        StructField("PriorityDesc", StringType(), True, metadata={"comment": "Priority description, e.g. Routine"}),
+        StructField("DecisionDate", StringType(), True, metadata={"comment": "Date decision was made."}),
+        StructField("ReceiptDate", StringType(), True, metadata={"comment": "Date of receipt of decision."}),
+        StructField("DateSeenFirst", StringType(), True, metadata={"comment": "Date person first seen by specialist."}),
+        StructField("CancerType", StringType(), True, metadata={"comment": "Details on type of cancer, e.g. suspected skin cancers."}),
+        StructField("StatusDesc", StringType(), True, metadata={"comment": "Description of status, e.g. Non-Cancer"}),
+        StructField("FirstAppt", StringType(), True, metadata={"comment": "1 if first appointment, 2 if not."}),
+        StructField("DiagDate", StringType(), True, metadata={"comment": "Date of diagnosis if any."}),
+        StructField("DiagCode", StringType(), True, metadata={"comment": "ICD10 code of diagnosis."}),
+        StructField("DiagDesc", StringType(), True, metadata={"comment": "Text description of the diagnosis."}),
+        StructField("OtherDiagDate", StringType(), True, metadata={"comment": "Date for additional diagnosis"}),
+        StructField("Laterality", StringType(), True, metadata={"comment": "Laterality of cancer if known, e.g. Right."}),
+        StructField("DiagBasis", StringType(), True, metadata={"comment": "SCR code for basis of diagnosis."}),
+        StructField("Histology", StringType(), True, metadata={"comment": "Code for histology results."}),
+        StructField("Differentiation", StringType(), True, metadata={"comment": "Coded result for cancer differentiation"}),
+        StructField("ClinicalTStage", StringType(), True, metadata={"comment": "Number for clinical stage."}),
+        StructField("ClinicalTCertainty", StringType(), True, metadata={"comment": "Code for clinical certainty."}),
+        StructField("ClinicalNStage", StringType(), True, metadata={"comment": "Code for clinical N stage."}),
+        StructField("ClinicalNCertainty", StringType(), True, metadata={"comment": "Code for clinical N certainty."}),
+        StructField("ClinicalMStage", StringType(), True, metadata={"comment": "Code for clinical M stage"}),
+        StructField("ClinicalMCertainty", StringType(), True, metadata={"comment": "Code for clinical M certainty."}),
+        StructField("PathologicalTCertainty", StringType(), True, metadata={"comment": "Code for pathological T certainty."}),
+        StructField("PathologicalTStage", StringType(), True, metadata={"comment": "Code for pathological T stage."}),
+        StructField("PathologicalNCertainty", StringType(), True, metadata={"comment": "Code for pathological N certainty."}),
+        StructField("PathologicalNStage", StringType(), True, metadata={"comment": "Code for pathological N stage."}),
+        StructField("PathologicalMCertainty", StringType(), True, metadata={"comment": "Code for pathological M certainty."}),
+        StructField("PathologicalMStage", StringType(), True, metadata={"comment": "Code for pathological M stage."}),
+        StructField("TumourStatus", StringType(), True, metadata={"comment": "Tumor status code."}),
+        StructField("TumourDesc", StringType(), True, metadata={"comment": "Description of the tumor."}),
+        StructField("NonCancer", StringType(), True, metadata={"comment": "Free text description of non cancer referral details."}),
+        StructField("CRecurrence", StringType(), True, metadata={"comment": "Any text descriptio of recurrence."}),
+        StructField("RefComments", StringType(), True, metadata={"comment": "Any comments attached to the referral."}),
+        StructField("DecisionReason", StringType(), True, metadata={"comment": "Any text provided to support descision."}),
+        StructField("TreatReason", StringType(), True, metadata={"comment": "Any text provided to support treatment reason."}),
+        StructField("RecSiteID", StringType(), True, metadata={"comment": "ID for rec site."}),
+        StructField("NewTumourSite", StringType(), True, metadata={"comment": "Any text about new tumor site."}),
+        StructField("ActionID", StringType(), True, metadata={"comment": "SCR ID fo action."}),
+        StructField("SnomedCD", StringType(), True, metadata={"comment": "SCR ID for snomed code."}),
+        StructField("SubSiteID", StringType(), True, metadata={"comment": "SCR ID for subsite."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_referrals_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2367,7 +3040,8 @@ def scr_referrals_update():
 
 dlt.create_target_table(
     name = "rde_scr_referrals",
-    comment="Incrementally updated SCR referrals data",
+    comment=scr_referrals_comment,
+    schema=schema_rde_scr_referrals,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2387,6 +3061,17 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_comments_comment = "Comments for patients in the Sommerset Cancer Registry"
+schema_rde_scr_trackingcomments = StructType([
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital ID."}),
+        StructField("COM_ID", StringType(), True, metadata={"comment": "SCR comment ID."}),
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR care pathway ID"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber for patient."}),
+        StructField("Date_Time", StringType(), True, metadata={"comment": "Date and time of comment."}),
+        StructField("Comments", StringType(), True, metadata={"comment": "Free text of the comment."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_trackingcomments_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2424,7 +3109,8 @@ def scr_trackingcomments_update():
 
 dlt.create_target_table(
     name = "rde_scr_trackingcomments",
-    comment="Incrementally updated SCR tracking comments data",
+    comment=scr_comments_comment,
+    schema=schema_rde_scr_trackingcomments,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2444,6 +3130,27 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_careplan_comment = "Details on the agreed care plan for patients in the Sommerset Cancer Registry"
+schema_rde_scr_careplan = StructType([
+        StructField("PlanID", StringType(), True, metadata={"comment": "SCR ID for the care plan."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Barts Local hospital ID."}),
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR ID for the care pathway."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber of patient."}),
+        StructField("MDTDate", StringType(), True, metadata={"comment": "Date of cancer multi disciplinary team meeting."}),
+        StructField("CareIntent", StringType(), True, metadata={"comment": "Code for care intention."}),
+        StructField("TreatType", StringType(), True, metadata={"comment": "Code for tareatment type"}),
+        StructField("WHOStatus", StringType(), True, metadata={"comment": "Code for WHOStatus"}),
+        StructField("PlanType", StringType(), True, metadata={"comment": "Code for Plan type"}),
+        StructField("Network", StringType(), True, metadata={"comment": "Yes/no for network."}),
+        StructField("NetworkDate", StringType(), True, metadata={"comment": "Date of network"}),
+        StructField("AgreedCarePlan", StringType(), True, metadata={"comment": "Y/n for agreed care plan."}),
+        StructField("MDTSite", StringType(), True, metadata={"comment": "SCR code for the MDT site."}),
+        StructField("MDTComments", StringType(), True, metadata={"comment": "Any free text comments from the MDT meeting."}),
+        StructField("NetworkFeedback", StringType(), True, metadata={"comment": "Any freetext feedback from network."}),
+        StructField("NetworkComments", StringType(), True, metadata={"comment": "Any freetext comments from network."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_careplan_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2491,7 +3198,8 @@ def scr_careplan_update():
 
 dlt.create_target_table(
     name = "rde_scr_careplan",
-    comment="Incrementally updated SCR care plan data",
+    comment=scr_careplan_comment,
+    schema=schema_rde_scr_careplan,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2511,6 +3219,30 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_treatment_comment = "Details on cancer treaments for individuals in the Sommerset Cancer Registry"
+schema_rde_scr_deftreatment = StructType([
+        StructField("TreatmentID", StringType(), True, metadata={"comment": "SCR id for the treatment."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier."}),
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR ID For the care plan."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
+        StructField("DecisionDate", StringType(), True, metadata={"comment": "Date of treatment decision."}),
+        StructField("StartDate", StringType(), True, metadata={"comment": "Date of start of treatment."}),
+        StructField("Treatment", StringType(), True, metadata={"comment": "code for treatment type."}),
+        StructField("TreatEvent", StringType(), True, metadata={"comment": "Code for type of treatment event."}),
+        StructField("TreatSetting", StringType(), True, metadata={"comment": "Code for type of treatment setting."}),
+        StructField("TPriority", StringType(), True, metadata={"comment": "Code for treatment priority."}),
+        StructField("Intent", StringType(), True, metadata={"comment": "Code for treatment intent."}),
+        StructField("TreatNo", StringType(), True, metadata={"comment": "Sequential number of treatment."}),
+        StructField("TreatID", StringType(), True, metadata={"comment": "SCR ID for treatment."}),
+        StructField("ChemoRT", StringType(), True, metadata={"comment": "Code for chemotherapy."}),
+        StructField("DelayComments", StringType(), True, metadata={"comment": "Any comments about any delay."}),
+        StructField("DEPRECATEDComments", StringType(), True, metadata={"comment": "Any attached comments."}),
+        StructField("DEPRECATEDAllComments", StringType(), True, metadata={"comment": "Concatenation of all comments."}),
+        StructField("RootTCIComments", StringType(), True, metadata={"comment": "Free text of any root ci comments."}),
+        StructField("ROOT_DATE_COMMENTS", StringType(), True, metadata={"comment": "Date of root ci comments."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_deftreatment_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2561,7 +3293,8 @@ def scr_deftreatment_update():
 
 dlt.create_target_table(
     name = "rde_scr_deftreatment",
-    comment="Incrementally updated SCR definitive treatment data",
+    comment=scr_treatment_comment,
+    schema=schema_rde_scr_deftreatment,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2581,6 +3314,33 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_diagnosis_comment = "Diagnoses for individuals in the Sommerset Cancer Registry"
+schema_rde_scr_diagnosis = StructType([
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR ID for care plan."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
+        StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Skin"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "Nuhs number of patient."}),
+        StructField("HospitalNumber", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
+        StructField("PatientStatus", StringType(), True, metadata={"comment": "Free text for status of patient."}),
+        StructField("TumourStatus", StringType(), True, metadata={"comment": "Text status of tumour, e.g. Primary"}),
+        StructField("NewTumourSite", StringType(), True, metadata={"comment": "Text details of new tumour site."}),
+        StructField("DiagDate", StringType(), True, metadata={"comment": "Date of diagnosis."}),
+        StructField("DatePatInformed", StringType(), True, metadata={"comment": "Date patient was informed."}),
+        StructField("PrimDiagICD", StringType(), True, metadata={"comment": "ICD10 code for primary diagnosis."}),
+        StructField("PrimDiagSnomed", StringType(), True, metadata={"comment": "SNOMED code for primary diagnosis."}),
+        StructField("SecDiag", StringType(), True, metadata={"comment": "ICD10 code for secondary diagnosis."}),
+        StructField("Laterality", StringType(), True, metadata={"comment": "Laterality of the cancer. e.g. Right"}),
+        StructField("NonCancerdet", StringType(), True, metadata={"comment": "Any free text details of diagnosis being non cancer or other patient inadmissability."}),
+        StructField("DiagBasis", StringType(), True, metadata={"comment": "Basis for the diagnosis, e.g. Clinical investigation."}),
+        StructField("Histology", StringType(), True, metadata={"comment": "Code for Histology of the tumour."}),
+        StructField("Differentiation", StringType(), True, metadata={"comment": "Any text details about differentiation."}),
+        StructField("Comments", StringType(), True, metadata={"comment": "Any free text commands on the diagnosis."}),
+        StructField("PathwayEndFaster", StringType(), True, metadata={"comment": "Date for end of pathway."}),
+        StructField("PathwayEndReason", StringType(), True, metadata={"comment": "Reason for the end of the pathway."}),
+        StructField("PrimCancerSite", StringType(), True, metadata={"comment": "Location of the primary cancer, e.g. Lower Gastroinestinal."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2634,7 +3394,8 @@ def scr_diagnosis_update():
 
 dlt.create_target_table(
     name = "rde_scr_diagnosis",
-    comment="Incrementally updated SCR diagnosis data",
+    comment=scr_diagnosis_comment,
+    schema=schema_rde_scr_diagnosis,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2654,6 +3415,29 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_investigations_comment = "Details of investigations undertaken for patients in the Sommerset Cancer Registry"
+schema_rde_scr_investigations = StructType([
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR ID for care plan"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Lung"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS number of patient."}),
+        StructField("HospitalNumber", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("DiagInvestigation", StringType(), True, metadata={"comment": "Method of investigation, e.g. PET scan."}),
+        StructField("ReqDate", StringType(), True, metadata={"comment": "Requested date of investigation"}),
+        StructField("DatePerformed", StringType(), True, metadata={"comment": "Date investigation performed"}),
+        StructField("DateReported", StringType(), True, metadata={"comment": "Date report submitted"}),
+        StructField("BiopsyTaken", StringType(), True, metadata={"comment": "Yes/No on if biopsy taken."}),
+        StructField("Outcome", StringType(), True, metadata={"comment": "Outcome status of the investigation, e.g. Performed"}),
+        StructField("Comments", StringType(), True, metadata={"comment": "Any free text comments attached to the investigation."}),
+        StructField("NICIPCode", StringType(), True, metadata={"comment": "NICIP procedure code for the investiation. "}),
+        StructField("SnomedCT", StringType(), True, metadata={"comment": "Any associated SNOMED code."}),
+        StructField("AnotomicalSite", StringType(), True, metadata={"comment": "Site of the investigation, e.g. Whole Body Imaging"}),
+        StructField("AnatomicalSide", StringType(), True, metadata={"comment": "Side of investigation if applicable, e.g. Left"}),
+        StructField("ImagingReport", StringType(), True, metadata={"comment": "Text of the report from the investigation."}),
+        StructField("StagingLaproscopyPerformed", StringType(), True, metadata={"comment": "Yes/No on if staging laproscopy performed."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_investigations_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2703,7 +3487,8 @@ def scr_investigations_update():
 
 dlt.create_target_table(
     name = "rde_scr_investigations",
-    comment="Incrementally updated SCR investigations data",
+    comment=scr_investigations_comment,
+    schema=schema_rde_scr_investigations,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2723,6 +3508,28 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+scr_pathology_comment = "Details of pathology performed for patients in the Sommerset Cancer Registry"
+schema_rde_scr_pathology = StructType([
+        StructField("PathologyID", StringType(), True, metadata={"comment": "SCR pathology result identifier."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("CareID", StringType(), True, metadata={"comment": "SCR care plan identifier."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
+        StructField("PathologyType", StringType(), True, metadata={"comment": "Code for type of pathology."}),
+        StructField("ResultDate", StringType(), True, metadata={"comment": "Date for receiging pathology results."}),
+        StructField("ExcisionMargins", StringType(), True, metadata={"comment": "Code for excision margins"}),
+        StructField("Nodes", StringType(), True, metadata={"comment": "Number of nodes."}),
+        StructField("PositiveNodes", StringType(), True, metadata={"comment": "Number of positive nodes."}),
+        StructField("PathTstage", StringType(), True, metadata={"comment": "Number for stage in the T pathology."}),
+        StructField("PathNstage", StringType(), True, metadata={"comment": "Number for the stage in the N pathology."}),
+        StructField("PathMstage", StringType(), True, metadata={"comment": "Number for the stage in the M pathology."}),
+        StructField("Comments", StringType(), True, metadata={"comment": "Any attached free text comment."}),
+        StructField("SampleDate", StringType(), True, metadata={"comment": "Date the sample was taken."}),
+        StructField("PathologyReport", StringType(), True, metadata={"comment": "Text of the report"}),
+        StructField("SNomedCT", StringType(), True, metadata={"comment": "SCR ID for snomed concept."}),
+        StructField("SNomedID", StringType(), True, metadata={"comment": "Code for snomed oncept."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_scr_pathology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2771,7 +3578,8 @@ def scr_pathology_update():
 
 dlt.create_target_table(
     name = "rde_scr_pathology",
-    comment="Incrementally updated SCR pathology data",
+    comment=scr_pathology_comment,
+    schema=schema_rde_scr_pathology,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2791,6 +3599,29 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+powerforms_comment = "Contains details of differnet types of powerforms completed for a particular patient."
+schema_rde_powerforms = StructType([
+        StructField("PERSON_ID", StringType(), True, metadata={"comment": "Unique identifer of the patient."}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("ENCNTR_ID", StringType(), True, metadata={"comment": "This is the value of the unique primary identifier of the encounter table."}),
+        StructField("PerformDate", StringType(), True, metadata={"comment": "Activity performed date and time"}),
+        StructField("DOC_RESPONSE_KEY", StringType(), True, metadata={"comment": "Unique identifier for this powerform event."}),
+        StructField("Form", StringType(), True, metadata={"comment": "Name of the form."}),
+        StructField("FormID", LongType(), True, metadata={"comment": "This is the event_id from CLINICAL_EVENT. For imported data (for which there actually is no HNAM form/event) it?s a negative number corresponding to an external index system."}),
+        StructField("Section", StringType(), True, metadata={"comment": "Name of the section"}),
+        StructField("SectionID", LongType(), True, metadata={"comment": "Identifies a documentation set section"}),
+        StructField("Element", StringType(), True, metadata={"comment": "Name of the element"}),
+        StructField("ElementID", LongType(), True, metadata={"comment": "Identifies a documentation set element"}),
+        StructField("Component", StringType(), True, metadata={"comment": "Name of the component."}),
+        StructField("ComponentDesc", StringType(), True, metadata={"comment": "Description of the component"}),
+        StructField("ComponentID", LongType(), True, metadata={"comment": "Identifies a documentation set component"}),
+        StructField("Response", StringType(), True, metadata={"comment": "Response input into the form for the specific component, element, section, form."}),
+        StructField("ResponseNumeric", IntegerType(), True, metadata={"comment": "1 if response is a number, otherwise 0."}),
+        StructField("Status", StringType(), True, metadata={"comment": "Status of the results on the form"}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_powerforms_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2851,7 +3682,8 @@ def powerforms_update():
 
 dlt.create_target_table(
     name = "rde_powerforms",
-    comment="Incrementally updated Powerforms data",
+    comment=powerforms_comment,
+    schema=schema_rde_powerforms,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2871,6 +3703,22 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+powertrials_comment = "Table of details of individuals registered on a study in powertrials."
+schema_rde_mill_powertrials = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Study_Code", StringType(), True, metadata={"comment": "Code for study in powertrials"}),
+        StructField("Study_Name", StringType(), True, metadata={"comment": "Name of study in powertrials"}),
+        StructField("Study_Participant_ID", StringType(), True, metadata={"comment": "ID for participant within the given study."}),
+        StructField("On_Study_Date", StringType(), True, metadata={"comment": "Date participant joined the study."}),
+        StructField("Off_Study_Date", StringType(), True, metadata={"comment": "Date participant left the study."}),
+        StructField("Off_Study_Code", StringType(), True, metadata={"comment": "Code for reason for leaving the study if applicabl.e"}),
+        StructField("Off_Study_Reason", StringType(), True, metadata={"comment": "Text for the code for leaving the study if applicable."}),
+        StructField("Off_Study_Comment", StringType(), True, metadata={"comment": "Free text comment for reason for leaving the study."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_mill_powertrials_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2922,7 +3770,8 @@ def mill_powertrials_update():
 
 dlt.create_target_table(
     name = "rde_mill_powertrials",
-    comment="Incrementally updated Powertrials data",
+    comment=powertrials_comment,
+    schema=schema_rde_mill_powertrials,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -2942,6 +3791,17 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+aliases_comment = "Table of alternative identifiers such as NHS Number or MRN for all the patients in the cohort."
+schema_rde_aliases = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("CodeType", StringType(), True, metadata={"comment": "Type of code, NHS Number or MRN"}),
+        StructField("Code", StringType(), True, metadata={"comment": "Alphanumeric of code."}),
+        StructField("IssueDate", StringType(), True, metadata={"comment": "Date the code started being used."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_aliases_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -2984,7 +3844,8 @@ def aliases_update():
 
 dlt.create_target_table(
     name = "rde_aliases",
-    comment="Incrementally updated patient aliases data",
+    comment=aliases_comment,
+    schema=schema_rde_aliases,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3004,6 +3865,19 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+critactivity_comment = "Table of activities occuring in the critical care pathway for a given patient."
+schema_rde_critactivity = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "The unique identifier for each patient"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Identifier"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "NHS Number"}),
+        StructField("Period_ID", StringType(), True, metadata={"comment": "ID for the crit care period."}),
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "ID for the CDS"}),
+        StructField("ActivityDate", StringType(), True, metadata={"comment": "Date of the activity."}),
+        StructField("ActivityCode", IntegerType(), True, metadata={"comment": "Code for the activity."}),
+        StructField("ActivityDesc", StringType(), True, metadata={"comment": "Text description of the code."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_critactivity_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3048,7 +3922,8 @@ def critactivity_update():
 
 dlt.create_target_table(
     name = "rde_critactivity",
-    comment="Incrementally updated critical care activity data",
+    comment=critactivity_comment,
+    schema=schema_rde_critactivity,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3068,6 +3943,31 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+critperiod_comment = "Table of critical care periods for a given patient."
+schema_rde_critperiod = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "The unique identifier for each patient"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Identifier"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "NHS Number"}),
+        StructField("Period_ID", StringType(), True, metadata={"comment": "ID For the crit care period."}),
+        StructField("StartDate", StringType(), True, metadata={"comment": "Date the period starts."}),
+        StructField("DischargeDate", StringType(), True, metadata={"comment": "Date of discharge from critical care."}),
+        StructField("Level_2_Days", IntegerType(), True, metadata={"comment": "Days in level 2."}),
+        StructField("Level_3_Days", IntegerType(), True, metadata={"comment": "Days in level 3."}),
+        StructField("Dischage_Dest_CD", IntegerType(), True, metadata={"comment": "Code for the discharge destination."}),
+        StructField("Discharge_destination", StringType(), True, metadata={"comment": "Text description of the discharge destination."}),
+        StructField("Adv_Cardio_Days", IntegerType(), True, metadata={"comment": "Days in Advanced cardio unit."}),
+        StructField("Basic_Cardio_Days", IntegerType(), True, metadata={"comment": "Days in basic cardio unit."}),
+        StructField("Adv_Resp_Days", IntegerType(), True, metadata={"comment": "Days in advanced respiritory unit."}),
+        StructField("Basic_Resp_Days", IntegerType(), True, metadata={"comment": "Days in basic respitory unit."}),
+        StructField("Renal_Days", IntegerType(), True, metadata={"comment": "Days in Renal Unit."}),
+        StructField("Neuro_Days", IntegerType(), True, metadata={"comment": "Days in Neuro Unit."}),
+        StructField("Gastro_Days", IntegerType(), True, metadata={"comment": "Days in Gastro unit."}),
+        StructField("Derm_Days", IntegerType(), True, metadata={"comment": "Days in dermatology Unit."}),
+        StructField("Liver_Days", IntegerType(), True, metadata={"comment": "Days in Liver unit."}),
+        StructField("No_Organ_Systems", IntegerType(), True, metadata={"comment": "Number of organ systems."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_critperiod_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3124,7 +4024,8 @@ def critperiod_update():
 
 dlt.create_target_table(
     name = "rde_critperiod",
-    comment="Incrementally updated critical care period data",
+    comment=critperiod_comment,
+    schema=schema_rde_critperiod,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3144,6 +4045,17 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+critopcs_comment = "Details of procedures undertaken in the critical care pathway."
+schema_rde_critopcs = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "The unique identifier for each patient"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local Identifier"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "NHS Number"}),
+        StructField("Period_ID", StringType(), True, metadata={"comment": "ID For the crit care period."}),
+        StructField("ProcDate", StringType(), True, metadata={"comment": "Date of the procedure."}),
+        StructField("ProcCode", StringType(), True, metadata={"comment": "OPCS Code of the procedure."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_critopcs_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3182,7 +4094,8 @@ def critopcs_update():
 
 dlt.create_target_table(
     name = "rde_critopcs",
-    comment="Incrementally updated critical care OPCS data",
+    comment=critopcs_comment,
+    schema=schema_rde_critopcs,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3202,6 +4115,28 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+measurements_comment = "Table of all measurements taken for a given patient."
+schema_rde_measurements = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("SystemLookup", StringType(), True, metadata={"comment": "Lookup for the system the measurement comes from."}),
+        StructField("ClinicalSignificanceDate", StringType(), True, metadata={"comment": "The date of clinical significance for the measurement."}),
+        StructField("ResultNumeric", BooleanType(), True, metadata={"comment": "1 indicates EVENT_RESULT_TXT is numeric; 0 otherwise."}),
+        StructField("EventResult", StringType(), True, metadata={"comment": "The measurement."}),
+        StructField("UnitsCode", IntegerType(), True, metadata={"comment": "Code for the units."}),
+        StructField("UnitsDesc", StringType(), True, metadata={"comment": "Lookup of the code for the units."}),
+        StructField("NormalCode", IntegerType(), True, metadata={"comment": "Code for the normalcy value."}),
+        StructField("NormalDesc", StringType(), True, metadata={"comment": "Lookup of the code for the normalcy value."}),
+        StructField("LowValue", StringType(), True, metadata={"comment": "Lower threshold for normal results."}),
+        StructField("HighValue", StringType(), True, metadata={"comment": "Higher threshold for normal results."}),
+        StructField("EventText", StringType(), True, metadata={"comment": "Text for the event."}),
+        StructField("EventType", StringType(), True, metadata={"comment": "Type lookup for the event."}),
+        StructField("EventParent", StringType(), True, metadata={"comment": "Lookup details for the parent of this measurement event."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
+
 
 @dlt.table(name="rde_measurements_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3263,7 +4198,8 @@ def measurements_update():
 
 dlt.create_target_table(
     name = "rde_measurements",
-    comment="Incrementally updated patient measurements data",
+    comment=measurements_comment,
+    schema=schema_rde_measurements,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3283,6 +4219,24 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+emergency_comment = "Details of an admission to the emergency department."
+
+schema_rde_emergencyd = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("Arrival_Dt_Tm", StringType(), True, metadata={"comment": "Date of arrival in emergency department"}),
+        StructField("Departure_Dt_Tm", StringType(), True, metadata={"comment": "Date of departure from department."}),
+        StructField("Dischage_Status_CD", StringType(), True, metadata={"comment": "Code for discharge status."}),
+        StructField("Discharge_Status_Desc", StringType(), True, metadata={"comment": "Description of discharge status code."}),
+        StructField("Discharge_Dest_CD", StringType(), True, metadata={"comment": "Code for discharge destination."}),
+        StructField("Discharge_Dest_Desc", StringType(), True, metadata={"comment": "Description of discharge destination code."}),
+        StructField("Diag_Code", StringType(), True, metadata={"comment": "Code for diagnosis."}),
+        StructField("SNOMED_CD", StringType(), True, metadata={"comment": "SNOMED code for diagnosis."}),
+        StructField("SNOMED_Desc", StringType(), True, metadata={"comment": "Description of snomed code."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_emergencyd_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3336,7 +4290,8 @@ def emergencyd_update():
 
 dlt.create_target_table(
     name = "rde_emergencyd",
-    comment="Incrementally updated emergency department data",
+    comment=emergency_comment,
+    schema=schema_rde_emergencyd,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3356,6 +4311,56 @@ dlt.apply_changes(
 )
 
 # COMMAND ----------
+
+medadmin_comment = "Table include all administration events for medicines."
+
+schema_rde_medadmin = StructType([
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("EVENT_ID", StringType(), True, metadata={"comment": "ID for the admin event."}),
+        StructField("ORDER_ID", StringType(), True, metadata={"comment": "ID of the order linked to the admin event."}),
+        StructField("EVENT_TYPE", StringType(), True, metadata={"comment": "Code for the type of event."}),
+        StructField("ORDER_SYNONYM_ID", StringType(), True, metadata={"comment": "Millenium identifier of the drug."}),
+        StructField("ORDER_MULTUM", StringType(), True, metadata={"comment": "MULTUM drug ontology code, maps to rxnorm."}),
+        StructField("Order_Desc", StringType(), True, metadata={"comment": "Description of the drug."}),
+        StructField("Order_Detail", StringType(), True, metadata={"comment": "Detailed notes about the order."}),
+        StructField("ORDER_STRENGTH", FloatType(), True, metadata={"comment": "Strength for the order."}),
+        StructField("ORDER_STRENGTH_UNIT", StringType(), True, metadata={"comment": "Units used in the strength of order."}),
+        StructField("ORDER_VOLUME", FloatType(), True, metadata={"comment": "Volume for the order."}),
+        StructField("ORDER_VOLUME_UNIT", StringType(), True, metadata={"comment": "Units used in the volume of the order."}),
+        StructField("ORDER_ACTION_SEQUENCE", IntegerType(), True, metadata={"comment": "If part of a sequence, the order in which the sequence takes place."}),
+        StructField("ADMIN_ROUTE", StringType(), True, metadata={"comment": "Administration route."}),
+        StructField("ADMIN_METHOD", StringType(), True, metadata={"comment": "Method of administration"}),
+        StructField("ADMIN_INITIAL_DOSAGE", FloatType(), True, metadata={"comment": "Initial dosage if different from total dosage."}),
+        StructField("ADMIN_DOSAGE", FloatType(), True, metadata={"comment": "Dosage for the specific administration"}),
+        StructField("ADMIN_DOSAGE_UNIT", StringType(), True, metadata={"comment": "Units used for the admin dosage."}),
+        StructField("ADMIN_INITIAL_VOLUME", FloatType(), True, metadata={"comment": "Initial volume"}),
+        StructField("ADMIN_TOTAL_INTAKE_VOLUME", FloatType(), True, metadata={"comment": "Total intake volume"}),
+        StructField("ADMIN_DILUENT_TYPE", StringType(), True, metadata={"comment": "Diluent type if used."}),
+        StructField("ADMIN_INFUSION_RATE", FloatType(), True, metadata={"comment": "Infusion rate if used."}),
+        StructField("ADMIN_INFUSION_UNIT", StringType(), True, metadata={"comment": "Units for infusion."}),
+        StructField("ADMIN_INFUSION_TIME", StringType(), True, metadata={"comment": "Time over which infusion takes place."}),
+        StructField("ADMIN_MEDICATION_FORM", StringType(), True, metadata={"comment": "Form of medication administered if required."}),
+        StructField("ADMIN_STRENGTH", FloatType(), True, metadata={"comment": "Strength of drug administered."}),
+        StructField("ADMIN_STRENGTH_UNIT", StringType(), True, metadata={"comment": "Units for strength of drug."}),
+        StructField("ADMIN_INFUSED_VOLUME", FloatType(), True, metadata={"comment": "Volume infused for the administration."}),
+        StructField("ADMIN_INFUSED_VOLUME_UNIT", StringType(), True, metadata={"comment": "Units for the volume infused."}),
+        StructField("ADMIN_REMAINING_VOLUME", FloatType(), True, metadata={"comment": "Remaining volume if any."}),
+        StructField("ADMIN_REMAINING_VOLUME_UNIT", StringType(), True, metadata={"comment": "Units for remaining volume."}),
+        StructField("ADMIN_IMMUNIZATION_TYPE", StringType(), True, metadata={"comment": "Type of aimmunization if relevent."}),
+        StructField("ADMIN_REFUSAL", StringType(), True, metadata={"comment": "Code for an administration refusal if relevent."}),
+        StructField("ADMIN_IV_EVENT", StringType(), True, metadata={"comment": "Code for an IV event if required."}),
+        StructField("ADMIN_SYNONYM_ID", StringType(), True, metadata={"comment": "Internal code for the drug administered."}),
+        StructField("ADMIN_MULTUM", StringType(), True, metadata={"comment": "MULTUM drug ontology code for drug administred."}),
+        StructField("Admin_Desc", StringType(), True, metadata={"comment": "Text description of the drug administred"}),
+        StructField("ADMINISTRATOR", StringType(), True, metadata={"comment": "Role of the member of staff administering the drug."}),
+        StructField("EVENT_DESC", StringType(), True, metadata={"comment": "Clinical event description for the event code."}),
+        StructField("EVENT_DATE", StringType(), True, metadata={"comment": "Date of the clinical event for the administration."}),
+        StructField("ADMIN_START_DATE", StringType(), True, metadata={"comment": "Date and time administration of drug started."}),
+        StructField("ADMIN_END_DATE", StringType(), True, metadata={"comment": "Date and time administration of drug concluded."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_medadmin_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3464,7 +4469,8 @@ def medadmin_update():
 
 dlt.create_target_table(
     name = "rde_medadmin",
-    comment="Incrementally updated medication administration data",
+    comment=medadmin_comment,
+    schema=schema_rde_medadmin,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
@@ -3485,6 +4491,34 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+pharmacy_order_comment = "Table of the details of all pharmacy orders."
+schema_rde_pharmacyorders = StructType([
+        StructField("OrderID", StringType(), True, metadata={"comment": "Unique ID to identify orders"}),
+        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+        StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
+        StructField("ENCNTRID", StringType(), True, metadata={"comment": "Identifier for the encounter linked to this order."}),
+        StructField("EncType", StringType(), True, metadata={"comment": "Type of the encounter linked to this order."}),
+        StructField("PERSONID", StringType(), True, metadata={"comment": "Unique identifier."}),
+        StructField("OrderDate", StringType(), True, metadata={"comment": "Date and time the order is placed"}),
+        StructField("LastOrderStatusDateTime", StringType(), True, metadata={"comment": "Date and time in which the status was updated last"}),
+        StructField("ReqStartDateTime", StringType(), True, metadata={"comment": "Start date requested for the order."}),
+        StructField("OrderText", StringType(), True, metadata={"comment": "Medicine details/prescirption "}),
+        StructField("Comments", StringType(), True, metadata={"comment": "Any free text comments attached to the order."}),
+        StructField("OrderDetails", StringType(), True, metadata={"comment": "Includes details like dosage, form ect"}),
+        StructField("LastOrderStatus", StringType(), True, metadata={"comment": "Description of last order status include Ordered, Cancelled, Completed, Voided Without Results, Discontinued, Future, Incomplete, InProcess, Ordered, Suspended, Pending Complete"}),
+        StructField("ClinicalCategory", StringType(), True, metadata={"comment": "This field describes the clinical category which  includes Activity\
+"}),
+        StructField("ActivityDesc", StringType(), True, metadata={"comment": "description of Activity_CD like Consults, Communication Orders, Diets, General Assessments, Infectious Diseases Consults, Microbiology, Patient Activity, Pharmacy, Hospital At Night, Appointment Consults OM, Diagnostic Cardiology, Non Theatre Procedures"}),
+        StructField("OrderableType", StringType(), True, metadata={"comment": "Description of Orderable_CD like Dietary, Discern Rule Order, Laboratory, Patient Care, Pharmacy"}),
+        StructField("PriorityDesc", StringType(), True, metadata={"comment": "Description of Priority_CD like ROUTINE, STAT, Urgent, Within 2 wks"}),
+        StructField("CancelledReason", StringType(), True, metadata={"comment": "reason for cancellation of this order"}),
+        StructField("CancelledDT", StringType(), True, metadata={"comment": "date of cancellation of this order"}),
+        StructField("CompletedDT", StringType(), True, metadata={"comment": "completed date"}),
+        StructField("DiscontinuedDT", StringType(), True, metadata={"comment": "discountinued date"}),
+        StructField("ConceptIdent", StringType(), True, metadata={"comment": "Identifier for the drug ordered."}),
+        StructField("PRIORITY_CD", StringType(), True, metadata={"comment": "Priority code for the order."}),
+        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+    ])
 
 @dlt.table(name="rde_pharmacyorders_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -3627,7 +4661,8 @@ def pharmacyorders_update():
 # Declare the target table
 dlt.create_target_table(
     name = "rde_pharmacyorders",
-    comment="Incrementally updated pharmacy orders data",
+    comment=pharmacy_order_comment,
+    schema=schema_rde_pharmacyorders,
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
