@@ -1127,7 +1127,7 @@ schema_rde_raw_pathology = StructType([
         StructField("TFCCode", StringType(), True, metadata={"comment": "TFCCode"}),
         StructField("Subcode", StringType(), True, metadata={"comment": "TFCCode subcode"}),
         StructField("WkgCode", StringType(), True, metadata={"comment": "WkgCode"}),
-        StructField("Processed", IntegerType(), True, metadata={"comment": "1 indicates that NotProcessed is 0; 0 when NotProcessed is 1"}),
+        #StructField("Processed", IntegerType(), True, metadata={"comment": "1 indicates that NotProcessed is 0; 0 when NotProcessed is 1"}),
         StructField("Result", StringType(), True, metadata={"comment": "Pathology result"}),
         StructField("ResultNumeric", IntegerType(), True, metadata={"comment": "1 indicates that TFCValue is numeric, not null, and not [.]; 0 otherwise. Note that in some cases where the value is for example [4.3  37%], it is identified as non-numeric. "}),
         StructField("TFCResultSeq", LongType(), True, metadata={"comment": "ID number from external system(s)"}),
@@ -1192,7 +1192,7 @@ def raw_pathology_incr():
             filtered_pres.TFCCode,
             filtered_pres.LegTFCCode.alias("Subcode"),
             filtered_pres.WkgCode,
-            when(filtered_pres.NotProcessed == 1, 0).otherwise(1).alias("Processed"),
+            #when(filtered_pres.NotProcessed == 1, 0).otherwise(1).alias("Processed"),
             filtered_pres.TFCValue.alias("Result"),
             when(
                 filtered_pres.TFCValue.isNotNull() & 
