@@ -1120,10 +1120,10 @@ schema_rde_raw_pathology = StructType([
         StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
         StructField("LabNo", StringType(), True, metadata={"comment": "Reference number from pathology system"}),
-        StructField("TLCCode", StringType(), True, metadata={"comment": "TLCCode"}),
-        StructField("Specimen", StringType(), True, metadata={"comment": "Type of specimen"}),
-        StructField("TLCSnomed", StringType(), True, metadata={"comment": "TLCSnomed"}),
-        StructField("TLCDesc", StringType(), True, metadata={"comment": "Description of TLCCode"}),
+        #StructField("TLCCode", StringType(), True, metadata={"comment": "TLCCode"}),
+        #StructField("Specimen", StringType(), True, metadata={"comment": "Type of specimen"}),
+        #StructField("TLCSnomed", StringType(), True, metadata={"comment": "TLCSnomed"}),
+        #StructField("TLCDesc", StringType(), True, metadata={"comment": "Description of TLCCode"}),
         StructField("TFCCode", StringType(), True, metadata={"comment": "TFCCode"}),
         StructField("Subcode", StringType(), True, metadata={"comment": "TFCCode subcode"}),
         StructField("WkgCode", StringType(), True, metadata={"comment": "WkgCode"}),
@@ -1171,7 +1171,7 @@ def raw_pathology_incr():
         filtered_pres
         .join(filtered_psl, "LabNo")
         .join(pmrt, filtered_pres.TFCCode == pmrt.TFCCode, "left")
-        .join(pmor, filtered_pres.TLCCode == pmor.TLCCode, "left")
+        #.join(pmor, filtered_pres.TLCCode == pmor.TLCCode, "left")
         .join(patient_demographics, 
               (filtered_psl.NHSNo == patient_demographics.NHS_Number) | 
               (filtered_psl.MRN == patient_demographics.MRN), 
@@ -1185,10 +1185,10 @@ def raw_pathology_incr():
             patient_demographics.NHS_Number,
             patient_demographics.MRN,
             filtered_pres.LabNo,
-            filtered_pres.TLCCode,
-            pmor.CSpecTypeCode.alias("Specimen"),
-            pmor.SnomedCTCode.alias("TLCSnomed"),
-            pmor.TLCDesc_Full.alias("TLCDesc"),
+            #filtered_pres.TLCCode,
+            #pmor.CSpecTypeCode.alias("Specimen"),
+            #pmor.SnomedCTCode.alias("TLCSnomed"),
+            #pmor.TLCDesc_Full.alias("TLCDesc"),
             filtered_pres.TFCCode,
             filtered_pres.LegTFCCode.alias("Subcode"),
             filtered_pres.WkgCode,
