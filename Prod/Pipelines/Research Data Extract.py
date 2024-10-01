@@ -1130,7 +1130,7 @@ schema_rde_raw_pathology = StructType([
         StructField("Processed", IntegerType(), True, metadata={"comment": "1 indicates that NotProcessed is 0; 0 when NotProcessed is 1"}),
         StructField("Result", StringType(), True, metadata={"comment": "Pathology result"}),
         StructField("ResultNumeric", IntegerType(), True, metadata={"comment": "1 indicates that TFCValue is numeric, not null, and not [.]; 0 otherwise. Note that in some cases where the value is for example [4.3  37%], it is identified as non-numeric. "}),
-        StructField("ResultIDNo", LongType(), True, metadata={"comment": "ID number from external system(s)"}),
+        StructField("TFCResultSeq", LongType(), True, metadata={"comment": "ID number from external system(s)"}),
         StructField("SectionCode", StringType(), True, metadata={"comment": "SectionCode"}),
         StructField("TFCDesc", StringType(), True, metadata={"comment": "Description of TFCCode"}),
         StructField("RequestDT", TimestampType(), True, metadata={"comment": "Request datetime"}),
@@ -1200,7 +1200,7 @@ def raw_pathology_incr():
                 filtered_pres.TFCValue.cast("double").isNotNull(), 
                 1
             ).otherwise(0).alias("ResultNumeric"),
-            filtered_pres.ResultIDNo,
+            filtered_pres.TFCResultSeq,
             pmrt.SectionCode,
             pmrt.TFCDesc_Full.alias("TFCDesc"),
             filtered_psl.RequestDT,
@@ -1235,7 +1235,7 @@ dlt.create_target_table(
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "LabNo,TFCCode,ResultIDNo"
+        "pipelines.autoOptimize.zOrderCols": "LabNo,TFCCode,TFCResultSeq"
 
     }
 )
@@ -1243,7 +1243,7 @@ dlt.create_target_table(
 dlt.apply_changes(
     target = "rde_raw_pathology",
     source = "raw_pathology_update",
-    keys = ["PERSON_ID", "ResultIDNo"],
+    keys = ["PERSON_ID", "TFCResultSeq"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],
