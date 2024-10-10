@@ -2,6 +2,10 @@
 from pyspark.sql import functions as F
 from pyspark.sql.functions import to_date
 from delta.tables import DeltaTable
+from pyspark.sql.window import Window
+
+spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
 
 # Get the maximum ADC_UPDT from the target table
 target_table = DeltaTable.forName(spark, "4_prod.bronze.mill_form_activity")
@@ -76,14 +80,22 @@ mill_form_activity = (
         ).alias("ADC_UPDT")
     )
 )
+mill_form_activity = mill_form_activity.repartition("DCP_FORMS_ACTIVITY_ID")
 
-# Perform the merge operation
-(target_table.alias("target")
- .merge(
-     mill_form_activity.alias("source"),
-     "target.DCP_FORMS_ACTIVITY_ID = source.DCP_FORMS_ACTIVITY_ID"
- )
- .whenMatchedUpdateAll()
- .whenNotMatchedInsertAll()
- .execute()
-)
+row_count = mill_form_activity.count()
+print(f"Number of rows in mill_form_activity: {row_count}")
+
+# Get the list of DCP_FORMS_ACTIVITY_ID to be deleted
+ids_to_delete = mill_form_activity.select("DCP_FORMS_ACTIVITY_ID").distinct()
+
+# Delete matching rows from the target table
+window = Window.partitionBy(F.lit(1))  # Global window
+ids_to_delete_set = ids_to_delete.select(F.collect_set("DCP_FORMS_ACTIVITY_ID").over(window).alias("id_set")).first().id_set
+
+target_table.delete(F.col("DCP_FORMS_ACTIVITY_ID").isin(ids_to_delete_set))
+
+# Append the new data to the target table
+mill_form_activity.write.format("delta").mode("append").saveAsTable("4_prod.bronze.mill_form_activity")
+
+# Optimize the target table
+#target_table.optimize().executeZOrderBy("DCP_FORMS_ACTIVITY_ID")
