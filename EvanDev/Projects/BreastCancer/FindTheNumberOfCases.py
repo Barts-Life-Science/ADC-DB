@@ -28,6 +28,31 @@
 
 # COMMAND ----------
 
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT e.* FROM 4_prod.raw.pacs_examinations AS e
+# MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+# MAGIC ON e.examinationid = er.examinationreportexaminationid
+# MAGIC LIMIT 10
+# MAGIC
+# MAGIC -- ExaminationBodyPart and ExaminationDescription contain info about the imaging body part
+# MAGIC -- ExaminationModality, ExaminationCode, and ExaminationDescription contain info about the imaging modality
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- Guess the meaning of ExaminationStatus
+# MAGIC
+# MAGIC SELECT ExaminationStatus, COUNT(*)
+# MAGIC FROM 4_prod.raw.pacs_examinations AS e
+# MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+# MAGIC ON e.examinationid = er.examinationreportexaminationid
+# MAGIC WHERE ExaminationDate BETWEEN '2010-01-01' AND '2024-01-25'
+# MAGIC GROUP BY ExaminationStatus
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC
 # MAGIC ### Examinations - Body Part
@@ -36,9 +61,8 @@
 
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT * FROM 4_prod.raw.pacs_examinations LIMIT 10
-# MAGIC
-# MAGIC -- ExaminationBodyPart and ExaminationDescription contain info about the imaging body part
+# MAGIC SELECT DISTINCT ExaminationBodyPart
+# MAGIC FROM 4_prod.raw.pacs_Examinations
 
 # COMMAND ----------
 
@@ -61,7 +85,7 @@
 
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT DISTINCT ExaminationCode, ExaminationDescription 
+# MAGIC SELECT DISTINCT ExaminationDescription 
 # MAGIC from 4_prod.raw.pacs_examinations
 # MAGIC WHERE ExaminationDescription LIKE '%breast%' OR ExaminationDescription LIKE '%mammogram%'
 
@@ -91,13 +115,14 @@ body_parts = {
     "axilla":["%axilla%"],
     "bone":["%bone%"],
     "brain":["%brain%"],
+    #"head":["%head%"],
     "breast":["%breast%", "%mammogram%"],
     "chest":["%chest%", "%thora%"],
     "liver": ["%liver%"],
     "neck": ["%neck%"],
     "pelvis": ["%pelvis%"],
     "sentinel node": ["%sentinel node%"],
-    "spine": ["%spin%"],
+    "spine": ["%spine%", "%spinal%"],
     "whole body": ["%whole body%"]
 }
 
@@ -106,10 +131,12 @@ SELECT '__KEY__', COUNT(DISTINCT e.ExaminationId)
 FROM 4_prod.raw.pacs_examinations AS e
 INNER JOIN breast_cancer_patients AS p
 ON e.ExaminationId = p.ExaminationId
+INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+ON e.ExaminationId = er.ExaminationReportExaminationId
 WHERE 
 """
 
-q_template_cond = """e.ExaminationDescription LIKE '__VAL__'\n"""
+q_template_cond = """LOWER(e.ExaminationDescription) LIKE LOWER('__VAL__') OR LOWER(e.ExaminationBodyPart) LIKE LOWER('__VAL__')\n"""
 
 q = ""
 for i, key_val in enumerate(body_parts.items()):
@@ -140,16 +167,91 @@ display(tmp_df)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC
+# MAGIC Use short code table
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT DISTINCT short_code
+# MAGIC from 4_prod.raw.pacs_examinations AS e
+# MAGIC LEFT JOIN 1_inland.evan_demo.pacs_shortcodes AS sc
+# MAGIC ON e.ExaminationCode = sc.short_code OR e.ExaminationCode = sc.short_code + 'C'
+# MAGIC WHERE sc.short_code IS NOT NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- ExaminationCode is not standardised; there could be some weird values.
+# MAGIC
+# MAGIC SELECT DISTINCT ExaminationCode
+# MAGIC from 4_prod.raw.pacs_examinations AS e
+# MAGIC LEFT JOIN 1_inland.evan_demo.pacs_shortcodes AS sc
+# MAGIC ON e.ExaminationCode = sc.short_code OR e.ExaminationCode = sc.short_code + 'C'
+# MAGIC WHERE sc.short_code IS NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT ExaminationId, RequestId, e.ExaminationModality, e.ExaminationCode, e.ExaminationDescription, r.RequestQuestion
+# MAGIC FROM 4_prod.raw.pacs_examinations AS e
+# MAGIC INNER JOIN 4_prod.raw.pacs_requests AS r
+# MAGIC ON e.ExaminationRequestId = r.RequestId
+# MAGIC WHERE ExaminationDate > '2010-01-01'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ### Examinations - Modalities
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT DISTINCT ExaminationModality FROM 4_prod.raw.pacs_examinations
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- Check NULL values in these two columns
+# MAGIC -- ExaminationDescription has a lot fewer NULL values 
+# MAGIC
+# MAGIC SELECT 'ExaminationModality', COUNT(*)
+# MAGIC from 4_prod.raw.pacs_examinations
+# MAGIC WHERE ExaminationModality IS NULL
+# MAGIC AND ExaminationStatus=100
+# MAGIC AND ExaminationDate BETWEEN '2010-01-01' AND '2024-01-25'
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'ExaminationDescription', COUNT(*)
+# MAGIC FROM 4_prod.raw.pacs_examinations
+# MAGIC WHERE ExaminationDescription IS NULL
+# MAGIC AND ExaminationStatus=100
+# MAGIC AND ExaminationDate BETWEEN '2010-01-01' AND '2024-01-25'
+# MAGIC
+
+# COMMAND ----------
+
 
 modalities = {
-    "mammogram":["%mammogram%"],
+    "mammogram":["%mammogram%", "MG%"],
     "ultrasound":["%ultrasound%", "US%", "%echo", "%sonograph%"],
-    "mri":["%mri%"],
-    "pet":["%pet%"],
-    "ct":["%ct%"],
-    "nuclear medicine":["%nuclear%", "%nm%"],
-    "x-ray": ["%x ray%", "%x-ray%"],
-    "tomosynthesis": ["%tomosynthesis%"]
+    "mri":["% MRI %", 'MR%'],
+    "pet":["% pet %", 'PT%'],
+    "ct":["ct%"],
+    "nuclear medicine":["%nuclear%", "NM%"],
+    "x-ray": ["%x ray%", "%x-ray%", "XR%"],
+    "tomosynthesis": ["%tomosynthesis%"],
+    "contrast": ["%contrast%"]
 }
 
 q_template_main = """
@@ -157,10 +259,12 @@ SELECT '__KEY__', COUNT(DISTINCT e.ExaminationId)
 FROM 4_prod.raw.pacs_examinations AS e
 INNER JOIN breast_cancer_patients AS p
 ON e.ExaminationId = p.ExaminationId
+INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+ON e.ExaminationId = er.ExaminationReportExaminationId
 WHERE 
 """
 
-q_template_cond = """e.ExaminationDescription LIKE '__VAL__'\n"""
+q_template_cond = """LOWER(e.ExaminationDescription) LIKE LOWER('__VAL__') OR LOWER(e.ExaminationModality) LIKE LOWER('__VAL__')\n"""
 
 q = ""
 for i, key_val in enumerate(modalities.items()):
