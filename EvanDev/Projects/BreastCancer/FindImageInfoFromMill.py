@@ -1,0 +1,71 @@
+# Databricks notebook source
+# MAGIC %sql
+# MAGIC -- This query decodes the contributor system cd in mill_clinical_event
+# MAGIC -- CODE_VALUE = 6141416 : BLT_TIE_RAD
+# MAGIC
+# MAGIC SELECT cv.*
+# MAGIC FROM 3_lookup.mill.mill_code_value AS cv
+# MAGIC INNER JOIN (SELECT DISTINCT CONTRIBUTOR_SYSTEM_CD FROM 4_prod.raw.mill_clinical_event) AS ce
+# MAGIC ON cv.CODE_VALUE = ce.CONTRIBUTOR_SYSTEM_CD
+# MAGIC --WHERE DESCRIPTION ILIKE '%Calcifi%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC AND EVENT_TITLE_TEXT ILIKE '%CT%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC AND EVENT_TITLE_TEXT ILIKE '%calcifi%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC AND EVENT_TITLE_TEXT ILIKE '%calcifi%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC AND EVENT_TITLE_TEXT ILIKE '%leison%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC AND EVENT_TITLE_TEXT ILIKE '%density%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE 
+# MAGIC --CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC EVENT_TITLE_TEXT ILIKE '%BI-RAD%'
+# MAGIC LIMIT 10
