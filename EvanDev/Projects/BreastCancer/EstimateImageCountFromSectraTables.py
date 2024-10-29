@@ -29,14 +29,25 @@
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC
 # MAGIC SELECT e.* FROM 4_prod.raw.pacs_examinations AS e
 # MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
 # MAGIC ON e.examinationid = er.examinationreportexaminationid
 # MAGIC LIMIT 10
 # MAGIC
+# MAGIC
 # MAGIC -- ExaminationBodyPart and ExaminationDescription contain info about the imaging body part
 # MAGIC -- ExaminationModality, ExaminationCode, and ExaminationDescription contain info about the imaging modality
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT e.* FROM 4_prod.raw.pacs_examinations AS e
+# MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+# MAGIC ON e.examinationid = er.examinationreportexaminationid
+# MAGIC WHERE ExaminationAccessionNumber ILIKE '%long%'
+# MAGIC LIMIT 10
+# MAGIC
 
 # COMMAND ----------
 
@@ -463,6 +474,46 @@ display(tmp_df)
 # MAGIC INNER JOIN breast_cancer_patients AS bcp
 # MAGIC ON e.ExaminationPatientId = bcp.PatientId
 # MAGIC WHERE LOWER(ReportText) LIKE '%partial response%' AND LOWER(ReportText) NOT LIKE '%partial response to treatment%'
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT ExaminationAccessionNumber), COUNT(DISTINCT e.ExaminationId), COUNT(*) FROM 4_prod.raw.pacs_reports AS r
+# MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+# MAGIC ON r.ReportId = er.ExaminationReportReportId
+# MAGIC INNER JOIN 4_prod.raw.pacs_examinations AS e
+# MAGIC ON er.ExaminationReportExaminationId = e.ExaminationId
+# MAGIC INNER JOIN breast_cancer_patients AS bcp
+# MAGIC ON e.ExaminationPatientId = bcp.PatientId
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT ExaminationAccessionNumber), COUNT(DISTINCT e.ExaminationId), COUNT(*) FROM (SELECT DISTINCT ReportId FROM 4_prod.raw.pacs_reports) AS r
+# MAGIC INNER JOIN (SELECT DISTINCT ExaminationReportReportId, ExaminationReportExaminationId FROM 4_prod.raw.pacs_examinationreports) AS er
+# MAGIC ON r.ReportId = er.ExaminationReportReportId
+# MAGIC INNER JOIN (SELECT DISTINCT ExaminationId, ExaminationPatientId, ExaminationAccessionNumber FROM 4_prod.raw.pacs_examinations) AS e
+# MAGIC ON er.ExaminationReportExaminationId = e.ExaminationId
+# MAGIC INNER JOIN (SELECT DISTINCT PatientId FROM breast_cancer_patients) AS bcp
+# MAGIC ON e.ExaminationPatientId = bcp.PatientId
+# MAGIC LIMIT 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT ExaminationAccessionNumber), COUNT(DISTINCT e.ExaminationId), COUNT(*) FROM (SELECT DISTINCT ReportId FROM 4_prod.raw.pacs_reports) AS r
+# MAGIC INNER JOIN (SELECT DISTINCT ExaminationReportReportId, ExaminationReportExaminationId FROM 4_prod.raw.pacs_examinationreports) AS er
+# MAGIC ON r.ReportId = er.ExaminationReportReportId
+# MAGIC INNER JOIN (SELECT DISTINCT ExaminationId, ExaminationPatientId, ExaminationAccessionNumber FROM 4_prod.raw.pacs_examinations) AS e
+# MAGIC ON er.ExaminationReportExaminationId = e.ExaminationId
+# MAGIC INNER JOIN (SELECT DISTINCT PatientId FROM breast_cancer_patients) AS bcp
+# MAGIC ON e.ExaminationPatientId = bcp.PatientId
+# MAGIC WHERE ExaminationAccessionNumber = 'VALUE_TOO_LONG'
 # MAGIC LIMIT 10
 
 # COMMAND ----------
