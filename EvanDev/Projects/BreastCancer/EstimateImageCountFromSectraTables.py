@@ -46,6 +46,7 @@
 # MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
 # MAGIC ON e.examinationid = er.examinationreportexaminationid
 # MAGIC WHERE ExaminationAccessionNumber ILIKE '%long%'
+# MAGIC AND examinationdate > '2024-01-01'
 # MAGIC LIMIT 10
 # MAGIC
 
@@ -618,6 +619,20 @@ display(tmp_df)
 # MAGIC %sql
 # MAGIC
 # MAGIC SELECT e.* FROM 4_prod.raw.pacs_examinations AS e
-# MAGIC INNER JOIN 4_prod.raw.pacs_examinationreports AS er
+# MAGIC INNER JOIN (SELECT DISTINCT examinationreportexaminationid FROM 4_prod.raw.pacs_examinationreports) AS er
 # MAGIC ON e.examinationid = er.examinationreportexaminationid
-# MAGIC LIMIT 10
+# MAGIC WHERE ExaminationAccessionNumber = 'VALUE_TOO_LONG'
+# MAGIC LIMIT 20
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
+# MAGIC WHERE CONTRIBUTOR_SYSTEM_CD = 
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM 4_prod.raw.pacs_series LIMIT 10

@@ -49,7 +49,10 @@
 # MAGIC -- was not able to get a match using examination accession num from Sectra
 # MAGIC
 # MAGIC SELECT * FROM 4_prod.raw.mill_clinical_event
-# MAGIC WHERE Reference_Nbr ILIKE '%{redacted_examinationaccessionnumber}%'
+# MAGIC WHERE 
+# MAGIC Reference_Nbr ILIKE 'UKSBH%'
+# MAGIC AND CONTRIBUTOR_SYSTEM_CD = '6141416' -- BLT_TIE_RAD
+# MAGIC LIMIT 10
 
 # COMMAND ----------
 
