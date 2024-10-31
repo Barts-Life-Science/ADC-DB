@@ -43,6 +43,91 @@ def table_exists_with_rows(table_name):
 
 # COMMAND ----------
 
+
+@dlt.table(
+    name="code_value",
+    comment="Code Value Table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "CODE_VALUE"
+    }
+)
+def lookup_code_value():
+    return (
+        spark.table("3_lookup.mill.mill_code_value").filter(col("ACTIVE_IND") > 0)
+)
+
+@dlt.table(
+    name="patient_nhs",
+    comment="NHS table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
+    }
+)
+def lookup_nhs_number():
+    window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
+    return (
+        spark.table("4_prod.raw.mill_person_alias")
+        .filter((col("PERSON_ALIAS_TYPE_CD") == 18) & (col("ACTIVE_IND") == 1))
+        .withColumn("row", row_number().over(window))
+        .filter(col("row") == 1)
+        .select("PERSON_ID", "ALIAS", "ADC_UPDT")
+    )
+
+@dlt.table(
+    name="patient_mrn",
+    comment="MRN table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSON_ID"
+    }
+)
+def lookup_mrn():
+    window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
+    return (
+        spark.table("4_prod.raw.mill_person_alias")
+        .filter((col("PERSON_ALIAS_TYPE_CD") == 10) & (col("ACTIVE_IND") == 1))
+        .withColumn("row", row_number().over(window))
+        .filter(col("row") == 1)
+        .select("PERSON_ID", "ALIAS", "ADC_UPDT")
+    )
+
+@dlt.table(
+    name="current_address",
+    comment="Address table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "PARENT_ENTITY_ID"
+    }
+)
+def lookup_address():
+    current_date_val = current_date()
+    
+
+    window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(
+        when(col("ZIPCODE").isNotNull() & (trim(col("ZIPCODE")) != ""), 0).otherwise(1),
+        desc("BEG_EFFECTIVE_DT_TM")
+    )
+    
+    return (
+        spark.table("4_prod.raw.mill_address")
+        .filter(
+            (col("PARENT_ENTITY_NAME") == "PERSON") & 
+            (col("ACTIVE_IND") == 1) & 
+            (col("END_EFFECTIVE_DT_TM") > current_date_val)
+        )
+        .withColumn("row", row_number().over(window))
+        .filter(col("row") == 1)
+        .select("PARENT_ENTITY_ID", "ZIPCODE", "CITY", "ADC_UPDT")
+    )
+
+# COMMAND ----------
+
 demographics_comment = "Contains the basic demographic details of each patient included in the extract." 
 
 schema_rde_patient_demographics = StructType([
@@ -78,10 +163,10 @@ def patient_demographics_incr():
   
     pat = spark.table("4_prod.raw.mill_person_patient").alias("Pat").filter(col("active_ind") == 1)
     pers = spark.table("4_prod.raw.mill_person").alias("Pers").filter(col("active_ind") == 1)
-    address_lookup = spark.table("4_prod.support_tables.current_address").alias("A")
-    nhs_lookup = spark.table("4_prod.support_tables.patient_nhs").alias("NHS")
-    mrn_lookup = spark.table("4_prod.support_tables.patient_mrn").alias("MRN")
-    code_value_lookup = spark.table("4_prod.support_tables.code_value").alias("CV")
+    address_lookup = dlt.read("current_address").alias("A")
+    nhs_lookup = dlt.read("patient_nhs").alias("NHS")
+    mrn_lookup = dlt.read("patient_mrn").alias("MRN")
+    code_value_lookup = dlt.read("code_value").alias("CV")
     
     
  
@@ -210,7 +295,7 @@ def encounter_incr():
 
     encounter = spark.table("4_prod.raw.mill_encounter")
     patient_demographics = dlt.read("rde_patient_demographics").alias("D")
-    code_value_lookup = spark.table("4_prod.support_tables.code_value").alias("CV")
+    code_value_lookup = dlt.read("code_value").alias("CV")
     encounter_alias = spark.table("4_prod.raw.mill_encntr_alias")
 
     person_ids = (
