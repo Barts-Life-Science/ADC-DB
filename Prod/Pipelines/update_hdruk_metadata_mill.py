@@ -256,14 +256,14 @@ import json
 hdruk_300_str = \
 '''
 {
-    "identifier": "https://web.www.healthdatagateway.org/96c1f3b7-902d-40e7-989f-51844219b1dc",
-    "version": "3.0.0",
+    "identifier": "https://web.www.healthdatagateway.org/f948711f-b176-44e4-b57e-5776997a2e75",
+    "version": "1.0.0",
     "issued": "2024-11-26T00:00:00.000Z",
-    "modified": "2024-11-26T00:00:00.000Z",
+    "modified": "###CURR_DATE_STR###T00:00:00.000Z",
     "revisions": [{"url": "https://web.dev.hdruk.cloud//dataset/648?version=2.0.0","version": "2.0.0"}],
     "summary": {
-        "title": "Barts Research Data Extract",
-        "abstract": "The dataset is extracted from tlocal EHR System(Cerner Millenium) containing demographics, administrative hospital encounter information, previous medical history (diagnoses and procedures), current symptoms and disease complications, and clinical events.",
+        "title": "Barts Health NHS Cerner Millenium Electronic Patient Record",
+        "abstract": "Barts Health NHS Cerner Millenium Electronic Patient Record.",
         "contactPoint": "BartsHealth.ResearchDataRequest@nhs.net",
         "keywords": ["Hospital Inpatient data","Outpatient","Pathology","Radiology","Maternity","Critical Care","Pharmacy"],
         "alternateIdentifiers": null,
@@ -279,7 +279,7 @@ hdruk_300_str = \
         }
     },
     "documentation": {
-        "description": "Collecting information about people in contact with adult psychological therapy services in England. The IAPT data set was developed with the IAPT programme as a patient level, output based, secondary uses data set which aims to deliver robust, comprehensive, nationally consistent and comparable information for patients accessing NHS-funded IAPT services in England. This national data set has been collected since April 2012 and is a mandatory submission for all NHS funded care, including care delivered by independent sector healthcare providers. Data collection on patients with depression and anxiety disorders that are offered psychological therapies, so that we can improve the delivery of care for these conditions.Providers of NHS-funded IAPT services are required to submit data to NHS Digital on a monthly basis.As a secondary uses data set the IAPT data set re-uses clinical and operational data for purposes other than direct patient care. It defines the data items, definitions and associated value sets extracted or derived from local information systems and sent to NHS Digital for analysis purposes. Timescales for dissemination can be found under 'Our Service Levels' at the following link: https://digital.nhs.uk/services/data-access-request-service-dars/data-access-request-service-dars-process",
+        "description": "Barts Health NHS Trust Cerner Millenium Electronic Patient Record.",
         "associatedMedia": null,
         "inPipeline": null
     },
@@ -361,7 +361,7 @@ hdruk_300_str = \
             "observedNode": "Persons",
             "measuredValue": ###PATIENT_COUNT_INT###,
             "measuredProperty": "COUNT",
-            "observationDate": "2024-11-25",
+            "observationDate": "###CURR_DATE_STR###",
             "disambiguatingDescription": "Total number of distinct PERSON_ID in the Millenium Encounter table"
         }
     ],
@@ -408,6 +408,12 @@ hdruk_300_str = hdruk_300_str.replace("###PATIENT_COUNT_INT###", str(patientcoun
 
 # COMMAND ----------
 
+currentdate = spark.sql("SELECT CAST(CURRENT_DATE() AS STRING) AS curr_date").collect()[0]["curr_date"]
+print(currentdate)
+hdruk_300_str = hdruk_300_str.replace("###CURR_DATE_STR###", currentdate)
+
+# COMMAND ----------
+
 hdruk_300_json = json.loads(hdruk_300_str)
 
 # COMMAND ----------
@@ -416,50 +422,7 @@ hdruk_300_json = json.loads(hdruk_300_str)
 
 # COMMAND ----------
 
-# description for rde tables
-hdruk_300_json["documentation"]["description"] = '''
-The dataset contains multiple tables sourced from the hospital EHR system(Cerner Millenium) as well as derived data assets such as CDS reports. It includes most structured data in the system. The dataset is broken up into the following subsections.
 
-Demographics
-
-Inpatient
-
-Outpatient
-
-Pathology
-
-ARIA(Cancer Pharmacy system.)
-
-Powerforms(Custom forms used for data capture in the system)
-
-Radiology
-
-Family History
-
-SNOMED Recordings
-
-BLOB dataset(Free text notes and reports)
-
-MSDS(Maternity Data)
-
-Pharmacy Orders
-
-Allergy
-
-SCR(Summerset Cancer Registry)
-
-Powertrials(Database of trial information)
-
-Aliases(Different patient identifiers
-
-Critical Care
-
-Measurements
-
-Emergency Department
-
-Medicines Administered
-'''
 
 # COMMAND ----------
 
@@ -491,20 +454,21 @@ hdruk_300_json["structuralMetadata"]["tables"]
 
 import requests
 
-api_path = "https://api.dev.hdruk.cloud/api/v1/integrations/datasets/648"
+api_path = "https://api.dev.hdruk.cloud/api/v1/integrations/datasets/992"
 headers = {
     "x-application-id": dbutils.secrets.get(scope="adc_store", key="hdruk_app_id"),
     "x-client-id": dbutils.secrets.get(scope="adc_store", key="hdruk_client_id"),
     "Content-Type": "application/json"
 }
 response = requests.get(
-    "https://api.healthdatagateway.org/api/v1/datasets/648",
+    "https://api.healthdatagateway.org/api/v1/datasets/992",
     headers=headers
 )
 print(response)
 
 # COMMAND ----------
 
+import json
 response_json = json.loads(response.text)
 response_json
 
@@ -512,7 +476,7 @@ response_json
 
 import requests
 
-api_path = "https://api.healthdatagateway.org/api/v1/integrations/datasets/648"
+api_path = "https://api.healthdatagateway.org/api/v1/integrations/datasets/992"
 headers = {
     "x-application-id": dbutils.secrets.get(scope="adc_store", key="hdruk_app_id"),
     "x-client-id": dbutils.secrets.get(scope="adc_store", key="hdruk_client_id"),

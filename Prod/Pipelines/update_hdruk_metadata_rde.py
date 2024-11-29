@@ -276,7 +276,7 @@ hdruk_300_str = \
     "identifier": "https://web.www.healthdatagateway.org/96c1f3b7-902d-40e7-989f-51844219b1dc",
     "version": "3.0.0",
     "issued": "2024-11-26T00:00:00.000Z",
-    "modified": "2024-11-26T00:00:00.000Z",
+    "modified": "###CURR_DATE_STR###T00:00:00.000Z",
     "revisions": [{"url": "https://web.dev.hdruk.cloud//dataset/648?version=2.0.0","version": "2.0.0"}],
     "summary": {
         "title": "Barts Research Data Extract",
@@ -378,7 +378,7 @@ hdruk_300_str = \
             "observedNode": "Persons",
             "measuredValue": ###PATIENT_COUNT_INT###,
             "measuredProperty": "COUNT",
-            "observationDate": "2024-11-25",
+            "observationDate": "###CURR_DATE_STR###",
             "disambiguatingDescription": "Total number of distinct PERSON_ID in the Millenium Encounter table"
         }
     ],
@@ -418,10 +418,16 @@ hdruk_300_str = \
 
 # COMMAND ----------
 
-patientcount = spark.sql("SELECT COUNT(DISTINCT PERSON_ID) AS patientcount FROM 4_prod.raw.mill_encounter").collect()[0]["patientcount"]
+patientcount = spark.sql("SELECT COUNT(DISTINCT PERSON_ID) AS patientcount FROM 4_prod.rde.rde_encounter").collect()[0]["patientcount"]
 patientcount = round(patientcount,-5)
 print(patientcount)
 hdruk_300_str = hdruk_300_str.replace("###PATIENT_COUNT_INT###", str(patientcount))
+
+# COMMAND ----------
+
+currentdate = spark.sql("SELECT CAST(CURRENT_DATE() AS STRING) AS curr_date").collect()[0]["curr_date"]
+print(currentdate)
+hdruk_300_str = hdruk_300_str.replace("###CURR_DATE_STR###", currentdate)
 
 # COMMAND ----------
 
