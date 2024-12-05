@@ -48,11 +48,13 @@ def pacs_clinical_event():
     return spark.sql(
         """
         SELECT 
-            rq.RequestIdString AS AccessionNumber,
-            ce.SERIES_REF_NBR,
-            ce.REFERENCE_NBR,
-            ce.CLINICAL_EVENT_ID,
-            ce.ENCNTR_ID
+            ce.CLINICAL_EVENT_ID AS MillClinicalEventId,
+            ce.ENCNTR_ID AS MillEncntrId,
+            ce.PERSON_ID As MillPersonId,
+            rq.RequestIdString AS RequestAccessionNumber,
+            ce.SERIES_REF_NBR AS MillSeriesRefNbr,
+            ce.REFERENCE_NBR AS MillReferenceNbr,
+            ce.EVENT_TAG AS MillEventTag
         FROM 4_prod.raw.pacs_requests AS rq
         LEFT JOIN 4_prod.raw.mill_clinical_event AS ce
         ON rq.RequestIdString = LEFT(COALESCE(ce.SERIES_REF_NBR, ce.REFERENCE_NBR), 16)
