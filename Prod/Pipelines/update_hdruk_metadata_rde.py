@@ -270,11 +270,48 @@ import json
 
 # COMMAND ----------
 
+import requests
+
+api_path = "https://api.dev.hdruk.cloud/api/v1/integrations/datasets/648"
+headers = {
+    "x-application-id": dbutils.secrets.get(scope="adc_store", key="hdruk_app_id"),
+    "x-client-id": dbutils.secrets.get(scope="adc_store", key="hdruk_client_id"),
+    "Content-Type": "application/json"
+}
+response = requests.get(
+    "https://api.healthdatagateway.org/api/v1/datasets/648",
+    headers=headers
+)
+print(response)
+
+# COMMAND ----------
+
+response_json = json.loads(response.text)
+response_json
+
+# COMMAND ----------
+
+version_nbr_str = response_json["data"]["versions"][0]["metadata"]["metadata"]["required"]["version"]
+version_nbrs = version_nbr_str.split(".")
+version_nbrs = [int(x) for x in version_nbrs]
+
+if version_nbrs[2] >= 12:
+    version_nbrs[2] = 0
+    version_nbrs[1] =+ 1
+else:
+    version_nbrs[2] =+ 1
+
+new_version_nbr_str = f'{version_nbrs[0]}.{version_nbrs[1]}.{version_nbrs[2]}'
+print("old:", version_nbr_str)
+print("new:", new_version_nbr_str)
+
+# COMMAND ----------
+
 hdruk_300_str = \
 '''
 {
     "identifier": "https://web.www.healthdatagateway.org/96c1f3b7-902d-40e7-989f-51844219b1dc",
-    "version": "3.0.0",
+    "version": "###VER_NUM_STR###",
     "issued": "2024-11-26T00:00:00.000Z",
     "modified": "###CURR_DATE_STR###T00:00:00.000Z",
     "revisions": [{"url": "https://web.dev.hdruk.cloud//dataset/648?version=2.0.0","version": "2.0.0"}],
@@ -425,9 +462,17 @@ hdruk_300_str = hdruk_300_str.replace("###PATIENT_COUNT_INT###", str(patientcoun
 
 # COMMAND ----------
 
+hdruk_300_str = hdruk_300_str.replace("###VER_NUM_STR###", new_version_nbr_str)
+
+# COMMAND ----------
+
 currentdate = spark.sql("SELECT CAST(CURRENT_DATE() AS STRING) AS curr_date").collect()[0]["curr_date"]
 print(currentdate)
 hdruk_300_str = hdruk_300_str.replace("###CURR_DATE_STR###", currentdate)
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -508,28 +553,7 @@ hdruk_300_json["structuralMetadata"]["tables"]
 
 # COMMAND ----------
 
-
-
-# COMMAND ----------
-
-import requests
-
-api_path = "https://api.dev.hdruk.cloud/api/v1/integrations/datasets/648"
-headers = {
-    "x-application-id": dbutils.secrets.get(scope="adc_store", key="hdruk_app_id"),
-    "x-client-id": dbutils.secrets.get(scope="adc_store", key="hdruk_client_id"),
-    "Content-Type": "application/json"
-}
-response = requests.get(
-    "https://api.healthdatagateway.org/api/v1/datasets/648",
-    headers=headers
-)
-print(response)
-
-# COMMAND ----------
-
-response_json = json.loads(response.text)
-response_json
+import json
 
 # COMMAND ----------
 
