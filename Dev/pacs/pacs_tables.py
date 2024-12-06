@@ -28,9 +28,15 @@ def pacs_patient_alias():
         WHERE 
             mrn.PERSON_ALIAS_TYPE_CD = 10 -- MRN
             AND nhs.PERSON_ALIAS_TYPE_CD = 18 -- NHS
+            AND mrn.active_ind = 1
+            AND nhs.active_ind = 1
         """
     )
     
+
+
+
+# COMMAND ----------
 
 
 
@@ -54,7 +60,10 @@ def pacs_clinical_event():
             rq.RequestIdString AS RequestAccessionNumber,
             ce.SERIES_REF_NBR AS MillSeriesRefNbr,
             ce.REFERENCE_NBR AS MillReferenceNbr,
-            ce.EVENT_TAG AS MillEventTag
+            ce.EVENT_TITLE_TEXT AS MillEventTitle,
+            REPLACE(REPLACE(SUBSTRING_INDEX(rq.RequestQuestion, '-', 6), '-', ''), ' ', '') AS RequestShortcode,
+            ce.EVENT_START_DT_TM AS MillEventStartDtTm,
+            ce.UPDT_DT_TM AS MillUpdtDtTm
         FROM 4_prod.raw.pacs_requests AS rq
         LEFT JOIN 4_prod.raw.mill_clinical_event AS ce
         ON rq.RequestIdString = LEFT(COALESCE(ce.SERIES_REF_NBR, ce.REFERENCE_NBR), 16)
@@ -62,6 +71,7 @@ def pacs_clinical_event():
             ce.CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD
         """
     )
+
     
 
 
