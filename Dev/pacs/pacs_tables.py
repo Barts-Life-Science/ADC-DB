@@ -53,22 +53,98 @@ def pacs_patient_alias():
 def pacs_clinical_event():
     return spark.sql(
         """
+        WITH rq AS (
+            SELECT
+                *,
+                REPLACE(
+                    REPLACE(SUBSTRING_INDEX(RequestQuestion,'-',6),'-',''),
+                    ' ',
+                    ''
+                ) AS RequestShortcode
+            FROM 4_prod.raw.pacs_requests
+        ),
+        ce1 AS (
+            SELECT
+                *,
+                COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
+                CASE
+                    WHEN EVENT_TAG = 'RADRPT'
+                    THEN 1
+                    ELSE 0
+                END AS MillIsRadrpt
+            FROM 4_prod.raw.mill_clinical_event
+            WHERE 
+                CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
+                AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
+        ),
+        ce2 AS (
+            SELECT
+                *,
+                CASE
+                    WHEN LEFT(MillRefNbr, 1) RLIKE '[0-9]'
+                    THEN LEFT(MillRefNbr, 7)
+                    ELSE LEFT(MillRefNbr, 16)
+                END AS MillAccessionNbr,
+                CASE
+                    WHEN LEFT(MillRefNbr, 1) RLIKE '[0-9]'
+                    THEN SUBSTRING(MillRefNbr, 8, LEN(MillRefNbr)-8)                     
+                    ELSE SUBSTRING(MillRefNbr, 17, LEN(MillRefNbr)-17) 
+                END AS MillRefNbrItemCode,
+                RIGHT(MillRefNbr, 1) AS MillRefNbrLastDigit
+            FROM ce1
+        ),
+        ce3 AS (
+            SELECT
+                *,
+                CASE
+                    WHEN MillRefNbrLastDigit = '0' AND EVENT_TAG != 'RADRPT'
+                    THEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
+                    ELSE MillRefNbrItemCode
+                END AS MillPacsExamCode
+            FROM ce2
+        ),
+        er AS (
+            SELECT
+                ExaminationReportExaminationId, 
+                ExaminationReportRequestId,
+                COUNT(DISTINCT ExaminationReportReportId) AS ReportIdCount
+            FROM 4_prod.raw.pacs_examinationreports AS er
+            GROUP BY
+                ExaminationReportExaminationId, 
+                ExaminationReportRequestId
+        ),
+        ex AS (
+            SELECT *
+            FROM er
+            LEFT JOIN 4_prod.raw.pacs_examinations AS e
+            ON er.examinationreportexaminationid = e.examinationid
+        )
         SELECT 
-            ce.CLINICAL_EVENT_ID AS MillClinicalEventId,
-            ce.ENCNTR_ID AS MillEncntrId,
-            ce.PERSON_ID As MillPersonId,
-            rq.RequestIdString AS RequestAccessionNumber,
-            ce.SERIES_REF_NBR AS MillSeriesRefNbr,
-            ce.REFERENCE_NBR AS MillReferenceNbr,
-            ce.EVENT_TITLE_TEXT AS MillEventTitle,
-            REPLACE(REPLACE(SUBSTRING_INDEX(rq.RequestQuestion, '-', 6), '-', ''), ' ', '') AS RequestShortcode,
-            ce.EVENT_START_DT_TM AS MillEventStartDtTm,
-            ce.UPDT_DT_TM AS MillUpdtDtTm
-        FROM 4_prod.raw.pacs_requests AS rq
-        LEFT JOIN 4_prod.raw.mill_clinical_event AS ce
-        ON rq.RequestIdString = LEFT(COALESCE(ce.SERIES_REF_NBR, ce.REFERENCE_NBR), 16)
-        WHERE 
-            ce.CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD
+            ce3.CLINICAL_EVENT_ID AS MillClinicalEventId,
+            rq.RequestId,
+            ex.ExaminationId,
+            ce3.MillRefNbr AS MillPacsRefNbr,
+            rq.RequestIdString AS RequestAccessionNbr,
+            --ex.ExaminationReportReportId,
+            ce3.MillPacsExamCode,
+            ex.ExaminationBodyPart,
+            ex.ExaminationModality,
+            --ce2.PARENT_EVENT_ID AS MillParentEventId,
+            ce3.ENCNTR_ID AS MillEncntrId,
+            ce3.PERSON_ID AS MillPersonId,
+            ce3.EVENT_TITLE_TEXT AS MillEventTitle,
+            ce3.MillIsRadrpt,
+            ex.ExaminationScheduledDate,
+            ce3.EVENT_START_DT_TM AS MillEventStartDtTm, -- ReportDate?
+            ce3.UPDT_DT_TM AS MillUpdtDtTm
+        FROM ce3
+        LEFT JOIN rq
+        ON rq.RequestIdString = ce3.MillAccessionNbr
+        LEFT JOIN ex
+        ON 
+            rq.RequestId = ex.examinationreportrequestid
+            AND ce3.MillPacsExamCode = ex.ExaminationCode
+            --AND DATE_FORMAT(ce3.EVENT_START_DT_TM, 'y-m') = DATE_FORMAT(ex.ExaminationScheduledDate, 'y-m')
         """
     )
 
