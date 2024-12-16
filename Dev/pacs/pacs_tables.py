@@ -1,5 +1,6 @@
 # Databricks notebook source
 import dlt
+import time
 
 # COMMAND ----------
 
@@ -38,7 +39,124 @@ def pacs_patient_alias():
 
 # COMMAND ----------
 
+@dlt.table(
+    name="stag_mill_clinical_event_pacs",
+    comment="staging mill_clinical_event data for pacs",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "temporary":"true"
+    }
+)
+def stag_mill_clinical_event_pacs():
+    start = time.time()
+    df = spark.sql(
+        """
+        WITH ce1 AS (
+            SELECT
+                *,
+                COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
+                CASE
+                    WHEN EVENT_TAG = 'RADRPT'
+                    THEN 1
+                    ELSE 0
+                END AS MillIsRadrpt,
+                CASE
+                    WHEN EVENT_START_DT_TM < '2000-01-01'
+                    THEN NULL
+                    ELSE EVENT_START_DT_TM
+                END AS MillEventDate
+            FROM 4_prod.raw.mill_clinical_event
+            WHERE 
+                CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
+                AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
+        ),
+        ce2 AS (
+            SELECT
+                *,
+                pacs_MillRefToAccessionNbr(MillRefNbr) AS MillAccessionNbr
+            FROM ce1
+        ),
+        ce3 AS (
+            SELECT
+                *,
+                LEFT(REPLACE(MillRefNbr, MillAccessionNbr, ''), LEN(MillRefNbr)-LEN(MillAccessionNbr)-1) AS MillRefNbrItemCode
+            FROM ce2 
+        ),
+        ce4 AS (
+            SELECT
+                *,
+                CASE
+                    WHEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2) = RIGHT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
+                    THEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
+                    ELSE MillRefNbrItemCode
+                END AS MillPacsExamCode
+            FROM ce3
+        )
+        SELECT *
+        FROM ce4
+        """)
+    end = time.time()
+    print("Time elapsed:", end-start)
+    return df
 
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_pacs_examinations_examcode",
+    comment="Map examcode to exam modality for staging pacs_examinations",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "temporary":"true"
+    }
+)
+def stag_pacs_examinations_examcode():
+    return spark.sql(
+        """
+        SELECT
+            ExaminationCode, 
+            MODE(ExaminationModality) AS ExaminationModality
+        FROM 4_prod.raw.pacs_examinations
+        GROUP BY ExaminationCode
+        """
+    )
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_pacs_examinations",
+    comment="staging pacs_examinations",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "temporary":"true"
+    }
+)
+def stag_pacs_examinations():
+    return spark.sql(
+        """
+        WITH er AS (
+            SELECT
+                ExaminationReportExaminationId, 
+                ExaminationReportRequestId,
+                COUNT(ExaminationReportReportId) AS ExaminationReportCount
+            FROM 4_prod.raw.pacs_examinationreports AS er
+            GROUP BY ExaminationReportExaminationId, ExaminationReportRequestId
+        )
+        SELECT 
+            e.*,
+            er.*
+            --COALESCE(e.ExaminationModality, excd.ExaminationModality) AS ImputedExaminationModality
+        FROM 4_prod.raw.pacs_examinations AS e
+        LEFT JOIN er
+        ON er.examinationreportexaminationid = e.examinationid
+        --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
+        --ON excd.ExaminationCode = e.ExaminationCode
+        """
+    )
 
 # COMMAND ----------
 
@@ -50,101 +168,46 @@ def pacs_patient_alias():
         "delta.enableRowTracking": "true"
     }
 )
+#@dlt.expect("valid timestamp", "MillEventStartDtTm > '2000-01-01'")
 def pacs_clinical_event():
     return spark.sql(
         """
-        WITH rq AS (
-            SELECT
-                *,
-                REPLACE(
-                    REPLACE(SUBSTRING_INDEX(RequestQuestion,'-',6),'-',''),
-                    ' ',
-                    ''
-                ) AS RequestShortcode
-            FROM 4_prod.raw.pacs_requests
-        ),
-        ce1 AS (
-            SELECT
-                *,
-                COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
-                CASE
-                    WHEN EVENT_TAG = 'RADRPT'
-                    THEN 1
-                    ELSE 0
-                END AS MillIsRadrpt
-            FROM 4_prod.raw.mill_clinical_event
-            WHERE 
-                CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
-                AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
-        ),
-        ce2 AS (
-            SELECT
-                *,
-                CASE
-                    WHEN LEFT(MillRefNbr, 1) RLIKE '[0-9]'
-                    THEN LEFT(MillRefNbr, 7)
-                    ELSE LEFT(MillRefNbr, 16)
-                END AS MillAccessionNbr,
-                CASE
-                    WHEN LEFT(MillRefNbr, 1) RLIKE '[0-9]'
-                    THEN SUBSTRING(MillRefNbr, 8, LEN(MillRefNbr)-8)                     
-                    ELSE SUBSTRING(MillRefNbr, 17, LEN(MillRefNbr)-17) 
-                END AS MillRefNbrItemCode,
-                RIGHT(MillRefNbr, 1) AS MillRefNbrLastDigit
-            FROM ce1
-        ),
-        ce3 AS (
-            SELECT
-                *,
-                CASE
-                    WHEN MillRefNbrLastDigit = '0' AND EVENT_TAG != 'RADRPT'
-                    THEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
-                    ELSE MillRefNbrItemCode
-                END AS MillPacsExamCode
-            FROM ce2
-        ),
-        er AS (
-            SELECT
-                ExaminationReportExaminationId, 
-                ExaminationReportRequestId,
-                COUNT(DISTINCT ExaminationReportReportId) AS ReportIdCount
-            FROM 4_prod.raw.pacs_examinationreports AS er
-            GROUP BY
-                ExaminationReportExaminationId, 
-                ExaminationReportRequestId
-        ),
-        ex AS (
-            SELECT *
-            FROM er
-            LEFT JOIN 4_prod.raw.pacs_examinations AS e
-            ON er.examinationreportexaminationid = e.examinationid
-        )
         SELECT 
             ce3.CLINICAL_EVENT_ID AS MillClinicalEventId,
             rq.RequestId,
             ex.ExaminationId,
+            ex.ExaminationReportCount,
             ce3.MillRefNbr AS MillPacsRefNbr,
-            rq.RequestIdString AS RequestAccessionNbr,
+            COALESCE(rq.RequestIdString, ce3.MillAccessionNbr) AS AccessionNbr,
             --ex.ExaminationReportReportId,
             ce3.MillPacsExamCode,
+            lkp_ex.id AS LkpExamCodeId,
             ex.ExaminationBodyPart,
-            ex.ExaminationModality,
+            COALESCE(ex.ExaminationModality, pexcd.ExaminationModality) AS ExaminationModality,
             --ce2.PARENT_EVENT_ID AS MillParentEventId,
             ce3.ENCNTR_ID AS MillEncntrId,
             ce3.PERSON_ID AS MillPersonId,
             ce3.EVENT_TITLE_TEXT AS MillEventTitle,
             ce3.MillIsRadrpt,
             ex.ExaminationScheduledDate,
-            ce3.EVENT_START_DT_TM AS MillEventStartDtTm, -- ReportDate?
+            CASE
+                WHEN ce3.MillEventDate IS NULL
+                THEN ex.ExaminationScheduledDate
+                ELSE ce3.MillEventDate
+            END AS MillEventDate,
             ce3.UPDT_DT_TM AS MillUpdtDtTm
-        FROM ce3
-        LEFT JOIN rq
+        FROM LIVE.stag_mill_clinical_event_pacs AS ce3
+        LEFT JOIN 4_prod.raw.pacs_requests AS rq
         ON rq.RequestIdString = ce3.MillAccessionNbr
-        LEFT JOIN ex
+        LEFT JOIN LIVE.stag_pacs_examinations AS ex
         ON 
             rq.RequestId = ex.examinationreportrequestid
             AND ce3.MillPacsExamCode = ex.ExaminationCode
             --AND DATE_FORMAT(ce3.EVENT_START_DT_TM, 'y-m') = DATE_FORMAT(ex.ExaminationScheduledDate, 'y-m')
+        LEFT JOIN LIVE.pacs_lkp_examcode AS lkp_ex
+        ON ce3.MillPacsExamCode = lkp_ex.short_code
+        LEFT JOIN LIVE.stag_pacs_examinations_examcode AS pexcd
+        ON ce3.MillPacsExamCode = pexcd.examinationcode
         """
     )
 
@@ -154,4 +217,15 @@ def pacs_clinical_event():
 
 # COMMAND ----------
 
-
+@dlt.table(
+    name="pacs_lkp_examcode",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def pacs_lkp_examcode():
+    return spark.read.format("csv") \
+                     .option("header", "true") \
+                     .load("/Volumes/4_prod/pacs/base/Annex-1-DID_lookup_group.csv")
