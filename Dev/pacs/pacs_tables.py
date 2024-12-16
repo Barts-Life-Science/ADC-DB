@@ -1,6 +1,35 @@
 # Databricks notebook source
 import dlt
-import time
+from pyspark.sql import functions as F
+
+
+# COMMAND ----------
+
+
+def pacs_py_MillRefToAccessionNbr(column):
+    return \
+        F.when(
+            column.rlike(r'^\d{16}$'), 
+            F.left(column, F.lit(16))
+        ).when(
+            column.rlike(r'^\d{7}$'),
+            F.left(column, F.lit(7))
+        ).when(
+            column.rlike(r'^\d{6}$'),
+            F.left(column, F.lit(6))
+        ).when(
+            column.like('RNH098'),
+            F.lit('RNH098')
+        ).when(
+            F.substring(column, 15, 1).rlike(r'\D'),
+            F.left(column, F.lit(14))
+        ).otherwise(
+            F.left(column, F.lit(16))
+        )
+    
+    
+
+spark.udf.register("pacs_py_MillRefAccessionNbr", pacs_py_MillRefToAccessionNbr)
 
 # COMMAND ----------
 
@@ -49,7 +78,6 @@ def pacs_patient_alias():
     }
 )
 def stag_mill_clinical_event_pacs():
-    start = time.time()
     df = spark.sql(
         """
         WITH ce1 AS (
@@ -96,8 +124,45 @@ def stag_mill_clinical_event_pacs():
         SELECT *
         FROM ce4
         """)
-    end = time.time()
-    print("Time elapsed:", end-start)
+    return df
+
+
+# COMMAND ----------
+
+
+
+@dlt.table(
+    name="stag_mill_clinical_event_pacs_2",
+    comment="staging mill_clinical_event data for pacs",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "temporary":"true"
+    }
+)
+def stag_mill_clinical_event_pacs_2():
+    df = spark.sql(
+        """
+        SELECT
+            *,
+            COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
+            CASE
+                WHEN EVENT_TAG = 'RADRPT'
+                THEN 1
+                ELSE 0
+            END AS MillIsRadrpt,
+            CASE
+                WHEN EVENT_START_DT_TM < '2000-01-01'
+                THEN NULL
+                ELSE EVENT_START_DT_TM
+            END AS MillEventDate
+        FROM 4_prod.raw.mill_clinical_event
+        WHERE 
+            CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
+            AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
+        """
+    )
+    df = df.withColumn("MillAccessionNbr", pacs_py_MillRefToAccessionNbr(F.col("MillRefNbr")))
     return df
 
 
@@ -179,12 +244,10 @@ def pacs_clinical_event():
             ex.ExaminationReportCount,
             ce3.MillRefNbr AS MillPacsRefNbr,
             COALESCE(rq.RequestIdString, ce3.MillAccessionNbr) AS AccessionNbr,
-            --ex.ExaminationReportReportId,
             ce3.MillPacsExamCode,
             lkp_ex.id AS LkpExamCodeId,
             ex.ExaminationBodyPart,
             COALESCE(ex.ExaminationModality, pexcd.ExaminationModality) AS ExaminationModality,
-            --ce2.PARENT_EVENT_ID AS MillParentEventId,
             ce3.ENCNTR_ID AS MillEncntrId,
             ce3.PERSON_ID AS MillPersonId,
             ce3.EVENT_TITLE_TEXT AS MillEventTitle,
@@ -195,7 +258,8 @@ def pacs_clinical_event():
                 THEN ex.ExaminationScheduledDate
                 ELSE ce3.MillEventDate
             END AS MillEventDate,
-            ce3.UPDT_DT_TM AS MillUpdtDtTm
+            ce3.UPDT_DT_TM AS MillUpdtDtTm,
+            blob.BLOB_CONTENTS AS ReportText
         FROM LIVE.stag_mill_clinical_event_pacs AS ce3
         LEFT JOIN 4_prod.raw.pacs_requests AS rq
         ON rq.RequestIdString = ce3.MillAccessionNbr
@@ -203,11 +267,12 @@ def pacs_clinical_event():
         ON 
             rq.RequestId = ex.examinationreportrequestid
             AND ce3.MillPacsExamCode = ex.ExaminationCode
-            --AND DATE_FORMAT(ce3.EVENT_START_DT_TM, 'y-m') = DATE_FORMAT(ex.ExaminationScheduledDate, 'y-m')
         LEFT JOIN LIVE.pacs_lkp_examcode AS lkp_ex
         ON ce3.MillPacsExamCode = lkp_ex.short_code
         LEFT JOIN LIVE.stag_pacs_examinations_examcode AS pexcd
         ON ce3.MillPacsExamCode = pexcd.examinationcode
+        LEFT JOIN 4_prod.raw.pi_cde_blob_content AS blob
+        ON ce3.EVENT_ID = blob.EVENT_ID -- TODO: Check if EVENT_ID is one-to-one mapping
         """
     )
 
