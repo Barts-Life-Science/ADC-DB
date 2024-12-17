@@ -84,6 +84,13 @@ def pacs_patient_alias():
 
 # COMMAND ----------
 
+
+
+
+# COMMAND ----------
+
+
+
 @dlt.table(
     name="stag_mill_clinical_event_pacs",
     comment="staging mill_clinical_event data for pacs",
@@ -94,69 +101,6 @@ def pacs_patient_alias():
     }
 )
 def stag_mill_clinical_event_pacs():
-    df = spark.sql(
-        """
-        WITH ce1 AS (
-            SELECT
-                *,
-                COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
-                CASE
-                    WHEN EVENT_TAG = 'RADRPT'
-                    THEN 1
-                    ELSE 0
-                END AS MillIsRadrpt,
-                CASE
-                    WHEN EVENT_START_DT_TM < '2000-01-01'
-                    THEN NULL
-                    ELSE EVENT_START_DT_TM
-                END AS MillEventDate
-            FROM 4_prod.raw.mill_clinical_event
-            WHERE 
-                CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
-                AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
-        ),
-        ce2 AS (
-            SELECT
-                *,
-                pacs_MillRefToAccessionNbr(MillRefNbr) AS MillAccessionNbr
-            FROM ce1
-        ),
-        ce3 AS (
-            SELECT
-                *,
-                LEFT(REPLACE(MillRefNbr, MillAccessionNbr, ''), LEN(MillRefNbr)-LEN(MillAccessionNbr)-1) AS MillRefNbrItemCode
-            FROM ce2 
-        ),
-        ce4 AS (
-            SELECT
-                *,
-                CASE
-                    WHEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2) = RIGHT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
-                    THEN LEFT(MillRefNbrItemCode, LEN(MillRefNbrItemCode)/2)
-                    ELSE MillRefNbrItemCode
-                END AS MillPacsExamCode
-            FROM ce3
-        )
-        SELECT *
-        FROM ce4
-        """)
-    return df
-
-
-# COMMAND ----------
-
-
-
-@dlt.table(
-    name="stag_mill_clinical_event_pacs_2",
-    comment="staging mill_clinical_event data for pacs",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "temporary":"true"
-    }
-)
-def stag_mill_clinical_event_pacs_2():
     df = spark.sql(
         """
         SELECT
@@ -261,7 +205,7 @@ def pacs_clinical_event():
             ex.ExaminationReportCount,
             ce3.MillRefNbr AS MillPacsRefNbr,
             COALESCE(rq.RequestIdString, ce3.MillAccessionNbr) AS AccessionNbr,
-            ce3.MillPacsExamCode,
+            ce3.MillExamCode,
             lkp_ex.id AS LkpExamCodeId,
             ex.ExaminationBodyPart,
             COALESCE(ex.ExaminationModality, pexcd.ExaminationModality) AS ExaminationModality,
@@ -283,11 +227,11 @@ def pacs_clinical_event():
         LEFT JOIN LIVE.stag_pacs_examinations AS ex
         ON 
             rq.RequestId = ex.examinationreportrequestid
-            AND ce3.MillPacsExamCode = ex.ExaminationCode
+            AND ce3.MillExamCode = ex.ExaminationCode
         LEFT JOIN LIVE.pacs_lkp_examcode AS lkp_ex
-        ON ce3.MillPacsExamCode = lkp_ex.short_code
+        ON ce3.MillExamCode = lkp_ex.short_code
         LEFT JOIN LIVE.stag_pacs_examinations_examcode AS pexcd
-        ON ce3.MillPacsExamCode = pexcd.examinationcode
+        ON ce3.MillExamCode = pexcd.examinationcode
         --LEFT JOIN 4_prod.raw.pi_cde_blob_content AS blob
         --ON ce3.EVENT_ID = blob.EVENT_ID -- TODO: Check if EVENT_ID is one-to-one mapping
         """
