@@ -6,7 +6,7 @@ from pyspark.sql import functions as F
 # COMMAND ----------
 
 
-def pacs_py_MillRefToAccessionNbr(column):
+def pacs_MillRefToAccessionNbr(column):
     return \
         F.when(
             column.rlike(r'^\d{16}$'), 
@@ -29,7 +29,23 @@ def pacs_py_MillRefToAccessionNbr(column):
     
     
 
-spark.udf.register("pacs_py_MillRefAccessionNbr", pacs_py_MillRefToAccessionNbr)
+spark.udf.register("pacs_MillRefAccessionNbr", pacs_MillRefToAccessionNbr)
+
+# COMMAND ----------
+
+def pacs_MillRefToExamCode(mill_ref_col, accession_nbr_col):
+    mill_ref_last_char = F.right(mill_ref_col, F.lit(1))
+    mill_item_code = F.replace(mill_ref_col, accession_nbr_col, F.lit(''))
+    mill_item_code = F.replace(mill_item_code, mill_ref_last_char, F.lit(''))
+    mill_ref_left = F.left(mill_item_code, F.length(mill_item_code))
+    mill_ref_right = F.right(mill_item_code, F.length(mill_item_code))
+    return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
+
+spark.udf.register("pacs_MillRefToExamCode", pacs_MillRefToExamCode)
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -162,7 +178,8 @@ def stag_mill_clinical_event_pacs_2():
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
         """
     )
-    df = df.withColumn("MillAccessionNbr", pacs_py_MillRefToAccessionNbr(F.col("MillRefNbr")))
+    df = df.withColumn("MillAccessionNbr", pacs_MillRefToAccessionNbr(F.col("MillRefNbr")))
+    df = df.withColumn("MillExamCode", pacs_MillRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))
     return df
 
 
@@ -258,8 +275,8 @@ def pacs_clinical_event():
                 THEN ex.ExaminationScheduledDate
                 ELSE ce3.MillEventDate
             END AS MillEventDate,
-            ce3.UPDT_DT_TM AS MillUpdtDtTm,
-            blob.BLOB_CONTENTS AS ReportText
+            ce3.UPDT_DT_TM AS MillUpdtDtTm
+            --blob.BLOB_CONTENTS AS ReportText
         FROM LIVE.stag_mill_clinical_event_pacs AS ce3
         LEFT JOIN 4_prod.raw.pacs_requests AS rq
         ON rq.RequestIdString = ce3.MillAccessionNbr
@@ -271,8 +288,8 @@ def pacs_clinical_event():
         ON ce3.MillPacsExamCode = lkp_ex.short_code
         LEFT JOIN LIVE.stag_pacs_examinations_examcode AS pexcd
         ON ce3.MillPacsExamCode = pexcd.examinationcode
-        LEFT JOIN 4_prod.raw.pi_cde_blob_content AS blob
-        ON ce3.EVENT_ID = blob.EVENT_ID -- TODO: Check if EVENT_ID is one-to-one mapping
+        --LEFT JOIN 4_prod.raw.pi_cde_blob_content AS blob
+        --ON ce3.EVENT_ID = blob.EVENT_ID -- TODO: Check if EVENT_ID is one-to-one mapping
         """
     )
 

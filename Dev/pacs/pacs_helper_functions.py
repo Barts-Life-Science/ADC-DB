@@ -57,18 +57,18 @@ import time
 
 start = time.time()
 df = spark.sql(
-        """
-        WITH ce1 AS (
-            SELECT
-                COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr
-            FROM 4_prod.raw.mill_clinical_event
-            WHERE 
-                CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
-                AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
-        )
+    """
+    WITH ce1 AS (
         SELECT
-            pacs_MillRefToAccessionNbr(MillRefNbr) AS MillAccessionNbr
-        FROM ce1
+            COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr
+        FROM 4_prod.raw.mill_clinical_event
+        WHERE 
+            CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
+            AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
+    )
+    SELECT
+        pacs_MillRefToAccessionNbr(MillRefNbr) AS MillAccessionNbr
+    FROM ce1
     """
 )
 df.collect()
