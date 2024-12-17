@@ -132,3 +132,25 @@
 # MAGIC WHERE MillPacsRefNbr LIKE 'RNH0%' AND ExaminationModality IS NOT NULL
 # MAGIC AND MillPacsRefNbr NOT LIKE 'RNH0XR%' AND MillPacsRefNbr NOT LIKE 'RNH0CT%'
 # MAGIC LIMIT 1000
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- check if EventId is unique
+# MAGIC SELECT COUNT(DISTINCT MillEventId), COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_clinical_event
+# MAGIC WHERE MillEventId IS NOT NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT EVENT_ID), COUNT(*)
+# MAGIC FROM 4_prod.raw.pi_cde_blob_content AS blob
+# MAGIC INNER JOIN (SELECT DISTINCT MillEventId FROM 4_prod.pacs.pacs_clinical_event) AS e
+# MAGIC ON blob.EVENT_ID = e.MillEventId
+
+# COMMAND ----------
+
+

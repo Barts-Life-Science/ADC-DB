@@ -210,6 +210,7 @@ def pacs_clinical_event():
             ex.ExaminationBodyPart,
             COALESCE(ex.ExaminationModality, pexcd.ExaminationModality) AS ExaminationModality,
             ce3.ENCNTR_ID AS MillEncntrId,
+            ce3.EVENT_ID AS MillEventId,
             ce3.PERSON_ID AS MillPersonId,
             ce3.EVENT_TITLE_TEXT AS MillEventTitle,
             ce3.MillIsRadrpt,
