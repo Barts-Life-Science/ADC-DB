@@ -1,4 +1,92 @@
 # Databricks notebook source
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   COUNT(*), 
+# MAGIC   COUNT(ExaminationIdString), 
+# MAGIC   COUNT(ExaminationText1), 
+# MAGIC   COUNT(ExaminationAccessionNumber)
+# MAGIC FROM 4_prod.raw.pacs_examinations
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.raw.pacs_examinations
+# MAGIC WHERE 
+# MAGIC   ExaminationText1 != ExaminationAccessionNumber 
+# MAGIC   AND ExaminationText1 IS NOT NULL 
+# MAGIC   AND ExaminationAccessionNumber != 'VALUE_TOO_LONG'
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ## PACS_EXAM
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE MillAccessionNbr IS NULL
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'Total count' AS issue,
+# MAGIC   COUNT(*) AS count
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'Duplicates' AS issue,
+# MAGIC   COUNT(*) - COUNT(DISTINCT ExaminationId) AS count
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'No RequestId' AS issue,
+# MAGIC   COUNT(*) - COUNT(RequestId) AS count
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'No MillAccessionNbr' AS issue,
+# MAGIC   COUNT(*) - COUNT(MillAccessionNbr) AS count
+# MAGIC FROM 4_prod.pacs.pacs_exam
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE ExamAccessionNbr != MillAccessionNbr
+# MAGIC AND MillAccessionNbr IS NOT NULL
+# MAGIC AND ExamAccessionNbr IS NOT NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.pacs_exam_ext
+# MAGIC WHERE MillAccessionNbr IS NULL
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Pacs_Clinical_Event
 
@@ -154,7 +242,7 @@
 # MAGIC
 # MAGIC SELECT *
 # MAGIC FROM 4_prod.pacs.pacs_clinical_event
-# MAGIC WHERE ExaminationModality IS NULL
+# MAGIC WHERE ExaminationModality IS NOT NULL
 # MAGIC LIMIT 1000
 
 # COMMAND ----------

@@ -309,7 +309,7 @@ def process_term_matches(df, snomed_sct, snomed_concepts):
         )
     )
 
-# Helper function to standardize Multum drug codes
+
 def standardize_multum(code):
     """
     Standardizes Multum drug codes by removing 'd' prefix and converting to string.
@@ -584,7 +584,7 @@ def create_nomenclature_mapping_incr():
     Returns:
         DataFrame: Incremental nomenclature mappings
     """
-    # Read reference tables
+
     code_value = spark.table("3_lookup.mill.mill_code_value").select(
         "CODE_VALUE", "CDF_MEANING", "DESCRIPTION", "DISPLAY"
     )
@@ -723,15 +723,15 @@ def create_nomenclature_mapping_incr():
 
 # COMMAND ----------
 
-# Generate incremental updates
+
 updates_df = create_nomenclature_mapping_incr()
     
-# Apply updates to target table
+
 update_nomen_table(updates_df, "4_prod.bronze.tempone_nomenclature")
 
 # COMMAND ----------
 
-# Helper functions
+
 def standardize_code(code):
     """
     Standardizes clinical codes by removing dots, spaces, and converting to uppercase.
@@ -1083,10 +1083,10 @@ def create_snomed_mapping_incr():
 # COMMAND ----------
 
 
-# Generate incremental updates
+
 updates_df = create_snomed_mapping_incr()
     
-# Apply updates to target table
+
 update_nomen_table(updates_df, "4_prod.bronze.temptwo_nomenclature")
 
 # COMMAND ----------
@@ -1311,7 +1311,7 @@ def create_icd10_mapping_incr():
     Returns:
         DataFrame: Incremental ICD10 mappings
     """
-    # Get timestamp of last processed record
+
     max_adc_updt = get_max_timestamp("4_prod.bronze.tempthree_nomenclature")
     
     # Get base and reference tables
@@ -1428,10 +1428,10 @@ def create_icd10_mapping_incr():
 
 # COMMAND ----------
 
-# Generate incremental updates
+
 updates_df = create_icd10_mapping_incr()
     
-# Apply updates to target table
+
 update_nomen_table(updates_df, "4_prod.bronze.tempthree_nomenclature")
 
 # COMMAND ----------
@@ -1617,7 +1617,7 @@ def create_opcs4_mapping_incr():
     Returns:
         DataFrame: Incremental OPCS4 mappings
     """
-    # Get timestamp of last processed record
+
     max_adc_updt = get_max_timestamp("4_prod.bronze.nomenclature")
 
     # Get base and reference tables
@@ -1718,8 +1718,8 @@ def create_opcs4_mapping_incr():
 
 # COMMAND ----------
 
-# Generate incremental updates
+
 updates_df = create_opcs4_mapping_incr()
     
-# Apply updates to target table
+
 update_nomen_table(updates_df, "4_prod.bronze.nomenclature")

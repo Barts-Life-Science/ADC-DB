@@ -180,6 +180,10 @@ def stag_pacs_examinations_examcode():
 
 # COMMAND ----------
 
+
+
+# COMMAND ----------
+
 @dlt.table(
     name="stag_pacs_examinations",
     comment="staging pacs_examinations",
@@ -190,7 +194,7 @@ def stag_pacs_examinations_examcode():
     }
 )
 def stag_pacs_examinations():
-    return spark.sql(
+    df = spark.sql(
         """
         WITH er AS (
             SELECT
@@ -212,9 +216,67 @@ def stag_pacs_examinations():
         --ON excd.ExaminationCode = e.ExaminationCode
         """
     )
+    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)))
+    df = df.withColumn('ExaminationLongIdString', F.when(F.length(F.col('ExaminationIdString'))<6, F.lit(None)))
+    df = df.withColumn('ExamIdOrAccessionNbr', F.coalesce(F.col('ExaminationAccessionNumber'), F.col('ExaminationLongIdString'), F.col('ExaminationText1')))
+    return df
 
 # COMMAND ----------
 
+@dlt.table(
+    name="pacs_exam",
+    comment="extended pacs exam table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    }
+)
+def pacs_exam():
+    df = spark.sql(
+        """
+        With ce AS (
+            SELECT 
+                MillAccessionNbr,
+                MAX(CLINICAL_EVENT_ID) AS MillClinicalEventId,
+                MAX(EVENT_ID) AS MillEventId,
+                MAX(PERSON_ID) AS MillPersonId
+            FROM LIVE.stag_mill_clinical_event_pacs
+            WHERE LOWER(MillEventReltn) = 'root'
+            GROUP BY MillAccessionNbr
+        )
+        SELECT 
+            e.ExaminationId,
+            e.ExaminationModality,
+            e.ExaminationBodyPart,
+            e.ExaminationScheduledDate,
+            e.ExaminationReportCount,
+            r.RequestId,
+            r.RequestIdString,
+            ce.MillAccessionNbr,
+            e.ExamIdOrAccessionNbr,
+            ce.MillClinicalEventId,
+            ce.MillEventId,
+            ce.MillPersonId
+        FROM LIVE.stag_pacs_examinations AS e
+        LEFT JOIN 4_prod.raw.pacs_requests AS r
+        ON e.ExaminationReportRequestId = r.RequestId
+        LEFT JOIN ce
+        ON 
+            ce.MillAccessionNbr = r.RequestIdString
+            --ce.MillAccessionNbr = e.ExamAccessionNbr 
+        WHERE 
+            e.ADC_Deleted IS NULL
+            AND r.ADC_Deleted IS NULL
+        --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
+        --ON excd.ExaminationCode = e.ExaminationCode
+        """)
+    
+    return df
+
+
+# COMMAND ----------
+
+'''
 @dlt.table(
     name="pacs_clinical_event",
     comment="mill_clinical_event joined with pacs_requests",
@@ -272,7 +334,7 @@ def pacs_clinical_event():
     )
 
     
-
+'''
 
 
 # COMMAND ----------
