@@ -899,8 +899,17 @@ def add_snomed_terms(matches_df, snomed_terms, base_df):
     matches_df = matches_df.alias("matches")
     snomed_terms = snomed_terms.alias("terms")
     
+    # Add row number to pick just one term (preferably the shortest one)
+    snomed_terms_deduplicated = snomed_terms.withColumn(
+        "term_rank",
+        F.row_number().over(
+            Window.partitionBy("CUI")
+            .orderBy(F.length("TERM"))  # Order by term length to get the shortest term
+        )
+    ).filter(F.col("term_rank") == 1)  # Keep only one term per CUI
+    
     with_terms = matches_df.join(
-        snomed_terms,
+        snomed_terms_deduplicated,
         F.col("matches.temp_snomed_code") == F.col("terms.CUI"),
         "left"
     ).select(

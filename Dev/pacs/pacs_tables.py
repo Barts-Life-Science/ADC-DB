@@ -6,8 +6,8 @@ from collections import OrderedDict
 # COMMAND ----------
 
 def createMillRefRegexPatternList():
-    #TODO: Add preprocess
     patterns = []
+    # Each item is a 3-element tuple (preprocess, regex_pattern, extraction)
     patterns.append((lambda col:F.left(col, F.lit(16)), r'\d{16}', lambda col:F.left(col, F.lit(16))))
     patterns.append((lambda col:F.left(col, F.lit(7)), r'\d{7}', lambda col:F.left(col, F.lit(7))))
     patterns.append((lambda col:F.left(col, F.lit(6)), r'\d{6}', lambda col:F.left(col, F.lit(6))))
@@ -54,11 +54,10 @@ spark.udf.register("pacs_MillRefAccessionNbr", pacs_MillRefToAccessionNbr)
 # COMMAND ----------
 
 def pacs_MillRefToExamCode(mill_ref_col, accession_nbr_col):
-    mill_ref_last_char = F.right(mill_ref_col, F.lit(1))
-    mill_item_code = F.replace(mill_ref_col, accession_nbr_col, F.lit(''))
-    mill_item_code = F.replace(mill_item_code, mill_ref_last_char, F.lit(''))
-    mill_ref_left = F.left(mill_item_code, F.length(mill_item_code))
-    mill_ref_right = F.right(mill_item_code, F.length(mill_item_code))
+    mill_item_code = F.replace(F.left(mill_ref_col, F.length(mill_ref_col)-1), accession_nbr_col, F.lit(''))
+    mill_item_code = F.replace(mill_item_code, F.lit('_SECTRA'), F.lit(''))
+    mill_ref_left = F.left(mill_item_code, F.length(mill_item_code)/2)
+    mill_ref_right = F.right(mill_item_code, F.length(mill_item_code)/2)
     return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
 
 spark.udf.register("pacs_MillRefToExamCode", pacs_MillRefToExamCode)

@@ -109,8 +109,15 @@
 # MAGIC UNION
 # MAGIC
 # MAGIC SELECT 
-# MAGIC   'Duplicates' AS condition,
+# MAGIC   'Duplicates (MillClinicalEventId, RequestId, ExaminationId)' AS condition,
 # MAGIC   COUNT(MillClinicalEventId, RequestId, ExaminationId) - COUNT(DISTINCT MillClinicalEventId, RequestId, ExaminationId) AS num_rows
+# MAGIC FROM 4_prod.pacs.pacs_clinical_event
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Duplicates (MillClinicalEventId)' AS condition,
+# MAGIC   COUNT(MillClinicalEventId) - COUNT(DISTINCT MillClinicalEventId) AS num_rows
 # MAGIC FROM 4_prod.pacs.pacs_clinical_event
 # MAGIC
 # MAGIC UNION
