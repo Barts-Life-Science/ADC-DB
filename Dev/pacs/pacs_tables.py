@@ -1,31 +1,51 @@
 # Databricks notebook source
 import dlt
 from pyspark.sql import functions as F
+from collections import OrderedDict
+
+# COMMAND ----------
+
+def createMillRefRegexPatternList():
+    #TODO: Add preprocess
+    patterns = []
+    patterns.append((lambda col:F.left(col, F.lit(16)), r'\d{16}', lambda col:F.left(col, F.lit(16))))
+    patterns.append((lambda col:F.left(col, F.lit(7)), r'\d{7}', lambda col:F.left(col, F.lit(7))))
+    patterns.append((lambda col:F.left(col, F.lit(6)), r'\d{6}', lambda col:F.left(col, F.lit(6))))
+    patterns.append((lambda col:F.left(col, F.lit(6)), r'RNH098', lambda col:F.lit('RNH098')))
+    patterns.append((lambda col:F.substring(col, 15, 1), r'\D', lambda col:F.left(col, F.lit(14))))
+    patterns.append((lambda col:col, r'.+', lambda col:F.left(col, F.lit(16))))
+    return patterns
 
 
 # COMMAND ----------
 
 
-def pacs_MillRefToAccessionNbr(column):
-    return \
-        F.when(
-            column.rlike(r'^\d{16}$'), 
-            F.left(column, F.lit(16))
-        ).when(
-            column.rlike(r'^\d{7}$'),
-            F.left(column, F.lit(7))
-        ).when(
-            column.rlike(r'^\d{6}$'),
-            F.left(column, F.lit(6))
-        ).when(
-            column.like('RNH098'),
-            F.lit('RNH098')
-        ).when(
-            F.substring(column, 15, 1).rlike(r'\D'),
-            F.left(column, F.lit(14))
-        ).otherwise(
-            F.left(column, F.lit(16))
-        )
+
+
+def pacs_IdentifyMillRefPattern(pattern_list, column):    
+    for i, pat in enumerate(pattern_list[::-1]):
+        if i == 0:
+            nested = F.when(pat[0](column).rlike(pat[1]), F.lit(pat[1])).otherwise(F.lit(None))
+        else:
+            nested = F.when(pat[0](column).rlike(pat[1]), F.lit(pat[1])).otherwise(nested)
+
+    return nested
+    
+    
+
+spark.udf.register("pacs_IdentifyMillRefPattern", pacs_IdentifyMillRefPattern)
+
+# COMMAND ----------
+
+
+def pacs_MillRefToAccessionNbr(pattern_list, column):
+    for i, pat in enumerate(pattern_list[::-1]):
+        if i == 0:
+            nested = F.when(pat[0](column).rlike(pat[1]), pat[2](column)).otherwise(F.lit(None))
+        else:
+            nested = F.when(pat[0](column).rlike(pat[1]), pat[2](column)).otherwise(nested)
+
+    return nested
     
     
 
@@ -104,7 +124,7 @@ def stag_mill_clinical_event_pacs():
     df = spark.sql(
         """
         SELECT
-            *,
+            ce.*,
             COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
             CASE
                 WHEN EVENT_TAG = 'RADRPT'
@@ -115,15 +135,24 @@ def stag_mill_clinical_event_pacs():
                 WHEN EVENT_START_DT_TM < '2000-01-01'
                 THEN NULL
                 ELSE EVENT_START_DT_TM
-            END AS MillEventDate
-        FROM 4_prod.raw.mill_clinical_event
+            END AS MillEventDate,
+            event_class_cd.DESCRIPTION AS MillEventClass,
+            event_reltn_cd.DESCRIPTION AS MillEventReltn
+        FROM 4_prod.raw.mill_clinical_event AS ce
+        LEFT JOIN 3_lookup.mill.mill_code_value AS event_class_cd
+        ON ce.EVENT_CLASS_CD = event_class_cd.CODE_VALUE
+        LEFT JOIN 3_lookup.mill.mill_code_value AS event_reltn_cd
+        ON ce.EVENT_RELTN_CD = event_reltn_cd.CODE_VALUE
         WHERE 
             CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
         """
     )
-    df = df.withColumn("MillAccessionNbr", pacs_MillRefToAccessionNbr(F.col("MillRefNbr")))
+    patterns = createMillRefRegexPatternList()
+    df = df.withColumn("MillAccessionNbr", pacs_MillRefToAccessionNbr(patterns, F.col("MillRefNbr")))
+    df = df.withColumn("MillRefNbrPattern", pacs_IdentifyMillRefPattern(patterns, F.col("MillRefNbr")))
     df = df.withColumn("MillExamCode", pacs_MillRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))
+    df = df.withColumn("MillEventDate", F.coalesce(F.col("MillEventDate"), F.col("PERFORMED_DT_TM")))
     return df
 
 
@@ -179,6 +208,7 @@ def stag_pacs_examinations():
         FROM 4_prod.raw.pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
+        WHERE ADC_Deleted IS NULL
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         """
@@ -214,16 +244,22 @@ def pacs_clinical_event():
             ce3.PERSON_ID AS MillPersonId,
             ce3.EVENT_TITLE_TEXT AS MillEventTitle,
             ce3.MillIsRadrpt,
+            ce3.MillEventClass,
+            ce3.MillEventReltn,
             ex.ExaminationScheduledDate,
             CASE
                 WHEN ce3.MillEventDate IS NULL
                 THEN ex.ExaminationScheduledDate
                 ELSE ce3.MillEventDate
             END AS MillEventDate,
+            CASE
+                WHEN MillEventDate IS NULL
+                THEN 0
+                ELSE DATEDIFF(ex.ExaminationScheduledDate, ce3.MillEventDate)
+            END AS ExamDateDiff,
             ce3.UPDT_DT_TM AS MillUpdtDtTm
-            --blob.BLOB_CONTENTS AS ReportText
         FROM LIVE.stag_mill_clinical_event_pacs AS ce3
-        LEFT JOIN 4_prod.raw.pacs_requests AS rq
+        LEFT JOIN (SELECT * FROM 4_prod.raw.pacs_requests WHERE ADC_Deleted IS NULL) AS rq
         ON rq.RequestIdString = ce3.MillAccessionNbr
         LEFT JOIN LIVE.stag_pacs_examinations AS ex
         ON 
@@ -233,8 +269,6 @@ def pacs_clinical_event():
         ON ce3.MillExamCode = lkp_ex.short_code
         LEFT JOIN LIVE.stag_pacs_examinations_examcode AS pexcd
         ON ce3.MillExamCode = pexcd.examinationcode
-        --LEFT JOIN 4_prod.raw.pi_cde_blob_content AS blob
-        --ON ce3.EVENT_ID = blob.EVENT_ID -- TODO: Check if EVENT_ID is one-to-one mapping
         """
     )
 
@@ -256,3 +290,33 @@ def pacs_lkp_examcode():
     return spark.read.format("csv") \
                      .option("header", "true") \
                      .load("/Volumes/4_prod/pacs/base/Annex-1-DID_lookup_group.csv")
+
+# COMMAND ----------
+
+@dlt.table(
+    name="pacs_blob_content",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def pacs_blob_content():
+    return spark.sql(
+        """
+        WITH milleventid AS (
+            SELECT DISTINCT EVENT_ID
+            FROM LIVE.stag_mill_clinical_event_pacs AS ce
+        )
+        SELECT
+            blob.EVENT_ID,
+            blob.BLOB_CONTENTS AS ReportText
+        FROM 4_prod.raw.pi_cde_blob_content AS blob
+        INNER JOIN milleventid
+        ON blob.EVENT_ID = milleventid.EVENT_ID
+        """
+    )
+
+    
+
+

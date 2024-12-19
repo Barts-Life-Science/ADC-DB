@@ -50,7 +50,7 @@
 
 # MAGIC %sql
 # MAGIC
-# MAGIC -- Check which column is best for imputing Mill_Clinical_Event.Event_Start_Dt_Tm
+# MAGIC -- Check which column is best for imputing Mill_Clinical_Event.Performed_Dt_Tm
 # MAGIC -- Lower value is better
 # MAGIC WITH cte_examid AS(
 # MAGIC   SELECT DISTINCT MillClinicalEventId, ExaminationId
@@ -68,6 +68,33 @@
 # MAGIC WHERE 
 # MAGIC   mce.Event_Start_Dt_Tm > '2010-01-01'
 # MAGIC   AND mce.Contributor_System_Cd = 6141416	--BLT_TIE_RAD
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- Check if at least 1 row exists with MillEventReltn = 'root' per MillAccessionNbr group
+# MAGIC
+# MAGIC SELECT DISTINCT MillAccessionNbr, MillRefNbrPattern
+# MAGIC FROM 4_prod.pacs.stag_mill_clinical_event_pacs
+# MAGIC
+# MAGIC EXCEPT
+# MAGIC
+# MAGIC SELECT DISTINCT MillAccessionNbr, MillRefNbrPattern
+# MAGIC FROM 4_prod.pacs.stag_mill_clinical_event_pacs
+# MAGIC WHERE  Lower(MillEventReltn) = 'root'
+# MAGIC
+# MAGIC
+# MAGIC
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.stag_mill_clinical_event_pacs
+# MAGIC LIMIT 100
 
 # COMMAND ----------
 
