@@ -1,4 +1,104 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC
+# MAGIC ## STAG_PACS_EXAMINATIONS
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- Query: Check number of exams in ExaminationReports if ExaminationAccessionNumber is not null
+# MAGIC -- Observation: 
+# MAGIC
+# MAGIC SELECT
+# MAGIC   COUNT(*) AS total,
+# MAGIC   COUNT(RequestId) AS matched_request_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS nonnull_reqeust_id_str_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       ExaminationAccessionNumber IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS nonnull_exam_accession_nbr_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString = ExaminationAccessionNumber
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationAccessionNumber IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS matched_exam_accession_nbr_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString != ExaminationAccessionNumber
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationAccessionNumber IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS unmatched_exam_accession_nbr_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString = ExaminationIdString
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationIdString IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS matched_exam_id_str_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString != ExaminationIdString
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationIdString IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS unmatched_exam_id_str_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString = ExaminationText1
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationText1 IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS matched_exam_text1_count,
+# MAGIC   SUM(CASE
+# MAGIC     WHEN 
+# MAGIC       RequestIdString != ExaminationText1
+# MAGIC       AND RequestIdString IS NOT NULL
+# MAGIC       AND ExaminationText1 IS NOT NULL
+# MAGIC     THEN 1
+# MAGIC     ELSE 0
+# MAGIC   END) AS unmatched_exam_text1_count
+# MAGIC FROM 4_prod.pacs.stag_pacs_examinations AS ex
+# MAGIC LEFT JOIN 4_prod.raw.pacs_requests AS rq
+# MAGIC ON ex.ExaminationReportRequestId = rq.RequestId
+# MAGIC
+# MAGIC   
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC -- Query: Check number of exams in ExaminationReports if ExaminationAccessionNumber is not null
+# MAGIC -- Observation: 
+# MAGIC
+# MAGIC SELECT
+# MAGIC   ExaminationIdString,
+# MAGIC   ExaminationAccessionNumber,
+# MAGIC   ExaminationText1,
+# MAGIC   RequestIdString
+# MAGIC FROM 4_prod.pacs.stag_pacs_examinations AS ex
+# MAGIC LEFT JOIN 4_prod.raw.pacs_requests AS rq
+# MAGIC ON ex.ExaminationReportRequestId = rq.RequestId
+# MAGIC WHERE ExaminationAccessionNumber IS NOT NULL
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC
 # MAGIC SELECT 
@@ -12,12 +112,8 @@
 
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT *
-# MAGIC FROM 4_prod.raw.pacs_examinations
-# MAGIC WHERE 
-# MAGIC   ExaminationText1 != ExaminationAccessionNumber 
-# MAGIC   AND ExaminationText1 IS NOT NULL 
-# MAGIC   AND ExaminationAccessionNumber != 'VALUE_TOO_LONG'
+# MAGIC SELECT ExamIdOrAccessionNbr
+# MAGIC FROM `4_prod`.pacs.stag_pacs_examinations
 # MAGIC LIMIT 100
 
 # COMMAND ----------
@@ -32,7 +128,7 @@
 # MAGIC
 # MAGIC SELECT *
 # MAGIC FROM 4_prod.pacs.pacs_exam
-# MAGIC WHERE MillAccessionNbr IS NULL
+# MAGIC WHERE RequestIdString IS NULL
 # MAGIC LIMIT 100
 
 # COMMAND ----------

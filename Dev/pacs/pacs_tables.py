@@ -1,7 +1,7 @@
 # Databricks notebook source
 import dlt
 from pyspark.sql import functions as F
-from collections import OrderedDict
+
 
 # COMMAND ----------
 
@@ -189,8 +189,8 @@ def stag_pacs_examinations_examcode():
     comment="staging pacs_examinations",
     table_properties={
         "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "temporary":"true"
+        "delta.enableRowTracking": "true"
+        #"temporary":"true"
     }
 )
 def stag_pacs_examinations():
@@ -216,8 +216,9 @@ def stag_pacs_examinations():
         --ON excd.ExaminationCode = e.ExaminationCode
         """
     )
-    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)))
-    df = df.withColumn('ExaminationLongIdString', F.when(F.length(F.col('ExaminationIdString'))<6, F.lit(None)))
+    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)).otherwise(F.col('ExaminationAccessionNumber')))
+    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').rlike(r'FLO\d{6}A\d{4}0'), F.left(F.col('ExaminationAccessionNumber'), F.lit(14))).otherwise(F.col('ExaminationAccessionNumber')))
+    df = df.withColumn('ExaminationLongIdString', F.when(F.length(F.col('ExaminationIdString'))>F.lit(6), F.col('ExaminationIdString')).otherwise(F.lit(None)))
     df = df.withColumn('ExamIdOrAccessionNbr', F.coalesce(F.col('ExaminationAccessionNumber'), F.col('ExaminationLongIdString'), F.col('ExaminationText1')))
     return df
 
