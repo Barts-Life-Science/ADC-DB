@@ -1,4 +1,14 @@
 # Databricks notebook source
+import sys, os
+
+sys.path.append("/Workspace/Shared/ADC-DB/Dev/pacs/utils/")
+
+# COMMAND ----------
+
+import pacs_data_transformations as DT
+
+# COMMAND ----------
+
 # Mock data for cleaning ExaminationAccessionNumber
 
 df = spark.sql("""
@@ -34,7 +44,13 @@ VALUES
 ('123456', NULL, '123456123456', '123456', 'Remove appended ExaminationIdString'),
 ('123456', '41234', '123456123456', '123456', 'Remove appended ExaminationIdString'),
 ('00123456', NULL, '0012345600123456', '00123456', 'Remove appended ExaminationIdString'),
-('123456789123456', '1', '1234567891234561', NULL, 'Mark as missing')
+('123456789123456', '1', '1234567891234561', NULL, 'Mark as missing'),
+('19123456', '3123', '191234563123', NULL, 'Mark as missing when ExaminationIdString is the correct accession number')
+
 ) AS tmp(ExaminationIdString, ExaminationDicomStudyId, ExaminationAccessionNumber, Expected_ExaminationAccessionNumber, Expected_Transformation)
 """)
 display(df)
+
+# COMMAND ----------
+
+df = df.withColumn('ExaminationAccessionNumber_t', DT)

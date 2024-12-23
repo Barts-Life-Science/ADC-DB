@@ -5,16 +5,31 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 
-def createMillRefRegexPatternList():
-    patterns = []
-    # Each item is a 3-element tuple (preprocess, regex_pattern, extraction)
-    patterns.append((lambda col:F.left(col, F.lit(16)), r'\d{16}', lambda col:F.left(col, F.lit(16))))
-    patterns.append((lambda col:F.left(col, F.lit(7)), r'\d{7}', lambda col:F.left(col, F.lit(7))))
-    patterns.append((lambda col:F.left(col, F.lit(6)), r'\d{6}', lambda col:F.left(col, F.lit(6))))
-    patterns.append((lambda col:F.left(col, F.lit(6)), r'RNH098', lambda col:F.lit('RNH098')))
-    patterns.append((lambda col:F.substring(col, 15, 1), r'\D', lambda col:F.left(col, F.lit(14))))
-    patterns.append((lambda col:col, r'.+', lambda col:F.left(col, F.lit(16))))
-    return patterns
+import sys, os
+
+sys.path.append("/Workspace/Shared/ADC-DB/Dev/pacs/utils")
+import pacs_data_transformations as DT
+
+# COMMAND ----------
+
+spark.udf.register("identifyMillRefPattern", DT.identifyMillRefPattern)
+spark.udf.register("millRefAccessionNbr", DT.millRefToAccessionNbr)
+spark.udf.register("millRefToExamCode", DT.millRefToExamCode)
+
+# COMMAND ----------
+
+
+    
+    
+
+
+
+# COMMAND ----------
+
+
+    
+    
+
 
 
 # COMMAND ----------
@@ -22,45 +37,6 @@ def createMillRefRegexPatternList():
 
 
 
-def pacs_IdentifyMillRefPattern(pattern_list, column):    
-    for i, pat in enumerate(pattern_list[::-1]):
-        if i == 0:
-            nested = F.when(pat[0](column).rlike(pat[1]), F.lit(pat[1])).otherwise(F.lit(None))
-        else:
-            nested = F.when(pat[0](column).rlike(pat[1]), F.lit(pat[1])).otherwise(nested)
-
-    return nested
-    
-    
-
-spark.udf.register("pacs_IdentifyMillRefPattern", pacs_IdentifyMillRefPattern)
-
-# COMMAND ----------
-
-
-def pacs_MillRefToAccessionNbr(pattern_list, column):
-    for i, pat in enumerate(pattern_list[::-1]):
-        if i == 0:
-            nested = F.when(pat[0](column).rlike(pat[1]), pat[2](column)).otherwise(F.lit(None))
-        else:
-            nested = F.when(pat[0](column).rlike(pat[1]), pat[2](column)).otherwise(nested)
-
-    return nested
-    
-    
-
-spark.udf.register("pacs_MillRefAccessionNbr", pacs_MillRefToAccessionNbr)
-
-# COMMAND ----------
-
-def pacs_MillRefToExamCode(mill_ref_col, accession_nbr_col):
-    mill_item_code = F.replace(F.left(mill_ref_col, F.length(mill_ref_col)-1), accession_nbr_col, F.lit(''))
-    mill_item_code = F.replace(mill_item_code, F.lit('_SECTRA'), F.lit(''))
-    mill_ref_left = F.left(mill_item_code, F.length(mill_item_code)/2)
-    mill_ref_right = F.right(mill_item_code, F.length(mill_item_code)/2)
-    return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
-
-spark.udf.register("pacs_MillRefToExamCode", pacs_MillRefToExamCode)
 
 # COMMAND ----------
 
@@ -147,10 +123,10 @@ def stag_mill_clinical_event_pacs():
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
         """
     )
-    patterns = createMillRefRegexPatternList()
-    df = df.withColumn("MillAccessionNbr", pacs_MillRefToAccessionNbr(patterns, F.col("MillRefNbr")))
-    df = df.withColumn("MillRefNbrPattern", pacs_IdentifyMillRefPattern(patterns, F.col("MillRefNbr")))
-    df = df.withColumn("MillExamCode", pacs_MillRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))
+    patterns = P.createMillRefRegexPatternList()
+    df = df.withColumn("MillAccessionNbr", DT.millRefToAccessionNbr(patterns, F.col("MillRefNbr")))
+    df = df.withColumn("MillRefNbrPattern", DT.identifyMillRefPattern(patterns, F.col("MillRefNbr")))
+    df = df.withColumn("MillExamCode", DT.millRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))
     df = df.withColumn("MillEventDate", F.coalesce(F.col("MillEventDate"), F.col("PERFORMED_DT_TM")))
     return df
 
