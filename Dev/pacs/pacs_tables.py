@@ -15,6 +15,7 @@ import pacs_data_transformations as DT
 spark.udf.register("identifyMillRefPattern", DT.identifyMillRefPattern)
 spark.udf.register("millRefAccessionNbr", DT.millRefToAccessionNbr)
 spark.udf.register("millRefToExamCode", DT.millRefToExamCode)
+spark.udf.register("transformExamAccessionNumber", DT.transformExamAccessionNumber)
 
 # COMMAND ----------
 
@@ -123,7 +124,7 @@ def stag_mill_clinical_event_pacs():
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
         """
     )
-    patterns = P.createMillRefRegexPatternList()
+    patterns = DT.createMillRefRegexPatternList()
     df = df.withColumn("MillAccessionNbr", DT.millRefToAccessionNbr(patterns, F.col("MillRefNbr")))
     df = df.withColumn("MillRefNbrPattern", DT.identifyMillRefPattern(patterns, F.col("MillRefNbr")))
     df = df.withColumn("MillExamCode", DT.millRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))

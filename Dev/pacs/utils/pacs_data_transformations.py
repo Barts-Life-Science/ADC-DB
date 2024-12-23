@@ -1,8 +1,6 @@
 from pyspark.sql import functions as F
 
-"""
-stag_mill_clinical_event_pacs
-"""
+
 def createMillRefRegexPatternList():
     patterns = []
     # Each item is a 3-element tuple (preprocess, regex_pattern, extraction)
@@ -51,10 +49,7 @@ def millRefToExamCode(mill_ref_col, accession_nbr_col):
     return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
 
 
-"""
-stag_pacs_examinations
-"""
-def transformExaminationAccessionNumber(exam_access_nbr_col, exam_id_str_col):
+def transformExamAccessionNumber(exam_access_nbr_col, exam_id_str_col):
     x = F.when(exam_access_nbr_col.eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)).otherwise(exam_access_nbr_col)
     x = F.when(exam_id_str_col.eqNullSafe(F.right(x, F.length(exam_id_str_col))), F.left(x, F.length(x)-F.length(exam_id_str_col))).otherwise(F.lit(None))
     return x
