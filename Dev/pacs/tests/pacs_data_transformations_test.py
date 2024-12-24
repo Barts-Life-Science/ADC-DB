@@ -15,6 +15,32 @@ spark = SparkSession.builder \
                     .appName('unit-tests') \
                     .getOrCreate()
 
+
+def test_millRefToAccessionNumber():
+    df = spark.sql("""
+        SELECT *
+        FROM (
+        VALUES
+        ('1234567CPANSCCPANSC0', '1234567', 'Keep the first 7 char'),
+        ('123456FUPLLM1', '123456', 'Keep the first 6 char'),
+        ('0000002001234567XDPEA0', '0000002001234567', 'Keep the first 16 char'),
+        ('RNH0XR17012345XCHESXCHES0', 'RNH0XR17012345', 'Keep the first 14 char'),
+        ('RNH0MA17012345XMAMB0', 'RNH0MA17012345', 'Keep the first 14 char'),
+        ('UKRLH02001234567UNECKN1', 'UKRLH02001234567', 'Keep the first 16 char'),
+        ('UKRLH02001234567CCHAPCCHAP0', 'UKRLH02001234567', 'Keep the first 16 char'),
+        ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'Keep the first 16 char')
+        ) AS tmp(MillRefNbr, Expected_AccessionNbr, ExpectedTransformationDescription)
+    """)
+
+    patterns = DT.createMillRefRegexPatternList()
+
+    df = df.withColumn('AccessionNbr', DT.millRefToAccessionNbr(patterns, F.col('MillRefNbr')))
+ 
+    diff = df.filter("Expected_AccessionNbr != AccessionNbr")
+
+    assert 0 == diff.count(), f"{diff.count()} test samples failed"
+   
+
 def test_transformExamAccessionNumber():
     df = spark.sql("""
         SELECT *
@@ -58,5 +84,5 @@ def test_transformExamAccessionNumber():
 
     diff = df.filter("Expected_ExaminationAccessionNumber != ExaminationAccessionNumber_t")
 
-    assert 0 == diff.count(), f"{diff.count()} test samples failed at transformationExamAccessionNumber"
+    assert 0 == diff.count(), f"{diff.count()} test samples failed"
     
