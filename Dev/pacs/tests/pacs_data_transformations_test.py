@@ -28,18 +28,41 @@ def test_millRefToAccessionNumber():
         ('RNH0MA17012345XMAMB0', 'RNH0MA17012345', 'Keep the first 14 char'),
         ('UKRLH02001234567UNECKN1', 'UKRLH02001234567', 'Keep the first 16 char'),
         ('UKRLH02001234567CCHAPCCHAP0', 'UKRLH02001234567', 'Keep the first 16 char'),
-        ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'Keep the first 16 char')
+        ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'Keep the first 16 char'),
+        ('UKRLH02001234567NC131YNC131Y0', 'UKRLH02001234567', 'Keep the first 16 char'),
+        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'Keep the first 16 char')
         ) AS tmp(MillRefNbr, Expected_AccessionNbr, ExpectedTransformationDescription)
     """)
 
     patterns = DT.createMillRefRegexPatternList()
-
     df = df.withColumn('AccessionNbr', DT.millRefToAccessionNbr(patterns, F.col('MillRefNbr')))
- 
     diff = df.filter("Expected_AccessionNbr != AccessionNbr")
-
     assert 0 == diff.count(), f"{diff.count()} test samples failed"
    
+
+def test_millRefToExamCode():
+    df = spark.sql("""
+        SELECT *
+        FROM (
+        VALUES
+        ('1234567CPANSCCPANSC0', '1234567', 'CPANSC', 'Keep the exam code without the repeat and the last digit'),
+        ('123456FUPLLM1', '123456', 'FUPLLM', 'Keep the exam code without the last digit'),
+        ('0000002001234567XDPEA0', '0000002001234567', 'XDPEA', 'Keep the exam code without the last digit'),
+        ('RNH0XR17012345XCHESXCHES0', 'RNH0XR17012345', 'XCHES', 'Keep the exam code without the repeat and the last digit'),
+        ('RNH0MA17012345XMAMB0', 'RNH0MA17012345', 'XMAMB', 'Keep the exam code without the last digit'),
+        ('UKRLH02001234567UNECKN1', 'UKRLH02001234567', 'UNECKN', 'Keep the exam code without the last digit'),
+        ('UKRLH02001234567CCHAPCCHAP0', 'UKRLH02001234567', 'CCHAP', 'Keep the exam code without the repeat and the last digit'),
+        ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'CABDOC', 'Keep the exam code without the repeat and the last digit'),
+        ('UKRLH02001234567NC131YNC131Y0', 'UKRLH02001234567', 'NC131Y', 'Keep the exam code without the repeat and the last digit'),
+        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'NF18WO', 'Keep the exam code without the repeat and the last digit')
+
+        ) AS tmp(MillRefNbr, AccessionNbr, Expected_ExamCode, ExpectedTransformationDescription)
+    """)
+
+    df = df.withColumn('ExamCode', DT.millRefToExamCode(F.col('MillRefNbr'), F.col('AccessionNbr')))
+    diff = df.filter("Expected_ExamCode != ExamCode")
+    assert 0 == diff.count(), f"{diff.count()} test samples failed"
+
 
 def test_transformExamAccessionNumber():
     df = spark.sql("""
