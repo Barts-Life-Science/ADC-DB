@@ -41,14 +41,6 @@ def millRefToExamCode(mill_ref_col, accession_nbr_col):
     return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
 
 
-def millRefToExamCode(mill_ref_col, accession_nbr_col):
-    mill_item_code = F.replace(F.left(mill_ref_col, F.length(mill_ref_col)-1), accession_nbr_col, F.lit(''))
-    mill_item_code = F.replace(mill_item_code, F.lit('_SECTRA'), F.lit(''))
-    mill_ref_left = F.left(mill_item_code, F.length(mill_item_code)/2)
-    mill_ref_right = F.right(mill_item_code, F.length(mill_item_code)/2)
-    return F.when(mill_ref_left.eqNullSafe(mill_ref_right), mill_ref_left).otherwise(mill_item_code)
-
-
 def transformExamAccessionNumber(exam_access_nbr_col, exam_id_str_col):
     x = F.when(exam_access_nbr_col.eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)).otherwise(exam_access_nbr_col)
     x = F.when(exam_id_str_col.eqNullSafe(F.right(x, F.length(exam_id_str_col))), F.left(x, F.length(x)-F.length(exam_id_str_col))).otherwise(F.lit(None))

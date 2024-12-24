@@ -33,4 +33,4 @@ sys.dont_write_bytecode = True
 # }
 # ...
 #
-retcode = pytest.main(["/Workspace/Shared/ADC-DB/Dev/pacs/tests/test_pacs_data_transformations.py"])
+retcode = pytest.main(["/Workspace/Shared/ADC-DB/Dev/pacs/tests/pacs_data_transformations_test.py"])

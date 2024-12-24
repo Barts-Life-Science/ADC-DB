@@ -184,7 +184,6 @@ def stag_pacs_examinations():
         SELECT 
             e.*,
             er.*
-            --COALESCE(e.ExaminationModality, excd.ExaminationModality) AS ImputedExaminationModality
         FROM 4_prod.raw.pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
@@ -193,10 +192,8 @@ def stag_pacs_examinations():
         --ON excd.ExaminationCode = e.ExaminationCode
         """
     )
-    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)).otherwise(F.col('ExaminationAccessionNumber')))
-    df = df.withColumn('ExaminationAccessionNumber', F.when(F.col('ExaminationAccessionNumber').rlike(r'FLO\d{6}A\d{4}0'), F.left(F.col('ExaminationAccessionNumber'), F.lit(14))).otherwise(F.col('ExaminationAccessionNumber')))
-    df = df.withColumn('ExaminationLongIdString', F.when(F.length(F.col('ExaminationIdString'))>F.lit(6), F.col('ExaminationIdString')).otherwise(F.lit(None)))
-    df = df.withColumn('ExamIdOrAccessionNbr', F.coalesce(F.col('ExaminationAccessionNumber'), F.col('ExaminationLongIdString'), F.col('ExaminationText1')))
+    df = df.withColumn('ExaminationAccessionNumber_t', DT.transformExamAccessionNumber(F.col('ExaminationAccessionNumber'), F.col('ExaminationIdString')))
+    df = df.withColumn('ExamRefNbr', F.coalesce(F.col('ExaminationAccessionNumber_t'), F.col('ExaminationIdString'), F.col('ExaminationText1')))
     return df
 
 # COMMAND ----------
@@ -231,7 +228,7 @@ def pacs_exam():
             r.RequestId,
             r.RequestIdString,
             ce.MillAccessionNbr,
-            e.ExamIdOrAccessionNbr,
+            e.ExamRefNbr,
             ce.MillClinicalEventId,
             ce.MillEventId,
             ce.MillPersonId
