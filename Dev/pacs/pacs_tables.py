@@ -207,15 +207,38 @@ def intmd_pacs_examinations():
                 COUNT(ExaminationReportReportId) AS ExaminationReportCount
             FROM 4_prod.raw.pacs_examinationreports AS er
             GROUP BY ExaminationReportExaminationId, ExaminationReportRequestId
+        ),
+        ce AS (
+            SELECT 
+                MillAccessionNbr,
+                MAX(CLINICAL_EVENT_ID) AS MillClinicalEventId,
+                MAX(EVENT_ID) AS MillEventId,
+                MAX(PERSON_ID) AS MillPersonId
+            FROM LIVE.stag_mill_clinical_event_pacs
+            WHERE LOWER(MillEventReltn) = 'root'
+            GROUP BY MillAccessionNbr
         )
         SELECT 
             e.*,
-            er.*
+            er.*,
+            r.RequestId,
+            r.RequestIdString,
+            ce.MillAccessionNbr,
+            ce.MillClinicalEventId,
+            ce.MillEventId,
+            ce.MillPersonId
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
+        LEFT JOIN 4_prod.raw.pacs_requests AS r
+        ON er.ExaminationReportRequestId = r.RequestId
+        LEFT JOIN ce
+        ON ce.MillAccessionNbr = r.RequestIdString
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
+        WHERE 
+            e.ADC_Deleted IS NULL
+            AND r.ADC_Deleted IS NULL
         """
     )
     return df
@@ -233,39 +256,20 @@ def intmd_pacs_examinations():
 def pacs_exam():
     df = spark.sql(
         """
-        With ce AS (
-            SELECT 
-                MillAccessionNbr,
-                MAX(CLINICAL_EVENT_ID) AS MillClinicalEventId,
-                MAX(EVENT_ID) AS MillEventId,
-                MAX(PERSON_ID) AS MillPersonId
-            FROM LIVE.stag_mill_clinical_event_pacs
-            WHERE LOWER(MillEventReltn) = 'root'
-            GROUP BY MillAccessionNbr
-        )
         SELECT 
-            e.ExaminationId,
-            e.ExaminationModality,
-            e.ExaminationBodyPart,
-            e.ExaminationScheduledDate,
-            e.ExaminationReportCount,
-            r.RequestId,
-            r.RequestIdString,
-            ce.MillAccessionNbr,
-            e.ExamRefNbr,
-            ce.MillClinicalEventId,
-            ce.MillEventId,
-            ce.MillPersonId
+            ExaminationId,
+            ExaminationModality,
+            ExaminationBodyPart,
+            ExaminationScheduledDate,
+            ExaminationReportCount,
+            RequestId,
+            RequestIdString,
+            MillAccessionNbr,
+            ExamRefNbr,
+            MillClinicalEventId,
+            MillEventId,
+            MillPersonId
         FROM LIVE.intmd_pacs_examinations AS e
-        LEFT JOIN 4_prod.raw.pacs_requests AS r
-        ON e.ExaminationReportRequestId = r.RequestId
-        LEFT JOIN ce
-        ON 
-            ce.MillAccessionNbr = r.RequestIdString
-            --ce.MillAccessionNbr = e.ExamAccessionNbr 
-        WHERE 
-            e.ADC_Deleted IS NULL
-            AND r.ADC_Deleted IS NULL
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         """)
