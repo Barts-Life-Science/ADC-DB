@@ -101,7 +101,8 @@ def test_transformExamAccessionNumber():
         ('123456', '41234', '123456123456', '123456', 'Remove appended ExaminationIdString'),
         ('00123456', NULL, '0012345600123456', '00123456', 'Remove appended ExaminationIdString'),
         ('123456789123456', '1', '1234567891234561', NULL, 'Mark as missing'),
-        ('19123456', '3123', '191234563123', NULL, 'Mark as missing when ExaminationIdString is the correct accession number')
+        ('19123456', '3123', '191234563123', NULL, 'Mark as missing when ExaminationIdString is the correct accession number'),
+        ('RAJ_R15123456701', '15123456701', 'VALUE_TOO_LONG', NULL, 'Mark as missing')
         ) AS tmp(ExaminationIdString, ExaminationDicomStudyId, ExaminationAccessionNumber, Expected_ExaminationAccessionNumber, ExpectedTransformationDescription)
     """)
 
