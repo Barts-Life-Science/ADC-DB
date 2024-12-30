@@ -12,10 +12,10 @@ import pacs_data_transformations as DT
 
 # COMMAND ----------
 
-spark.udf.register("identifyMillRefPattern", DT.identifyMillRefPattern)
-spark.udf.register("millRefAccessionNbr", DT.millRefToAccessionNbr)
-spark.udf.register("millRefToExamCode", DT.millRefToExamCode)
-spark.udf.register("transformExamAccessionNumber", DT.transformExamAccessionNumber)
+#spark.udf.register("identifyMillRefPattern", DT.identifyMillRefPattern)
+#spark.udf.register("millRefAccessionNbr", DT.millRefToAccessionNbr)
+#spark.udf.register("millRefToExamCode", DT.millRefToExamCode)
+#spark.udf.register("transformExamAccessionNumber", DT.transformExamAccessionNumber)
 
 # COMMAND ----------
 
@@ -173,6 +173,32 @@ def stag_pacs_examinations_examcode():
 def stag_pacs_examinations():
     df = spark.sql(
         """
+        SELECT 
+            e.*
+        FROM 4_prod.raw.pacs_examinations AS e
+        WHERE ADC_Deleted IS NULL
+        --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
+        --ON excd.ExaminationCode = e.ExaminationCode
+        """
+    )
+    df = df.withColumn('ExaminationAccessionNumber_t', DT.transformExamAccessionNumber(F.col('ExaminationAccessionNumber'), F.col('ExaminationIdString')))
+    df = df.withColumn('ExamRefNbr', F.coalesce(F.col('ExaminationAccessionNumber_t'), F.col('ExaminationIdString'), F.col('ExaminationText1')))
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="intmd_pacs_examinations",
+    comment="intermediate pacs_examinations",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+        #"temporary":"true"
+    }
+)
+def intmd_pacs_examinations():
+    df = spark.sql(
+        """
         WITH er AS (
             SELECT
                 ExaminationReportExaminationId, 
@@ -184,16 +210,13 @@ def stag_pacs_examinations():
         SELECT 
             e.*,
             er.*
-        FROM 4_prod.raw.pacs_examinations AS e
+        FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
-        WHERE ADC_Deleted IS NULL
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         """
     )
-    df = df.withColumn('ExaminationAccessionNumber_t', DT.transformExamAccessionNumber(F.col('ExaminationAccessionNumber'), F.col('ExaminationIdString')))
-    df = df.withColumn('ExamRefNbr', F.coalesce(F.col('ExaminationAccessionNumber_t'), F.col('ExaminationIdString'), F.col('ExaminationText1')))
     return df
 
 # COMMAND ----------
@@ -232,7 +255,7 @@ def pacs_exam():
             ce.MillClinicalEventId,
             ce.MillEventId,
             ce.MillPersonId
-        FROM LIVE.stag_pacs_examinations AS e
+        FROM LIVE.intmd_pacs_examinations AS e
         LEFT JOIN 4_prod.raw.pacs_requests AS r
         ON e.ExaminationReportRequestId = r.RequestId
         LEFT JOIN ce

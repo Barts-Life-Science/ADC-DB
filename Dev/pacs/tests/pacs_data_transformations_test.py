@@ -30,7 +30,8 @@ def test_millRefToAccessionNumber():
         ('UKRLH02001234567CCHAPCCHAP0', 'UKRLH02001234567', 'Keep the first 16 char'),
         ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'Keep the first 16 char'),
         ('UKRLH02001234567NC131YNC131Y0', 'UKRLH02001234567', 'Keep the first 16 char'),
-        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'Keep the first 16 char')
+        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'Keep the first 16 char'),
+        ('UKOUT02001234567_SECTRAMSKUHMSKUH0', 'UKOUT02001234567',  'Keep the first 16 char')
         ) AS tmp(MillRefNbr, Expected_AccessionNbr, ExpectedTransformationDescription)
     """)
 
@@ -54,7 +55,8 @@ def test_millRefToExamCode():
         ('UKRLH02001234567CCHAPCCHAP0', 'UKRLH02001234567', 'CCHAP', 'Keep the exam code without the repeat and the last digit'),
         ('UKRLH02001234567CABDOCCABDOC0', 'UKRLH02001234567', 'CABDOC', 'Keep the exam code without the repeat and the last digit'),
         ('UKRLH02001234567NC131YNC131Y0', 'UKRLH02001234567', 'NC131Y', 'Keep the exam code without the repeat and the last digit'),
-        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'NF18WO', 'Keep the exam code without the repeat and the last digit')
+        ('UKWXH02001234567NF18WONF18WO0', 'UKWXH02001234567', 'NF18WO', 'Keep the exam code without the repeat and the last digit'),
+        ('UKOUT02001234567_SECTRAMSKUHMSKUH0', 'UKOUT02001234567', 'MSKUH', 'Keep the exam code without _SECTRA, the repeat, and the last digit')
 
         ) AS tmp(MillRefNbr, AccessionNbr, Expected_ExamCode, ExpectedTransformationDescription)
     """)
