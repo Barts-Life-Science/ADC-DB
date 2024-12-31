@@ -57,21 +57,36 @@ import pacs_data_transformations as DT
 def pacs_patient_alias():
     return spark.sql(
         """
+        WITH mrn AS (
+            SELECT
+                ALIAS,
+                MAX(PERSON_ID)
+            FROM 4_prod.raw.mill_person_alias AS mrn
+            WHERE 
+                ACTIVE_IND = 1
+                AND PERSON_ALIAS_TYPE_CD = 10 -- MRN
+            GROUP BY ALIAS
+        ),
+        nhs AS (
+            SELECT
+                MAX(ALIAS) AS ALIAS,
+                PERSON_ID
+            FROM 4_prod.raw.mill_person_alias
+            WHERE 
+                PERSON_ALIAS_TYPE_CD = 18 -- NHS
+                AND ACTIVE_IND = 1
+            GROUP BY PERSON_ID
+        )
         SELECT 
             PatientId AS PacsPatientId, 
             CAST(mrn.PERSON_ID AS BIGINT) AS MillPersonId, 
             mrn.ALIAS AS Mrn,
             nhs.ALIAS AS NhsNumber
         FROM 4_prod.raw.pacs_patients AS p
-        LEFT JOIN 4_prod.raw.mill_person_alias AS mrn
+        LEFT JOIN mrn
         ON p.PatientPersonalId = mrn.ALIAS
-        LEFT JOIN 4_prod.raw.mill_person_alias AS nhs
+        LEFT JOIN nhs
         ON mrn.PERSON_ID = nhs.PERSON_ID
-        WHERE 
-            mrn.PERSON_ALIAS_TYPE_CD = 10 -- MRN
-            AND nhs.PERSON_ALIAS_TYPE_CD = 18 -- NHS
-            AND mrn.active_ind = 1
-            AND nhs.active_ind = 1
         """
     )
     
@@ -99,6 +114,15 @@ def pacs_patient_alias():
 def stag_mill_clinical_event_pacs():
     df = spark.sql(
         """
+        -- These are wrong person_id with name like 'TESTDONOTUSE'
+        WITH bad_pid AS (
+            SELECT DISTINCT PERSON_ID
+            FROM 4_prod.raw.mill_person
+            WHERE
+                BIRTH_DT_TM < '1900-01-10'
+                AND LOWER(NAME_FIRST) LIKE '%test%'
+                AND LOWER(NAME_LAST) LIKE '%test%'
+        )
         SELECT
             ce.*,
             COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
@@ -113,12 +137,19 @@ def stag_mill_clinical_event_pacs():
                 ELSE EVENT_START_DT_TM
             END AS MillEventDate,
             event_class_cd.DESCRIPTION AS MillEventClass,
-            event_reltn_cd.DESCRIPTION AS MillEventReltn
+            event_reltn_cd.DESCRIPTION AS MillEventReltn,
+            CASE
+                WHEN bad_pid.PERSON_ID IS NULL
+                THEN ce.PERSON_ID
+                ELSE NULL
+            END AS MillPersonId
         FROM 4_prod.raw.mill_clinical_event AS ce
         LEFT JOIN 3_lookup.mill.mill_code_value AS event_class_cd
         ON ce.EVENT_CLASS_CD = event_class_cd.CODE_VALUE
         LEFT JOIN 3_lookup.mill.mill_code_value AS event_reltn_cd
         ON ce.EVENT_RELTN_CD = event_reltn_cd.CODE_VALUE
+        LEFT JOIN bad_pid
+        ON ce.PERSON_ID = bad_pid.PERSON_ID
         WHERE 
             CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
@@ -213,7 +244,7 @@ def intmd_pacs_examinations():
                 MillAccessionNbr,
                 MAX(CLINICAL_EVENT_ID) AS MillClinicalEventId,
                 MAX(EVENT_ID) AS MillEventId,
-                MAX(PERSON_ID) AS MillPersonId
+                MAX(MillPersonId) AS MillPersonId
             FROM LIVE.stag_mill_clinical_event_pacs
             WHERE LOWER(MillEventReltn) = 'root'
             GROUP BY MillAccessionNbr

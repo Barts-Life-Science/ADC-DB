@@ -36,6 +36,15 @@
 
 # MAGIC %sql
 # MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.intmd_pacs_examinations
+# MAGIC WHERE PacsMillPersonId IS NULL
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
 # MAGIC -- Check consistency on MillPersonId between mill_clinical_event and pacs_examinations tables
 # MAGIC
 # MAGIC SELECT COUNT(*)
@@ -48,7 +57,7 @@
 # MAGIC
 # MAGIC SELECT *
 # MAGIC FROM 4_prod.pacs.intmd_pacs_examinations
-# MAGIC WHERE MillPersonId != ExamMillPersonId
+# MAGIC WHERE MillPersonId != PacsMillPersonId
 # MAGIC LIMIT 100
 
 # COMMAND ----------
@@ -77,3 +86,7 @@
 # MAGIC FROM 4_prod.pacs.pacs_exam
 # MAGIC WHERE MillPersonId IS NULL 
 # MAGIC LIMIT 100
+
+# COMMAND ----------
+
+
