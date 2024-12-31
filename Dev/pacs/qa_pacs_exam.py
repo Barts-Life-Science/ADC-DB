@@ -43,6 +43,10 @@
 
 # COMMAND ----------
 
+
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC
 # MAGIC -- Check consistency on MillPersonId between mill_clinical_event and pacs_examinations tables
@@ -70,12 +74,33 @@
 # MAGIC %sql
 # MAGIC
 # MAGIC SELECT COUNT(*)
+# MAGIC
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC
+# MAGIC SELECT 'Missing MillAccessionNbr', COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE MillAccessionNbr IS NULL
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'Missing MillAccessionNbr and ExamRefNbr', COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE MillAccessionNbr IS NULL AND ExamRefNbr IS NULL
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'Missing MillPersonId', COUNT(*)
 # MAGIC FROM 4_prod.pacs.pacs_exam
 # MAGIC WHERE MillPersonId IS NULL 
 # MAGIC
 # MAGIC UNION
 # MAGIC
-# MAGIC SELECT COUNT(*)
+# MAGIC SELECT 'Total', COUNT(*)
 # MAGIC FROM 4_prod.pacs.pacs_exam
 # MAGIC
 

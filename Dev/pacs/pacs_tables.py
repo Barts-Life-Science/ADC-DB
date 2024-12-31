@@ -60,7 +60,7 @@ def pacs_patient_alias():
         WITH mrn AS (
             SELECT
                 ALIAS,
-                MAX(PERSON_ID)
+                MAX(PERSON_ID) AS PERSON_ID
             FROM 4_prod.raw.mill_person_alias AS mrn
             WHERE 
                 ACTIVE_IND = 1
