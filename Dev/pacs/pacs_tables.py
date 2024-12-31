@@ -217,6 +217,13 @@ def intmd_pacs_examinations():
             FROM LIVE.stag_mill_clinical_event_pacs
             WHERE LOWER(MillEventReltn) = 'root'
             GROUP BY MillAccessionNbr
+        ),
+        pa AS (
+            SELECT
+                PacsPatientId,
+                MAX(MillPersonId) AS MillPersonId
+            FROM LIVE.pacs_patient_alias
+            GROUP BY PacsPatientId
         )
         SELECT 
             e.*,
@@ -226,7 +233,8 @@ def intmd_pacs_examinations():
             ce.MillAccessionNbr,
             ce.MillClinicalEventId,
             ce.MillEventId,
-            ce.MillPersonId
+            ce.MillPersonId,
+            pa.MillPersonId AS PacsMillPersonId
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
@@ -234,6 +242,8 @@ def intmd_pacs_examinations():
         ON er.ExaminationReportRequestId = r.RequestId
         LEFT JOIN ce
         ON ce.MillAccessionNbr = r.RequestIdString
+        LEFT JOIN pa
+        ON e.ExaminationPatientId = pa.PacsPatientId
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         WHERE 
@@ -268,7 +278,7 @@ def pacs_exam():
             ExamRefNbr,
             MillClinicalEventId,
             MillEventId,
-            MillPersonId
+            COALESCE(PacsMillPersonId, MillPersonId) AS MillPersonId
         FROM LIVE.intmd_pacs_examinations AS e
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
