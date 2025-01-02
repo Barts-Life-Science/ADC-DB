@@ -57,15 +57,26 @@ import pacs_data_transformations as DT
 def pacs_patient_alias():
     return spark.sql(
         """
-        WITH mrn AS (
+        WITH alias AS (
             SELECT
                 ALIAS,
-                MAX(PERSON_ID) AS PERSON_ID
-            FROM 4_prod.raw.mill_person_alias AS mrn
+                MAX(PERSON_ID) AS PERSON_ID,
+                MAX(PERSON_ALIAS_TYPE_CD) AS PERSON_ALIAS_TYPE_CD
+            FROM 4_prod.raw.mill_person_alias
+            WHERE 
+                ACTIVE_IND = 1
+                AND PERSON_ID IS NOT NULL
+            GROUP BY ALIAS
+        ),
+        mrn AS (
+            SELECT
+                MAX(ALIAS) AS ALIAS,
+                PERSON_ID
+            FROM 4_prod.raw.mill_person_alias
             WHERE 
                 ACTIVE_IND = 1
                 AND PERSON_ALIAS_TYPE_CD = 10 -- MRN
-            GROUP BY ALIAS
+            GROUP BY PERSON_ID
         ),
         nhs AS (
             SELECT
@@ -76,17 +87,32 @@ def pacs_patient_alias():
                 PERSON_ALIAS_TYPE_CD = 18 -- NHS
                 AND ACTIVE_IND = 1
             GROUP BY PERSON_ID
+        ),
+        exam AS (
+            SELECT
+                ExaminationPatientId,
+                MAX(ExaminationDate) AS LatestExamDate
+            FROM LIVE.stag_pacs_examinations
+            GROUP BY ExaminationPatientId
         )
         SELECT 
             PatientId AS PacsPatientId, 
-            CAST(mrn.PERSON_ID AS BIGINT) AS MillPersonId, 
+            PatientPersonalId,
+            alias.ALIAS AS MillAlias,
+            alias.PERSON_ALIAS_TYPE_CD AS MillAliasType,
+            CAST(alias.PERSON_ID AS BIGINT) AS MillPersonId,
             mrn.ALIAS AS Mrn,
-            nhs.ALIAS AS NhsNumber
+            nhs.ALIAS AS NhsNumber,
+            exam.LatestExamDate
         FROM 4_prod.raw.pacs_patients AS p
+        LEFT JOIN alias
+        ON p.PatientPersonalId = alias.ALIAS
         LEFT JOIN mrn
-        ON p.PatientPersonalId = mrn.ALIAS
+        ON alias.PERSON_ID = mrn.PERSON_ID
         LEFT JOIN nhs
-        ON mrn.PERSON_ID = nhs.PERSON_ID
+        ON alias.PERSON_ID = nhs.PERSON_ID
+        LEFT JOIN exam
+        ON p.PatientId = exam.ExaminationPatientId
         """
     )
     
