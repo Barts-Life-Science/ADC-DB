@@ -41,12 +41,8 @@ import pacs_data_transformations as DT
 
 # COMMAND ----------
 
-
-
-# COMMAND ----------
-
 @dlt.table(
-    name="pacs_patient_alias",
+    name="stag_patient_alias",
     comment="PacsPatientId, MillPersonId, Mrn, NhsNumber",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -54,7 +50,7 @@ import pacs_data_transformations as DT
         #"pipelines.autoOptimize.zOrderCols": "MillPersonId"
     }
 )
-def pacs_patient_alias():
+def stag_patient_alias():
     return spark.sql(
         """
         WITH alias AS (
@@ -87,13 +83,6 @@ def pacs_patient_alias():
                 PERSON_ALIAS_TYPE_CD = 18 -- NHS
                 AND ACTIVE_IND = 1
             GROUP BY PERSON_ID
-        ),
-        exam AS (
-            SELECT
-                ExaminationPatientId,
-                MAX(ExaminationDate) AS LatestExamDate
-            FROM LIVE.stag_pacs_examinations
-            GROUP BY ExaminationPatientId
         )
         SELECT 
             PatientId AS PacsPatientId, 
@@ -102,8 +91,7 @@ def pacs_patient_alias():
             alias.PERSON_ALIAS_TYPE_CD AS MillAliasType,
             CAST(alias.PERSON_ID AS BIGINT) AS MillPersonId,
             mrn.ALIAS AS Mrn,
-            nhs.ALIAS AS NhsNumber,
-            exam.LatestExamDate
+            nhs.ALIAS AS NhsNumber
         FROM 4_prod.raw.pacs_patients AS p
         LEFT JOIN alias
         ON p.PatientPersonalId = alias.ALIAS
@@ -111,8 +99,39 @@ def pacs_patient_alias():
         ON alias.PERSON_ID = mrn.PERSON_ID
         LEFT JOIN nhs
         ON alias.PERSON_ID = nhs.PERSON_ID
+        """
+    )
+    
+
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="pacs_patient_alias",
+    comment="PacsPatientId, MillPersonId, Mrn, NhsNumber",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"#,
+        #"pipelines.autoOptimize.zOrderCols": "MillPersonId"
+    }
+)
+def pacs_patient_alias():
+    return spark.sql(
+        """
+        WITH exam AS (
+            SELECT
+                ExaminationPatientId,
+                MAX(ExaminationDate) AS LatestExamDate
+            FROM LIVE.stag_pacs_examinations
+            GROUP BY ExaminationPatientId
+        )
+        SELECT 
+            p.*,
+            exam.LatestExamDate
+        FROM LIVE.stag_patient_alias AS p
         LEFT JOIN exam
-        ON p.PatientId = exam.ExaminationPatientId
+        ON p.PacsPatientId = exam.ExaminationPatientId
         """
     )
     
@@ -279,7 +298,7 @@ def intmd_pacs_examinations():
             SELECT
                 PacsPatientId,
                 MAX(MillPersonId) AS MillPersonId
-            FROM LIVE.pacs_patient_alias
+            FROM LIVE.stag_patient_alias
             GROUP BY PacsPatientId
         )
         SELECT 
