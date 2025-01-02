@@ -344,6 +344,8 @@ def pacs_exam():
         """
         SELECT 
             ExaminationId,
+            ExaminationCode,
+            ExaminationDescription,
             ExaminationModality,
             ExaminationBodyPart,
             ExaminationScheduledDate,

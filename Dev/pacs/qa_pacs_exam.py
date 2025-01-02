@@ -88,9 +88,15 @@
 # MAGIC
 # MAGIC UNION
 # MAGIC
-# MAGIC SELECT 'Missing MillAccessionNbr and ExamRefNbr', COUNT(*)
+# MAGIC SELECT 'Missing ExamRefNbr', COUNT(*)
 # MAGIC FROM 4_prod.pacs.pacs_exam
-# MAGIC WHERE MillAccessionNbr IS NULL AND ExamRefNbr IS NULL
+# MAGIC WHERE ExamRefNbr IS NULL
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'Missing MillAccessionNbr, ExamRefNbr, RequestIdString', COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE MillAccessionNbr IS NULL AND ExamRefNbr IS NULL AND RequestIdString IS NULL
 # MAGIC
 # MAGIC UNION
 # MAGIC
@@ -102,6 +108,22 @@
 # MAGIC
 # MAGIC SELECT 'Total', COUNT(*)
 # MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'MillAccessionNbr = ExamRefNbr', COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE 
+# MAGIC   MillAccessionNbr = ExamRefNbr
+# MAGIC   AND ExamRefNbr IS NOT NULL
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'MillAccessionNbr = RequestIdString', COUNT(*)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC WHERE 
+# MAGIC   MillAccessionNbr = RequestIdString
+# MAGIC   AND RequestIdString IS NOT NULL
 # MAGIC
 
 # COMMAND ----------
