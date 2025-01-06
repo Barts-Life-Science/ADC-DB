@@ -395,13 +395,15 @@ def stag_pacs_requests():
             ) AS SplitRequestQuestion,
             REGEXP_COUNT(
                 RequestQuestion, 
-                r'----- ([A-Z0-9]{4,8}) ------'
-            ) AS ParsedRequestExamCodeCount
+                --r'----- ([A-Z0-9]{4,8}) ------'
+                r'----- '
+            ) AS RequestQuestionSplitCount
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
         """)
-    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, "----- ", "")) = 0")
+    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, '----- ', '')) = 0")
+    df = df.withColumn("RequestExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
     return df
 
 
