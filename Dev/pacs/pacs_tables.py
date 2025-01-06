@@ -400,11 +400,8 @@ def stag_pacs_requests():
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
-            AND (
-                LENGTH(SplitRequestQuestion) > 0
-                OR LENGTH(RequestQuestion) = 0
         """)
-    
+    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, "----- ", "")) = 0")
     return df
 
 
