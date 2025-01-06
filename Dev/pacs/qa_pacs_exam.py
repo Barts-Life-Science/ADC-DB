@@ -125,6 +125,11 @@
 # MAGIC   MillAccessionNbr = RequestIdString
 # MAGIC   AND RequestIdString IS NOT NULL
 # MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT 'Distinct ExaminationId', COUNT(DISTINCT ExaminationId)
+# MAGIC FROM 4_prod.pacs.pacs_exam
+# MAGIC
 
 # COMMAND ----------
 

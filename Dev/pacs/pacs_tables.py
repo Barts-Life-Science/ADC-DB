@@ -300,6 +300,14 @@ def intmd_pacs_examinations():
                 MAX(MillPersonId) AS MillPersonId
             FROM LIVE.stag_patient_alias
             GROUP BY PacsPatientId
+        ),
+        r AS (
+            SELECT 
+                RequestId,
+                MAX(RequestIdString) AS RequestIdString
+            FROM LIVE.stag_pacs_requests
+            WHERE ADC_Deleted IS NULL
+            GROUP BY RequestId
         )
         SELECT 
             e.*,
@@ -314,7 +322,7 @@ def intmd_pacs_examinations():
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
-        LEFT JOIN 4_prod.raw.pacs_requests AS r
+        LEFT JOIN r
         ON er.ExaminationReportRequestId = r.RequestId
         LEFT JOIN ce
         ON ce.MillAccessionNbr = r.RequestIdString
@@ -324,7 +332,6 @@ def intmd_pacs_examinations():
         --ON excd.ExaminationCode = e.ExaminationCode
         WHERE 
             e.ADC_Deleted IS NULL
-            AND r.ADC_Deleted IS NULL
         """
     )
     return df
@@ -361,6 +368,74 @@ def pacs_exam():
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         """)
+    
+    return df
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_pacs_requests",
+    comment="staging pacs requests table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    }
+)
+def stag_pacs_requests():
+    df = spark.sql(
+        """
+        SELECT
+            *,
+            EXPLODE_OUTER(
+                SPLIT(
+                    RequestQuestion, 
+                    r'----- '
+                )
+            ) AS SplitRequestQuestion,
+            REGEXP_COUNT(
+                RequestQuestion, 
+                r'----- ([A-Z0-9]{4,8}) ------'
+            ) AS ParsedRequestExamCodeCount
+        FROM 4_prod.raw.pacs_requests
+        WHERE 
+            ADC_Deleted IS NULL
+            AND (
+                LENGTH(SplitRequestQuestion) > 0
+                OR LENGTH(RequestQuestion) = 0
+        """)
+    
+    return df
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="intmd_pacs_requests",
+    comment="intermediate pacs requests table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    }
+)
+def intmd_pacs_requests():
+    df = spark.sql(
+        """
+        WITH pa AS (
+            SELECT
+                PacsPatientId,
+                MAX(MillPersonId) AS MillPersonId
+            FROM LIVE.stag_patient_alias
+            GROUP BY PacsPatientId
+        )
+        SELECT
+            r.*,
+            pa.MillPersonId
+        FROM LIVE.stag_pacs_requests AS r
+        LEFT JOIN pa
+        ON r.RequestPatientId = pa.PacsPatientId
+        """)
+    
     
     return df
 
