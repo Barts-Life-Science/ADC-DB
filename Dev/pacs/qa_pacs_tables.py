@@ -124,3 +124,52 @@
 # MAGIC   'ExamCode' AS tag,
 # MAGIC   1-COUNT(MillExamCode)/COUNT(*) AS value
 # MAGIC FROM 4_prod.pacs.stag_mill_clinical_event_pacs
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Total count' AS item,
+# MAGIC   'Total' AS tag,
+# MAGIC   COUNT(*) AS value
+# MAGIC FROM 4_prod.raw.pacs_requests
+# MAGIC WHERE ADC_Deleted IS NULL
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'Missing RequestPatientId' AS item,
+# MAGIC   'PatientId' AS tag,
+# MAGIC   1-COUNT(RequestPatientId)/COUNT(*) AS value
+# MAGIC FROM 4_prod.raw.pacs_requests
+# MAGIC WHERE ADC_Deleted IS NULL
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'Missing RequestIdString' AS item,
+# MAGIC   'ExamRefNbr' AS tag,
+# MAGIC   1-COUNT(RequestIdString)/COUNT(*) AS value
+# MAGIC FROM 4_prod.raw.pacs_requests
+# MAGIC WHERE ADC_Deleted IS NULL
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Total count' AS item,
+# MAGIC   'Total' AS tag,
+# MAGIC   COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'Missing RequestQuestionExamCode' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(RequestQuestionExamCode)/COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC
