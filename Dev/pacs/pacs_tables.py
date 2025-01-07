@@ -181,20 +181,20 @@ def stag_mill_clinical_event_pacs():
                 THEN NULL
                 ELSE EVENT_START_DT_TM
             END AS MillEventDate,
-            event_class_cd.DESCRIPTION AS MillEventClass,
-            event_reltn_cd.DESCRIPTION AS MillEventReltn,
             CASE
                 WHEN bad_pid.PERSON_ID IS NULL
                 THEN ce.PERSON_ID
                 ELSE NULL
-            END AS MillPersonId
+            END AS MillPersonId,
+            event_class_cd.DESCRIPTION AS MillEventClass,
+            event_reltn_cd.DESCRIPTION AS MillEventReltn
         FROM 4_prod.raw.mill_clinical_event AS ce
+        LEFT JOIN bad_pid
+        ON ce.PERSON_ID = bad_pid.PERSON_ID
         LEFT JOIN 3_lookup.mill.mill_code_value AS event_class_cd
         ON ce.EVENT_CLASS_CD = event_class_cd.CODE_VALUE
         LEFT JOIN 3_lookup.mill.mill_code_value AS event_reltn_cd
         ON ce.EVENT_RELTN_CD = event_reltn_cd.CODE_VALUE
-        LEFT JOIN bad_pid
-        ON ce.PERSON_ID = bad_pid.PERSON_ID
         WHERE 
             CONTRIBUTOR_SYSTEM_CD = 6141416 -- BLT_TIE_RAD 
             AND VALID_UNTIL_DT_TM > CURRENT_TIMESTAMP()
@@ -206,6 +206,10 @@ def stag_mill_clinical_event_pacs():
     df = df.withColumn("MillExamCode", DT.millRefToExamCode(F.col("MillRefNbr"), F.col("MillAccessionNbr")))
     df = df.withColumn("MillEventDate", F.coalesce(F.col("MillEventDate"), F.col("PERFORMED_DT_TM")))
     return df
+
+
+# COMMAND ----------
+
 
 
 # COMMAND ----------
@@ -324,7 +328,7 @@ def intmd_pacs_examinations():
         ON er.examinationreportexaminationid = e.examinationid
         LEFT JOIN r
         ON er.ExaminationReportRequestId = r.RequestId
-        LEFT JOIN ce
+        LEFT JOIN ce -- TODO: this should join with ExamRefNbr too
         ON ce.MillAccessionNbr = r.RequestIdString
         LEFT JOIN pa
         ON e.ExaminationPatientId = pa.PacsPatientId
