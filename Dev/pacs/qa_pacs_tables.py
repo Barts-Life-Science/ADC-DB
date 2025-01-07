@@ -173,3 +173,35 @@
 # MAGIC   1-COUNT(RequestQuestionExamCode)/COUNT(*) AS value
 # MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
 # MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ## Intermediate
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Total count' AS item,
+# MAGIC   'Total' AS tag,
+# MAGIC   COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Missing MillPersonId' AS item,
+# MAGIC   'PatientId' AS tag,
+# MAGIC   1-COUNT(MillPersonId)/COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Missing MillPersonId_t' AS item,
+# MAGIC   'PatientId' AS tag,
+# MAGIC   1-COUNT(MillPersonId_t)/COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam

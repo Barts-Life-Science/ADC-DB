@@ -506,6 +506,14 @@ def intmd_pacs_requestexam():
                 RequestAnamnesisExamCodeSeq AS RequestExamCodeSeq
             FROM LIVE.stag_pacs_requestanamnesis
             
+        ),
+        ce AS (
+            SELECT
+                MillAccessionNbr,
+                MAX(MillPersonId) AS MillPersonId,
+                MAX(MillEventDate) AS MillEventDate
+            FROM LIVE.stag_mill_clinical_event_pacs
+            GROUP BY MillAccessionNbr
         )
         SELECT
             r.*,
@@ -513,7 +521,8 @@ def intmd_pacs_requestexam():
             uni.RequestExamCodeSeq,
             rq.SplitRequestQuestion,
             ra.SplitRequestAnamnesis,
-            pa.MillPersonId
+            pa.MillPersonId,
+            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t
         FROM uni
         LEFT JOIN LIVE.stag_pacs_requestquestion AS rq
         ON uni.RequestId = rq.RequestId
@@ -527,6 +536,8 @@ def intmd_pacs_requestexam():
         ON uni.RequestId = r.RequestId
         LEFT JOIN pa
         ON r.RequestPatientId = pa.PacsPatientId
+        LEFT JOIN ce
+        ON r.RequestIdString = ce.MillAccessionNbr
         """)
     
     
