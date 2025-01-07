@@ -305,7 +305,7 @@ def intmd_pacs_examinations():
             SELECT 
                 RequestId,
                 MAX(RequestIdString) AS RequestIdString
-            FROM LIVE.stag_pacs_requests
+            FROM 4_prod.raw.pacs_requests
             WHERE ADC_Deleted IS NULL
             GROUP BY RequestId
         )
@@ -374,40 +374,6 @@ def pacs_exam():
 
 # COMMAND ----------
 
-@dlt.table(
-    name="stag_pacs_requests",
-    comment="staging pacs requests table",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    }
-)
-def stag_pacs_requests():
-    df = spark.sql(
-        """
-        SELECT
-            *,
-            EXPLODE_OUTER(
-                SPLIT(
-                    RequestQuestion, 
-                    r'----- '
-                )
-            ) AS SplitRequestQuestion,
-            REGEXP_COUNT(
-                RequestQuestion, 
-                --r'----- ([A-Z0-9]{4,8}) ------'
-                r'----- '
-            ) AS RequestQuestionSplitCount
-        FROM 4_prod.raw.pacs_requests
-        WHERE 
-            ADC_Deleted IS NULL
-        """)
-    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, '----- ', '')) = 0")
-    df = df.withColumn("RequestExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
-    df = df.withColumn("RequestExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestExamCode").orderBy("RequestId")))
-    # add another col to show whether examcode is in the right format
-    # Separate 
-    return df
 
 
 # COMMAND ----------
@@ -481,8 +447,9 @@ def stag_pacs_requestanamnesis():
             ADC_Deleted IS NULL
         """)
     df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR LENGTH(REPLACE(RequestAnamnesis, '----- ', '')) = 0")
-    df = df.withColumn("RequestAnamesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
-    df = df.withColumn("RequestAnamesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamesisExamCode").orderBy("RequestId")))
+    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
+    # TODO: Add index to array after regexp instead of this
+    df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
     # add another col to show whether examcode is in the right format
     return df
 
@@ -490,14 +457,14 @@ def stag_pacs_requestanamnesis():
 # COMMAND ----------
 
 @dlt.table(
-    name="intmd_pacs_requests",
+    name="intmd_pacs_requestexam",
     comment="intermediate pacs requests table",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
     }
 )
-def intmd_pacs_requests():
+def intmd_pacs_requestexam():
     df = spark.sql(
         """
         WITH pa AS (
@@ -506,11 +473,46 @@ def intmd_pacs_requests():
                 MAX(MillPersonId) AS MillPersonId
             FROM LIVE.stag_patient_alias
             GROUP BY PacsPatientId
+        ),
+        r AS (
+            SELECT *
+            FROM 4_prod.raw.pacs_requests
+            WHERE ADC_Deleted IS NULL
+        ),
+        uni AS (
+            SELECT
+                RequestId,
+                RequestQuestionExamCode AS RequestExamCode,
+                RequestQuestionExamCodeSeq AS RequestExamCodeSeq
+            FROM LIVE.stag_pacs_requestquestion
+
+            UNION
+
+            SELECT
+                RequestId,
+                RequestAnamnesisExamCode AS RequestExamCode,
+                RequestAnamnesisExamCodeSeq AS RequestExamCodeSeq
+            FROM LIVE.stag_pacs_requestanamnesis
+            
         )
         SELECT
             r.*,
+            uni.RequestExamCode,
+            uni.RequestExamCodeSeq,
+            rq.SplitRequestQuestion,
+            ra.SplitRequestAnamnesis,
             pa.MillPersonId
-        FROM LIVE.stag_pacs_requests AS r
+        FROM uni
+        LEFT JOIN LIVE.stag_pacs_requestquestion AS rq
+        ON uni.RequestId = rq.RequestId
+        AND uni.RequestExamCode = rq.RequestQuestionExamCode
+        AND uni.RequestExamCodeSeq = rq.RequestQuestionExamCodeSeq
+        LEFT JOIN LIVE.stag_pacs_requestanamnesis AS ra
+        ON uni.RequestId = ra.RequestId
+        AND uni.RequestExamCode = ra.RequestAnamnesisExamCode
+        AND uni.RequestExamCodeSeq = ra.RequestAnamnesisExamCodeSeq
+        LEFT JOIN r
+        ON uni.RequestId = r.RequestId
         LEFT JOIN pa
         ON r.RequestPatientId = pa.PacsPatientId
         """)
