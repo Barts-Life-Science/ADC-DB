@@ -1,7 +1,7 @@
 # Databricks notebook source
 import dlt
 from pyspark.sql import functions as F
-
+from pyspark.sql.window import *
 
 # COMMAND ----------
 
@@ -404,6 +404,86 @@ def stag_pacs_requests():
         """)
     df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, '----- ', '')) = 0")
     df = df.withColumn("RequestExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
+    df = df.withColumn("RequestExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestExamCode").orderBy("RequestId")))
+    # add another col to show whether examcode is in the right format
+    # Separate 
+    return df
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_pacs_requestquestion",
+    comment="staging pacs requests table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    }
+)
+def stag_pacs_requestquestion():
+    df = spark.sql(
+        """
+        SELECT
+            RequestId,
+            RequestQuestion,
+            EXPLODE_OUTER(
+                SPLIT(
+                    RequestQuestion, 
+                    r'----- '
+                )
+            ) AS SplitRequestQuestion,
+            REGEXP_COUNT(
+                RequestQuestion, 
+                --r'----- ([A-Z0-9]{4,8}) ------'
+                r'----- '
+            ) AS RequestQuestionSplitCount
+        FROM 4_prod.raw.pacs_requests
+        WHERE 
+            ADC_Deleted IS NULL
+        """)
+    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, '----- ', '')) = 0")
+    df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
+    df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
+    # add another col to show whether examcode is in the right format
+    # Separate 
+    return df
+
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_pacs_requestanamnesis",
+    comment="staging pacs requests table",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    }
+)
+def stag_pacs_requestanamnesis():
+    df = spark.sql(
+        """
+        SELECT
+            RequestId,
+            RequestAnamnesis,
+            EXPLODE_OUTER(
+                SPLIT(
+                    RequestAnamnesis,
+                    r'----- '
+                )
+            ) AS SplitRequestAnamnesis,
+            REGEXP_COUNT(
+                RequestAnamnesis, 
+                --r'----- ([A-Z0-9]{4,8}) ------'
+                r'----- '
+            ) AS RequestAnanesisSplitCount
+        FROM 4_prod.raw.pacs_requests
+        WHERE 
+            ADC_Deleted IS NULL
+        """)
+    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR LENGTH(REPLACE(RequestAnamnesis, '----- ', '')) = 0")
+    df = df.withColumn("RequestAnamesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
+    df = df.withColumn("RequestAnamesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamesisExamCode").orderBy("RequestId")))
+    # add another col to show whether examcode is in the right format
     return df
 
 
