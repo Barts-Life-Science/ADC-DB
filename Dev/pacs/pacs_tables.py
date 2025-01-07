@@ -432,7 +432,7 @@ def stag_pacs_requestanamnesis():
             RequestId,
             RequestAnamnesis,
             EXPLODE_OUTER(
-                SPLIT(
+                SPLIT( -- split order is not guaranteed
                     RequestAnamnesis,
                     r'----- '
                 )
@@ -441,12 +441,20 @@ def stag_pacs_requestanamnesis():
                 RequestAnamnesis, 
                 --r'----- ([A-Z0-9]{4,8}) ------'
                 r'----- '
-            ) AS RequestAnanesisSplitCount
+            ) AS RequestAnamnesisSplitCount
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
         """)
-    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR LENGTH(REPLACE(RequestAnamnesis, '----- ', '')) = 0")
+    # Attempt to add examcode seq order info
+    '''
+    df = df.withColumn("RequestAnamnesisSplitCount", F.size(F.col("SplitRequestAnamnesisArray")))
+    # Each array element maps to a new row
+    df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
+    '''
+
+    # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
+    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR LENGTH(RequestAnamnesis) = 0")
     df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
