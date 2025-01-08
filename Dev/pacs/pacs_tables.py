@@ -411,7 +411,7 @@ def stag_pacs_requestquestion():
         WHERE 
             ADC_Deleted IS NULL
         """)
-    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR LENGTH(REPLACE(RequestQuestion, '----- ', '')) = 0")
+    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount = 0 OR RequestQuestion IS NULL")
     df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
     # add another col to show whether examcode is in the right format
@@ -458,7 +458,7 @@ def stag_pacs_requestanamnesis():
     '''
 
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
-    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR LENGTH(RequestAnamnesis) = 0")
+    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount = 0 OR RequestAnamnesis IS NULL")
     df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
@@ -522,7 +522,8 @@ def intmd_pacs_requestexam():
             rq.SplitRequestQuestion,
             ra.SplitRequestAnamnesis,
             pa.MillPersonId,
-            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t
+            --COALESCE(pa.MillPersonId, ce.MillPersonId), AS MillPersonId_t
+            ce.MillEventDate
         FROM uni
         LEFT JOIN LIVE.stag_pacs_requestquestion AS rq
         ON uni.RequestId = rq.RequestId

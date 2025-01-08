@@ -170,9 +170,25 @@
 # MAGIC SELECT
 # MAGIC   'Missing RequestQuestionExamCode' AS item,
 # MAGIC   'ExamCode' AS tag,
-# MAGIC   1-COUNT(RequestQuestionExamCode)/COUNT(*) AS value
+# MAGIC   1-COUNT(RequestQuestionExamCode)/(SELECT COUNT(*) FROM 4_prod.pacs.stag_pacs_requestquestion WHERE LENGTH(RequestQuestion)>0) AS value
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC WHERE LENGTH(RequestQuestionExamCode) > 0 
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT
+# MAGIC   'RequestId in pacs_requests but not in stag_pacs_requestquestion' AS item,
+# MAGIC   'Id' AS tag,
+# MAGIC   1-COUNT(DISTINCT RequestId)/(SELECT COUNT(DISTINCT RequestId) FROM 4_prod.raw.pacs_requests WHERE ADC_Deleted IS NULL)  AS value
 # MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
 # MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing RequestQuestion' AS item,
+# MAGIC   'Input' AS tag,
+# MAGIC   1-COUNT(RequestQuestion)/(SELECT COUNT(*) FROM 4_prod.raw.pacs_requests) AS value
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC WHERE LENGTH(RequestQuestion) > 0
 
 # COMMAND ----------
 
@@ -198,10 +214,10 @@
 # MAGIC   1-COUNT(MillPersonId)/COUNT(*) AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
 # MAGIC
-# MAGIC UNION ALL
 # MAGIC
-# MAGIC SELECT 
-# MAGIC   'Missing MillPersonId_t' AS item,
-# MAGIC   'PatientId' AS tag,
-# MAGIC   1-COUNT(MillPersonId_t)/COUNT(*) AS value
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'RequestId in pacs_requests but not in intmd_pacs_requestexam' AS item,
+# MAGIC   'Id' AS tag,
+# MAGIC   1-COUNT(DISTINCT RequestId)/(SELECT COUNT(DISTINCT RequestId) FROM 4_prod.raw.pacs_requests WHERE ADC_Deleted IS NULL)  AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
