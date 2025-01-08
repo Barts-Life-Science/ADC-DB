@@ -214,6 +214,13 @@
 # MAGIC   1-COUNT(MillPersonId)/COUNT(*) AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
 # MAGIC
+# MAGIC UNION ALL
+# MAGIC
+# MAGIC SELECT 
+# MAGIC   'Missing MillPersonId_t' AS item,
+# MAGIC   'PatientId' AS tag,
+# MAGIC   1-COUNT(MillPersonId_t)/COUNT(*) AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
 # MAGIC
 # MAGIC UNION ALL
 # MAGIC SELECT
@@ -242,4 +249,40 @@
 # MAGIC   'Missing ExamDate' AS item,
 # MAGIC   'ExamDate' AS tag,
 # MAGIC   1-COUNT(ExamDate)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ExamCode' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(RequestExamCode)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ExamCode_t' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(RequestExamCode_t)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ExaminationId' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(ExaminationId)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing MillClinicalEventId' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(MillClinicalEventId)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ReportId' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   1-COUNT(ReportId)/COUNT(*)  AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam

@@ -396,23 +396,23 @@ def stag_pacs_requestquestion():
         SELECT
             RequestId,
             RequestQuestion,
-            EXPLODE_OUTER(
-                SPLIT(
-                    RequestQuestion, 
-                    r'----- '
-                )
-            ) AS SplitRequestQuestion,
-            REGEXP_COUNT(
+            SPLIT(
                 RequestQuestion, 
-                --r'----- ([A-Z0-9]{4,8}) ------'
                 r'----- '
-            ) AS RequestQuestionSplitCount
+            ) AS SplitRequestQuestionArray
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
         """)
-    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount = 0 OR RequestQuestion IS NULL")
+    df = df.withColumn("RequestQuestionSplitCount", F.size(F.col("SplitRequestQuestionArray")))
+    df = df.withColumn("RequestQuestionSplitCount", F.coalesce(F.col("RequestQuestionSplitCount"), F.lit(0)))
+    # Each array element maps to a new row
+    df = df.select(df["*"], F.explode_outer(F.col("SplitRequestQuestionArray")).alias("SplitRequestQuestion"))
+
+
+    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
     df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
+    df = df.withColumn("RequestQuestionExamCode", F.when(F.length(F.col("RequestQuestionExamCode"))>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
     # add another col to show whether examcode is in the right format
     # Separate 
@@ -435,31 +435,23 @@ def stag_pacs_requestanamnesis():
         SELECT
             RequestId,
             RequestAnamnesis,
-            EXPLODE_OUTER(
-                SPLIT( -- split order is not guaranteed
-                    RequestAnamnesis,
-                    r'----- '
-                )
-            ) AS SplitRequestAnamnesis,
-            REGEXP_COUNT(
-                RequestAnamnesis, 
-                --r'----- ([A-Z0-9]{4,8}) ------'
+            SPLIT( -- split order is not guaranteed
+                RequestAnamnesis,
                 r'----- '
-            ) AS RequestAnamnesisSplitCount
+            ) AS SplitRequestAnamnesisArray
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
         """)
-    # Attempt to add examcode seq order info
-    '''
+
     df = df.withColumn("RequestAnamnesisSplitCount", F.size(F.col("SplitRequestAnamnesisArray")))
+    df = df.withColumn("RequestAnamnesisSplitCount", F.coalesce(F.col("RequestAnamnesisSplitCount"), F.lit(0)))
     # Each array element maps to a new row
     df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
-    '''
-
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
-    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount = 0 OR RequestAnamnesis IS NULL")
+    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
     df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
+    df = df.withColumn("RequestAnamnesisExamCode", F.when(F.length(F.col("RequestAnamnesisExamCode"))>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
     # add another col to show whether examcode is in the right format
@@ -511,39 +503,68 @@ def intmd_pacs_requestexam():
             SELECT
                 MillAccessionNbr,
                 MAX(MillPersonId) AS MillPersonId,
-                MAX(MillEventDate) AS MillEventDate
+                MAX(MillEventDate) AS MillEventDate,
+                Max(MillExamCode) AS MillExamCode,
+                MAX(Clinical_Event_Id) AS MillClinicalEventId
             FROM LIVE.stag_mill_clinical_event_pacs
             GROUP BY MillAccessionNbr
         ),
-        examdate AS (
+        exam AS (
             SELECT
                 ExaminationReportRequestId,
-                MAX(ExaminationDate) AS ExaminationDate
+                MAX(ExaminationDate) AS ExaminationDate,
+                MAX(ExaminationCode) AS ExaminationCode,
+                MAX(ExaminationId) AS ExaminationId
             FROM 4_prod.raw.pacs_examinationreports AS er
             LEFT JOIN LIVE.stag_pacs_examinations AS e
             ON er.examinationreportexaminationid = e.examinationid
             WHERE e.ADC_Deleted IS NULL
             GROUP BY ExaminationReportRequestId
+        ),
+        erp AS (
+            SELECT
+                ExaminationReportRequestId,
+                MAX(ReportId) AS ReportId,
+                MAX(ReportDate) AS ReportDate
+            FROM 4_prod.raw.pacs_examinationreports AS er
+            LEFT JOIN 4_prod.raw.pacs_reports AS rp
+            ON er.examinationreportreportid = rp.reportid
+            WHERE rp.ADC_Deleted IS NULL
+            GROUP BY ExaminationReportRequestId
         )
         SELECT
             r.*,
-            uni.RequestExamCode,
+            CASE
+                WHEN LENGTH(uni.RequestExamCode) = 0
+                THEN NULL
+                ELSE uni.RequestExamCode
+            END AS RequestExamCode,
+            exam.ExaminationCode,
+            ce.MillExamCode,
             uni.RequestExamCodeSeq,
             rq.SplitRequestQuestion,
             ra.SplitRequestAnamnesis,
             pa.MillPersonId,
             COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t,
             ce.MillEventDate,
-            examdate.ExaminationDate,
-            COALESCE(examdate.ExaminationDate, ce.MillEventDate) AS ExamDate
+            exam.ExaminationDate,
+            COALESCE(exam.ExaminationDate, ce.MillEventDate, erp.ReportDate) AS ExamDate,
+            ce.MillClinicalEventId,
+            exam.ExaminationId,
+            erp.ReportId
         FROM uni
         LEFT JOIN LIVE.stag_pacs_requestquestion AS rq
         ON uni.RequestId = rq.RequestId
-        AND uni.RequestExamCode = rq.RequestQuestionExamCode
+        AND (
+            uni.RequestExamCode = rq.RequestQuestionExamCode 
+            OR (uni.RequestExamCode IS NULL AND rq.RequestQuestionExamCode IS NULL))
         AND uni.RequestExamCodeSeq = rq.RequestQuestionExamCodeSeq
         LEFT JOIN LIVE.stag_pacs_requestanamnesis AS ra
         ON uni.RequestId = ra.RequestId
-        AND uni.RequestExamCode = ra.RequestAnamnesisExamCode
+        AND (
+            uni.RequestExamCode = ra.RequestAnamnesisExamCode
+            OR (uni.RequestExamCode IS NULL AND ra.RequestAnamnesisExamCode IS NULL)
+        )
         AND uni.RequestExamCodeSeq = ra.RequestAnamnesisExamCodeSeq
         LEFT JOIN r
         ON uni.RequestId = r.RequestId
@@ -551,11 +572,14 @@ def intmd_pacs_requestexam():
         ON r.RequestPatientId = pa.PacsPatientId
         LEFT JOIN ce
         ON r.RequestIdString = ce.MillAccessionNbr
-        LEFT JOIN examdate
-        ON uni.RequestId = examdate.examinationreportrequestid
+        LEFT JOIN exam
+        ON uni.RequestId = exam.examinationreportrequestid
+        LEFT JOIN erp
+        ON uni.RequestId = erp.examinationreportrequestid
         """)
     
-    
+    df = df.withColumn("RequestExamCode_t", F.when(F.length(F.col("RequestExamCode"))>0, F.col("RequestExamCode")).otherwise(F.coalesce(F.col("ExaminationCode"), F.col("MillExamCode"))))
+
     return df
 
 
@@ -655,8 +679,7 @@ def pacs_blob_content():
             FROM LIVE.stag_mill_clinical_event_pacs AS ce
         )
         SELECT
-            blob.EVENT_ID,
-            blob.BLOB_CONTENTS AS ReportText
+            blob.*
         FROM 4_prod.raw.pi_cde_blob_content AS blob
         INNER JOIN milleventid
         ON blob.EVENT_ID = milleventid.EVENT_ID
