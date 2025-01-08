@@ -221,3 +221,25 @@
 # MAGIC   'Id' AS tag,
 # MAGIC   1-COUNT(DISTINCT RequestId)/(SELECT COUNT(DISTINCT RequestId) FROM 4_prod.raw.pacs_requests WHERE ADC_Deleted IS NULL)  AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing MillEventDate' AS item,
+# MAGIC   'ExamDate' AS tag,
+# MAGIC   1-COUNT(MillEventDate)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ExaminationDate' AS item,
+# MAGIC   'ExamDate' AS tag,
+# MAGIC   1-COUNT(ExaminationDate)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
+# MAGIC   'Missing ExamDate' AS item,
+# MAGIC   'ExamDate' AS tag,
+# MAGIC   1-COUNT(ExamDate)/COUNT(*)  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam

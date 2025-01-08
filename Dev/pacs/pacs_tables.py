@@ -514,6 +514,16 @@ def intmd_pacs_requestexam():
                 MAX(MillEventDate) AS MillEventDate
             FROM LIVE.stag_mill_clinical_event_pacs
             GROUP BY MillAccessionNbr
+        ),
+        examdate AS (
+            SELECT
+                ExaminationReportRequestId,
+                MAX(ExaminationDate) AS ExaminationDate
+            FROM 4_prod.raw.pacs_examinationreports AS er
+            LEFT JOIN LIVE.stag_pacs_examinations AS e
+            ON er.examinationreportexaminationid = e.examinationid
+            WHERE e.ADC_Deleted IS NULL
+            GROUP BY ExaminationReportRequestId
         )
         SELECT
             r.*,
@@ -522,8 +532,10 @@ def intmd_pacs_requestexam():
             rq.SplitRequestQuestion,
             ra.SplitRequestAnamnesis,
             pa.MillPersonId,
-            --COALESCE(pa.MillPersonId, ce.MillPersonId), AS MillPersonId_t
-            ce.MillEventDate
+            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t,
+            ce.MillEventDate,
+            examdate.ExaminationDate,
+            COALESCE(examdate.ExaminationDate, ce.MillEventDate) AS ExamDate
         FROM uni
         LEFT JOIN LIVE.stag_pacs_requestquestion AS rq
         ON uni.RequestId = rq.RequestId
@@ -539,6 +551,8 @@ def intmd_pacs_requestexam():
         ON r.RequestPatientId = pa.PacsPatientId
         LEFT JOIN ce
         ON r.RequestIdString = ce.MillAccessionNbr
+        LEFT JOIN examdate
+        ON uni.RequestId = examdate.examinationreportrequestid
         """)
     
     
