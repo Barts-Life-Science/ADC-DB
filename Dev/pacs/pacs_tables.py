@@ -405,7 +405,7 @@ def stag_pacs_requestquestion():
             ADC_Deleted IS NULL
         """)
     df = df.withColumn("RequestQuestionSplitCount", F.size(F.col("SplitRequestQuestionArray")))
-    df = df.withColumn("RequestQuestionSplitCount", F.coalesce(F.col("RequestQuestionSplitCount"), F.lit(0)))
+    df = df.withColumn("RequestQuestionSplitCount", F.coalesce(F.col("RequestQuestionSplitCount"), F.lit(-1)))
     # Each array element maps to a new row
     df = df.select(df["*"], F.explode_outer(F.col("SplitRequestQuestionArray")).alias("SplitRequestQuestion"))
 
@@ -445,7 +445,7 @@ def stag_pacs_requestanamnesis():
         """)
 
     df = df.withColumn("RequestAnamnesisSplitCount", F.size(F.col("SplitRequestAnamnesisArray")))
-    df = df.withColumn("RequestAnamnesisSplitCount", F.coalesce(F.col("RequestAnamnesisSplitCount"), F.lit(0)))
+    df = df.withColumn("RequestAnamnesisSplitCount", F.coalesce(F.col("RequestAnamnesisSplitCount"), F.lit(-1)))
     # Each array element maps to a new row
     df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
