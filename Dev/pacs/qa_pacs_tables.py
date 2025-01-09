@@ -286,3 +286,102 @@
 # MAGIC   'ExamCode' AS tag,
 # MAGIC   1-COUNT(ReportId)/COUNT(*)  AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+
+# COMMAND ----------
+
+
+total = spark.sql("""
+    SELECT COUNT(*) AS total
+    FROM 4_prod.pacs.intmd_pacs_examinations
+""").collect()[0]["total"]
+print("total count:", total)
+
+df = spark.sql(f"""
+    SELECT
+        'Missing ExaminationDate' AS item,
+        1-COUNT(ExaminationDate)/{total} AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+
+    UNION ALL
+
+    SELECT
+        'Missing MillPersonId' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+
+    UNION ALL
+
+    SELECT
+        'Missing MillPersonId_t' AS item,
+        1-COUNT(MillPersonId_t)/{total} AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+""")
+
+display(df)
+
+# COMMAND ----------
+
+
+table = "4_prod.pacs.intmd_mill_clinical_event_pacs"
+
+total = spark.sql(f"""
+    SELECT COUNT(*) AS total
+    FROM {table}
+""").collect()[0]["total"]
+print("total count:", total)
+
+df = spark.sql(f"""
+    SELECT
+        'Missing MillPersonId' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM {table}
+
+""")
+
+display(df)
+
+# COMMAND ----------
+
+
+table = "4_prod.pacs.intmd_pacs_patient_alias"
+
+total = spark.sql(f"""
+    SELECT COUNT(*) AS total
+    FROM {table}
+""").collect()[0]["total"]
+print("total count:", total)
+
+df = spark.sql(f"""
+    SELECT
+        'Missing MillPersonId' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM {table}
+
+    UNION ALL
+
+    SELECT
+        'Missing MillPersonId_t' AS item,
+        1-COUNT(MillPersonId_t)/{total} AS value
+    FROM {table}
+
+    UNION ALL
+
+
+    SELECT
+        'Missing MillPersonId after 2014' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM {table}
+    WHERE LatestExamDate > '2014-01-01'
+
+    UNION ALL
+
+
+    SELECT
+        'Missing MillPersonId_t after 2014' AS item,
+        1-COUNT(MillPersonId_t)/{total} AS value
+    FROM {table}
+    WHERE LatestExamDate >'2014-01-01'
+
+""")
+
+display(df)

@@ -108,7 +108,7 @@ def stag_patient_alias():
 # COMMAND ----------
 
 @dlt.table(
-    name="pacs_patient_alias",
+    name="intmd_pacs_patient_alias",
     comment="PacsPatientId, MillPersonId, Mrn, NhsNumber",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -116,7 +116,7 @@ def stag_patient_alias():
         #"pipelines.autoOptimize.zOrderCols": "MillPersonId"
     }
 )
-def pacs_patient_alias():
+def intmd_pacs_patient_alias():
     return spark.sql(
         """
         WITH exam AS (
@@ -125,13 +125,46 @@ def pacs_patient_alias():
                 MAX(ExaminationDate) AS LatestExamDate
             FROM LIVE.stag_pacs_examinations
             GROUP BY ExaminationPatientId
+        ),
+        millpersonid AS (
+            SELECT
+                MillAccessionNbr,
+                MAX(MillPersonId) AS MillPersonId
+            FROM LIVE.stag_mill_clinical_event_pacs
+            GROUP BY MillAccessionNbr
+        ),
+        rq_personid AS (
+            SELECT
+                RequestPatientId,
+                MAX(MillPersonId) AS MillPersonId
+            FROM 4_prod.raw.pacs_requests AS r
+            INNER JOIN millpersonid AS m
+            ON r.RequestIdString = m.MillAccessionNbr
+            WHERE ADC_Deleted IS NULL
+            GROUP BY RequestPatientId
+        ),
+        ex_personid AS (
+            SELECT
+                ExaminationPatientId,
+                MAX(MillPersonId) AS MillPersonId
+            FROM LIVE.stag_pacs_examinations AS e
+            INNER JOIN millpersonid AS m
+            ON m.MillAccessionNbr = e.ExamRefNbr
+            GROUP BY ExaminationPatientId
         )
         SELECT 
             p.*,
+            rq_personid.MillPersonId AS RequestMillPersonId,
+            ex_personid.MillPersonId AS ExamMillPersonId,
+            COALESCE(p.MillPersonId, rq_personid.MillPersonId, ex_personid.MillPersonId) AS MillPersonId_t,
             exam.LatestExamDate
         FROM LIVE.stag_patient_alias AS p
         LEFT JOIN exam
         ON p.PacsPatientId = exam.ExaminationPatientId
+        LEFT JOIN rq_personid
+        ON p.PacsPatientId = rq_personid.RequestPatientId
+        LEFT JOIN ex_personid
+        ON p.PacsPatientId = ex_personid.ExaminationPatientId
         """
     )
     
@@ -172,11 +205,6 @@ def stag_mill_clinical_event_pacs():
             ce.*,
             COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr,
             CASE
-                WHEN EVENT_TAG = 'RADRPT'
-                THEN 1
-                ELSE 0
-            END AS MillIsRadrpt,
-            CASE
                 WHEN EVENT_START_DT_TM < '2000-01-01'
                 THEN NULL
                 ELSE EVENT_START_DT_TM
@@ -211,6 +239,31 @@ def stag_mill_clinical_event_pacs():
 # COMMAND ----------
 
 
+
+@dlt.table(
+    name="intmd_mill_clinical_event_pacs",
+    comment="intermediate mill_clinical_event data for pacs",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "temporary":"true"
+    }
+)
+def intmd_mill_clinical_event_pacs():
+    df = spark.sql(
+        """
+        SELECT
+            CLINICAL_EVENT_ID,
+            EVENT_ID,
+            MillPersonId,
+            MillAccessionNbr,
+            MillExamCode,
+            MillEventDate,
+            MillEventClass,
+            MillEventReltn
+        FROM LIVE.stag_mill_clinical_event_pacs
+        """)
+    return df
 
 # COMMAND ----------
 
@@ -321,8 +374,8 @@ def intmd_pacs_examinations():
             ce.MillAccessionNbr,
             ce.MillClinicalEventId,
             ce.MillEventId,
-            ce.MillPersonId,
-            pa.MillPersonId AS PacsMillPersonId
+            pa.MillPersonId,
+            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
@@ -367,7 +420,7 @@ def pacs_exam():
             ExamRefNbr,
             MillClinicalEventId,
             MillEventId,
-            COALESCE(PacsMillPersonId, MillPersonId) AS MillPersonId
+            MillPersonId_t AS MillPersonId
         FROM LIVE.intmd_pacs_examinations AS e
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
