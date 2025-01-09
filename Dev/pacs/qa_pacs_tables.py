@@ -382,6 +382,51 @@ df = spark.sql(f"""
     FROM {table}
     WHERE LatestExamDate >'2014-01-01'
 
+    
+    UNION ALL
+
+
+    SELECT
+        'PaitentIdCouldBePersonId' AS item,
+        COUNT(*)/{total} AS value
+    FROM {table}
+    WHERE PatientIdCouldBePersonId = TRUE
+
+""")
+
+display(df)
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+
+table = "4_prod.pacs.all_pacs_ref_nbr"
+
+total = spark.sql(f"""
+    SELECT COUNT(*) AS total
+    FROM {table}
+""").collect()[0]["total"]
+print("total count:", total)
+
+df = spark.sql(f"""
+    SELECT
+        'Missing MillPersonId' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM {table}
+
+
+    UNION ALL
+
+
+    SELECT
+        'Missing MillPersonId after 2014' AS item,
+        1-COUNT(MillPersonId)/{total} AS value
+    FROM {table}
+    WHERE ExamDate > '2014-01-01'
+
 """)
 
 display(df)

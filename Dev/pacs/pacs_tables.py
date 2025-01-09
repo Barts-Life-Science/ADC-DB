@@ -151,13 +151,24 @@ def intmd_pacs_patient_alias():
             INNER JOIN millpersonid AS m
             ON m.MillAccessionNbr = e.ExamRefNbr
             GROUP BY ExaminationPatientId
+        ),
+        ce_personid AS (
+            SELECT DISTINCT 
+                MillPersonId
+            FROM LIVE.stag_mill_clinical_event_pacs
         )
         SELECT 
             p.*,
             rq_personid.MillPersonId AS RequestMillPersonId,
             ex_personid.MillPersonId AS ExamMillPersonId,
             COALESCE(p.MillPersonId, rq_personid.MillPersonId, ex_personid.MillPersonId) AS MillPersonId_t,
-            exam.LatestExamDate
+            exam.LatestExamDate,
+            CASE
+                WHEN ce_personid.MillPersonId IS NULL
+                THEN FALSE
+                ELSE TRUE
+            END AS PatientIdCouldBePersonId
+            
         FROM LIVE.stag_patient_alias AS p
         LEFT JOIN exam
         ON p.PacsPatientId = exam.ExaminationPatientId
@@ -165,6 +176,8 @@ def intmd_pacs_patient_alias():
         ON p.PacsPatientId = rq_personid.RequestPatientId
         LEFT JOIN ex_personid
         ON p.PacsPatientId = ex_personid.ExaminationPatientId
+        LEFT JOIN ce_personid
+        ON p.PacsPatientId = ce_personid.MillPersonId
         """
     )
     
@@ -395,6 +408,7 @@ def intmd_pacs_examinations():
 
 # COMMAND ----------
 
+'''
 @dlt.table(
     name="pacs_exam",
     comment="extended pacs exam table",
@@ -427,7 +441,7 @@ def pacs_exam():
         """)
     
     return df
-
+'''
 
 # COMMAND ----------
 
@@ -742,3 +756,44 @@ def pacs_blob_content():
     
 
 
+
+# COMMAND ----------
+
+@dlt.table(
+    name="all_pacs_ref_nbr",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def all_pacs_ref_nbr():
+    df = spark.sql("""
+        SELECT DISTINCT
+            MillAccessionNbr AS RefNbr,
+            'mill_clinical_event' AS SrcTable,
+            MillExamCode AS ExamCode,
+            MillPersonId AS MillPersonId,
+            MillEventDate AS ExamDate
+        FROM LIVE.intmd_mill_clinical_event_pacs
+
+        UNION ALL
+        SELECT DISTINCT
+            RequestIdString AS RefNbr,
+            'pacs_requests' AS SrcTable,
+            RequestExamCode_t AS ExamCode,
+            MillPersonId_t AS MillPersonId,
+            ExamDate
+        FROM LIVE.intmd_pacs_requestexam
+
+        UNION ALL
+        SELECT DISTINCT
+            ExamRefNbr AS RefNbr,
+            'pacs_examinations' AS SrcTable,
+            ExaminationCode AS ExamCode,
+            MillPersonId_t AS MillPersonId,
+            ExaminationDate
+        FROM LIVE.intmd_pacs_examinations
+            
+    """)
+    return df
