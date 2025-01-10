@@ -312,6 +312,14 @@ df = spark.sql(f"""
     UNION ALL
 
     SELECT
+        'Missing MillPersonId after 2014' AS item,
+        1-COUNT(MillPersonId)/COUNT(*) AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+    WHERE ExaminationDate > '2014-01-01'
+
+    UNION ALL
+
+    SELECT
         'Missing MillPersonId_t' AS item,
         1-COUNT(MillPersonId_t)/{total} AS value
     FROM 4_prod.pacs.intmd_pacs_examinations
@@ -354,14 +362,14 @@ print("total count:", total)
 df = spark.sql(f"""
     SELECT
         'Missing MillPersonId' AS item,
-        1-COUNT(MillPersonId)/{total} AS value
+        1-COUNT(MillPersonId)/COUNT(*) AS value
     FROM {table}
 
     UNION ALL
 
     SELECT
         'Missing MillPersonId_t' AS item,
-        1-COUNT(MillPersonId_t)/{total} AS value
+        1-COUNT(MillPersonId_t)/COUNT(*) AS value
     FROM {table}
 
     UNION ALL
@@ -369,7 +377,7 @@ df = spark.sql(f"""
 
     SELECT
         'Missing MillPersonId after 2014' AS item,
-        1-COUNT(MillPersonId)/{total} AS value
+        1-COUNT(MillPersonId)/COUNT(*) AS value
     FROM {table}
     WHERE LatestExamDate > '2014-01-01'
 
@@ -378,7 +386,7 @@ df = spark.sql(f"""
 
     SELECT
         'Missing MillPersonId_t after 2014' AS item,
-        1-COUNT(MillPersonId_t)/{total} AS value
+        1-COUNT(MillPersonId_t)/COUNT(*) AS value
     FROM {table}
     WHERE LatestExamDate >'2014-01-01'
 
@@ -422,11 +430,58 @@ df = spark.sql(f"""
 
 
     SELECT
+        'Missing ExamDate' AS item,
+        1-COUNT(ExamDate)/{total} AS value
+    FROM {table}
+
+    UNION ALL
+
+    SELECT
         'Missing MillPersonId after 2014' AS item,
-        1-COUNT(MillPersonId)/{total} AS value
+        1-COUNT(MillPersonId)/COUNT(*) AS value
     FROM {table}
     WHERE ExamDate > '2014-01-01'
+
+    UNION ALL
+
+    SELECT
+        'Missing MillPersonId before 2014' AS item,
+        1-COUNT(MillPersonId)/COUNT(*) AS value
+    FROM {table}
+    WHERE ExamDate < '2014-01-01'
 
 """)
 
 display(df)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT MillPersonId)
+# MAGIC FROM 4_prod.pacs.intmd_mill_clinical_event_pacs
+# MAGIC
+# MAGIC UNION
+# MAGIC
+# MAGIC SELECT COUNT(DISTINCT MillPersonId)
+# MAGIC FROM 4_prod.pacs.intmd_mill_clinical_event_pacs
+# MAGIC WHERE PacsPatientId IS NOT NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC WHERE ExamDate > '2022-01-01'
+# MAGIC AND MillPersonId IS NULL
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.all_pacs_ref_nbr
+# MAGIC WHERE MillPersonId IS NULL
+# MAGIC LIMIT 100

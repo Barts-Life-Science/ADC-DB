@@ -265,23 +265,34 @@ def stag_mill_clinical_event_pacs():
 def intmd_mill_clinical_event_pacs():
     df = spark.sql(
         """
+        WITH pacs_pid AS (
+            SELECT
+                MillPersonId,
+                MAX(PacsPatientId) AS PacsPatientId
+            FROM LIVE.stag_patient_alias
+            WHERE MillPersonId IS NOT NULL
+            GROUP BY MillPersonId
+        )
         SELECT
             CLINICAL_EVENT_ID,
             EVENT_ID,
-            MillPersonId,
+            ce.MillPersonId,
+            PacsPatientId,
             MillAccessionNbr,
             MillExamCode,
             MillEventDate,
             MillEventClass,
             MillEventReltn
-        FROM LIVE.stag_mill_clinical_event_pacs
+        FROM LIVE.stag_mill_clinical_event_pacs AS ce
+        LEFT JOIN pacs_pid
+        ON ce.MillPersonId = pacs_pid.MillPersonId
         """)
     return df
 
 # COMMAND ----------
 
 @dlt.table(
-    name="stag_pacs_examinations_examcode",
+    name="intmd_pacs_examcode",
     comment="Map examcode to exam modality for staging pacs_examinations",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -289,14 +300,38 @@ def intmd_mill_clinical_event_pacs():
         "temporary":"true"
     }
 )
-def stag_pacs_examinations_examcode():
+def intmd_pacs_examcode():
     return spark.sql(
         """
+        WITH uni AS (
+            SELECT
+                ExaminationCode AS ExamCode, 
+                --MODE(ExaminationModality) AS ExaminationModality,
+                COUNT(*) AS RowCount,
+                'PacsExam' AS SrcTable
+            FROM LIVE.stag_pacs_examinations
+            GROUP BY ExaminationCode
+            UNION ALL
+            SELECT
+                RequestQuestionExamCode AS ExamCode,
+                COUNT(*) AS RowCount,
+                'PacsRequestQuestion' AS SrcTable
+            FROM LIVE.stag_pacs_requestquestion
+            GROUP BY RequestQuestionExamCode
+            UNION ALL
+            SELECT
+                MillExamCode AS ExamCode,
+                COUNT(*) AS RowCount,
+                'MillCE' AS SrcTable
+            FROM LIVE.stag_mill_clinical_event_pacs
+            WHERE LOWER(MillEventReltn) = 'root'
+            GROUP BY MillExamCode
+        )
         SELECT
-            ExaminationCode, 
-            MODE(ExaminationModality) AS ExaminationModality
-        FROM 4_prod.raw.pacs_examinations
-        GROUP BY ExaminationCode
+            ExamCode,
+            SrcTable,
+            RowCount
+        FROM uni
         """
     )
 
@@ -741,15 +776,19 @@ def pacs_lkp_examcode():
 def pacs_blob_content():
     return spark.sql(
         """
-        WITH milleventid AS (
-            SELECT DISTINCT EVENT_ID
+        WITH millevent AS (
+            SELECT
+                EVENT_ID,
+                MAX(MillAccessionNbr) AS MillAccessionNbr
             FROM LIVE.stag_mill_clinical_event_pacs AS ce
+            GROUP BY EVENT_ID
         )
         SELECT
-            blob.*
+            blob.*,
+            millevent.MillAccessionNbr
         FROM 4_prod.raw.pi_cde_blob_content AS blob
-        INNER JOIN milleventid
-        ON blob.EVENT_ID = milleventid.EVENT_ID
+        INNER JOIN millevent
+        ON blob.EVENT_ID = millevent.EVENT_ID
         """
     )
 
@@ -774,6 +813,7 @@ def all_pacs_ref_nbr():
             'mill_clinical_event' AS SrcTable,
             MillExamCode AS ExamCode,
             MillPersonId AS MillPersonId,
+            PacsPatientId,
             MillEventDate AS ExamDate
         FROM LIVE.intmd_mill_clinical_event_pacs
 
@@ -783,6 +823,7 @@ def all_pacs_ref_nbr():
             'pacs_requests' AS SrcTable,
             RequestExamCode_t AS ExamCode,
             MillPersonId_t AS MillPersonId,
+            RequestPatientId,
             ExamDate
         FROM LIVE.intmd_pacs_requestexam
 
@@ -792,6 +833,7 @@ def all_pacs_ref_nbr():
             'pacs_examinations' AS SrcTable,
             ExaminationCode AS ExamCode,
             MillPersonId_t AS MillPersonId,
+            ExaminationPatientId,
             ExaminationDate
         FROM LIVE.intmd_pacs_examinations
             
