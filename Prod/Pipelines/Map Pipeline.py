@@ -650,13 +650,20 @@ update_table(updates_df, "4_prod.bronze.map_medical_personnel", "PERSON_ID")
 # Helper function to get event time boundaries for encounters
 def get_event_times():
     """
-    Calculates earliest and latest clinical event times for each encounter.
+    Calculates earliest and latest clinical event times for each encounter,
+    excluding dates before 1950 and future dates.
     
     Returns:
         DataFrame: Event time boundaries with encounter ID
     """
+    from pyspark.sql.functions import current_timestamp, year
+
     return (
         spark.table("4_prod.raw.mill_clinical_event")
+        .where(
+            (year("CLINSIG_UPDT_DT_TM") >= 1950) &
+            ("CLINSIG_UPDT_DT_TM" <= current_timestamp())
+        )
         .groupBy("ENCNTR_ID")
         .agg(
             min("CLINSIG_UPDT_DT_TM").alias("earliest_event_time"),

@@ -481,6 +481,28 @@ display(df)
 
 # MAGIC %sql
 # MAGIC
+# MAGIC SELECT COUNT(*)
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC WHERE requestquestionexamcode RLIKE '^[a-zA-Z0-9]{4,8}$'
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT COUNT(*)
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
+# MAGIC WHERE requestquestionexamcode NOT RLIKE '^[a-zA-Z0-9]{4,8}$'
+# MAGIC LIMIT 100
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
 # MAGIC SELECT *
 # MAGIC FROM 4_prod.pacs.all_pacs_ref_nbr
 # MAGIC WHERE MillPersonId IS NULL
