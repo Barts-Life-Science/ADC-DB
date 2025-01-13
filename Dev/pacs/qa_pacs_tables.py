@@ -450,6 +450,15 @@ df = spark.sql(f"""
     FROM {table}
     WHERE ExamDate < '2014-01-01'
 
+
+    UNION ALL
+
+    SELECT
+        'Missing ExamCode' AS item,
+        1- COUNT(ExamCode)/{total} AS value
+    FROM {table}
+    WHERE ExamCode IS NOT NULL
+
 """)
 
 display(df)
