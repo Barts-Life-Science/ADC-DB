@@ -335,6 +335,22 @@ df = spark.sql(f"""
         'Missing MillPersonId_t' AS item,
         1-COUNT(MillPersonId_t)/{total} AS value
     FROM 4_prod.pacs.intmd_pacs_examinations
+
+    UNION ALL
+
+    SELECT
+        'Missing ExaminationCode' AS item,
+        1-COUNT(ExaminationCode)/{total} AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+
+
+    UNION ALL
+
+    SELECT
+        'Space char in ExaminationCode' AS item,
+        COUNT(ExaminationCode)/{total} AS value
+    FROM 4_prod.pacs.intmd_pacs_examinations
+    WHERE ExaminationCode LIKE '% %'
 """)
 
 display(df)

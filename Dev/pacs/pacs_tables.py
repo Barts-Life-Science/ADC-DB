@@ -301,39 +301,62 @@ def intmd_mill_clinical_event_pacs():
     }
 )
 def intmd_pacs_examcode():
-    return spark.sql(
+    df = spark.sql(
         """
         WITH uni AS (
+            SELECT DISTINCT
+                ExaminationCode AS RawExamCode
+            FROM LIVE.stag_pacs_examinations
+            UNION
+            SELECT DISTINCT
+                RequestQuestionExamCode AS RawExamCode
+            FROM LIVE.stag_pacs_requestquestion
+            UNION
+            SELECT DISTINCT
+                RequestAnamnesisExamCode AS RawExamCode
+            FROM LIVE.stag_pacs_requestanamnesis
+            UNION
+            SELECT DISTINCT
+                MillExamCode AS RawExamCode
+            FROM LIVE.stag_mill_clinical_event_pacs
+        ),
+        exam AS (
             SELECT
-                ExaminationCode AS ExamCode, 
-                --MODE(ExaminationModality) AS ExaminationModality,
-                COUNT(*) AS RowCount,
-                'PacsExam' AS SrcTable
+                ExaminationCode AS ExamCode,
+                MODE(ExaminationModality) AS ExamModality
             FROM LIVE.stag_pacs_examinations
             GROUP BY ExaminationCode
-            UNION ALL
+        ),
+        ce1 AS (
             SELECT
-                RequestQuestionExamCode AS ExamCode,
-                COUNT(*) AS RowCount,
-                'PacsRequestQuestion' AS SrcTable
-            FROM LIVE.stag_pacs_requestquestion
-            GROUP BY RequestQuestionExamCode
-            UNION ALL
-            SELECT
-                MillExamCode AS ExamCode,
-                COUNT(*) AS RowCount,
-                'MillCE' AS SrcTable
+                EVENT_TITLE_TEXT AS MillEventTitleText,
+                MODE(MillExamCode) AS MillExamCode
             FROM LIVE.stag_mill_clinical_event_pacs
-            WHERE LOWER(MillEventReltn) = 'root'
+            GROUP BY EVENT_TITLE_TEXT
+        ),
+        ce2 AS (
+            SELECT
+                MillExamCode,
+                MODE(EVENT_TITLE_TEXT) AS MillEventTitleText
+            FROM LIVE.stag_mill_clinical_event_pacs
             GROUP BY MillExamCode
         )
         SELECT
-            ExamCode,
-            SrcTable,
-            RowCount
+            RawExamCode,
+            ExamModality,
+            ce1.MillExamCode,
+            COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText
         FROM uni
+        LEFT JOIN exam
+        ON uni.RawExamCode = exam.ExamCode
+        LEFT JOIN ce1
+        ON uni.RawExamCode = ce1.MillEventTitleText
+        LEFT JOIN ce2
+        ON uni.RawExamCode = ce2.MillExamCode
         """
     )
+
+    return df
 
 
 # COMMAND ----------
@@ -399,6 +422,13 @@ def intmd_pacs_examinations():
             WHERE LOWER(MillEventReltn) = 'root'
             GROUP BY MillAccessionNbr
         ),
+        ce_examcode AS (
+            SELECT
+                EVENT_TITLE_TEXT,
+                MAX(MillExamCode) AS MillExamCode
+            FROM LIVE.stag_mill_clinical_event_pacs
+            GROUP BY EVENT_TITLE_TEXT
+        ),
         pa AS (
             SELECT
                 PacsPatientId,
@@ -423,7 +453,8 @@ def intmd_pacs_examinations():
             ce.MillClinicalEventId,
             ce.MillEventId,
             pa.MillPersonId,
-            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t
+            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t,
+            COALESCE(ce_examcode.MillExamCode, e.ExaminationCode) AS ExaminationCode_t
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
         ON er.examinationreportexaminationid = e.examinationid
@@ -433,12 +464,15 @@ def intmd_pacs_examinations():
         ON ce.MillAccessionNbr = r.RequestIdString
         LEFT JOIN pa
         ON e.ExaminationPatientId = pa.PacsPatientId
+        LEFT JOIN ce_examcode
+        ON ce_examcode.EVENT_TITLE_TEXT = e.ExaminationCode
         --LEFT JOIN LIVE.stag_pacs_examinations_examcode AS excd
         --ON excd.ExaminationCode = e.ExaminationCode
         WHERE 
             e.ADC_Deleted IS NULL
         """
     )
+
     return df
 
 # COMMAND ----------
@@ -789,11 +823,12 @@ def pacs_blob_content():
     return spark.sql(
         """
         WITH millevent AS (
-            SELECT
+            SELECT DISTINCT
                 EVENT_ID,
-                MAX(MillAccessionNbr) AS MillAccessionNbr
+                --MAX(MillAccessionNbr) AS MillAccessionNbr
+                MillAccessionNbr
             FROM LIVE.stag_mill_clinical_event_pacs AS ce
-            GROUP BY EVENT_ID
+            --GROUP BY EVENT_ID
         )
         SELECT
             blob.*,
