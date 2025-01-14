@@ -691,7 +691,7 @@ def intmd_pacs_requestexam():
         """)
     
     #df = df.withColumn("RequestExamCode_t", F.when(F.length(F.col("RequestExamCode"))>0, F.col("RequestExamCode")).otherwise(F.coalesce(F.col("ExaminationCode"), F.col("MillExamCode"))))
-    df = df.withColumn("RequestExamCode_t", F.coalesce(F.col("MillExamCode2"), F.col("MillExamCode"), F.col("ExaminationCode"), F.col("RequestExamCode")))
+    df = df.withColumn("RequestExamCode_t", F.coalesce(F.col("MillExamCode2"), F.col("RequestExamCode"), F.col("ExaminationCode"), F.col("MillExamCode")))
     
 
     return df

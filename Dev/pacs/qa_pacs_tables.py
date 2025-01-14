@@ -502,10 +502,10 @@ display(df)
 
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT COUNT(*)
+# MAGIC SELECT *
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
-# MAGIC WHERE requestexamcode NOT RLIKE '^[a-zA-Z0-9]{4,8}$' AND MillExamCode IS NULL
-# MAGIC
+# MAGIC WHERE requestexamcode_t NOT RLIKE '^[a-zA-Z0-9]{4,8}$' AND MillExamCode IS NULL
+# MAGIC LIMIT 100
 
 # COMMAND ----------
 
