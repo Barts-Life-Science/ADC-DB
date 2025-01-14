@@ -320,10 +320,23 @@ def intmd_pacs_examcode():
                 MillExamCode AS RawExamCode
             FROM LIVE.stag_mill_clinical_event_pacs
         ),
+        link_rqq_exam AS (
+            SELECT
+                RequestQuestionExamCode,
+                MODE(ExaminationCode) AS LinkedExamCodeFromPacsExam
+            FROM LIVE.stag_pacs_requestquestion AS rq
+            LEFT JOIN (SELECT DISTINCT ExaminationReportRequestId, ExaminationReportExaminationId FROM 4_prod.raw.pacs_examinationreports) AS er
+            ON rq.RequestId = er.ExaminationReportRequestId
+            LEFT JOIN LIVE.stag_pacs_examinations AS e
+            ON er.ExaminationReportExaminationId = e.ExaminationId
+            WHERE ExaminationCode IS NOT NULL AND ExaminationCode NOT LIKE '% %'
+            GROUP BY RequestQuestionExamCode
+        ),
         exam AS (
             SELECT
                 ExaminationCode AS ExamCode,
-                MODE(ExaminationModality) AS ExamModality
+                MODE(ExaminationModality) AS ExamModality,
+                COUNT(*) AS NumRowsInPacsExam
             FROM LIVE.stag_pacs_examinations
             GROUP BY ExaminationCode
         ),
@@ -337,16 +350,36 @@ def intmd_pacs_examcode():
         ce2 AS (
             SELECT
                 MillExamCode,
-                MODE(EVENT_TITLE_TEXT) AS MillEventTitleText
+                MODE(EVENT_TITLE_TEXT) AS MillEventTitleText,
+                COUNT(*) AS NumRowsInMillCE
             FROM LIVE.stag_mill_clinical_event_pacs
             GROUP BY MillExamCode
+        ),
+        rqq AS (
+            SELECT
+                RequestQuestionExamCode,
+                COUNT(*) AS NumRowsInRequestQuestion
+            FROM LIVE.stag_pacs_requestquestion
+            GROUP BY RequestQuestionExamCode
+        ),
+        rqa AS (
+            SELECT
+                RequestAnamnesisExamCode,
+                COUNT(*) AS NumRowsInRequestAnamnesis
+            FROM LIVE.stag_pacs_requestanamnesis
+            GROUP BY RequestAnamnesisExamCode
         )
         SELECT
             RawExamCode,
             ce1.MillExamCode,
-            COALESCE(ce1.MillExamCOde, uni.RawExamCode) AS ExamCode_t,
+            link_rqq_exam.LinkedExamCodeFromPacsExam,
+            COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode_t,
             ExamModality,
-            COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText
+            COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
+            rqq.NumRowsInRequestQuestion,
+            rqa.NumRowsInRequestAnamnesis,
+            exam.NumRowsInPacsExam,
+            ce2.NumRowsInMillCE
         FROM uni
         LEFT JOIN ce1
         ON uni.RawExamCode = ce1.MillEventTitleText
@@ -354,6 +387,12 @@ def intmd_pacs_examcode():
         ON uni.RawExamCode = ce2.MillExamCode
         LEFT JOIN exam
         ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = exam.ExamCode
+        LEFT JOIN rqq
+        ON uni.RawExamCode = rqq.RequestQuestionExamCode
+        LEFT JOIN rqa
+        ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
+        LEFT JOIN link_rqq_exam
+        ON uni.RawExamCode = link_rqq_exam.RequestQuestionExamCode
         """
     )
 
@@ -548,7 +587,7 @@ def stag_pacs_requestquestion():
 
 
     df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
-    df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
+    df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'([^\n\-]+) ------', 1))
     df = df.withColumn("RequestQuestionExamCode", F.when(F.length(F.col("RequestQuestionExamCode"))>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
     
@@ -587,7 +626,7 @@ def stag_pacs_requestanamnesis():
     df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
     df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
-    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'(.+) ------', 1))
+    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'([^\n\-]+) ------', 1))
     df = df.withColumn("RequestAnamnesisExamCode", F.when(F.length(F.col("RequestAnamnesisExamCode"))>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))

@@ -553,3 +553,13 @@ display(df)
 # MAGIC FROM 4_prod.pacs.all_pacs_ref_nbr
 # MAGIC WHERE MillPersonId IS NULL
 # MAGIC LIMIT 100
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.intmd_pacs_examcode
+# MAGIC WHERE ExamCode_t LIKE '% %' AND LinkedExamCodeFromPacsExam IS NOT NULL
+# MAGIC LIMIT 100
+# MAGIC
