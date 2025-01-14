@@ -267,6 +267,14 @@
 # MAGIC
 # MAGIC UNION ALL
 # MAGIC SELECT
+# MAGIC   'Space char in ExamCode_t' AS item,
+# MAGIC   'ExamCode' AS tag,
+# MAGIC   COUNT(RequestExamCode_t)/15897572  AS value
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC WHERE RequestExamCode_t LIKE '% %'
+# MAGIC
+# MAGIC UNION ALL
+# MAGIC SELECT
 # MAGIC   'Missing ExaminationId' AS item,
 # MAGIC   'ExamCode' AS tag,
 # MAGIC   1-COUNT(ExaminationId)/COUNT(*)  AS value
@@ -286,6 +294,10 @@
 # MAGIC   'ExamCode' AS tag,
 # MAGIC   1-COUNT(ReportId)/COUNT(*)  AS value
 # MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -491,17 +503,26 @@ display(df)
 # MAGIC %sql
 # MAGIC
 # MAGIC SELECT COUNT(*)
-# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
-# MAGIC WHERE requestquestionexamcode RLIKE '^[a-zA-Z0-9]{4,8}$'
+# MAGIC FROM 4_prod.pacs.intmd_pacs_requestexam
+# MAGIC WHERE requestexamcode NOT RLIKE '^[a-zA-Z0-9]{4,8}$' AND MillExamCode IS NULL
 # MAGIC
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC
-# MAGIC SELECT COUNT(*)
-# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion
-# MAGIC WHERE requestquestionexamcode NOT RLIKE '^[a-zA-Z0-9]{4,8}$'
+# MAGIC WITH ce AS (
+# MAGIC   SELECT
+# MAGIC     EVENT_TITLE_TEXT,
+# MAGIC     MAX(MillExamCode) AS MillExamCode
+# MAGIC   FROM 4_prod.pacs.stag_mill_clinical_event_pacs
+# MAGIC   GROUP BY EVENT_TITLE_TEXT
+# MAGIC )
+# MAGIC SELECT *
+# MAGIC FROM 4_prod.pacs.stag_pacs_requestquestion AS rq
+# MAGIC LEFT JOIN ce
+# MAGIC ON rq.RequestQuestionExamCOde = ce.EVENT_TITLE_TEXT
+# MAGIC WHERE --requestquestionexamcode NOT RLIKE '^[a-zA-Z0-9]{4,8}$'
+# MAGIC ce.EVENT_TITLE_TEXT IS NOT NULL
 # MAGIC LIMIT 100
 
 # COMMAND ----------

@@ -516,8 +516,8 @@ def stag_pacs_requestquestion():
     df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'(.+) ------', 1))
     df = df.withColumn("RequestQuestionExamCode", F.when(F.length(F.col("RequestQuestionExamCode"))>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
-    # add another col to show whether examcode is in the right format
-    # Separate 
+    
+
     return df
 
 
@@ -611,6 +611,13 @@ def intmd_pacs_requestexam():
             FROM LIVE.stag_mill_clinical_event_pacs
             GROUP BY MillAccessionNbr
         ),
+        ce_examcode AS (
+            SELECT
+                EVENT_TITLE_TEXT,
+                MAX(MillExamCode) AS MillExamCode
+            FROM LIVE.stag_mill_clinical_event_pacs
+            GROUP BY EVENT_TITLE_TEXT
+        ),
         exam AS (
             SELECT
                 ExaminationReportRequestId,
@@ -643,6 +650,7 @@ def intmd_pacs_requestexam():
             END AS RequestExamCode,
             exam.ExaminationCode,
             ce.MillExamCode,
+            ce_examcode.MillExamCode AS MillExamCode2,
             uni.RequestExamCodeSeq,
             rq.SplitRequestQuestion,
             ra.SplitRequestAnamnesis,
@@ -678,9 +686,13 @@ def intmd_pacs_requestexam():
         ON uni.RequestId = exam.examinationreportrequestid
         LEFT JOIN erp
         ON uni.RequestId = erp.examinationreportrequestid
+        LEFT JOIN ce_examcode
+        ON uni.RequestExamCode = ce_examcode.EVENT_TITLE_TEXT
         """)
     
-    df = df.withColumn("RequestExamCode_t", F.when(F.length(F.col("RequestExamCode"))>0, F.col("RequestExamCode")).otherwise(F.coalesce(F.col("ExaminationCode"), F.col("MillExamCode"))))
+    #df = df.withColumn("RequestExamCode_t", F.when(F.length(F.col("RequestExamCode"))>0, F.col("RequestExamCode")).otherwise(F.coalesce(F.col("ExaminationCode"), F.col("MillExamCode"))))
+    df = df.withColumn("RequestExamCode_t", F.coalesce(F.col("MillExamCode2"), F.col("MillExamCode"), F.col("ExaminationCode"), F.col("RequestExamCode")))
+    
 
     return df
 
