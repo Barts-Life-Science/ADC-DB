@@ -343,16 +343,17 @@ def intmd_pacs_examcode():
         )
         SELECT
             RawExamCode,
-            ExamModality,
             ce1.MillExamCode,
+            COALESCE(ce1.MillExamCOde, uni.RawExamCode) AS ExamCode_t,
+            ExamModality,
             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText
         FROM uni
-        LEFT JOIN exam
-        ON uni.RawExamCode = exam.ExamCode
         LEFT JOIN ce1
         ON uni.RawExamCode = ce1.MillEventTitleText
         LEFT JOIN ce2
         ON uni.RawExamCode = ce2.MillExamCode
+        LEFT JOIN exam
+        ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = exam.ExamCode
         """
     )
 
