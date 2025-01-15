@@ -64,6 +64,9 @@ def update_nomen_table(source_df, target_table):
         source_df: Source DataFrame with new/updated records
         target_table: Target table name to update
     """
+        # Check if source_df is empty
+    if source_df.count() == 0:
+        return
     
     if table_exists(target_table):
         # Create temporary view of source data
@@ -497,7 +500,8 @@ def standardize_opcs4(code):
     """
     if not code:
         return code
-    return code.strip().upper()
+    #return code.strip().upper()
+    return code.replace('.', '').replace(' ', '').upper()
 
 standardize_opcs4_udf = udf(standardize_opcs4)
 
@@ -580,7 +584,6 @@ def create_nomenclature_mapping_incr():
     """
     Creates an incremental mapping table that combines all vocabulary mappings.
 
-    
     Returns:
         DataFrame: Incremental nomenclature mappings
     """
@@ -600,6 +603,18 @@ def create_nomenclature_mapping_incr():
         (col("invalid_reason").isNull())
     )
 
+    icd10_concepts = spark.table("3_lookup.omop.concept").filter(
+        (col("concept_id").isNotNull()) &
+        (col("invalid_reason").isNull()) &
+        (col("vocabulary_id").isin(["ICD10", "ICD10CM"]))
+    )
+
+    opcs4_concepts = spark.table("3_lookup.omop.concept").filter(
+        (col("concept_id").isNotNull()) &
+        (col("invalid_reason").isNull()) &
+        (col("vocabulary_id") == "OPCS4")
+    )
+    
     max_adc_updt = get_max_timestamp("4_prod.bronze.tempone_nomenclature")
 
     # Create vocabulary-specific reference subsets
@@ -621,10 +636,10 @@ def create_nomenclature_mapping_incr():
     # Initialize vocabulary type indicators
     base_with_vocab_type = (
         base_nomenclature
-        .withColumn("is_snomed", lit(False))
-        .withColumn("is_multum", lit(False))
-        .withColumn("is_icd10", lit(False))
-        .withColumn("is_opcs4", lit(False))
+        .withColumn("is_snomed", col("SOURCE_VOCABULARY_CD").isin(466776237, 673967))
+        .withColumn("is_multum", col("SOURCE_VOCABULARY_CD").isin(64004559, 1238, 1237))
+        .withColumn("is_icd10", col("SOURCE_VOCABULARY_CD").isin(2976507, 647081))
+        .withColumn("is_opcs4", col("SOURCE_VOCABULARY_CD") == 685812)
     )
 
     # Update vocabulary type flags using broadcast joins for efficiency
@@ -650,49 +665,99 @@ def create_nomenclature_mapping_incr():
         when(col("is_snomed"), regexp_extract(col("CONCEPT_CKI"), "SNOMED!(.*)", 1))
         .when(col("is_multum"), regexp_replace(lower(col("SOURCE_IDENTIFIER")), "d", ""))
         .when(col("is_icd10"), regexp_replace(upper(col("SOURCE_IDENTIFIER")), "[^A-Z0-9]", ""))
-        .when(col("is_opcs4"), trim(upper(col("SOURCE_IDENTIFIER"))))
+        .when(col("is_opcs4"), regexp_replace(upper(col("SOURCE_IDENTIFIER")), "[^A-Z0-9]", ""))
         .otherwise(col("SOURCE_IDENTIFIER"))
-    ).withColumn(
-        "match_type",
-        when(col("is_snomed"), "SNOMED")
-        .when(col("is_multum"), "MULTUM")
-        .when(col("is_icd10"), "ICD10")
-        .when(col("is_opcs4"), "OPCS4")
-        .otherwise(None)
     )
 
-    # Perform matching and prioritize results
-    matches = (
-        base_with_vocab_type
+    # Process ICD10 matches with standardized concept codes
+    icd10_matches = (
+        base_with_vocab_type.filter(col("is_icd10"))
         .join(
-            omop_concepts,
-            base_with_vocab_type.standardized_code == omop_concepts.concept_code,
+            icd10_concepts.withColumn(
+                "standardized_concept_code",
+                regexp_replace(upper(col("concept_code")), "[^A-Z0-9]", "")
+            ),
+            col("standardized_code") == col("standardized_concept_code"),
             "left"
         )
-        # Calculate match statistics
-        .withColumn(
-            "match_count",
-            count("concept_id").over(Window.partitionBy("SOURCE_IDENTIFIER"))
+        .withColumn("vocabulary_type", lit("ICD10"))
+    )
+
+    opcs4_matches = (
+        base_with_vocab_type.filter(col("is_opcs4"))
+        .join(
+            opcs4_concepts.withColumn(
+                "standardized_concept_code",
+                regexp_replace(upper(trim(col("concept_code"))), "[^A-Z0-9]", "")
+            ),
+            col("standardized_code") == col("standardized_concept_code"),
+            "left"
         )
-        # Assign priority to different vocabulary types
-        .withColumn(
-            "match_priority",
-            when(col("match_type") == "SNOMED", 1)
-            .when(col("match_type") == "MULTUM", 2)
-            .when(col("match_type") == "ICD10", 3)
-            .when(col("match_type") == "OPCS4", 4)
-            .otherwise(5)
+        .withColumn("vocabulary_type", lit("OPCS4"))
+    )
+
+    other_matches = (
+        base_with_vocab_type.filter(~col("is_icd10") & ~col("is_opcs4"))
+        .join(
+            spark.table("3_lookup.omop.concept")
+            .filter(
+                (col("concept_id").isNotNull()) &
+                (col("invalid_reason").isNull()) &
+                (~col("vocabulary_id").isin(["ICD10", "ICD10CM", "OPCS4"]))
+            ),
+            base_with_vocab_type.standardized_code == col("concept_code"),
+            "left"
         )
-        # Rank matches based on priority and standard concept status
-        .withColumn(
-            "row_num",
-            row_number().over(
-                Window.partitionBy("NOMENCLATURE_ID")
-                .orderBy(
-                    col("match_priority"),
-                    when(col("standard_concept") == "S", 1).otherwise(2),
-                    col("match_count")
-                )
+        .withColumn("vocabulary_type", 
+            when(col("is_snomed"), lit("SNOMED"))
+            .when(col("is_multum"), lit("MULTUM"))
+            .otherwise(lit("OTHER"))
+        )
+    )
+
+    # Define common columns for all matches
+    common_columns = [
+        col("NOMENCLATURE_ID"),
+        col("SOURCE_IDENTIFIER"),
+        col("SOURCE_STRING"),
+        col("SOURCE_VOCABULARY_CD"),
+        col("VOCAB_AXIS_CD"),
+        col("CONCEPT_CKI"),
+        col("ADC_UPDT"),
+        col("concept_id").alias("OMOP_CONCEPT_ID"),
+        col("concept_name").alias("OMOP_CONCEPT_NAME"),
+        col("standard_concept").alias("IS_STANDARD_OMOP_CONCEPT"),
+        col("domain_id").alias("CONCEPT_DOMAIN"),
+        col("concept_class_id").alias("CONCEPT_CLASS"),
+        col("standardized_code").alias("FOUND_CUI"),
+        col("vocabulary_type")
+    ]
+
+    # Select common columns for each match type
+    icd10_matches = icd10_matches.select(*common_columns)
+    opcs4_matches = opcs4_matches.select(*common_columns)
+    other_matches = other_matches.select(*common_columns)
+
+    # Combine all matches
+    matches = icd10_matches.unionAll(opcs4_matches).unionAll(other_matches)
+    matches = matches.withColumn(
+        "match_count",
+        count("OMOP_CONCEPT_ID").over(Window.partitionBy("SOURCE_IDENTIFIER"))
+    ).withColumn(
+        "match_priority",
+        when(col("vocabulary_type") == "SNOMED", 1)
+        .when(col("vocabulary_type") == "MULTUM", 2)
+        .when(col("vocabulary_type") == "ICD10", 3)
+        .when(col("vocabulary_type") == "OPCS4", 4)
+        .otherwise(5)
+    ).withColumn(
+        "row_num",
+        row_number().over(
+            Window.partitionBy("NOMENCLATURE_ID")
+            .orderBy(
+                col("match_priority"),
+                when(col("IS_STANDARD_OMOP_CONCEPT") == "S", 1).otherwise(2),
+                col("match_count")
             )
         )
     )
@@ -707,12 +772,12 @@ def create_nomenclature_mapping_incr():
             col("SOURCE_STRING"),
             col("SOURCE_VOCABULARY_CD"),
             col("VOCAB_AXIS_CD"),
-            col("concept_id").alias("OMOP_CONCEPT_ID"),
-            col("concept_name").alias("OMOP_CONCEPT_NAME"),
-            col("standard_concept").alias("IS_STANDARD_OMOP_CONCEPT"),
-            col("domain_id").alias("CONCEPT_DOMAIN"),
-            col("concept_class_id").alias("CONCEPT_CLASS"),
-            col("standardized_code").alias("FOUND_CUI"),
+            col("OMOP_CONCEPT_ID"),
+            col("OMOP_CONCEPT_NAME"),
+            col("IS_STANDARD_OMOP_CONCEPT"),
+            col("CONCEPT_DOMAIN"),
+            col("CONCEPT_CLASS"),
+            col("FOUND_CUI"),
             col("match_count").alias("NUMBER_OF_OMOP_MATCHES"),
             col("CONCEPT_CKI"),
             col("ADC_UPDT")
@@ -843,20 +908,27 @@ def add_omop_preference(df, source_code_col, target_code_col, source_concepts, t
 def process_matches(df, base_type, omop_type):
     """Helper function to process matches and aggregate results"""
     df = df.alias("matches")
-    return df.withColumn(
+    
+    # First filter to only records that actually got a match
+    matched_df = df.filter(F.col("matched_snomed_code").isNotNull())
+    
+    if matched_df.count() == 0:  # No matches found
+        return matched_df
+        
+    return matched_df.withColumn(
         "match_rank",
         F.row_number().over(
             Window.partitionBy("matches.NOMENCLATURE_ID")
             .orderBy(
-                F.col("matches.omop_mapped").desc(),
-                F.col("matches.SCUI")
+                F.col("matches.has_omop_map").desc(),
+                F.col("matches.matched_snomed_code")
             )
         )
     ).groupBy(F.col("matches.NOMENCLATURE_ID")).agg(
-        F.first(F.when(F.col("match_rank") == 1, F.col("matches.SCUI"))).alias("temp_snomed_code"),
-        F.count("matches.SCUI").alias("SNOMED_MATCH_COUNT"),
-        F.max(F.col("matches.omop_mapped")).alias("HAS_OMOP_MAP"),
-        F.when(F.max(F.col("matches.omop_mapped")) > 0, F.lit(omop_type))
+        F.first(F.when(F.col("match_rank") == 1, F.col("matches.matched_snomed_code"))).alias("temp_snomed_code"),
+        F.count("matches.matched_snomed_code").alias("SNOMED_MATCH_COUNT"),
+        F.max(F.col("matches.has_omop_map")).alias("HAS_OMOP_MAP"),
+        F.when(F.max(F.col("matches.has_omop_map")), F.lit(omop_type))
          .otherwise(F.lit(base_type))
          .alias("SNOMED_TYPE")
     )
@@ -938,29 +1010,50 @@ def add_snomed_terms(matches_df, snomed_terms, base_df):
 
 def create_snomed_mapping_incr():
     """Creates an incremental SNOMED mapping table processing only new/modified records."""
+    
+    print("Starting SNOMED mapping process...")
 
     max_adc_updt = get_max_timestamp("4_prod.bronze.temptwo_nomenclature")
+    print(f"Max ADC_UPDT timestamp: {max_adc_updt}")
     
     # Get base and reference tables
     base_df = spark.table("4_prod.bronze.tempone_nomenclature") \
         .filter(F.col("ADC_UPDT") > max_adc_updt)
+    
+    record_count = base_df.count()
+    print(f"Number of records to process: {record_count}")
+    
+    if record_count == 0:
+        print("No records to process")
+        return base_df  # Return empty DataFrame with original schema
 
-    # Extract SNOMED code and create a new DataFrame with all columns
+    # Extract SNOMED code and standardize FOUND_CUI
     base_df = base_df.select(
-        "*",  # Keep all original columns
+        "*",
         F.when(
             F.col("CONCEPT_CKI").like("SNOMED!%"),
             F.regexp_extract(F.col("CONCEPT_CKI"), "SNOMED!(.*)", 1)
-        ).otherwise(F.col("FOUND_CUI")).alias("SNOMED_CODE")
+        ).otherwise(F.lit(None)).alias("original_snomed_code"),
+        standardize_code_udf(F.col("FOUND_CUI")).alias("standardized_found_cui")
     )
 
-    # Load and prepare reference tables
+    # Count and print SNOMED codes found vs not found
+    snomed_counts = base_df.select(
+        F.sum(F.when(F.col("CONCEPT_CKI").like("SNOMED!%"), 1).otherwise(0)).alias("native_count"),
+        F.sum(F.when(F.col("CONCEPT_CKI").like("SNOMED!%"), 0).otherwise(1)).alias("not_found_count")
+    ).collect()[0]
+
+    print(f"Native SNOMED codes found: {snomed_counts['native_count']:,}")
+    print(f"SNOMED codes not found: {snomed_counts['not_found_count']:,}")
+
+    # Load reference tables
     icd_map = spark.table("3_lookup.trud.maps_icdsctmap")
+    opcs_map = spark.table("3_lookup.trud.maps_opcssctmap")
     snomed_hier = spark.table("3_lookup.trud.snomed_scthier")
     snomed_terms = spark.table("3_lookup.trud.snomed_sct")
     code_value = spark.table("3_lookup.mill.mill_code_value")
     
-    # Get OMOP reference tables with explicit column selection
+    # Get OMOP reference tables
     source_concepts = spark.table("3_lookup.omop.concept") \
         .filter(F.col("invalid_reason").isNull()) \
         .select("concept_id", "concept_code")
@@ -973,110 +1066,124 @@ def create_snomed_mapping_incr():
         .filter(F.col("relationship_id").isin(["Maps to", "Mapped from"])) \
         .select("concept_id_1", "concept_id_2", "relationship_id")
 
-    # Process direct matches
-    direct_matches = base_df.join(
-        icd_map,
-        base_df.SNOMED_CODE == icd_map.TCUI,
+    # Filter for ICD10 and OPCS4 source codes and those without existing SNOMED codes
+    icd10_base_df = base_df.filter(
+        (F.col("SOURCE_VOCABULARY_CD").isin([2976507, 647081])) &
+        (F.col("original_snomed_code").isNull())
+    )
+    
+    opcs4_base_df = base_df.filter(
+        (F.col("SOURCE_VOCABULARY_CD") == 685812) &
+        (F.col("original_snomed_code").isNull())
+    )
+    
+    print(f"Number of ICD10 records to process: {icd10_base_df.count()}")
+    print(f"Number of OPCS4 records to process: {opcs4_base_df.count()}")
+
+    # Process direct matches for ICD10
+    icd10_direct_matches = icd10_base_df.join(
+        icd_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
+        F.col("standardized_found_cui") == F.col("standardized_scui"),
         "left"
     ).select(
-        base_df["*"],
-        icd_map.SCUI,
-        icd_map.TCUI
+        icd10_base_df["*"],
+        icd_map.SCUI.alias("SCUI"),
+        icd_map.TCUI.alias("matched_snomed_code"),
+        F.lit(False).alias("has_omop_map")
     )
+
+    # Process direct matches for OPCS4
+    opcs4_direct_matches = opcs4_base_df.join(
+        opcs_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
+        F.col("standardized_found_cui") == F.col("standardized_scui"),
+        "left"
+    ).select(
+        opcs4_base_df["*"],
+        opcs_map.SCUI.alias("SCUI"),
+        opcs_map.TCUI.alias("matched_snomed_code"),
+        F.lit(False).alias("has_omop_map")
+    )
+    
+    direct_matches = icd10_direct_matches.unionAll(opcs4_direct_matches)
+    print(f"Direct matches found: {direct_matches.filter(F.col('matched_snomed_code').isNotNull()).count()}")
     
     direct_with_omop = add_omop_preference(
         df=direct_matches,
-        source_code_col="SNOMED_CODE",
-        target_code_col="SCUI",
+        source_code_col="SCUI",
+        target_code_col="matched_snomed_code",
         source_concepts=source_concepts,
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
 
-    # Process child matches
-    child_matches = base_df.join(
-        snomed_hier.select(
-            F.col("CHILD"),
-            F.col("PARENT")
-        ),
-        base_df.SNOMED_CODE == F.col("CHILD"),
-        "left"
-    ).join(
+    # Process prefix matches for ICD10
+    icd10_prefix_matches = icd10_base_df.join(
         icd_map,
-        F.col("PARENT") == icd_map.TCUI,
+        F.substring(F.col("standardized_found_cui"), 1, 3) == F.substring(F.col("SCUI"), 1, 3),
         "left"
     ).select(
-        base_df["*"],
-        icd_map.SCUI,
-        icd_map.TCUI,
-        F.col("PARENT")
-    ).filter(F.col("SCUI").isNotNull())
+        icd10_base_df["*"],
+        icd_map.SCUI.alias("SCUI"),
+        icd_map.TCUI.alias("matched_snomed_code"),
+        F.lit(False).alias("has_omop_map")
+    ).filter(F.col("matched_snomed_code").isNotNull())
+
+    # Process prefix matches for OPCS4
+    opcs4_prefix_matches = opcs4_base_df.join(
+        opcs_map,
+        F.substring(F.col("standardized_found_cui"), 1, 3) == F.substring(F.col("SCUI"), 1, 3),
+        "left"
+    ).select(
+        opcs4_base_df["*"],
+        opcs_map.SCUI.alias("SCUI"),
+        opcs_map.TCUI.alias("matched_snomed_code"),
+        F.lit(False).alias("has_omop_map")
+    ).filter(F.col("matched_snomed_code").isNotNull())
     
-    child_with_omop = add_omop_preference(
-        df=child_matches,
-        source_code_col="PARENT",
-        target_code_col="SCUI",
+    prefix_matches = icd10_prefix_matches.unionAll(opcs4_prefix_matches)
+    print(f"Prefix matches found: {prefix_matches.count()}")
+    
+    prefix_with_omop = add_omop_preference(
+        df=prefix_matches,
+        source_code_col="SCUI",
+        target_code_col="matched_snomed_code",
         source_concepts=source_concepts,
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
 
-    # Process parent matches
-    parent_matches = base_df.join(
-        snomed_hier.select(
-            F.col("CHILD"),
-            F.col("PARENT")
-        ),
-        base_df.SNOMED_CODE == F.col("PARENT"),
-        "left"
-    ).join(
-        icd_map,
-        F.col("CHILD") == icd_map.TCUI,
-        "left"
-    ).select(
-        base_df["*"],
-        icd_map.SCUI,
-        icd_map.TCUI,
-        F.col("CHILD")
-    ).filter(F.col("SCUI").isNotNull())
-    
-    parent_with_omop = add_omop_preference(
-        df=parent_matches,
-        source_code_col="CHILD",
-        target_code_col="SCUI",
-        source_concepts=source_concepts,
-        target_concepts=target_concepts,
-        omop_rels=omop_rels
-    )
-
-    # Process native SNOMED codes
-    snomed_code_values = code_value.filter(
-        F.col("CDF_MEANING").isin(["SNMCT", "SNMUKEMED"])
-    )
-    
-    native_codes = base_df.filter(
-        (F.col("SOURCE_VOCABULARY_CD").isin(
-            [row.CODE_VALUE for row in snomed_code_values.collect()]
-        )) |
-        (F.col("CONCEPT_CKI").like("SNOMED!%"))
-    ).select(
+    # Process native SNOMED codes (keep original ones)
+    native_codes = base_df.filter(F.col("original_snomed_code").isNotNull()).select(
         F.col("NOMENCLATURE_ID"),
-        F.col("SNOMED_CODE").alias("temp_snomed_code"),
+        F.col("original_snomed_code").alias("temp_snomed_code"),
         F.lit(1).alias("SNOMED_MATCH_COUNT"),
-        F.lit(0).alias("HAS_OMOP_MAP"),
+        F.lit(False).alias("HAS_OMOP_MAP"),
         F.lit("NATIVE").alias("SNOMED_TYPE")
     )
 
-    # Process the results
+    # Process results with match types
     direct_final = process_matches(direct_with_omop, "EXACT", "OMOP_ASSISTED")
-    child_final = process_matches(child_with_omop, "CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED")
-    parent_final = process_matches(parent_with_omop, "PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED")
+    prefix_final = process_matches(prefix_with_omop, "PREFIX", "PREFIX_OMOP_ASSISTED")
 
-    # Combine all matches
-    all_matches = combine_matches(native_codes, direct_final, child_final, parent_final)
+    print(f"Final direct matches: {direct_final.count()}")
+    print(f"Final prefix matches: {prefix_final.count()}")
 
-    # Add SNOMED terms
+    # Combine all matches with priority ordering
+    all_matches = combine_matches(
+        native_codes,  # Priority 1
+        direct_final,  # Priority 2
+        prefix_final   # Priority 3
+    )
+    
+    print(f"Total combined matches: {all_matches.count()}")
+
+    # Add SNOMED terms to final result
     final_df = add_snomed_terms(all_matches, snomed_terms, base_df)
+    
+    # Drop intermediate columns
+    final_df = final_df.drop("original_snomed_code", "standardized_found_cui")
+    
+    print(f"Final record count: {final_df.count()}")
 
     return final_df
 
