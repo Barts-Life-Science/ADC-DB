@@ -320,6 +320,7 @@ def intmd_pacs_examcode():
                 MillExamCode AS RawExamCode
             FROM LIVE.stag_mill_clinical_event_pacs
         ),
+        /*
         link_rqq_exam AS (
             SELECT
                 RequestQuestionExamCode,
@@ -331,13 +332,23 @@ def intmd_pacs_examcode():
             ON er.ExaminationReportExaminationId = e.ExaminationId
             WHERE ExaminationCode IS NOT NULL AND ExaminationCode NOT LIKE '% %'
             GROUP BY RequestQuestionExamCode
-        ),
+        ),*/
         exam AS (
             SELECT
                 ExaminationCode AS ExamCode,
                 MODE(ExaminationModality) AS ExamModality,
                 COUNT(*) AS NumRowsInPacsExam
             FROM LIVE.stag_pacs_examinations
+            GROUP BY ExaminationCode
+        ),
+        exam2 AS (
+            SELECT
+                ExaminationCode AS ExamCode,
+                MODE(ExaminationModality) AS ExamModality2
+            FROM LIVE.stag_pacs_examinations AS e
+            LEFT JOIN exam
+            ON e.ExaminationCode = exam.ExamCode
+            WHERE exam.ExamModality != ExaminationModality
             GROUP BY ExaminationCode
         ),
         ce1 AS (
@@ -372,9 +383,15 @@ def intmd_pacs_examcode():
         SELECT
             RawExamCode,
             ce1.MillExamCode,
-            link_rqq_exam.LinkedExamCodeFromPacsExam,
-            COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode_t,
+            --link_rqq_exam.LinkedExamCodeFromPacsExam,
+            COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
+            CASE
+                WHEN lkp.short_code IS NULL
+                THEN FALSE
+                ELSE TRUE
+            END AS IsExamCodeInLookupTable,
             ExamModality,
+            ExamModality2,
             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
             rqq.NumRowsInRequestQuestion,
             rqa.NumRowsInRequestAnamnesis,
@@ -391,8 +408,12 @@ def intmd_pacs_examcode():
         ON uni.RawExamCode = rqq.RequestQuestionExamCode
         LEFT JOIN rqa
         ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
-        LEFT JOIN link_rqq_exam
-        ON uni.RawExamCode = link_rqq_exam.RequestQuestionExamCode
+        --LEFT JOIN link_rqq_exam
+        --ON uni.RawExamCode = link_rqq_exam.RequestQuestionExamCode
+        LEFT JOIN LIVE.pacs_examcode_lookup AS lkp
+        ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = lkp.short_code
+        LEFT JOIN exam2
+        ON exam2.ExamCode = uni.RawExamCode
         """
     )
 
@@ -837,14 +858,14 @@ def pacs_clinical_event():
 # COMMAND ----------
 
 @dlt.table(
-    name="pacs_lkp_examcode",
+    name="pacs_examcode_lookup",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
     }
 )
-def pacs_lkp_examcode():
+def pacs_examcode_lookup():
     return spark.read.format("csv") \
                      .option("header", "true") \
                      .load("/Volumes/4_prod/pacs/base/Annex-1-DID_lookup_group.csv")

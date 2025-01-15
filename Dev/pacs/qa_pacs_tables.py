@@ -558,8 +558,7 @@ display(df)
 
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT *
+# MAGIC SELECT DISTINCT ExamModality
 # MAGIC FROM 4_prod.pacs.intmd_pacs_examcode
-# MAGIC WHERE ExamCode_t LIKE '% %' AND LinkedExamCodeFromPacsExam IS NOT NULL
 # MAGIC LIMIT 100
 # MAGIC
