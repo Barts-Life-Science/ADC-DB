@@ -67,7 +67,7 @@ def update_nomen_table(source_df, target_table):
         # Check if source_df is empty
     if source_df.count() == 0:
         return
-    
+    source_df = source_df.distinct()
     if table_exists(target_table):
         # Create temporary view of source data
         temp_view_name = f"temp_source_{target_table.replace('.', '_')}"
@@ -1008,6 +1008,141 @@ def add_snomed_terms(matches_df, snomed_terms, base_df):
 
 # COMMAND ----------
 
+def process_secondary_snomed_mappings(df, omop_concepts, concept_relationship):
+    """
+    Processes secondary SNOMED mappings by going through OMOP for records that don't have direct SNOMED mappings.
+    This specifically handles the ICD10 -> OMOP -> SNOMED path.
+    
+    Args:
+        df: DataFrame with existing mappings
+        omop_concepts: OMOP concepts reference table
+        concept_relationship: OMOP concept relationships table
+        
+    Returns:
+        DataFrame: Updated mappings with additional SNOMED codes found via OMOP
+    """
+    # First identify records that have OMOP mappings but no SNOMED mappings
+    candidates = df.filter(
+        (F.col("OMOP_CONCEPT_ID").isNotNull()) &
+        (F.col("SNOMED_CODE").isNull())
+    ).select(
+        "NOMENCLATURE_ID",
+        "OMOP_CONCEPT_ID",
+        "NUMBER_OF_OMOP_MATCHES"
+    ).alias("candidates")
+    
+    if candidates.count() == 0:
+        return df
+        
+    # Get SNOMED target concepts
+    snomed_targets = omop_concepts.filter(
+        F.col("vocabulary_id") == "SNOMED"
+    ).select(
+        F.col("concept_id").alias("snomed_concept_id"),
+        F.col("concept_code").alias("snomed_concept_code"),
+        F.col("concept_name").alias("snomed_concept_name")
+    ).alias("snomed")
+    
+    # Get valid relationships
+    valid_relationships = concept_relationship.filter(
+        F.col("relationship_id").isin(["Maps to", "Mapped from"])
+    ).select(
+        F.col("concept_id_1").alias("source_concept_id"),
+        F.col("concept_id_2").alias("target_concept_id")
+    ).alias("rels")
+    
+    # Add aliases to source concepts
+    source_concepts = omop_concepts.select(
+        F.col("concept_id").alias("source_id"),
+        F.col("concept_code").alias("source_code")
+    ).alias("source")
+    
+    # Get mappings from OMOP to SNOMED using concept_relationship
+    omop_to_snomed = source_concepts.join(
+        valid_relationships,
+        F.col("source.source_id") == F.col("rels.source_concept_id"),
+        "inner"
+    ).join(
+        snomed_targets,
+        (F.col("rels.target_concept_id") == F.col("snomed.snomed_concept_id")) &
+        (F.col("source.source_id") != F.col("snomed.snomed_concept_id")),
+        "inner"
+    ).select(
+        F.col("source.source_id").alias("omop_id"),
+        F.col("snomed.snomed_concept_code").alias("mapped_snomed_code"),
+        F.col("snomed.snomed_concept_name").alias("mapped_snomed_name")
+    )
+    
+    # Join candidates with OMOP-to-SNOMED mappings
+    secondary_matches = candidates.join(
+        omop_to_snomed,
+        F.col("candidates.OMOP_CONCEPT_ID") == F.col("omop_id"),
+        "inner"
+    ).select(
+        "NOMENCLATURE_ID",
+        "NUMBER_OF_OMOP_MATCHES",
+        "mapped_snomed_code",
+        "mapped_snomed_name"
+    )
+    
+    # Calculate combined match count
+    secondary_matches = secondary_matches.withColumn(
+        "match_count_per_nom",
+        F.count("mapped_snomed_code").over(Window.partitionBy("NOMENCLATURE_ID"))
+    ).withColumn(
+        "combined_match_count",
+        F.col("NUMBER_OF_OMOP_MATCHES") * F.col("match_count_per_nom")
+    )
+    
+    # Select best match for each record
+    best_matches = secondary_matches.withColumn(
+        "row_num",
+        F.row_number().over(
+            Window.partitionBy("NOMENCLATURE_ID")
+            .orderBy(F.col("combined_match_count"))
+        )
+    ).filter(F.col("row_num") == 1)
+    
+    # Update original records with secondary matches
+    updated_records = best_matches.select(
+        "NOMENCLATURE_ID",
+        F.col("mapped_snomed_code").alias("SNOMED_CODE"),
+        F.lit("OMOP_DERIVED").alias("SNOMED_TYPE"),
+        F.col("combined_match_count").alias("SNOMED_MATCH_COUNT"),
+        F.col("mapped_snomed_name").alias("SNOMED_TERM")
+    )
+    
+    # Get all columns from original DataFrame except the ones we're updating
+    original_columns = [col for col in df.columns if col not in 
+                       ["SNOMED_CODE", "SNOMED_TYPE", "SNOMED_MATCH_COUNT", "SNOMED_TERM"]]
+    
+    # Combine original mappings with new ones
+    result_df = df.alias("orig").join(
+        updated_records.alias("updates"),
+        "NOMENCLATURE_ID",
+        "left_outer"
+    )
+    
+    # Build the final selection
+    select_expr = []
+    
+    # Add all original columns except the ones we're updating
+    for col in original_columns:
+        select_expr.append(F.col(f"orig.{col}"))
+    
+    # Add the updated/coalesced columns
+    select_expr.extend([
+        F.coalesce(F.col("orig.SNOMED_CODE"), F.col("updates.SNOMED_CODE")).alias("SNOMED_CODE"),
+        F.coalesce(F.col("orig.SNOMED_TYPE"), F.col("updates.SNOMED_TYPE")).alias("SNOMED_TYPE"),
+        F.coalesce(F.col("orig.SNOMED_MATCH_COUNT"), F.col("updates.SNOMED_MATCH_COUNT")).alias("SNOMED_MATCH_COUNT"),
+        F.coalesce(F.col("orig.SNOMED_TERM"), F.col("updates.SNOMED_TERM")).alias("SNOMED_TERM")
+    ])
+    
+    # Return the final DataFrame with the correct column selection
+    return result_df.select(*select_expr)
+
+# COMMAND ----------
+
 def create_snomed_mapping_incr():
     """Creates an incremental SNOMED mapping table processing only new/modified records."""
     
@@ -1058,9 +1193,7 @@ def create_snomed_mapping_incr():
         .filter(F.col("invalid_reason").isNull()) \
         .select("concept_id", "concept_code")
     
-    target_concepts = spark.table("3_lookup.omop.concept") \
-        .filter(F.col("invalid_reason").isNull()) \
-        .select("concept_id", "concept_code")
+    target_concepts = source_concepts
     
     omop_rels = spark.table("3_lookup.omop.concept_relationship") \
         .filter(F.col("relationship_id").isin(["Maps to", "Mapped from"])) \
@@ -1179,6 +1312,10 @@ def create_snomed_mapping_incr():
 
     # Add SNOMED terms to final result
     final_df = add_snomed_terms(all_matches, snomed_terms, base_df)
+    # Process secondary mappings through OMOP for records without SNOMED codes
+    omop_concepts = spark.table("3_lookup.omop.concept").filter(F.col("invalid_reason").isNull())
+    concept_relationship = spark.table("3_lookup.omop.concept_relationship")
+    final_df = process_secondary_snomed_mappings(final_df, omop_concepts, omop_rels)
     
     # Drop intermediate columns
     final_df = final_df.drop("original_snomed_code", "standardized_found_cui")
@@ -1256,6 +1393,52 @@ def process_hierarchical_matches(df, base_type, omop_type):
          .alias("ICD10_TYPE")
     )
 
+def process_native_codes_icd10(base_df, icd10_code_values, icd_terms):
+    """
+    Process native ICD10 codes with standardization and term lookup.
+    
+    Args:
+        base_df: Base DataFrame containing source records
+        icd10_code_values: Reference table of valid ICD10 codes
+        icd_terms: Reference table containing ICD10 terms
+        
+    Returns:
+        DataFrame: Processed native ICD10 codes with standardized format and terms
+    """
+    native_codes = base_df.filter(
+        (col("SOURCE_VOCABULARY_CD").isin(
+            [row.CODE_VALUE for row in icd10_code_values.collect()]
+        )) |
+        (col("CONCEPT_CKI").like("ICD10WHO!%"))
+    )
+    
+    # First standardize the codes
+    with_standard_codes = native_codes.select(
+        col("NOMENCLATURE_ID"),
+        standardize_icd10_udf(
+            when(col("CONCEPT_CKI").like("ICD10WHO!%"),
+                regexp_replace(col("CONCEPT_CKI"), "ICD10WHO!", "")
+            ).otherwise(col("SOURCE_IDENTIFIER"))
+        ).alias("ICD10_CODE"),
+        lit(1).alias("ICD10_MATCH_COUNT"),
+        lit(False).alias("HAS_OMOP_MAP"),
+        lit("NATIVE").alias("ICD10_TYPE")
+    )
+    
+    # Then join with terms
+    return with_standard_codes.join(
+        icd_terms,
+        col("ICD10_CODE") == col("CUI"),
+        "left"
+    ).select(
+        col("NOMENCLATURE_ID"),
+        col("ICD10_CODE"),
+        col("ICD10_MATCH_COUNT"),
+        col("HAS_OMOP_MAP"),
+        col("ICD10_TYPE"),
+        col("TERM").alias("ICD10_TERM")
+    )
+
 def process_native_codes(base_df, icd10_code_values):
     """Helper function to process native ICD10 codes"""
     return base_df.filter(
@@ -1322,19 +1505,23 @@ def combine_matches_icd10(*dfs):
     combined = reduce(lambda df1, df2: df1.unionAll(df2), aliased_dfs)
     
     return combined.withColumn(
-        "priority",
-        F.when(F.col("ICD10_TYPE") == "NATIVE", 1)
-        .when(F.col("ICD10_TYPE").isin("EXACT", "OMOP_ASSISTED"), 2)
-        .when(F.col("ICD10_TYPE").isin("CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED"), 3)
-        .when(F.col("ICD10_TYPE").isin("PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED"), 4)
-        .otherwise(5)
-    ).withColumn(
-        "row_num",
-        F.row_number().over(
-            Window.partitionBy("NOMENCLATURE_ID")
-            .orderBy("priority", "ICD10_MATCH_COUNT")
+    "priority",
+    F.when(F.col("ICD10_TYPE") == "NATIVE", 1)
+    .when(F.col("ICD10_TYPE").isin("EXACT", "OMOP_ASSISTED"), 2)
+    .when(F.col("ICD10_TYPE").isin("CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED"), 3)
+    .when(F.col("ICD10_TYPE").isin("PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED"), 4)
+    .otherwise(5)
+).withColumn(
+    "row_num",
+    F.row_number().over(
+        Window.partitionBy("NOMENCLATURE_ID")
+        .orderBy(
+            F.col("ICD10_CODE").isNull().asc(),  
+            "priority", 
+            "ICD10_MATCH_COUNT"
         )
-    ).filter(F.col("row_num") == 1).drop("priority", "row_num")
+    )
+).filter(F.col("row_num") == 1)
 
 def add_icd10_terms(matches_df, icd_terms, base_df):
     """
@@ -1411,14 +1598,148 @@ def process_matches_icd10(df, base_type, omop_type):
 
 # COMMAND ----------
 
+def process_secondary_icd10_mappings(df, omop_concepts, concept_relationship):
+    """
+    Processes secondary ICD10 mappings by going through OMOP for records that don't have direct ICD10 mappings.
+    This specifically handles the SNOMED -> OMOP -> ICD10 path.
+    
+    Args:
+        df: DataFrame with existing mappings
+        omop_concepts: OMOP concepts reference table
+        concept_relationship: OMOP concept relationships table
+        
+    Returns:
+        DataFrame: Updated mappings with additional ICD10 codes found via OMOP
+    """
+    # First identify records that have OMOP mappings but no ICD10 mappings
+    candidates = df.filter(
+        (F.col("OMOP_CONCEPT_ID").isNotNull()) &
+        (F.col("ICD10_CODE").isNull())
+    ).select(
+        "NOMENCLATURE_ID",
+        "OMOP_CONCEPT_ID",
+        "NUMBER_OF_OMOP_MATCHES"
+    ).alias("candidates")
+    
+    if candidates.count() == 0:
+        return df
+        
+    # Get ICD10 target concepts
+    icd10_targets = omop_concepts.filter(
+        F.col("vocabulary_id").isin(["ICD10", "ICD10CM"])
+    ).select(
+        F.col("concept_id").alias("icd10_concept_id"),
+        F.col("concept_code").alias("icd10_concept_code"),
+        F.col("concept_name").alias("icd10_concept_name")
+    ).alias("icd10")
+    
+    # Get valid relationships
+    valid_relationships = concept_relationship.filter(
+        F.col("relationship_id").isin(["Maps to", "Mapped from"])
+    ).select(
+        F.col("concept_id_1").alias("source_concept_id"),
+        F.col("concept_id_2").alias("target_concept_id")
+    ).alias("rels")
+    
+    # Add aliases to source concepts
+    source_concepts = omop_concepts.select(
+        F.col("concept_id").alias("source_id"),
+        F.col("concept_code").alias("source_code")
+    ).alias("source")
+    
+    # Get mappings from OMOP to ICD10 using concept_relationship
+    omop_to_icd10 = source_concepts.join(
+        valid_relationships,
+        F.col("source.source_id") == F.col("rels.source_concept_id"),
+        "inner"
+    ).join(
+        icd10_targets,
+        (F.col("rels.target_concept_id") == F.col("icd10.icd10_concept_id")) &
+        (F.col("source.source_id") != F.col("icd10.icd10_concept_id")),
+        "inner"
+    ).select(
+        F.col("source.source_id").alias("omop_id"),
+        F.col("icd10.icd10_concept_code").alias("mapped_icd10_code"),
+        F.col("icd10.icd10_concept_name").alias("mapped_icd10_name")
+    )
+    
+    # Join candidates with OMOP-to-ICD10 mappings
+    secondary_matches = candidates.join(
+        omop_to_icd10,
+        F.col("candidates.OMOP_CONCEPT_ID") == F.col("omop_id"),
+        "inner"
+    ).select(
+        "NOMENCLATURE_ID",
+        "NUMBER_OF_OMOP_MATCHES",
+        "mapped_icd10_code",
+        "mapped_icd10_name"
+    )
+    
+    # Calculate combined match count
+    secondary_matches = secondary_matches.withColumn(
+        "match_count_per_nom",
+        F.count("mapped_icd10_code").over(Window.partitionBy("NOMENCLATURE_ID"))
+    ).withColumn(
+        "combined_match_count",
+        F.col("NUMBER_OF_OMOP_MATCHES") * F.col("match_count_per_nom")
+    )
+    
+    # Select best match for each record
+    best_matches = secondary_matches.withColumn(
+        "row_num",
+        F.row_number().over(
+            Window.partitionBy("NOMENCLATURE_ID")
+            .orderBy(F.col("combined_match_count"))
+        )
+    ).filter(F.col("row_num") == 1)
+    
+    # Update original records with secondary matches
+    updated_records = best_matches.select(
+        "NOMENCLATURE_ID",
+        F.col("mapped_icd10_code").alias("ICD10_CODE"),
+        F.lit("OMOP_DERIVED").alias("ICD10_TYPE"),
+        F.col("combined_match_count").alias("ICD10_MATCH_COUNT"),
+        F.col("mapped_icd10_name").alias("ICD10_TERM")
+    )
+    
+    # Get all columns from original DataFrame except the ones we're updating
+    original_columns = [col for col in df.columns if col not in 
+                       ["ICD10_CODE", "ICD10_TYPE", "ICD10_MATCH_COUNT", "ICD10_TERM"]]
+    
+    # Combine original mappings with new ones
+    result_df = df.alias("orig").join(
+        updated_records.alias("updates"),
+        "NOMENCLATURE_ID",
+        "left_outer"
+    )
+    
+    # Build the final selection
+    select_expr = []
+    
+    # Add all original columns except the ones we're updating
+    for col in original_columns:
+        select_expr.append(F.col(f"orig.{col}"))
+    
+    # Add the updated/coalesced columns
+    select_expr.extend([
+        F.coalesce(F.col("orig.ICD10_CODE"), F.col("updates.ICD10_CODE")).alias("ICD10_CODE"),
+        F.coalesce(F.col("orig.ICD10_TYPE"), F.col("updates.ICD10_TYPE")).alias("ICD10_TYPE"),
+        F.coalesce(F.col("orig.ICD10_MATCH_COUNT"), F.col("updates.ICD10_MATCH_COUNT")).alias("ICD10_MATCH_COUNT"),
+        F.coalesce(F.col("orig.ICD10_TERM"), F.col("updates.ICD10_TERM")).alias("ICD10_TERM")
+    ])
+    
+    # Return the final DataFrame with the correct column selection
+    return result_df.select(*select_expr)
+
+# COMMAND ----------
+
 def create_icd10_mapping_incr():
     """
     Creates an incremental ICD10 mapping table processing only new/modified records.
         
     Returns:
-        DataFrame: Incremental ICD10 mappings
+        DataFrame: Incremental ICD10 mappings with standardized codes and terms
     """
-
     max_adc_updt = get_max_timestamp("4_prod.bronze.tempthree_nomenclature")
     
     # Get base and reference tables
@@ -1505,32 +1826,22 @@ def create_icd10_mapping_incr():
     child_final = process_matches_icd10(child_with_omop, "CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED")
     parent_final = process_matches_icd10(parent_with_omop, "PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED")
 
-    # Process native ICD10 codes
+    # Process native ICD10 codes with the new function
     icd10_code_values = code_value.filter(
         col("CDF_MEANING").isin(["ICD10", "ICD10WHO"])
     )
     
-    native_codes = base_df.filter(
-        (col("base.SOURCE_VOCABULARY_CD").isin(
-            [row.CODE_VALUE for row in icd10_code_values.collect()]
-        )) |
-        (col("base.CONCEPT_CKI").like("ICD10WHO!%"))
-    ).select(
-        col("base.NOMENCLATURE_ID"),
-        when(col("base.CONCEPT_CKI").like("ICD10WHO!%"),
-            regexp_replace(col("base.CONCEPT_CKI"), "ICD10WHO!", "")
-        ).otherwise(col("base.SNOMED_CODE")).alias("ICD10_CODE"),
-        lit(1).alias("ICD10_MATCH_COUNT"),
-        lit(False).alias("HAS_OMOP_MAP"),
-        lit("NATIVE").alias("ICD10_TYPE")
-    )
+    native_codes = process_native_codes_icd10(base_df, icd10_code_values, icd_terms)
 
     # Combine all matches
     all_matches = combine_matches_icd10(native_codes, direct_final, child_final, parent_final)
 
     # Add ICD10 terms and return final result
     final_df = add_icd10_terms(all_matches, icd_terms, base_df)
-
+    # Process secondary mappings through OMOP for records without ICD10 codes
+    omop_concepts = spark.table("3_lookup.omop.concept").filter(F.col("invalid_reason").isNull())
+    concept_relationship = spark.table("3_lookup.omop.concept_relationship")
+    final_df = process_secondary_icd10_mappings(final_df, omop_concepts, concept_relationship)
     return final_df
 
 # COMMAND ----------
@@ -1642,37 +1953,42 @@ Returns:
 
 def combine_matches_opcs4(*dfs):
     """
-Helper function to combine and prioritize matches
-CopyArgs:
-    *dfs: Variable number of DataFrames to combine
+    Helper function to combine and prioritize matches
+    
+    Args:
+        *dfs: Variable number of DataFrames to combine
 
-Returns:
-    DataFrame: Combined and prioritized matches
+    Returns:
+        DataFrame: Combined and prioritized matches
     """
     combined = reduce(
-    lambda df1, df2: df1.unionAll(df2),
-    [df.select(
-        "NOMENCLATURE_ID", 
-        "OPCS4_CODE", 
-        "OPCS4_MATCH_COUNT", 
-        "HAS_OMOP_MAP", 
-        "OPCS4_TYPE"
-    ) for df in dfs]
+        lambda df1, df2: df1.unionAll(df2),
+        [df.select(
+            "NOMENCLATURE_ID", 
+            "OPCS4_CODE", 
+            "OPCS4_MATCH_COUNT", 
+            "HAS_OMOP_MAP", 
+            "OPCS4_TYPE"
+        ) for df in dfs]
     )
 
     return combined.withColumn(
-    "priority",
-    F.when(F.col("OPCS4_TYPE") == "NATIVE", 1)
-    .when(F.col("OPCS4_TYPE").isin("EXACT", "OMOP_ASSISTED"), 2)
-    .when(F.col("OPCS4_TYPE").isin("CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED"), 3)
-    .when(F.col("OPCS4_TYPE").isin("PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED"), 4)
-    .otherwise(5)
+        "priority",
+        F.when(F.col("OPCS4_TYPE") == "NATIVE", 1)
+        .when(F.col("OPCS4_TYPE").isin("EXACT", "OMOP_ASSISTED"), 2)
+        .when(F.col("OPCS4_TYPE").isin("CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED"), 3)
+        .when(F.col("OPCS4_TYPE").isin("PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED"), 4)
+        .otherwise(5)
     ).withColumn(
-    "row_num",
-    F.row_number().over(
-        Window.partitionBy("NOMENCLATURE_ID")
-        .orderBy("priority", "OPCS4_MATCH_COUNT")
-    )
+        "row_num",
+        F.row_number().over(
+            Window.partitionBy("NOMENCLATURE_ID")
+            .orderBy(
+                F.col("OPCS4_CODE").isNull().asc(),
+                "priority", 
+                "OPCS4_MATCH_COUNT"
+            )
+        )
     ).filter(F.col("row_num") == 1).drop("priority", "row_num")
 
 def add_opcs4_terms(matches_df, opcs_terms, base_df):
@@ -1716,6 +2032,141 @@ def add_opcs4_terms(matches_df, opcs_terms, base_df):
 
 # COMMAND ----------
 
+def process_secondary_opcs4_mappings(df, omop_concepts, concept_relationship):
+    """
+    Processes secondary OPCS4 mappings by going through OMOP for records that don't have direct OPCS4 mappings.
+    This specifically handles the SNOMED -> OMOP -> OPCS4 path.
+    
+    Args:
+        df: DataFrame with existing mappings
+        omop_concepts: OMOP concepts reference table
+        concept_relationship: OMOP concept relationships table
+        
+    Returns:
+        DataFrame: Updated mappings with additional OPCS4 codes found via OMOP
+    """
+    # First identify records that have OMOP mappings but no OPCS4 mappings
+    candidates = df.filter(
+        (F.col("OMOP_CONCEPT_ID").isNotNull()) &
+        (F.col("OPCS4_CODE").isNull())
+    ).select(
+        "NOMENCLATURE_ID",
+        "OMOP_CONCEPT_ID",
+        "NUMBER_OF_OMOP_MATCHES"
+    ).alias("candidates")
+    
+    if candidates.count() == 0:
+        return df
+        
+    # Get OPCS4 target concepts
+    opcs4_targets = omop_concepts.filter(
+        F.col("vocabulary_id") == "OPCS4"
+    ).select(
+        F.col("concept_id").alias("opcs4_concept_id"),
+        F.col("concept_code").alias("opcs4_concept_code"),
+        F.col("concept_name").alias("opcs4_concept_name")
+    ).alias("opcs4")
+    
+    # Get valid relationships
+    valid_relationships = concept_relationship.filter(
+        F.col("relationship_id").isin(["Maps to", "Mapped from"])
+    ).select(
+        F.col("concept_id_1").alias("source_concept_id"),
+        F.col("concept_id_2").alias("target_concept_id")
+    ).alias("rels")
+    
+    # Add aliases to source concepts
+    source_concepts = omop_concepts.select(
+        F.col("concept_id").alias("source_id"),
+        F.col("concept_code").alias("source_code")
+    ).alias("source")
+    
+    # Get mappings from OMOP to OPCS4 using concept_relationship
+    omop_to_opcs4 = source_concepts.join(
+        valid_relationships,
+        F.col("source.source_id") == F.col("rels.source_concept_id"),
+        "inner"
+    ).join(
+        opcs4_targets,
+        (F.col("rels.target_concept_id") == F.col("opcs4.opcs4_concept_id")) &
+        (F.col("source.source_id") != F.col("opcs4.opcs4_concept_id")),
+        "inner"
+    ).select(
+        F.col("source.source_id").alias("omop_id"),
+        F.col("opcs4.opcs4_concept_code").alias("mapped_opcs4_code"),
+        F.col("opcs4.opcs4_concept_name").alias("mapped_opcs4_name")
+    )
+    
+    # Join candidates with OMOP-to-OPCS4 mappings
+    secondary_matches = candidates.join(
+        omop_to_opcs4,
+        F.col("candidates.OMOP_CONCEPT_ID") == F.col("omop_id"),
+        "inner"
+    ).select(
+        "NOMENCLATURE_ID",
+        "NUMBER_OF_OMOP_MATCHES",
+        "mapped_opcs4_code",
+        "mapped_opcs4_name"
+    )
+    
+    # Calculate combined match count
+    secondary_matches = secondary_matches.withColumn(
+        "match_count_per_nom",
+        F.count("mapped_opcs4_code").over(Window.partitionBy("NOMENCLATURE_ID"))
+    ).withColumn(
+        "combined_match_count",
+        F.col("NUMBER_OF_OMOP_MATCHES") * F.col("match_count_per_nom")
+    )
+    
+    # Select best match for each record
+    best_matches = secondary_matches.withColumn(
+        "row_num",
+        F.row_number().over(
+            Window.partitionBy("NOMENCLATURE_ID")
+            .orderBy(F.col("combined_match_count"))
+        )
+    ).filter(F.col("row_num") == 1)
+    
+    # Update original records with secondary matches
+    updated_records = best_matches.select(
+        "NOMENCLATURE_ID",
+        F.col("mapped_opcs4_code").alias("OPCS4_CODE"),
+        F.lit("OMOP_DERIVED").alias("OPCS4_TYPE"),
+        F.col("combined_match_count").alias("OPCS4_MATCH_COUNT"),
+        F.col("mapped_opcs4_name").alias("OPCS4_TERM")
+    )
+    
+    # Get all columns from original DataFrame except the ones we're updating
+    original_columns = [col for col in df.columns if col not in 
+                       ["OPCS4_CODE", "OPCS4_TYPE", "OPCS4_MATCH_COUNT", "OPCS4_TERM"]]
+    
+    # Combine original mappings with new ones
+    result_df = df.alias("orig").join(
+        updated_records.alias("updates"),
+        "NOMENCLATURE_ID",
+        "left_outer"
+    )
+    
+    # Build the final selection
+    select_expr = []
+    
+    # Add all original columns except the ones we're updating
+    for col in original_columns:
+        select_expr.append(F.col(f"orig.{col}"))
+    
+    # Add the updated/coalesced columns
+    select_expr.extend([
+        F.coalesce(F.col("orig.OPCS4_CODE"), F.col("updates.OPCS4_CODE")).alias("OPCS4_CODE"),
+        F.coalesce(F.col("orig.OPCS4_TYPE"), F.col("updates.OPCS4_TYPE")).alias("OPCS4_TYPE"),
+        F.coalesce(F.col("orig.OPCS4_MATCH_COUNT"), F.col("updates.OPCS4_MATCH_COUNT")).alias("OPCS4_MATCH_COUNT"),
+        F.coalesce(F.col("orig.OPCS4_TERM"), F.col("updates.OPCS4_TERM")).alias("OPCS4_TERM")
+    ])
+    
+    # Return the final DataFrame with the correct column selection
+    return result_df.select(*select_expr)
+
+# COMMAND ----------
+
 def create_opcs4_mapping_incr():
     """
     Creates an incremental OPCS4 mapping table processing only new/modified records.
@@ -1725,7 +2176,7 @@ def create_opcs4_mapping_incr():
         DataFrame: Incremental OPCS4 mappings
     """
 
-    max_adc_updt = get_max_timestamp("4_prod.bronze.nomenclature")
+    max_adc_updt = get_max_timestamp("4_prod.bronze.tempfour_nomenclature")
 
     # Get base and reference tables
     base_df = spark.table("4_prod.bronze.tempthree_nomenclature") \
@@ -1820,7 +2271,10 @@ def create_opcs4_mapping_incr():
 
     # Add OPCS4 terms and return final result
     final_df = add_opcs4_terms(all_matches, opcs_terms, base_df)
-
+    # Process secondary mappings through OMOP for records without OPCS4 codes
+    omop_concepts = spark.table("3_lookup.omop.concept").filter(F.col("invalid_reason").isNull())
+    concept_relationship = spark.table("3_lookup.omop.concept_relationship")
+    final_df = process_secondary_opcs4_mappings(final_df, omop_concepts, concept_relationship)
     return final_df
 
 # COMMAND ----------
@@ -1829,4 +2283,212 @@ def create_opcs4_mapping_incr():
 updates_df = create_opcs4_mapping_incr()
     
 
+update_nomen_table(updates_df, "4_prod.bronze.tempfour_nomenclature")
+
+# COMMAND ----------
+
+def process_tertiary_omop_mappings(df, omop_concepts, concept_relationship):
+    """
+    Processes tertiary OMOP mappings sequentially: SNOMED first, then ICD10, then OPCS4
+    only for records that don't already have OMOP mappings.
+    """
+    result_df = df
+    
+    # Get valid concepts and relationships once
+    valid_concepts = omop_concepts.filter(F.col("invalid_reason").isNull())
+    valid_relationships = concept_relationship.filter(
+        F.col("relationship_id").isin(["Maps to", "Mapped from"])
+    )
+    
+    # Process SNOMED mappings first
+    snomed_candidates = result_df.alias("r").filter(
+        (F.col("r.OMOP_CONCEPT_ID").isNull()) &
+        (F.col("r.SNOMED_CODE").isNotNull()) & 
+        (F.col("r.SNOMED_TYPE") != "NATIVE")
+    )
+    
+    if snomed_candidates.count() > 0:
+        snomed_mappings = process_code_to_omop_mapping(
+            candidates_df=snomed_candidates,
+            source_code_col="SNOMED_CODE",
+            concepts_df=valid_concepts.filter(F.col("vocabulary_id") == "SNOMED"),
+            relationships_df=valid_relationships,
+            source_type="SNOMED"
+        )
+        
+        # Update result_df with SNOMED mappings
+        result_df = result_df.alias("orig").join(
+            snomed_mappings.alias("new"),
+            "NOMENCLATURE_ID",
+            "left_outer"
+        ).select(
+            *[F.col("orig." + c) for c in result_df.columns if c not in ["OMOP_CONCEPT_ID", "OMOP_CONCEPT_NAME"]],
+            F.coalesce("orig.OMOP_CONCEPT_ID", "new.OMOP_CONCEPT_ID").alias("OMOP_CONCEPT_ID"),
+            F.coalesce("orig.OMOP_CONCEPT_NAME", "new.OMOP_CONCEPT_NAME").alias("OMOP_CONCEPT_NAME")
+        )
+    
+    # Process ICD10 mappings for remaining unmapped records
+    icd10_candidates = result_df.alias("r").filter(
+        (F.col("r.OMOP_CONCEPT_ID").isNull()) &
+        (F.col("r.ICD10_CODE").isNotNull()) & 
+        (F.col("r.ICD10_TYPE") != "NATIVE")
+    )
+    
+    if icd10_candidates.count() > 0:
+        icd10_mappings = process_code_to_omop_mapping(
+            candidates_df=icd10_candidates,
+            source_code_col="ICD10_CODE",
+            concepts_df=valid_concepts.filter(F.col("vocabulary_id").isin(["ICD10", "ICD10CM"])),
+            relationships_df=valid_relationships,
+            source_type="ICD10"
+        )
+        
+        # Update result_df with ICD10 mappings
+        result_df = result_df.alias("orig").join(
+            icd10_mappings.alias("new"),
+            "NOMENCLATURE_ID",
+            "left_outer"
+        ).select(
+            *[F.col("orig." + c) for c in result_df.columns if c not in ["OMOP_CONCEPT_ID", "OMOP_CONCEPT_NAME"]],
+            F.coalesce("orig.OMOP_CONCEPT_ID", "new.OMOP_CONCEPT_ID").alias("OMOP_CONCEPT_ID"),
+            F.coalesce("orig.OMOP_CONCEPT_NAME", "new.OMOP_CONCEPT_NAME").alias("OMOP_CONCEPT_NAME")
+        )
+    
+    # Process OPCS4 mappings for remaining unmapped records
+    opcs4_candidates = result_df.alias("r").filter(
+        (F.col("r.OMOP_CONCEPT_ID").isNull()) &
+        (F.col("r.OPCS4_CODE").isNotNull()) & 
+        (F.col("r.OPCS4_TYPE") != "NATIVE")
+    )
+    
+    if opcs4_candidates.count() > 0:
+        opcs4_mappings = process_code_to_omop_mapping(
+            candidates_df=opcs4_candidates,
+            source_code_col="OPCS4_CODE",
+            concepts_df=valid_concepts.filter(F.col("vocabulary_id") == "OPCS4"),
+            relationships_df=valid_relationships,
+            source_type="OPCS4"
+        )
+        
+        # Update result_df with OPCS4 mappings
+        result_df = result_df.alias("orig").join(
+            opcs4_mappings.alias("new"),
+            "NOMENCLATURE_ID",
+            "left_outer"
+        ).select(
+            *[F.col("orig." + c) for c in result_df.columns if c not in ["OMOP_CONCEPT_ID", "OMOP_CONCEPT_NAME"]],
+            F.coalesce("orig.OMOP_CONCEPT_ID", "new.OMOP_CONCEPT_ID").alias("OMOP_CONCEPT_ID"),
+            F.coalesce("orig.OMOP_CONCEPT_NAME", "new.OMOP_CONCEPT_NAME").alias("OMOP_CONCEPT_NAME")
+        )
+    
+    return result_df
+
+def process_code_to_omop_mapping(candidates_df, source_code_col, concepts_df, relationships_df, source_type):
+    """
+    Helper function to process mappings from a specific code type to OMOP,
+    ensuring only one mapping per nomenclature_id
+    """
+    # Join candidates with OMOP concepts to get concept_ids
+    source_matches = candidates_df.join(
+        concepts_df.select(
+            F.col("concept_id").alias("source_concept_id"),
+            F.col("concept_code").alias("source_concept_code"),
+            F.col("standard_concept").alias("source_standard")
+        ),
+        F.col(source_code_col) == F.col("source_concept_code"),
+        "inner"
+    )
+    
+    # Use relationships to find target OMOP concepts
+    with_relationships = source_matches.join(
+        relationships_df.select(
+            F.col("concept_id_1").alias("rel_source_id"),
+            F.col("concept_id_2").alias("rel_target_id")
+        ),
+        (F.col("source_concept_id") == F.col("rel_source_id")),
+        "inner"
+    ).join(
+        concepts_df.select(
+            F.col("concept_id").alias("target_concept_id"),
+            F.col("concept_name").alias("target_concept_name"),
+            F.col("standard_concept").alias("target_standard"),
+            F.col("domain_id").alias("target_domain")
+        ),
+        F.col("rel_target_id") == F.col("target_concept_id"),
+        "inner"
+    )
+    
+    # Select best match for each record using window function
+    window_spec = Window.partitionBy("NOMENCLATURE_ID").orderBy(
+        # Prefer standard concepts
+        F.when(F.col("target_standard") == "S", 1)
+         .otherwise(0).desc(),
+        # Prefer certain domains based on source type
+        F.when(F.col("target_domain").isin(get_preferred_domains(source_type)), 1)
+         .otherwise(0).desc(),
+        # Use concept_id as final tiebreaker for deterministic results
+        F.col("target_concept_id")
+    )
+    
+    return with_relationships.withColumn(
+        "row_num", F.row_number().over(window_spec)
+    ).filter(
+        F.col("row_num") == 1
+    ).select(
+        "NOMENCLATURE_ID",
+        F.col("target_concept_id").alias("OMOP_CONCEPT_ID"),
+        F.col("target_concept_name").alias("OMOP_CONCEPT_NAME")
+    )
+
+def get_preferred_domains(source_type):
+    """
+    Returns preferred OMOP domains based on source vocabulary type
+    """
+    domain_preferences = {
+        "SNOMED": ["Condition", "Procedure", "Observation"],
+        "ICD10": ["Condition"],
+        "OPCS4": ["Procedure"]
+    }
+    return domain_preferences.get(source_type, [])
+
+# COMMAND ----------
+
+def create_final_nomenclature_incr():
+    """
+    Creates an incremental final nomenclature table with additional derived OMOP mappings.
+    Only processes records that have been added or modified since the last run.
+    
+    Returns:
+        DataFrame: Incremental final nomenclature mappings with all possible OMOP codes
+    """
+    # Get max timestamp from final table
+    max_adc_updt = get_max_timestamp("4_prod.bronze.nomenclature")
+    
+    # Get base nomenclature table with original column names
+    base_df = spark.table("4_prod.bronze.tempfour_nomenclature").filter(
+        F.col("ADC_UPDT") > max_adc_updt
+    )
+    
+    # If no new records, return empty DataFrame with correct schema
+    if base_df.count() == 0:
+        return base_df
+    
+    # Get OMOP reference tables
+    omop_concepts = spark.table("3_lookup.omop.concept").filter(
+        F.col("invalid_reason").isNull()
+    )
+    
+    concept_relationship = spark.table("3_lookup.omop.concept_relationship")
+    
+    # Process tertiary mappings
+    final_df = process_tertiary_omop_mappings(
+        df=base_df,
+        omop_concepts=omop_concepts,
+        concept_relationship=concept_relationship
+    )
+    
+    return final_df
+
+# Create and save incremental final nomenclature table
+updates_df = create_final_nomenclature_incr()
 update_nomen_table(updates_df, "4_prod.bronze.nomenclature")

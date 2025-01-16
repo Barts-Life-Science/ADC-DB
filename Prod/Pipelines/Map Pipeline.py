@@ -851,6 +851,7 @@ def create_diagnosis_mapping_incr():
     nomenclature = spark.table("4_prod.bronze.nomenclature")
     encounter = spark.table("4_prod.bronze.map_encounter")
     code_values = spark.table("3_lookup.mill.mill_code_value")
+
     
     # Create window for earliest diagnosis date
     earliest_date_window = Window.partitionBy("PERSON_ID", "NOMENCLATURE_ID")
@@ -864,7 +865,10 @@ def create_diagnosis_mapping_incr():
             "left"
         )
     )
-    
+
+
+
+
     # Calculate diagnosis dates
     diagnosis_with_dates = (
         diagnosis_with_encounter
@@ -905,14 +909,31 @@ def create_diagnosis_mapping_incr():
             substring_index(col("CONCEPT_CKI"), "!", -1)
         )
     )
+       # Check nomenclature join
+    after_nomenclature = diagnosis_with_encounter.join(
+        nomenclature_processed,
+        "NOMENCLATURE_ID",
+        "left"
+    )
+
     
+    # Check one of the code value joins
+    after_code_value = after_nomenclature.join(
+        code_values.select(
+            col("CODE_VALUE"),
+            col("DESCRIPTION").alias("diag_type_desc")
+        ).alias("diag_type"),
+        col("DIAG_TYPE_CD") == col("diag_type.CODE_VALUE"),
+        "left"
+    )
+
     # Start with base join
     result = diagnosis_with_dates.alias("diag").join(
         nomenclature_processed.alias("nom"),
         "NOMENCLATURE_ID",
         "left"
     )
-    
+
     # Add code value lookups one by one
     for lookup_name, (join_col, desc_col) in lookups.items():
         lookup_df = code_values.select(
@@ -925,7 +946,7 @@ def create_diagnosis_mapping_incr():
             col(join_col) == col(f"{lookup_name}.CODE_VALUE"),
             "left"
         )
-    
+
     # Select final columns
     return result.select(
         # Base columns
@@ -976,7 +997,10 @@ def create_diagnosis_mapping_incr():
 
 
 updates_df = create_diagnosis_mapping_incr()
-    
+
+
+
+
 
 update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID")
 
