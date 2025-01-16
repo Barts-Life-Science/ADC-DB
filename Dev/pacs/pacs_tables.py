@@ -320,19 +320,6 @@ def intmd_pacs_examcode():
                 MillExamCode AS RawExamCode
             FROM LIVE.stag_mill_clinical_event_pacs
         ),
-        /*
-        link_rqq_exam AS (
-            SELECT
-                RequestQuestionExamCode,
-                MODE(ExaminationCode) AS LinkedExamCodeFromPacsExam
-            FROM LIVE.stag_pacs_requestquestion AS rq
-            LEFT JOIN (SELECT DISTINCT ExaminationReportRequestId, ExaminationReportExaminationId FROM 4_prod.raw.pacs_examinationreports) AS er
-            ON rq.RequestId = er.ExaminationReportRequestId
-            LEFT JOIN LIVE.stag_pacs_examinations AS e
-            ON er.ExaminationReportExaminationId = e.ExaminationId
-            WHERE ExaminationCode IS NOT NULL AND ExaminationCode NOT LIKE '% %'
-            GROUP BY RequestQuestionExamCode
-        ),*/
         exam AS (
             SELECT
                 ExaminationCode AS ExamCode,
@@ -383,13 +370,7 @@ def intmd_pacs_examcode():
         SELECT
             RawExamCode,
             ce1.MillExamCode,
-            --link_rqq_exam.LinkedExamCodeFromPacsExam,
             COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
-            CASE
-                WHEN lkp.short_code IS NULL
-                THEN FALSE
-                ELSE TRUE
-            END AS IsExamCodeInLookupTable,
             ExamModality,
             ExamModality2,
             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
@@ -408,17 +389,16 @@ def intmd_pacs_examcode():
         ON uni.RawExamCode = rqq.RequestQuestionExamCode
         LEFT JOIN rqa
         ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
-        --LEFT JOIN link_rqq_exam
-        --ON uni.RawExamCode = link_rqq_exam.RequestQuestionExamCode
-        LEFT JOIN LIVE.pacs_examcode_lookup AS lkp
-        ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = lkp.short_code
         LEFT JOIN exam2
         ON exam2.ExamCode = uni.RawExamCode
         """
     )
-
+    df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
+    lkp = spark.read.table("LIVE.pacs_examcode_lookup").select("short_code")
+    df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
+    df = df.withColumn("IsExamCodeinLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
+    df = df.drop("short_code")
     return df
-
 
 # COMMAND ----------
 
