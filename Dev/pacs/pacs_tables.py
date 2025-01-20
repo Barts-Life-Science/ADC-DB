@@ -324,6 +324,7 @@ def intmd_pacs_examcode():
             SELECT
                 ExaminationCode AS ExamCode,
                 MODE(ExaminationModality) AS ExamModality,
+                MODE(ExaminationBodyPart) AS ExamBodyPart,
                 COUNT(*) AS NumRowsInPacsExam
             FROM LIVE.stag_pacs_examinations
             GROUP BY ExaminationCode
@@ -374,6 +375,7 @@ def intmd_pacs_examcode():
             ExamModality,
             ExamModality2,
             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
+            ExamBodyPart,
             rqq.NumRowsInRequestQuestion,
             rqa.NumRowsInRequestAnamnesis,
             exam.NumRowsInPacsExam,
@@ -396,7 +398,7 @@ def intmd_pacs_examcode():
     df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
     lkp = spark.read.table("LIVE.pacs_examcode_lookup").select("short_code")
     df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
-    df = df.withColumn("IsExamCodeinLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
+    df = df.withColumn("IsExamCodeInLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
     df = df.drop("short_code")
     return df
 
