@@ -933,17 +933,44 @@ def process_matches(df, base_type, omop_type):
 
 def combine_matches(*dfs):
     """Helper function to combine and prioritize matches"""
+    # Check if all DataFrames are empty
+    if all(df.count() == 0 for df in dfs):
+        # Return an empty DataFrame with the expected schema
+        return spark.createDataFrame(
+            [],
+            schema=StructType([
+                StructField("NOMENCLATURE_ID", StringType(), True),
+                StructField("temp_snomed_code", StringType(), True),
+                StructField("SNOMED_MATCH_COUNT", IntegerType(), True),
+                StructField("HAS_OMOP_MAP", BooleanType(), True),
+                StructField("SNOMED_TYPE", StringType(), True)
+            ])
+        )
+
     # Add unique aliases to each DataFrame
     aliased_dfs = []
     for i, df in enumerate(dfs):
-        aliased_dfs.append(
-            df.select(
-                F.col("NOMENCLATURE_ID"),
-                F.col("temp_snomed_code"),
-                F.col("SNOMED_MATCH_COUNT"),
-                F.col("HAS_OMOP_MAP"),
-                F.col("SNOMED_TYPE")
-            ).alias(f"df_{i}")
+        if df.count() > 0:  # Only process non-empty DataFrames
+            aliased_dfs.append(
+                df.select(
+                    F.col("NOMENCLATURE_ID"),
+                    F.col("temp_snomed_code"),
+                    F.col("SNOMED_MATCH_COUNT"),
+                    F.col("HAS_OMOP_MAP"),
+                    F.col("SNOMED_TYPE")
+                ).alias(f"df_{i}")
+            )
+    
+    if not aliased_dfs:  # If no valid DataFrames after filtering
+        return spark.createDataFrame(
+            [],
+            schema=StructType([
+                StructField("NOMENCLATURE_ID", StringType(), True),
+                StructField("temp_snomed_code", StringType(), True),
+                StructField("SNOMED_MATCH_COUNT", IntegerType(), True),
+                StructField("HAS_OMOP_MAP", BooleanType(), True),
+                StructField("SNOMED_TYPE", StringType(), True)
+            ])
         )
     
     combined = reduce(lambda df1, df2: df1.unionAll(df2), aliased_dfs)
@@ -1305,7 +1332,13 @@ def create_snomed_mapping_incr():
         direct_final,  # Priority 2
         prefix_final   # Priority 3
     )
-    
+    if all_matches.count() == 0:
+        # Return the original DataFrame with null SNOMED columns
+        return base_df.withColumn("SNOMED_CODE", F.lit(None)) \
+                     .withColumn("SNOMED_TYPE", F.lit(None)) \
+                     .withColumn("SNOMED_MATCH_COUNT", F.lit(None)) \
+                     .withColumn("SNOMED_TERM", F.lit(None)) \
+                     .drop("original_snomed_code", "standardized_found_cui")
     print(f"Total combined matches: {all_matches.count()}")
 
     # Add SNOMED terms to final result

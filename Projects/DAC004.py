@@ -17,7 +17,7 @@ SELECT
 FROM 4_prod.raw.mill_person_alias pa
 WHERE pa.ALIAS IN (
     SELECT Identifier 
-    FROM 5_projects.dac004.adams_table
+    FROM 6_mgmt.cohort_lookup.dac004_adams
 )
 """
 spark.sql(cohort_sql)

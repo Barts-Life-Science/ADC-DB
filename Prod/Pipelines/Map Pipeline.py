@@ -980,6 +980,7 @@ def create_diagnosis_mapping_incr():
         col("OMOP_CONCEPT_NAME"),
         col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
         col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+        col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
         col("SNOMED_CODE"),
         col("SNOMED_TYPE"),
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
@@ -1314,6 +1315,7 @@ def create_problem_mapping_incr():
         "OMOP_CONCEPT_NAME",
         col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
         col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+        col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
         "SNOMED_CODE",
         "SNOMED_TYPE",
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
@@ -2569,6 +2571,7 @@ def process_procedure_incremental():
                 "OMOP_CONCEPT_NAME",
                 col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
                 col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+                col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
                 "SNOMED_CODE",
                 "SNOMED_TYPE",
                 col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
@@ -2770,6 +2773,20 @@ def add_manual_omop_mappings_numeric(df, barts_mapfile, concepts):
         )
     )
     
+    # Process unit mappings
+    unit_maps = (
+        barts_mapfile
+        .filter(
+            (col("SourceTable") == "dbo.PI_CDE_CLINICAL_EVENT") &
+            (col("SourceField") == "EVENT_RESULT_UNITS_CD") &  
+            (col("OMOPField") == "unit_concept_id")
+        )
+        .select(
+            col("SourceValue").cast(IntegerType()),
+            col("OMOPConceptId").alias("OMOP_MANUAL_UNITS")
+        )
+    )
+    
     # Get concept details
     concept_details = (
         concepts
@@ -2784,12 +2801,20 @@ def add_manual_omop_mappings_numeric(df, barts_mapfile, concepts):
     
     return (
         df
+        # Join with concept mappings
         .join(
             concept_maps,
             (df.EVENT_CD.cast("string") == concept_maps.SourceValue) &
             (concept_maps.MAP_EVENT_CLASS_CD.isNull() | (df.EVENT_CLASS_CD == concept_maps.MAP_EVENT_CLASS_CD)),
             "left"
         )
+        # Join with unit mappings
+        .join(
+            unit_maps,
+            df.UNIT_OF_MEASURE_CD == unit_maps.SourceValue,
+            "left"
+        )
+        # Join with concept details
         .join(
             concept_details,
             col("OMOP_MANUAL_CONCEPT") == concept_details.concept_id,
@@ -2986,7 +3011,7 @@ def process_numeric_events_incremental():
                 col("ce.EVENT_CLASS_CD").cast(IntegerType()),
                 col("ce.PERFORMED_PRSNL_ID").cast(LongType()),
                 
-                col("NUMERIC_RESULT").cast(DoubleType()),
+                col("NUMERIC_RESULT").cast(FloatType()),
                 col("UNIT_OF_MEASURE_CD").cast(IntegerType()),
                 col("unit_desc").alias("UNIT_OF_MEASURE_DISPLAY"),
                 
@@ -3010,8 +3035,8 @@ def process_numeric_events_incremental():
                 col("entry_desc").alias("ENTRY_MODE_DISPLAY"),
                 
                 # Reference ranges
-                col("ce.NORMAL_LOW").cast(DoubleType()),
-                col("ce.NORMAL_HIGH").cast(DoubleType()),
+                col("ce.NORMAL_LOW").cast(FloatType()),
+                col("ce.NORMAL_HIGH").cast(FloatType()),
                 
                 # Timestamps
                 col("ce.PERFORMED_DT_TM").cast(TimestampType()),
