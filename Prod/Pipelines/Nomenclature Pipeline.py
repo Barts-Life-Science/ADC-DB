@@ -5,7 +5,6 @@
 # COMMAND ----------
 
 from pyspark.sql.functions import *
-from pyspark.sql.functions import max as spark_max
 from pyspark.sql.window import Window
 from datetime import datetime
 from pyspark.sql.utils import AnalysisException
@@ -36,8 +35,7 @@ def get_max_timestamp(table_name):
             return default_date
             
         # Try to get ADC_UPDT directly
-        result = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}")
-        max_date = result.select(max("max_date").alias("max_date")).first()["max_date"]
+        max_date = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}").first()["max_date"]
         
         return max_date if max_date is not None else default_date
         
