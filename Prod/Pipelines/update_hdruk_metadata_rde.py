@@ -294,14 +294,7 @@ response_json
 version_nbr_str = response_json["data"]["versions"][0]["metadata"]["metadata"]["required"]["version"]
 version_nbrs = version_nbr_str.split(".")
 version_nbrs = [int(x) for x in version_nbrs]
-
-if version_nbrs[2] >= 12:
-    version_nbrs[2] = 0
-    version_nbrs[1] =+ 1
-else:
-    version_nbrs[2] =+ 1
-
-new_version_nbr_str = f'{version_nbrs[0]}.{version_nbrs[1]}.{version_nbrs[2]}'
+new_version_nbr_str = f'{version_nbrs[0]}.{version_nbrs[1]+1 if version_nbrs[2]>=12 else version_nbrs[1]}.{0 if version_nbrs[2]>= 12 else version_nbrs[2]+1}'
 print("old:", version_nbr_str)
 print("new:", new_version_nbr_str)
 
@@ -378,7 +371,7 @@ hdruk_300_str = \
         },
         "access": {
             "accessRights": null,
-            "accessService":"Barts Health intends to have a secure data environment by early 2024. Projects requiring access to data before this data need to provide evidence of their own secure environment.",
+            "accessService":"Barts Health has a secure data environment since 2024. Projects requiring access to data can make an application on the Data Portal (data.bartshealth.nhs.uk).",
             "accessRequestCost": "Cost Recovery Model",
             "deliveryLeadTime": null,
             "jurisdiction": ["GB-ENG"],
