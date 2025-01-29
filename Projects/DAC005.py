@@ -1,7 +1,11 @@
 # Databricks notebook source
+#Bloodcounts
+
 project_identifier = 'dar005'
 
-rde_tables = ['rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_family_history', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders']
+rde_tables = ['rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_family_history', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_pathology', 'rde_raw_pathology']
+
+bloodcount_tables = ['action_message', 'ana_internal1', 'ana_internal2', 'bb', 'bb_f', 'cal', 'cls_param', 'dst_data', 'dst_data_2', 'err', 'flag_sus2', 'flagging', 'flg_gate', 'giveup', 'hsa', 'hsa_f', 'ig', 'ipu_csv1', 'ipu_csv2', 'jo_aflas', 'jo_aflas01', 'jo_aflas03', 'jo_aflas04', 'lyact', 'mix_issue', 'mt_data', 'neonew_hpc', 'neuteoissue', 'otherinfo', 'outputdata', 'plt_abn_sus', 'plt_clumps_wnr_gate', 'plt_clumps_wnr_v17_18', 'plt_clumps_wnr_v21', 'plt_dst_raw_data', 'plt_swt', 'rbc_abn_sus', 'rbc_dst_raw_data', 'reportable', 'reportable_f', 'research', 'research_f', 'sampling_plt', 'sampling_pltf', 'sampling_rbc', 'sampling_ret', 'sampling_wdf', 'sampling_wdf_2times', 'sampling_wnr', 'sampling_wpc', 'sampling_wpc_2times', 'sampling_wpc_3times', 'sampling_wpc_4times', 'service_in', 'service_out', 'servicesettinglog', 't_data', 'wbc_abn_sct_bf', 'wbc_abn_sus', 'wdf_low_sfl', 'wnr_aggl', 'wp_reana', 'xn_sample']
 
 max_ig_risk = 3
 max_ig_severity = 2
@@ -138,6 +142,15 @@ if existing_views_df.count() > 0:
         spark.sql(f"DROP VIEW IF EXISTS {project_identifier}.{view_name}")
         print(f"Dropped view: {project_identifier}.{view_name}")
 
+def get_sample_number_column(table_name):
+    columns = spark.table(f"4_prod.ancil_bloodcounts.{table_name}").columns
+    if 'sample_no_' in columns:
+        return 'sample_no_'
+    elif 'sampleid' in columns:
+        return 'sampleid'
+    else:
+        return None
+
 def get_columns_with_high_tags(table_name):
     # Get columns with high ig_risk
     high_risk_columns = spark.sql(f"""
@@ -220,6 +233,27 @@ for table in rde_tables:
         FROM 4_prod.rde.{table}
         """
         print(f"Warning: No person ID column found in {table}. Creating view without cohort filtering.")
+    
+    # Execute the SQL
+    spark.sql(view_sql)
+    
+    print(f"Created view: 5_projects.{project_identifier}.{table}")
+
+# Process bloodcount tables
+for table in bloodcount_tables:
+    # Get the appropriate sample number column name
+    sample_no_col = get_sample_number_column(table)
+    
+    if sample_no_col:
+        # Create view SQL with cohort filtering through rde_raw_pathology
+        view_sql = f"""
+        CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
+        AS
+        SELECT b.*
+        FROM 4_prod.ancil_bloodcounts.{table} b
+        INNER JOIN 4_prod.rde.rde_raw_pathology p ON b.{sample_no_col} = p.LabNo
+        INNER JOIN 6_mgmt.cohorts.{project_identifier} c ON p.PERSON_ID = c.PERSON_ID
+        """
     
     # Execute the SQL
     spark.sql(view_sql)
