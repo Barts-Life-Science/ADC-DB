@@ -396,7 +396,7 @@ def intmd_pacs_examcode():
         """
     )
     df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
-    lkp = spark.read.table("LIVE.pacs_examcode_lookup").select("short_code")
+    lkp = spark.read.table("LIVE.pacs_examcode_dict").select("short_code")
     df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
     df = df.withColumn("IsExamCodeInLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
     df = df.drop("short_code")
@@ -840,14 +840,14 @@ def pacs_clinical_event():
 # COMMAND ----------
 
 @dlt.table(
-    name="pacs_examcode_lookup",
+    name="pacs_examcode_dict",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
     }
 )
-def pacs_examcode_lookup():
+def pacs_examcode_dict():
     return spark.read.format("csv") \
                      .option("header", "true") \
                      .load("/Volumes/4_prod/pacs/base/Annex-1-DID_lookup_group.csv")
