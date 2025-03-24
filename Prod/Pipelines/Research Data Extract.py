@@ -24,7 +24,11 @@ def get_max_adc_updt(table_name):
         default_date = lit(datetime(1980, 1, 1)).cast(DateType())
         result = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}")
         max_date = result.select(max("max_date").alias("max_date")).first()["max_date"]
-        return max_date if max_date is not None else default_date
+        
+        # Return default date if max_date is None or in the future
+        if max_date is None or max_date > datetime.now():
+            return default_date
+        return max_date
     except:
         return lit(datetime(1980, 1, 1)).cast(DateType())
     
@@ -139,6 +143,7 @@ schema_rde_patient_demographics = StructType([
         StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Hospital number, another unique identifier"}),
         StructField("Date_of_Birth", TimestampType(), True, metadata={"comment": "The date on which a PERSON was born or is officially deemed to have been born."}),
+        StructField("Year_of_Birth", IntegerType(), True, metadata={"comment": "The year in which a PERSON was born."}), 
         StructField("GENDER_CD", IntegerType(), True, metadata={"comment": "Gender CD"}),
         StructField("Gender", StringType(), True, metadata={"comment": "Gender of the patient as text"}),
         StructField("ETHNIC_CD", IntegerType(), True, metadata={"comment": "Ethnicity CD"}),
@@ -205,6 +210,7 @@ def patient_demographics_incr():
             col("NHS.ALIAS").alias("NHS_Number"),
             col("MRN.ALIAS").alias("MRN"),
             col("Pers.BIRTH_DT_TM").alias("Date_of_Birth"),
+            year(col("Pers.BIRTH_DT_TM")).alias("Year_of_Birth"),
             col("Gend.CODE_VALUE").cast(IntegerType()).alias("GENDER_CD"),
             col("Gend.DISPLAY").alias("Gender"),
             col("Eth.CODE_VALUE").cast(IntegerType()).alias("ETHNIC_CD"),
@@ -395,7 +401,7 @@ dlt.apply_changes(
 
 apc_comment = "Diagnoses made in inpatient encounters"
 schema_rde_apc_diagnosis = StructType([
-        StructField("CDS_APC_ID", LongType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
         StructField("PERSONID", LongType(), True, metadata={"comment": "Patient unique identifier"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Patient Local hospital number"}),
         StructField("ICD_Diagnosis_Num", IntegerType(), True, metadata={"comment": "Sequential index of the diagnosis"}),
@@ -433,7 +439,7 @@ def apc_diagnosis_incr():
         .join(patient_demographics, col("Pat.NHS_Number") == col("Apc.NHS_NUMBER"), "inner")
         .join(lkp_icd_diag, col("Icd.ICD_Diagnosis_Cd") == col("ICDDESC.ICD_Diag_Cd"), "left")
         .select(
-            col("Icd.CDS_APC_ID").cast(LongType()).alias("CDS_APC_ID"),
+            col("Icd.CDS_APC_ID").cast(StringType()).alias("CDS_APC_ID"),
             col("Pat.PERSON_ID").cast(LongType()).alias("PERSONID"),
             col("Pat.MRN").cast(StringType()).alias("MRN"),
             col("Icd.ICD_Diagnosis_Num").cast(IntegerType()).alias("ICD_Diagnosis_Num"),
@@ -481,9 +487,127 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+all_prob_comment = "Table of all problems recorded in millenium problem table."
+
+schema_rde_all_problems = StructType([
+    StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier."}),
+    StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
+    StructField("Person_ID", LongType(), True, metadata={"comment": "Unique identifier for the patient."}),
+    StructField("Problem_code", StringType(), True, metadata={"comment": "Code for the problem."}),
+    StructField("Catalogue", StringType(), True, metadata={"comment": "Catalogue for the code."}),
+    StructField("CKI", StringType(), True, metadata={"comment": "CKI Code for the problem, may be the same as problem_code."}),
+    StructField("Code_text", StringType(), True, metadata={"comment": "Text description of the problem."}),
+    StructField("Problem_free_text", StringType(), True, metadata={"comment": "Free text description of the problem."}),
+    StructField("Problem_Instance_ID", LongType(), True, metadata={"comment": "Unique identifier for this instance of the problem."}),
+    StructField("Problem_ID", LongType(), True, metadata={"comment": "Unique identifier for the problem."}),
+    StructField("Onset_date", StringType(), True, metadata={"comment": "Date the problem began."}),
+    StructField("Resolution_date", StringType(), True, metadata={"comment": "Date the problem was resolved."}),
+    StructField("Life_cycle_status", StringType(), True, metadata={"comment": "Current status of the problem."}),
+    StructField("Classification", StringType(), True, metadata={"comment": "Classification/category of the problem."}),
+    StructField("Severity", StringType(), True, metadata={"comment": "Severity of the problem."}),
+    StructField("Certainty", StringType(), True, metadata={"comment": "Certainty level of the problem diagnosis."}),
+    StructField("Persistence", StringType(), True, metadata={"comment": "Indication of problem persistence."}),
+    StructField("Laterality", StringType(), True, metadata={"comment": "Laterality of the problem if applicable."}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+])
+
+@dlt.table(name="rde_all_problems_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def all_problems_incr():
+    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_all_problems")
+
+    mill_dir_problem = spark.table("4_prod.raw.mill_problem").alias("mil")
+    encounter = dlt.read("rde_encounter").alias("E")
+    mill_dir_nomenclature = spark.table("3_lookup.mill.mill_nomenclature").alias("nom")
+
+    return (
+        mill_dir_problem.filter(col("ADC_UPDT") > max_adc_updt)
+        .join(
+            encounter, 
+            col("mil.UPDATE_ENCNTR_ID") == col("E.ENCNTR_ID"), 
+            "left"
+        )
+        .join(
+            mill_dir_nomenclature, 
+            col("mil.NOMENCLATURE_ID") == col("nom.NOMENCLATURE_ID"), 
+            "left"
+        )
+        .select(
+            col("E.MRN").cast(StringType()).alias("MRN"),
+            col("E.NHS_Number").cast(StringType()).alias("NHS_Number"),
+            col("mil.PERSON_ID").cast(LongType()).alias("Person_ID"),
+            col("nom.SOURCE_IDENTIFIER").cast(StringType()).alias("Problem_code"),
+            when(col("nom.concept_cki").isNull(), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(0))
+            .cast(StringType()).alias("Catalogue"),
+    
+            when(col("nom.concept_cki").isNull() | ~col("nom.concept_cki").contains("!"), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(1))
+            .cast(StringType()).alias("CKI"),
+            col("nom.source_string").cast(StringType()).alias("Code_text"),
+            col("mil.PROBLEM_FTDESC").cast(StringType()).alias("Problem_free_text"),
+            col("mil.PROBLEM_INSTANCE_ID").cast(LongType()).alias("Problem_Instance_ID"),
+            col("mil.PROBLEM_ID").cast(LongType()).alias("Problem_ID"),
+            col("mil.ONSET_DT_TM").cast(StringType()).alias("Onset_date"),
+            col("mil.ACTUAL_RESOLUTION_DT_TM").cast(StringType()).alias("Resolution_date"),
+            col("mil.LIFE_CYCLE_STATUS_CD").cast(StringType()).alias("Life_cycle_status"),
+            col("mil.CLASSIFICATION_CD").cast(StringType()).alias("Classification"),
+            coalesce(
+                col("mil.SEVERITY_CD"), 
+                col("mil.SEVERITY_FTDESC")
+            ).cast(StringType()).alias("Severity"),
+            coalesce(
+                col("mil.CERTAINTY_CD"),
+                col("mil.PROBABILITY")
+            ).cast(StringType()).alias("Certainty"),
+            col("mil.PERSISTENCE_CD").cast(StringType()).alias("Persistence"),
+            col("mil.LATERALITY_CD").cast(StringType()).alias("Laterality"),
+            greatest(
+                col("mil.ADC_UPDT"), 
+                col("E.ADC_UPDT"), 
+                col("nom.ADC_UPDT")
+            ).alias("ADC_UPDT")
+        )
+        .distinct()
+    )
+
+@dlt.view(name="all_problems_update")
+def all_problems_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .option("ignoreChanges", "true")
+        .table("LIVE.rde_all_problems_incr")
+    )
+
+dlt.create_target_table(
+    name = "rde_all_problems",
+    comment=all_prob_comment,
+    schema=schema_rde_all_problems,
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "Person_ID,Problem_code"
+    }
+)
+
+dlt.apply_changes(
+    target = "rde_all_problems",
+    source = "all_problems_update",
+    keys = ["Person_ID", "Problem_Instance_ID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
+
+# COMMAND ----------
+
 apc_opcs_comment = "Procedures from inpatient encounters"
 schema_rde_apc_opcs = StructType([
-        StructField("CDS_APC_ID", LongType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
         StructField("PERSONID", LongType(), True, metadata={"comment": "Uniquely identifies the patient."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier"}),
         StructField("OPCS_Proc_Num", IntegerType(), True, metadata={"comment": "Sequential index of the procedures"}),
@@ -522,7 +646,7 @@ def apc_opcs_incr():
         .join(patient_demographics, col("Pat.NHS_Number") == col("Apc.NHS_NUMBER"), "inner")
         .join(lkp_opcs_410, col("OPCS.OPCS_Proc_Cd") == col("PDesc.Proc_Cd"), "left")
         .select(
-            col("OPCS.CDS_APC_ID").cast(LongType()).alias("CDS_APC_ID"),
+            col("OPCS.CDS_APC_ID").cast(StringType()).alias("CDS_APC_ID"),
             col("Pat.PERSON_ID").cast(LongType()).alias("PERSONID"),
             col("Pat.MRN").cast(StringType()).alias("MRN"),
             col("OPCS.OPCS_Proc_Num").cast(IntegerType()).alias("OPCS_Proc_Num"),
@@ -574,7 +698,7 @@ dlt.apply_changes(
 
 rde_op_diag_comment = "Diagnosis from outpatient encounters"
 schema_rde_op_diagnosis = StructType([
-        StructField("CDS_OPA_ID", LongType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
         StructField("PERSONID", LongType(), True, metadata={"comment": "Unique identifier of the patient"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
         StructField("ICD_Diagnosis_Num", IntegerType(), True, metadata={"comment": "Sequential number for the diagnoses"}),
@@ -611,7 +735,7 @@ def op_diagnosis_incr():
         .join(patient_demographics, col("Pat.NHS_Number") == col("OP.NHS_NUMBER"), "inner")
         .join(lkp_icd_diag, col("Icd.ICD_Diag_Cd") == col("ICDDESC.ICD_Diag_Cd"), "left")
         .select(
-            col("Icd.CDS_OPA_ID").cast(LongType()).alias("CDS_OPA_ID"),
+            col("Icd.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             col("Pat.PERSON_ID").cast(LongType()).alias("PERSONID"),
             col("Pat.MRN").cast(StringType()).alias("MRN"),
             col("Icd.ICD_Diag_Num").cast(IntegerType()).alias("ICD_Diagnosis_Num"),
@@ -662,7 +786,7 @@ dlt.apply_changes(
 
 opa_opcs_comment = "Procedures from outpatient appointments"
 schema_rde_opa_opcs = StructType([
-        StructField("CDS_OPA_ID", LongType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
         StructField("PERSONID", LongType(), True, metadata={"comment": "Unique identifier for the patient."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
         StructField("OPCS_Proc_Num", IntegerType(), True, metadata={"comment": "Sequential number of the procedure for the patient."}),
@@ -698,7 +822,7 @@ def opa_opcs_incr():
         .join(patient_demographics, col("Pat.NHS_Number") == col("OP.NHS_NUMBER"), "inner")
         .join(lkp_opcs_410, col("OPCS.OPCS_Proc_Cd") == col("OPDesc.Proc_Cd"), "left")
         .select(
-            col("OPCS.CDS_OPA_ID").cast(LongType()).alias("CDS_OPA_ID"),
+            col("OPCS.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             col("Pat.PERSON_ID").cast(LongType()).alias("PERSONID"),
             col("Pat.MRN").cast(StringType()).alias("MRN"),
             col("OPCS.OPCS_Proc_Num").cast(IntegerType()).alias("OPCS_Proc_Num"),
@@ -748,7 +872,7 @@ dlt.apply_changes(
 
 cds_apc_comment = "Details of an inpatient attendence"
 schema_rde_cds_apc = StructType([
-        StructField("CDS_APC_ID", LongType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
+        StructField("CDS_APC_ID", StringType(), True, metadata={"comment": "Uniquely identifies the inpatient attendence"}),
         StructField("PERSONID", LongType(), True, metadata={"comment": "Unique identifier for the person."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
@@ -819,7 +943,7 @@ def cds_apc_incr():
         .join(encounter.alias("Enc"), col("Pat.PERSON_ID") == col("Enc.PERSON_ID"), "left")
         .join(pi_cde_code_value_ref.alias("Descr"), col("Enc.ENCNTR_TYPE_CD") == col("Descr.CODE_VALUE_CD"), "left")
         .select(
-            col("APC.CDS_APC_ID").cast(LongType()).alias("CDS_APC_ID"),
+            col("APC.CDS_APC_ID").cast(StringType()).alias("CDS_APC_ID"),
             col("Pat.PERSON_ID").cast(LongType()).alias("PERSONID"),
             col("Pat.MRN").cast(StringType()).alias("MRN"),
             col("Pat.NHS_Number").cast(StringType()).alias("NHS_Number"),
@@ -844,7 +968,12 @@ def cds_apc_incr():
             col("APC.Ep_End_Dt_tm").cast(StringType()).alias("Ep_End_Dt"),
             col("APC.CDS_Activity_Dt").cast(StringType()).alias("CDS_Activity_Dt"),
             col("Descr.CODE_DESC_TXT").cast(StringType()).alias("ENC_DESC"),
-            greatest(col("HRG.ADC_UPDT"), col("APC.ADC_UPDT"), col("Pat.ADC_UPDT"), col("Enc.ADC_UPDT")).alias("ADC_UPDT")
+            greatest(
+    when(col("HRG.ADC_UPDT") <= current_timestamp(), col("HRG.ADC_UPDT")).otherwise(None),
+    when(col("APC.ADC_UPDT") <= current_timestamp(), col("APC.ADC_UPDT")).otherwise(None),
+    when(col("Pat.ADC_UPDT") <= current_timestamp(), col("Pat.ADC_UPDT")).otherwise(None),
+    when(col("Enc.ADC_UPDT") <= current_timestamp(), col("Enc.ADC_UPDT")).otherwise(None)
+).alias("ADC_UPDT")
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
@@ -884,7 +1013,7 @@ dlt.apply_changes(
 
 cds_opa_comment = "Details for each outpatient attendence"
 schema_rde_cds_opa = StructType([
-        StructField("CDS_OPA_ID", LongType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
+        StructField("CDS_OPA_ID", StringType(), True, metadata={"comment": "Uniquely identifies each outpatient attendence"}),
         StructField("AttendanceType", StringType(), True, metadata={"comment": "Type of attendance, Referall, pre-registration etc."}),
         StructField("CDSDate", StringType(), True, metadata={"comment": "\" Every CDS Type has a \"\"CDS Originating Date\"\" contained within the Commissioning Data Set data that must be used to populate the CDS ACTIVITY DATE\""}),
         StructField("Att_Dt", StringType(), True, metadata={"comment": "Date of appointment"}),
@@ -988,7 +1117,7 @@ def cds_opa_incr():
         .join(pi_lkp_cde_code_value_ref, col("Enc.ENCNTR_TYPE_CD") == col("AttType.CODE_VALUE_CD"), "left")
         .join(spark.table("op_attendance_view"), col("OPALL.CDS_OPA_ID") == col("op_attendance_view.CDS_BATCH_CONTENT_ID"), "left")
         .select(
-            col("OPALL.CDS_OPA_ID").cast(LongType()).alias("CDS_OPA_ID"),
+            col("OPALL.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             coalesce(col("Enc.ENC_TYPE"), lit("Outpatient")).cast(StringType()).alias("AttendanceType"),
             col("OPALL.CDS_Activity_Dt").cast(StringType()).alias("CDSDate"),
             col("OPALL.Att_Dt").cast(StringType()).alias("Att_Dt"),
@@ -1009,7 +1138,12 @@ def cds_opa_incr():
             col("op_attendance_view.ATTENDED_DNA_NHS_CD_ALIAS").cast(IntegerType()).alias("ATTENDED_DNA_NHS_CD_ALIAS"),
             col("op_attendance_view.EXPECTED_DUR_OF_APPT_NBR").cast(IntegerType()).alias("EXPECTED_DUR_OF_APPT_NBR"),
             col("op_attendance_view.ACTIVITY_LOC_TYPE_NHS_CD_ALIAS").cast(IntegerType()).alias("ACTIVITY_LOC_TYPE_NHS_CD_ALIAS"),
-            greatest(col("OPALL.ADC_UPDT"), col("Pat.ADC_UPDT"), col("HRG.ADC_UPDT"), col("Enc.ADC_UPDT")).alias("ADC_UPDT")
+            greatest(
+    when(col("OPALL.ADC_UPDT") <= current_timestamp(), col("OPALL.ADC_UPDT")).otherwise(None),
+    when(col("Pat.ADC_UPDT") <= current_timestamp(), col("Pat.ADC_UPDT")).otherwise(None),
+    when(col("HRG.ADC_UPDT") <= current_timestamp(), col("HRG.ADC_UPDT")).otherwise(None),
+    when(col("Enc.ADC_UPDT") <= current_timestamp(), col("Enc.ADC_UPDT")).otherwise(None)
+).alias("ADC_UPDT")
         ).filter(col("ADC_UPDT") > max_adc_updt)
     )
 
@@ -1921,6 +2055,96 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+all_diag_comment = "Table of all diagnoses recorded in millenium diagnosis table."
+
+schema_rde_all_diagnosis = StructType([
+    StructField("MRN", StringType(), True, metadata={"comment": "Local hospital identifier."}),
+    StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
+    StructField("Person_ID", LongType(), True, metadata={"comment": "Unique identifier for the patient."}),
+    StructField("Diagnosis_code", StringType(), True, metadata={"comment": "Code for the diagnosis."}),
+    StructField("Catalogue", StringType(), True, metadata={"comment": "Catalogue for the code, e.g. ICD10"}),
+    StructField("CKI", StringType(), True, metadata={"comment": "CKI for the diagnosis, may be the same as diagnosis_code"}),
+    StructField("Code_text", StringType(), True, metadata={"comment": "Text description of the diagnosis."}),
+    StructField("Diagnosis_note", StringType(), True, metadata={"comment": "Any free text notes attached to the diagnosis."}),
+    StructField("Diagnosis_ID", LongType(), True, metadata={"comment": "Internal ID for the diagnosis."}),
+    StructField("Diagnosis_date", StringType(), True, metadata={"comment": "Date the diagnosis was recorded."}),
+    StructField("Diagnosis_type", StringType(), True, metadata={"comment": "Type of diagnosis."}),
+    StructField("Diagnosis_priority", IntegerType(), True, metadata={"comment": "Priority of the diagnosis."}),
+    StructField("Present_on_admit", StringType(), True, metadata={"comment": "Whether diagnosis was present on admission."}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+])
+
+@dlt.table(name="rde_all_diagnosis_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def all_diagnosis_incr():
+    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_all_diagnosis")
+
+    mill_dir_diagnosis = spark.table("4_prod.raw.mill_diagnosis").alias("mil")
+    encounter = dlt.read("rde_encounter").alias("E")
+    mill_dir_nomenclature = spark.table("3_lookup.mill.mill_nomenclature").alias("nom")
+
+    return (
+        mill_dir_diagnosis.filter(col("ADC_UPDT") > max_adc_updt)
+        .join(encounter, col("mil.ENCNTR_id") == col("E.ENCNTR_ID"), "inner")
+        .join(mill_dir_nomenclature, col("mil.NOMENCLATURE_ID") == col("nom.NOMENCLATURE_ID"), "left")
+        .select(
+            col("E.MRN").cast(StringType()).alias("MRN"),
+            col("E.NHS_Number").cast(StringType()).alias("NHS_Number"),
+            col("E.PERSON_ID").cast(LongType()).alias("Person_ID"),
+            col("nom.SOURCE_IDENTIFIER").cast(StringType()).alias("Diagnosis_code"),
+            when(col("nom.concept_cki").isNull(), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(0))
+            .cast(StringType()).alias("Catalogue"),
+    
+            when(col("nom.concept_cki").isNull() | ~col("nom.concept_cki").contains("!"), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(1))
+            .cast(StringType()).alias("CKI"),
+            col("nom.source_string").cast(StringType()).alias("Code_text"),
+            col("mil.DIAG_NOTE").cast(StringType()).alias("Diagnosis_note"),
+            col("mil.DIAGNOSIS_ID").cast(LongType()).alias("Diagnosis_ID"),
+            coalesce(col("mil.DIAG_DT_TM"), col("mil.ACTIVE_STATUS_DT_TM")).cast(StringType()).alias("Diagnosis_date"),
+            col("mil.DIAG_TYPE_CD").cast(StringType()).alias("Diagnosis_type"),
+            col("mil.DIAG_PRIORITY").cast(IntegerType()).alias("Diagnosis_priority"),
+            col("mil.PRESENT_ON_ADMIT_CD").cast(StringType()).alias("Present_on_admit"),
+            greatest(col("mil.ADC_UPDT"), col("E.ADC_UPDT"), col("nom.ADC_UPDT")).alias("ADC_UPDT")
+        )
+        .distinct()
+    )
+
+@dlt.view(name="all_diagnosis_update")
+def all_diagnosis_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .option("ignoreChanges", "true")
+        .table("LIVE.rde_all_diagnosis_incr")
+    )
+
+dlt.create_target_table(
+    name = "rde_all_diagnosis",
+    comment=all_diag_comment,
+    schema=schema_rde_all_diagnosis,
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "Person_ID,Diagnosis_code,Diagnosis_date"
+    }
+)
+
+dlt.apply_changes(
+    target = "rde_all_diagnosis",
+    source = "all_diagnosis_update",
+    keys = ["Person_ID", "Diagnosis_ID"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
+
+# COMMAND ----------
+
 all_proc_comment = "Table of all procedures recorded in millenium procedure table."
 
 schema_rde_all_procedures = StructType([
@@ -1929,6 +2153,7 @@ schema_rde_all_procedures = StructType([
         StructField("Person_ID", LongType(), True, metadata={"comment": "Unique identifier for the patient."}),
         StructField("Procedure_code", StringType(), True, metadata={"comment": "OPCS code for the procedure."}),
         StructField("Catalogue", StringType(), True, metadata={"comment": "Catalogue for the code, e.g. OPCS"}),
+        StructField("CKI", StringType(), True, metadata={"comment": "CKI Code for the procedure, may be the same as procedure_code"}),
         StructField("Code_text", StringType(), True, metadata={"comment": "Text description of the procedure."}),
         StructField("Procedure_note", StringType(), True, metadata={"comment": "Any free text notes attached to the procedure."}),
         StructField("Procedure_ID", LongType(), True, metadata={"comment": "Internal ID for the procedure."}),
@@ -1954,7 +2179,13 @@ def all_procedures_incr():
             col("E.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("E.PERSON_ID").cast(LongType()).alias("Person_ID"),
             col("nom.SOURCE_IDENTIFIER").cast(StringType()).alias("Procedure_code"),
-            split(col("nom.concept_cki"), "!").getItem(0).cast(StringType()).alias("Catalogue"),
+            when(col("nom.concept_cki").isNull(), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(0))
+            .cast(StringType()).alias("Catalogue"),
+    
+            when(col("nom.concept_cki").isNull() | ~col("nom.concept_cki").contains("!"), None)
+            .otherwise(split(col("nom.concept_cki"), "!").getItem(1))
+            .cast(StringType()).alias("CKI"),
             col("nom.source_string").cast(StringType()).alias("Code_text"),
             col("mil.PROCEDURE_NOTE").cast(StringType()).alias("Procedure_note"),
             col("mil.PROCEDURE_ID").cast(LongType()).alias("Procedure_ID"),
@@ -1983,7 +2214,7 @@ dlt.create_target_table(
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "Person_ID,Procedure_code"
+        "pipelines.autoOptimize.zOrderCols": "Person_ID,Procedure_code,Procedure_date"
     }
 )
 

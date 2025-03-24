@@ -3,9 +3,9 @@
 
 project_identifier = 'dar005'
 
-rde_tables = ['rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_family_history', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_pathology', 'rde_raw_pathology']
+rde_tables = ['rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_family_history', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_pathology', 'rde_raw_pathology', 'rde_all_diagnosis', 'rde_msds_booking']
 
-bloodcount_tables = ['action_message', 'ana_internal1', 'ana_internal2', 'bb', 'bb_f', 'cal', 'cls_param', 'dst_data', 'dst_data_2', 'err', 'flag_sus2', 'flagging', 'flg_gate', 'giveup', 'hsa', 'hsa_f', 'ig', 'ipu_csv1', 'ipu_csv2', 'jo_aflas', 'jo_aflas01', 'jo_aflas03', 'jo_aflas04', 'lyact', 'mix_issue', 'mt_data', 'neonew_hpc', 'neuteoissue', 'otherinfo', 'outputdata', 'plt_abn_sus', 'plt_clumps_wnr_gate', 'plt_clumps_wnr_v17_18', 'plt_clumps_wnr_v21', 'plt_dst_raw_data', 'plt_swt', 'rbc_abn_sus', 'rbc_dst_raw_data', 'reportable', 'reportable_f', 'research', 'research_f', 'sampling_plt', 'sampling_pltf', 'sampling_rbc', 'sampling_ret', 'sampling_wdf', 'sampling_wdf_2times', 'sampling_wnr', 'sampling_wpc', 'sampling_wpc_2times', 'sampling_wpc_3times', 'sampling_wpc_4times', 'service_in', 'service_out', 'servicesettinglog', 't_data', 'wbc_abn_sct_bf', 'wbc_abn_sus', 'wdf_low_sfl', 'wnr_aggl', 'wp_reana', 'xn_sample']
+bloodcount_tables = ['action_message', 'ana_internal1', 'ana_internal2', 'bb', 'bb_f', 'cal', 'cls_param', 'dst_data', 'dst_data_2', 'err', 'flag_sus2', 'flagging', 'flg_gate', 'giveup', 'hsa', 'hsa_f', 'ig', 'ipu_csv1', 'ipu_csv2', 'jo_aflas', 'jo_aflas01', 'jo_aflas03', 'jo_aflas04', 'lyact', 'mix_issue', 'mt_data', 'neonew_hpc', 'neuteoissue', 'otherinfo', 'outputdata', 'plt_abn_sus', 'plt_clumps_wnr_gate', 'plt_clumps_wnr_v17_18', 'plt_clumps_wnr_v21', 'plt_dst_raw_data', 'plt_swt', 'rbc_abn_sus', 'rbc_dst_raw_data', 'reportable', 'reportable_f', 'research', 'research_f', 'sampling_plt', 'sampling_pltf', 'sampling_rbc', 'sampling_ret', 'sampling_wdf', 'sampling_wdf_2times', 'sampling_wnr', 'sampling_wpc', 'sampling_wpc_2times', 'sampling_wpc_3times', 'sampling_wpc_4times', 'service_in', 'service_out', 'servicesettinglog', 't_data', 'wbc_abn_sct_bf', 'wbc_abn_sus', 'wdf_low_sfl', 'wnr_aggl', 'wp_reana', 'xn_sample', 'sct_ret', 'sct_wdf', 'sct_wnr']
 
 max_ig_risk = 3
 max_ig_severity = 2
@@ -146,6 +146,8 @@ def get_sample_number_column(table_name):
     columns = spark.table(f"4_prod.ancil_bloodcounts.{table_name}").columns
     if 'sample_no_' in columns:
         return 'sample_no_'
+    elif 'sample_no' in columns:
+        return 'sample_no'
     elif 'sampleid' in columns:
         return 'sampleid'
     else:

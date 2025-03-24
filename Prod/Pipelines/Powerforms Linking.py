@@ -4,8 +4,6 @@ from pyspark.sql.functions import to_date
 from delta.tables import DeltaTable
 from pyspark.sql.window import Window
 
-spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
-spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
 
 # Get the maximum ADC_UPDT from the target table
 target_table = DeltaTable.forName(spark, "4_prod.bronze.mill_form_activity")
@@ -20,8 +18,10 @@ filtered_clinical_event = (
     spark.table("4_prod.raw.mill_clinical_event")
     .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
 )
+# Create a UDF to check if a string is a valid number
+is_valid_number = F.udf(lambda x: x is not None and x.replace('.', '').isdigit() if x else False)
 
-# Create the new table with updated filter
+# Modify the join condition
 mill_form_activity = (
     spark.table("4_prod.raw.mill_dcp_forms_activity")
     .filter(F.col("ADC_UPDT") > max_adc_updt)
@@ -30,12 +30,18 @@ mill_form_activity = (
         "DCP_FORMS_REF_ID"
     )
     .join(
-        filtered_clinical_event,
+        filtered_clinical_event.withColumn(
+            "parsed_reference",
+            F.when(F.col("REFERENCE_NBR").contains("!"),
+                  F.split(F.col("REFERENCE_NBR"), "!").getItem(0))
+            .otherwise(F.col("REFERENCE_NBR"))
+        ).filter(
+            (F.length(F.col("parsed_reference")) <= 10) &  # Add reasonable length check
+            F.col("parsed_reference").rlike("^[0-9]+(\\.[0-9]+)?$")  # Only allow valid numbers
+        ),
         (F.col("mill_dcp_forms_activity.ENCNTR_ID") == filtered_clinical_event.ENCNTR_ID) &
-        (F.col("mill_dcp_forms_activity.DCP_FORMS_ACTIVITY_ID").cast("integer") == 
-         F.when(filtered_clinical_event.REFERENCE_NBR.contains("!"),
-                F.split(filtered_clinical_event.REFERENCE_NBR, "!").getItem(0).cast("float").cast("integer"))
-         .otherwise(filtered_clinical_event.REFERENCE_NBR.cast("float").cast("integer"))),
+        (F.col("mill_dcp_forms_activity.DCP_FORMS_ACTIVITY_ID") == 
+         F.col("parsed_reference").cast("double").cast("long")),
         "inner"
     )
     .join(
@@ -90,7 +96,11 @@ ids_to_delete = mill_form_activity.select("DCP_FORMS_ACTIVITY_ID").distinct()
 
 # Delete matching rows from the target table
 window = Window.partitionBy(F.lit(1))  # Global window
-ids_to_delete_set = ids_to_delete.select(F.collect_set("DCP_FORMS_ACTIVITY_ID").over(window).alias("id_set")).first().id_set
+ids_to_delete_set = ids_to_delete.select(F.collect_set("DCP_FORMS_ACTIVITY_ID").over(window).alias("id_set")).first()
+if ids_to_delete_set is not None:
+    ids_to_delete_set = ids_to_delete_set.id_set
+else:
+    ids_to_delete_set = []
 
 target_table.delete(F.col("DCP_FORMS_ACTIVITY_ID").isin(ids_to_delete_set))
 

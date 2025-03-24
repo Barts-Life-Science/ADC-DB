@@ -18,7 +18,7 @@ from datetime import datetime
 # Specify the catalog, schema, and table name
 catalog = "4_prod"
 schema = "raw"
-table_name = "mill_allergy"
+table_name = "mill_organization"
 
 # Construct the path to the Delta table
 delta_table_path = f"{catalog}.{schema}.{table_name}"

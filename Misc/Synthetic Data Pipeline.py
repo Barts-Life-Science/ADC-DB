@@ -9,12 +9,104 @@ import time
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from pyspark.sql.types import TimestampType
-from pyspark.sql.functions import col, rand, unix_timestamp, lit
+from pyspark.sql.types import *
+from pyspark.sql.functions import col, rand, unix_timestamp, lit, when, substring
 
 # COMMAND ----------
 
-def generate_synthetic_data(catalog, schema, table_prefix):
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "false")
+
+# COMMAND ----------
+
+def table_exist_check(table_name):
+    try:
+        result = spark.sql(f"SELECT 1 FROM {table_name} LIMIT 1")
+        return result.first() is not None
+    except:
+        return False
+
+# COMMAND ----------
+
+def align_datatypes_with_schema(synthetic_data, original_schema):
+    """
+    Aligns datatypes in synthetic_data with the original Spark schema.
+    """
+    print("Aligning datatypes with original schema...")
+    synthetic_data = synthetic_data.copy()
+    
+    for field in original_schema.fields:
+        column_name = field.name
+        if column_name not in synthetic_data.columns:
+            print(f"Warning: Column {column_name} not found in synthetic data")
+            continue
+            
+        print(f"\nProcessing column: {column_name}")
+        print(f"Original type: {field.dataType}")
+        print(f"Current synthetic type: {synthetic_data[column_name].dtype}")
+        
+        try:
+            # Handle DateType or TimestampType
+            if isinstance(field.dataType, (DateType, TimestampType)):
+                synthetic_data[column_name] = pd.to_datetime(synthetic_data[column_name], errors='coerce')
+                
+                # Ensure dates are within valid range
+                min_date = pd.Timestamp('1970-01-01')
+                max_date = pd.Timestamp('2262-04-11')
+                
+                synthetic_data.loc[synthetic_data[column_name] < min_date, column_name] = min_date
+                synthetic_data.loc[synthetic_data[column_name] > max_date, column_name] = max_date
+                
+                print(f"Converted {column_name} to datetime")
+                
+            # Handle StringType
+            elif isinstance(field.dataType, StringType):
+                # Convert to string, handling NaN values
+                synthetic_data[column_name] = synthetic_data[column_name].fillna('')
+                synthetic_data[column_name] = synthetic_data[column_name].astype(str)
+                # Replace 'nan' strings with empty string
+                synthetic_data.loc[synthetic_data[column_name] == 'nan', column_name] = ''
+                
+            # Handle IntegerType
+            elif isinstance(field.dataType, IntegerType):
+                # Fill NaN with 0 or another appropriate value
+                synthetic_data[column_name] = synthetic_data[column_name].fillna(0)
+                synthetic_data[column_name] = synthetic_data[column_name].astype('int32')
+                
+            # Handle LongType
+            elif isinstance(field.dataType, LongType):
+                # Fill NaN with 0 or another appropriate value
+                synthetic_data[column_name] = synthetic_data[column_name].fillna(0)
+                synthetic_data[column_name] = synthetic_data[column_name].astype('int64')
+                
+            # Handle FloatType or DoubleType
+            elif isinstance(field.dataType, (FloatType, DoubleType)):
+                synthetic_data[column_name] = synthetic_data[column_name].astype('float64')
+                
+            # Handle BooleanType
+            elif isinstance(field.dataType, BooleanType):
+                synthetic_data[column_name] = synthetic_data[column_name].astype('bool')
+                
+            print(f"New type: {synthetic_data[column_name].dtype}")
+            print("Sample values after conversion:")
+            print(synthetic_data[column_name].head())
+            
+        except Exception as e:
+            print(f"Error converting column {column_name}: {str(e)}")
+            print("Attempting fallback conversion...")
+            try:
+                # Fallback to string conversion for problematic columns
+                synthetic_data[column_name] = synthetic_data[column_name].fillna('')
+                synthetic_data[column_name] = synthetic_data[column_name].astype(str)
+                synthetic_data.loc[synthetic_data[column_name] == 'nan', column_name] = ''
+                print("Fallback conversion successful")
+            except Exception as e2:
+                print(f"Fallback conversion failed: {str(e2)}")
+            
+    return synthetic_data
+
+# COMMAND ----------
+
+def generate_synthetic_data(catalog, schema, table_prefix, overwrite=True):
     """
     Generate synthetic data for tables matching the prefix in the specified catalog and schema.
     
@@ -22,6 +114,7 @@ def generate_synthetic_data(catalog, schema, table_prefix):
     catalog (str): The catalog name
     schema (str): The schema name
     table_prefix (str): The prefix of table names to process
+    overwrite (bool): If False, skip tables that already exist in destination
     """
     
     # Get list of tables matching the prefix
@@ -32,6 +125,17 @@ def generate_synthetic_data(catalog, schema, table_prefix):
         table_name = table_row['tableName']
         
         try:
+            # Check if table exists in destination
+            destination_table = f"a_synth.{schema}.{table_name}"
+            table_exists = False
+            if(table_exist_check(destination_table)):
+                table_exists = True
+
+            # Skip if table exists and overwrite is False
+            if table_exists and not overwrite:
+                print(f"Skipping {table_name} as it already exists and overwrite=False")
+                continue
+                
             print(f"Processing table: {table_name}")
             
             # Load source data
@@ -40,7 +144,11 @@ def generate_synthetic_data(catalog, schema, table_prefix):
             timestamp_cols = [f.name for f in source_df.schema.fields 
                             if isinstance(f.dataType, TimestampType)]
             
+            text_cols = [f.name for f in source_df.schema.fields 
+             if isinstance(f.dataType, StringType)]
             
+            binary_cols = [f.name for f in source_df.schema.fields 
+               if isinstance(f.dataType, BinaryType)]
             # Sample up to 100k random rows
             sampled_df = source_df.orderBy(rand()).limit(100000) 
 
@@ -57,12 +165,31 @@ def generate_synthetic_data(catalog, schema, table_prefix):
                     ).otherwise(lit(None))
                     )
 
+            # Handle text columns - trim to 256 characters
+            if text_cols:
+                for col_name in text_cols:
+                    sampled_df = sampled_df.withColumn(
+                        col_name,
+                        when(
+                            col(col_name).isNotNull(),
+                            substring(col(col_name), 1, 256)
+                        ).otherwise(lit(None))
+                    )
+
+            # Handle binary columns - set to null
+            if binary_cols:
+                for col_name in binary_cols:
+                    sampled_df = sampled_df.withColumn(
+                        col_name,
+                        lit(None)
+                    )
 
             # Convert to pandas
             pdf = sampled_df.toPandas()
             print(len(pdf))
-            
+
             # Initialize metadata
+            pdf = clean_boolean_data(pdf)
             metadata = SingleTableMetadata()
             metadata.detect_from_dataframe(pdf)
             
@@ -139,7 +266,15 @@ def generate_synthetic_data(catalog, schema, table_prefix):
                                     )
                 except Exception as e:
                     print(f"Error updating column {column_name}: {repr(e)}")
-            
+
+            for column_name, column_metadata in metadata.columns.items():
+                if column_metadata.get('sdtype') in ['numerical', 'integer']:
+                    try:
+                        # Convert to numeric, setting invalid values to NaN
+                        pdf[column_name] = pd.to_numeric(pdf[column_name], errors='coerce')
+                    except Exception as e:
+                        print(f"Error cleaning numerical column {column_name}: {repr(e)}")
+
             # Validate metadata
             metadata.validate()
             metadata.validate_data(data=pdf)
@@ -149,12 +284,17 @@ def generate_synthetic_data(catalog, schema, table_prefix):
             synthesizer.fit(pdf)
             synthetic_data = synthesizer.sample(num_rows=10000)
 
-            
+            # Before converting synthetic data to Spark DataFrame, get original schema
+            original_schema = source_df.schema
+            synthetic_data = align_datatypes_with_schema(synthetic_data, original_schema)
+
+            # Convert synthetic data to Spark DataFrame with original schema
+            synthetic_spark_df = spark.createDataFrame(synthetic_data, schema=original_schema)
             # Convert back to Spark DataFrame
-            synthetic_spark_df = spark.createDataFrame(synthetic_data)
-            
+            #synthetic_spark_df = spark.createDataFrame(synthetic_data)
+            print("Dataframe created")
             # Save to destination
-            synthetic_spark_df.write.format("delta").mode("overwrite") \
+            synthetic_spark_df.write.format("delta").option("overwriteSchema", "true").mode("overwrite") \
                 .saveAsTable(f"a_synth.{schema}.{table_name}")
             
             print(f"Successfully processed {table_name}")
@@ -164,11 +304,54 @@ def generate_synthetic_data(catalog, schema, table_prefix):
             continue
 
 def is_actually_boolean(series):
-    # Convert to string and check if only 'True' or 'False' values
-    unique_values = set(series.dropna().astype(str).str.lower().unique())
-    return unique_values.issubset({'true', 'false'})
-
+    """
+    Check if a series contains boolean-like values
+    """
+    # Drop NA values and convert to string
+    clean_series = series.dropna().astype(str).str.lower()
     
+    # Define valid boolean values
+    valid_boolean_values = {'true', 'false', '1', '0', 't', 'f', 'yes', 'no', 'y', 'n'}
+    
+    # Check if all non-null values are valid boolean representations
+    return all(val in valid_boolean_values for val in clean_series.unique())
+
+def clean_boolean_data(df):
+    """
+    Clean boolean columns in the dataframe by converting various boolean representations to True/False
+    """
+    for column in df.columns:
+        try:
+            # Check if column contains boolean-like values
+            if df[column].dtype == bool or (
+                df[column].dtype in [object, str] and 
+                is_actually_boolean(df[column])
+            ):
+                # Create a mapping dictionary for boolean conversion
+                bool_map = {
+                    'true': True, 
+                    't': True, 
+                    'yes': True, 
+                    'y': True, 
+                    '1': True, 
+                    'false': False, 
+                    'f': False, 
+                    'no': False, 
+                    'n': False, 
+                    '0': False
+                }
+                
+                # Convert to string, lowercase, and map to boolean
+                df[column] = df[column].astype(str).str.lower().map(bool_map)
+                
+                # Fill any NaN values that resulted from the mapping with None
+                df[column] = df[column].where(pd.notnull(df[column]), None)
+                
+        except Exception as e:
+            print(f"Warning: Could not clean boolean column {column}: {str(e)}")
+            continue
+            
+    return df
 
 def is_actually_numerical(series):
     try:
@@ -230,7 +413,124 @@ def is_valid_timestamp(ts):
 
 # COMMAND ----------
 
-generate_synthetic_data("4_prod", "raw", "mill_")
-generate_synthetic_data("4_prod", "dlt", "omop_")
-generate_synthetic_data("4_prod", "rde", "rde_")
+generate_synthetic_data("4_prod", "raw", "mill_", False)
+generate_synthetic_data("4_prod", "dlt", "omop_", False)
+generate_synthetic_data("4_prod", "rde", "rde_", False)
 
+
+# COMMAND ----------
+
+def convert_binary_columns_to_string(catalog, schema, table_prefix):
+    """
+    Convert binary columns to string type for tables matching the prefix in the specified catalog and schema.
+    
+    Parameters:
+    catalog (str): The catalog name
+    schema (str): The schema name 
+    table_prefix (str): The prefix of table names to process
+    """
+    
+    # Get list of tables matching the prefix
+    tables_df = spark.sql(f"SHOW TABLES IN {catalog}.{schema}")
+    matching_tables = tables_df.filter(f"tableName LIKE '{table_prefix}%'").select("tableName").collect()
+    
+    for table_row in matching_tables:
+        table_name = table_row['tableName']
+        
+        try:
+            print(f"Checking table: {table_name}")
+            
+            # Load table
+            df = spark.table(f"{catalog}.{schema}.{table_name}")
+            
+            # Get binary columns
+            binary_cols = [f.name for f in df.schema.fields 
+                          if isinstance(f.dataType, BinaryType)]
+            
+            if binary_cols:
+                print(f"Found binary columns in {table_name}: {binary_cols}")
+                
+                # Create new columns with string type
+                for col_name in binary_cols:
+                    df = df.withColumn(
+                        col_name,
+                        col(col_name).cast("string")
+                    )
+                
+                # Save back to table with updated schema
+                df.write.format("delta").option("overwriteSchema", "true").mode("overwrite") \
+                    .saveAsTable(f"{catalog}.{schema}.{table_name}")
+                
+                print(f"Successfully converted binary columns in {table_name}")
+            
+        except Exception as e:
+            print(f"Error processing table {table_name}: {repr(e)}")
+            continue
+
+
+
+# COMMAND ----------
+
+# Usage example:
+convert_binary_columns_to_string("a_synth", "raw", "mill")
+convert_binary_columns_to_string("a_synth", "dlt", "omop")
+convert_binary_columns_to_string("a_synth", "rde", "rde")
+
+
+
+# COMMAND ----------
+
+from pyspark.sql.functions import current_timestamp
+
+def create_synthetic_schema_tables(source_catalog, schema, table_prefix):
+    """
+    Create schema tables for each source schema, saved in the corresponding synthetic data location
+    with only tables matching the specified prefix.
+    
+    Parameters:
+    source_catalog (str): The source catalog name
+    schema (str): The source schema name
+    table_prefix (str): The prefix of table names to process
+    """
+    
+    try:
+        # Get schema information for tables matching the prefix
+        schema_query = f"""
+        SELECT 
+            table_name,
+            column_name,
+            data_type,
+            is_nullable,
+            COALESCE(comment, '') as column_comment
+        FROM {source_catalog}.information_schema.columns
+        WHERE table_schema = '{schema}'
+        AND table_name LIKE '{table_prefix}%'
+        ORDER BY table_name, column_name
+        """
+        
+        schema_df = spark.sql(schema_query)
+        
+        # Add timestamp column
+        schema_df = schema_df.withColumn(
+            "created_at", 
+            current_timestamp()
+        )
+        
+        # Define the schema table name
+        schema_table_name = f"{table_prefix}schema"
+        
+        # Write the schema information to the destination
+        schema_df.write.format("delta") \
+            .mode("overwrite") \
+            .saveAsTable(f"a_synth.{schema}.{schema_table_name}")
+        
+        print(f"Successfully created schema table: a_synth.{schema}.{schema_table_name}")
+            
+    except Exception as e:
+        print(f"Error creating schema table: {repr(e)}")
+
+# Example usage:
+# After running generate_synthetic_data, call:
+create_synthetic_schema_tables("4_prod", "raw", "mill_")
+create_synthetic_schema_tables("4_prod", "dlt", "omop_")
+create_synthetic_schema_tables("4_prod", "rde", "rde_")

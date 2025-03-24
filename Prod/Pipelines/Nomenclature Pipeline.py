@@ -11,6 +11,7 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
+from delta.tables import DeltaTable
 
 # COMMAND ----------
 
@@ -63,6 +64,9 @@ def update_nomen_table(source_df, target_table):
         target_table: Target table name to update
     """
         # Check if source_df is empty
+
+    if source_df is None:
+        return
     if source_df.count() == 0:
         return
     source_df = source_df.distinct()
@@ -586,9 +590,37 @@ def create_nomenclature_mapping_incr():
         DataFrame: Incremental nomenclature mappings
     """
 
+
+    
+    max_adc_updt = get_max_timestamp("4_prod.bronze.tempone_nomenclature")
+
+
+
+    # Get base nomenclature data
+    base_nomenclature = (
+        spark.table("3_lookup.mill.mill_nomenclature")
+        .filter(
+            (col("ACTIVE_IND") == 1) & 
+            (col("END_EFFECTIVE_DT_TM").isNull() | (col("END_EFFECTIVE_DT_TM") > current_timestamp())) &
+            (col("ADC_UPDT") > max_adc_updt) &
+            (col("source_identifier").isNotNull()) &
+            (trim(col("source_identifier")) != "")
+        )
+    )
+    
+    if(base_nomenclature.count() == 0):
+        return base_nomenclature
+    
+
     code_value = spark.table("3_lookup.mill.mill_code_value").select(
         "CODE_VALUE", "CDF_MEANING", "DESCRIPTION", "DISPLAY"
     )
+
+    # Create vocabulary-specific reference subsets
+    snomed_vocab_codes = code_value.filter(col("CDF_MEANING").isin(["SNMCT", "SNMUKEMED"]))
+    multum_vocab_codes = code_value.filter(col("CDF_MEANING") == "MUL.DRUG")
+    icd10_vocab_codes = code_value.filter(col("CDF_MEANING").isin(["ICD10", "ICD10WHO"]))
+    opcs4_vocab_codes = code_value.filter(col("CDF_MEANING") == "OPCS4")
     
     snomed_sct = spark.table("3_lookup.trud.snomed_sct").filter(
         (col("CUI").isNotNull()) &
@@ -611,24 +643,6 @@ def create_nomenclature_mapping_incr():
         (col("concept_id").isNotNull()) &
         (col("invalid_reason").isNull()) &
         (col("vocabulary_id") == "OPCS4")
-    )
-    
-    max_adc_updt = get_max_timestamp("4_prod.bronze.tempone_nomenclature")
-
-    # Create vocabulary-specific reference subsets
-    snomed_vocab_codes = code_value.filter(col("CDF_MEANING").isin(["SNMCT", "SNMUKEMED"]))
-    multum_vocab_codes = code_value.filter(col("CDF_MEANING") == "MUL.DRUG")
-    icd10_vocab_codes = code_value.filter(col("CDF_MEANING").isin(["ICD10", "ICD10WHO"]))
-    opcs4_vocab_codes = code_value.filter(col("CDF_MEANING") == "OPCS4")
-
-    # Get base nomenclature data
-    base_nomenclature = (
-        spark.table("3_lookup.mill.mill_nomenclature")
-        .filter(
-            (col("ACTIVE_IND") == 1) & 
-            (col("END_EFFECTIVE_DT_TM").isNull() | (col("END_EFFECTIVE_DT_TM") > current_timestamp())) &
-            (col("ADC_UPDT") > max_adc_updt)
-        )
     )
 
     # Initialize vocabulary type indicators
@@ -869,13 +883,16 @@ def add_omop_preference(df, source_code_col, target_code_col, source_concepts, t
         F.col(source_code_col) == F.col("source_concept_code"),
         "left"
     )
-    
+    print(f"Count of with source concepts: {with_source_concept.count()}")
+    with_source_concept.show(5)
+    target_concepts.show(5)
     # Join target codes with OMOP concepts
     with_target_concept = with_source_concept.join(
         target_concepts,
-        F.col(target_code_col) == F.col("target_concept_code"),
+        F.col(target_code_col).cast(StringType()) == F.col("target_concept_code").cast(StringType()),
         "left"
     )
+    print(f"Count of with target concepts: {with_target_concept.count()}")
     
     # Validate relationships and add preference flag
     return with_target_concept.join(
@@ -906,6 +923,8 @@ def add_omop_preference(df, source_code_col, target_code_col, source_concepts, t
 def process_matches(df, base_type, omop_type):
     """Helper function to process matches and aggregate results"""
     df = df.alias("matches")
+    print(f"Processing {omop_type} matches of base {base_type} records")
+
     
     # First filter to only records that actually got a match
     matched_df = df.filter(F.col("matched_snomed_code").isNotNull())
@@ -1273,6 +1292,7 @@ def create_snomed_mapping_incr():
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
+    print(f"Direct matches with OMOP mappings found: {direct_with_omop.count()}")
 
     # Process prefix matches for ICD10
     icd10_prefix_matches = icd10_base_df.join(
@@ -1309,6 +1329,7 @@ def create_snomed_mapping_incr():
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
+    print("Here1")
 
     # Process native SNOMED codes (keep original ones)
     native_codes = base_df.filter(F.col("original_snomed_code").isNotNull()).select(
@@ -1318,9 +1339,10 @@ def create_snomed_mapping_incr():
         F.lit(False).alias("HAS_OMOP_MAP"),
         F.lit("NATIVE").alias("SNOMED_TYPE")
     )
-
+    print("Here2")
     # Process results with match types
     direct_final = process_matches(direct_with_omop, "EXACT", "OMOP_ASSISTED")
+    print("Here3")
     prefix_final = process_matches(prefix_with_omop, "PREFIX", "PREFIX_OMOP_ASSISTED")
 
     print(f"Final direct matches: {direct_final.count()}")
@@ -1383,11 +1405,11 @@ def add_omop_preference_icd10(df, source_code_col, target_code_col, source_conce
     """
     return df.join(
         source_concepts,
-        F.col(source_code_col) == source_concepts.concept_code,
+        F.col(source_code_col).cast(StringType()) == source_concepts.concept_code.cast(StringType()),
         "left"
     ).join(
         target_concepts,
-        F.col(target_code_col) == target_concepts.concept_code,
+        F.col(target_code_col).cast(StringType()) == target_concepts.concept_code.cast(StringType()),
         "left"
     ).join(
         omop_rels,
@@ -1402,6 +1424,7 @@ def add_omop_preference_icd10(df, source_code_col, target_code_col, source_conce
         "has_omop_map",
         F.when(F.col("rel.relationship_id").isNotNull(), True).otherwise(False)
     )
+
 
 
 def process_hierarchical_matches(df, base_type, omop_type):
@@ -1778,6 +1801,9 @@ def create_icd10_mapping_incr():
         .filter(col("ADC_UPDT") > max_adc_updt) \
         .alias("base")
 
+    if(base_df.count() == 0):
+        return base_df
+
     icd_map = spark.table("3_lookup.trud.maps_icdsctmap").alias("icd_map")
     snomed_hier = spark.table("3_lookup.trud.snomed_scthier").alias("hier")
     icd_terms = spark.table("3_lookup.trud.maps_icd").alias("terms")
@@ -1802,6 +1828,7 @@ def create_icd10_mapping_incr():
         col("base.SNOMED_CODE") == col("icd_map.TCUI"),
         "left"
     )
+    print(direct_matches.count())
     
     direct_with_omop = add_omop_preference_icd10(
         df=direct_matches,
@@ -1811,6 +1838,7 @@ def create_icd10_mapping_incr():
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
+    print(direct_with_omop.count()) 
 
     # Process child matches
     child_matches = base_df.join(
@@ -1822,6 +1850,9 @@ def create_icd10_mapping_incr():
         col("hier.PARENT") == col("icd_map.TCUI"),
         "left"
     ).filter(col("icd_map.SCUI").isNotNull())
+
+
+    print(child_matches.count())
     
     child_with_omop = add_omop_preference_icd10(
         df=child_matches,
@@ -1831,6 +1862,8 @@ def create_icd10_mapping_incr():
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
+
+    print(child_with_omop.count())
 
     # Process parent matches
     parent_matches = base_df.join(
@@ -1843,6 +1876,8 @@ def create_icd10_mapping_incr():
         "left"
     ).filter(col("icd_map.SCUI").isNotNull())
     
+    print(parent_matches.count())
+
     parent_with_omop = add_omop_preference_icd10(
         df=parent_matches,
         source_code_col="hier.CHILD",
@@ -1851,11 +1886,14 @@ def create_icd10_mapping_incr():
         target_concepts=target_concepts,
         omop_rels=omop_rels
     )
-
+    print(parent_with_omop.count())
     # Process the results
     direct_final = process_matches_icd10(direct_with_omop, "EXACT", "OMOP_ASSISTED")
+    print(direct_final.count())
     child_final = process_matches_icd10(child_with_omop, "CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED")
+    print(child_final.count())
     parent_final = process_matches_icd10(parent_with_omop, "PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED")
+    print(parent_final.count())
 
     # Process native ICD10 codes with the new function
     icd10_code_values = code_value.filter(
@@ -1863,16 +1901,19 @@ def create_icd10_mapping_incr():
     )
     
     native_codes = process_native_codes_icd10(base_df, icd10_code_values, icd_terms)
-
+    print(native_codes.count())
     # Combine all matches
     all_matches = combine_matches_icd10(native_codes, direct_final, child_final, parent_final)
+    print(all_matches.count())
 
     # Add ICD10 terms and return final result
     final_df = add_icd10_terms(all_matches, icd_terms, base_df)
+    print(final_df.count())
     # Process secondary mappings through OMOP for records without ICD10 codes
     omop_concepts = spark.table("3_lookup.omop.concept").filter(F.col("invalid_reason").isNull())
     concept_relationship = spark.table("3_lookup.omop.concept_relationship")
     final_df = process_secondary_icd10_mappings(final_df, omop_concepts, concept_relationship)
+    print(final_df.count())
     return final_df
 
 # COMMAND ----------
@@ -1903,11 +1944,11 @@ def add_omop_preference_opcs4(df, source_code_col, target_code_col, source_conce
     """
     return df.join(
         source_concepts,
-        F.col(source_code_col) == source_concepts.concept_code,
+        F.col(source_code_col).cast(StringType()) == source_concepts.concept_code.cast(StringType()),
         "left"
     ).join(
         target_concepts,
-        F.col(target_code_col) == target_concepts.concept_code,
+        F.col(target_code_col).cast(StringType()) == target_concepts.concept_code.cast(StringType()),
         "left"
     ).join(
          omop_rels,
@@ -2025,33 +2066,40 @@ def combine_matches_opcs4(*dfs):
 def add_opcs4_terms(matches_df, opcs_terms, base_df):
     """
     Helper function to add OPCS4 terms to final mappings
-    Args:
-        matches_df: DataFrame with OPCS4 matches
-        opcs_terms: DataFrame with OPCS4 terms
-        base_df: Original base DataFrame
-
-    Returns:
-        DataFrame: Final mappings with OPCS4 terms
     """
+    print("Step 1: Before first join")
     # First join matches with terms
     with_terms = matches_df.join(
         opcs_terms,
-        matches_df.OPCS4_CODE == opcs_terms.CUI,
+        matches_df.OPCS4_CODE.cast(StringType()) == opcs_terms.CUI.cast(StringType()),
         "left"
-    ).select(
+    )
+    
+    print("Step 2: After first join, before select")
+    with_terms.show(2)
+    
+    with_terms = with_terms.select(
         "NOMENCLATURE_ID",
         "OPCS4_CODE",
         "OPCS4_TYPE",
         "OPCS4_MATCH_COUNT",
         F.col("TERM").alias("OPCS4_TERM")
     )
+    
+    print("Step 3: After select, before final join")
+    with_terms.show(2)
 
     # Then join with base DataFrame and preserve all columns
-    return base_df.join(
+    final_df = base_df.join(
         with_terms,
         "NOMENCLATURE_ID",
         "left"
-    ).select(
+    )
+    
+    print("Step 4: After final join, before final select")
+    final_df.show(2)
+    
+    return final_df.select(
         # Keep all original columns from base_df
         *[F.col(c) for c in base_df.columns],
         # Add new OPCS4 columns
@@ -2214,6 +2262,8 @@ def create_opcs4_mapping_incr():
         .filter(col("ADC_UPDT") > max_adc_updt) \
         .alias("base")
 
+    if(base_df.count() == 0):
+        return base_df
     opcs_map = spark.table("3_lookup.trud.maps_opcssctmap").alias("opcs_map")
     snomed_hier = spark.table("3_lookup.trud.snomed_scthier").alias("hier")
     opcs_terms = spark.table("3_lookup.trud.maps_opcs").alias("terms")
@@ -2238,6 +2288,7 @@ def create_opcs4_mapping_incr():
         col("base.SNOMED_CODE") == col("opcs_map.TCUI"),
         "left"
     )
+    print("Counter A {}.".format(direct_matches.count()))
 
     direct_with_omop = add_omop_preference_opcs4(
         df=direct_matches,
@@ -2249,6 +2300,7 @@ def create_opcs4_mapping_incr():
     )
 
     direct_final = process_matches_opcs4(direct_with_omop, "EXACT", "OMOP_ASSISTED")
+    print("Counter B {}.".format(direct_final.count()))
 
     # Process hierarchical matches
     child_matches = base_df.join(
@@ -2261,6 +2313,8 @@ def create_opcs4_mapping_incr():
         "left"
     ).filter(col("opcs_map.SCUI").isNotNull())
 
+    print("Counter D {}.".format(child_matches.count()))
+
     child_with_omop = add_omop_preference_opcs4(
         df=child_matches,
         source_code_col="hier.PARENT",
@@ -2270,8 +2324,10 @@ def create_opcs4_mapping_incr():
         omop_rels=omop_rels
     )
 
-    child_final = process_matches_opcs4(child_with_omop, "CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED")
+    print("Counter E {}.".format(child_with_omop.count()))
 
+    child_final = process_matches_opcs4(child_with_omop, "CHILDMATCH", "CHILDMATCH_OMOP_ASSISTED")
+    print("Counter C {}.".format(child_final.count()))
     parent_matches = base_df.join(
         snomed_hier,
         col("base.SNOMED_CODE") == col("hier.PARENT"),
@@ -2293,15 +2349,14 @@ def create_opcs4_mapping_incr():
 
     parent_final = process_matches_opcs4(parent_with_omop, "PARENTMATCH", "PARENTMATCH_OMOP_ASSISTED")
 
-    # Process native OPCS4 codes
     opcs4_code_values = code_value.filter(col("CDF_MEANING") == "OPCS4")
     native_codes = process_native_codes_opcs4(base_df, opcs4_code_values)
 
     # Combine all matches
     all_matches = combine_matches_opcs4(native_codes, direct_final, child_final, parent_final)
 
-    # Add OPCS4 terms and return final result
     final_df = add_opcs4_terms(all_matches, opcs_terms, base_df)
+
     # Process secondary mappings through OMOP for records without OPCS4 codes
     omop_concepts = spark.table("3_lookup.omop.concept").filter(F.col("invalid_reason").isNull())
     concept_relationship = spark.table("3_lookup.omop.concept_relationship")
@@ -2311,10 +2366,14 @@ def create_opcs4_mapping_incr():
 # COMMAND ----------
 
 
-updates_df = create_opcs4_mapping_incr()
-    
+opcs_updates_df = create_opcs4_mapping_incr()
 
-update_nomen_table(updates_df, "4_prod.bronze.tempfour_nomenclature")
+if(opcs_updates_df is None):
+    print("No new records to process.")
+else:
+    print("Processing {} new records.".format(opcs_updates_df.count()))
+
+update_nomen_table(opcs_updates_df, "4_prod.bronze.tempfour_nomenclature")
 
 # COMMAND ----------
 
@@ -2426,7 +2485,7 @@ def process_code_to_omop_mapping(candidates_df, source_code_col, concepts_df, re
             F.col("concept_code").alias("source_concept_code"),
             F.col("standard_concept").alias("source_standard")
         ),
-        F.col(source_code_col) == F.col("source_concept_code"),
+        F.col(source_code_col).cast(StringType()) == F.col("source_concept_code").cast(StringType()),
         "inner"
     )
     
@@ -2523,3 +2582,19 @@ def create_final_nomenclature_incr():
 # Create and save incremental final nomenclature table
 updates_df = create_final_nomenclature_incr()
 update_nomen_table(updates_df, "4_prod.bronze.nomenclature")
+
+# Only proceed if updates_df exists and has records
+if updates_df and updates_df.count() > 0:
+    # Read the full nomenclature table
+    full_nomenclature = spark.table("4_prod.bronze.nomenclature")
+    
+    # Write to destination, overwriting if exists
+    full_nomenclature.write \
+        .mode("overwrite") \
+        .format("delta") \
+        .option("overwriteSchema", "true") \
+        .saveAsTable("3_lookup.mill.map_nomenclature")
+    
+    print("Successfully replicated nomenclature table to lookup location")
+else:
+    print("No updates to replicate - skipping replication")
