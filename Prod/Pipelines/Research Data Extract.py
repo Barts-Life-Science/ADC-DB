@@ -1329,6 +1329,7 @@ schema_rde_raw_pathology = StructType([
         StructField("Pregnant", StringType(), True, metadata={"comment": "Pregnancy status"}),
         StructField("RefClinCode", StringType(), True, metadata={"comment": "RefClinCode"}),
         StructField("RefSourceCode", StringType(), True, metadata={"comment": "RefSourceCode"}),
+        StructField("SourceCode", StringType(), True, metadata={"comment": "Code for the source of the request"}),
         StructField("ClinicalDetails", StringType(), True, metadata={"comment": "Clinical information, or reason for requesting test"}),
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
@@ -1388,6 +1389,7 @@ def raw_pathology_incr():
             filtered_psl.Pregnant,
             filtered_psl.RefClinCode,
             filtered_psl.RefSourceCode,
+            filtered_psl.SourceCode,
             filtered_psl.ClinicalDetails,
             greatest(col("PRES.ADC_UPDT"), col("PSL.ADC_UPDT")).alias("ADC_UPDT")
         ).distinct()
@@ -4473,20 +4475,27 @@ dlt.apply_changes(
 emergency_comment = "Details of an admission to the emergency department."
 
 schema_rde_emergencyd = StructType([
-        StructField("PERSONID", LongType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
-        StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
-        StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
-        StructField("Arrival_Dt_Tm", StringType(), True, metadata={"comment": "Date of arrival in emergency department"}),
-        StructField("Departure_Dt_Tm", StringType(), True, metadata={"comment": "Date of departure from department."}),
-        StructField("Dischage_Status_CD", IntegerType(), True, metadata={"comment": "Code for discharge status."}),
-        StructField("Discharge_Status_Desc", StringType(), True, metadata={"comment": "Description of discharge status code."}),
-        StructField("Discharge_Dest_CD", IntegerType(), True, metadata={"comment": "Code for discharge destination."}),
-        StructField("Discharge_Dest_Desc", StringType(), True, metadata={"comment": "Description of discharge destination code."}),
-        StructField("Diag_Code", StringType(), True, metadata={"comment": "Code for diagnosis."}),
-        StructField("SNOMED_CD", IntegerType(), True, metadata={"comment": "SNOMED code for diagnosis."}),
-        StructField("SNOMED_Desc", StringType(), True, metadata={"comment": "Description of snomed code."}),
-        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
-    ])
+    StructField("PERSONID", LongType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+    StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+    StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales."}),
+    StructField("Arrival_Dt_Tm", StringType(), True, metadata={"comment": "Date of arrival in emergency department"}),
+    StructField("Departure_Dt_Tm", StringType(), True, metadata={"comment": "Date of departure from department."}),
+    StructField("Dischage_Status_CD", StringType(), True, metadata={"comment": "Code for discharge status."}),
+    StructField("Discharge_Status_Desc", StringType(), True, metadata={"comment": "Description of discharge status code."}),
+    StructField("Discharge_Dest_CD", StringType(), True, metadata={"comment": "Code for discharge destination."}),
+    StructField("Discharge_Dest_Desc", StringType(), True, metadata={"comment": "Description of discharge destination code."}),
+    StructField("Chief_Complaint_Code", StringType(), True, metadata={"comment": "Code for chief complaint."}),
+    StructField("Chief_Complaint_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of chief complaint SNOMED code."}),
+    StructField("Investigation_SNOMED_CD", StringType(), True, metadata={"comment": "SNOMED code for investigation."}),
+    StructField("Investigation_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of investigation SNOMED code."}),
+    StructField("Treatment_SNOMED_CD", StringType(), True, metadata={"comment": "SNOMED code for treatment."}),
+    StructField("Treatment_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of treatment SNOMED code."}),
+    StructField("Comorbidity_SNOMED_CD", StringType(), True, metadata={"comment": "SNOMED code for comorbidity."}),
+    StructField("Comorbidity_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of comorbidity SNOMED code."}),
+    StructField("Diag_SNOMED_CD", StringType(), True, metadata={"comment": "SNOMED code for diagnosis."}),
+    StructField("Diag_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of diagnosis SNOMED code."}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+])
 
 @dlt.table(name="rde_emergencyd_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
@@ -4498,8 +4507,15 @@ def emergencyd_incr():
     discharge_destination = spark.table("3_lookup.dwh.cds_ecd_ref_discharge_destination").alias("e")
     discharge_status = spark.table("3_lookup.dwh.cds_ecd_map_att_disp_disch_stat").alias("d")
     treatment_site = spark.table("3_lookup.dwh.site").alias("ts")
+    chief_complaint = spark.table("3_lookup.dwh.cds_ecd_ref_chief_complaint").alias("CCREF")
+    cds_aea_invest = spark.table("4_prod.raw.cds_aea_invest").alias("INV")
+    investigation = spark.table("3_lookup.dwh.cds_ecd_ref_investigation").alias("IREF")
+    cds_aea_treat = spark.table("4_prod.raw.cds_aea_treat").alias("TRT")
+    treatment = spark.table("3_lookup.dwh.cds_ecd_ref_treatment").alias("TREF")
+    cds_aea_comorbidity = spark.table("4_prod.raw.cds_aea_comorbidity").alias("COM")
+    comorbidity = spark.table("3_lookup.dwh.cds_ecd_ref_comorbidity").alias("CREF")
     cds_aea_diag = spark.table("4_prod.raw.cds_aea_diag").alias("DIA")
-    ecd_ref_diagnosis = spark.table("3_lookup.dwh.cds_ecd_ref_diagnosis").alias("REF")
+    diagnosis = spark.table("3_lookup.dwh.cds_ecd_ref_diagnosis").alias("REF")
 
     return (
         cds_aea
@@ -4507,8 +4523,15 @@ def emergencyd_incr():
         .join(discharge_destination, col("AEA.Discharge_Destination_Cd") == col("e.Discharge_Destination_Snomed_Cd"), "left")
         .join(discharge_status, col("AEA.Discharge_Status_Cd") == col("d.Discharge_Status_ECD_Cd"), "left")
         .join(treatment_site, col("AEA.treatment_site_code") == col("ts.site_cd"), "left")
+        .join(chief_complaint, col("AEA.Chief_Complaint_Cd") == col("CCREF.Chief_Complaint_Snomed_Cd"), "left")
+        .join(cds_aea_invest, col("AEA.cds_aea_id") == col("INV.cds_aea_id"), "left")
+        .join(investigation, col("INV.Invest_ECD_Cd") == col("IREF.Investigation_Snomed_Cd"), "left")
+        .join(cds_aea_treat, col("AEA.cds_aea_id") == col("TRT.cds_aea_id"), "left")
+        .join(treatment, col("TRT.Treat_ECD_Cd") == col("TREF.Treatment_Snomed_Cd"), "left")
+        .join(cds_aea_comorbidity, col("AEA.cds_aea_id") == col("COM.cds_aea_id"), "left")
+        .join(comorbidity, col("COM.Comorbidity_Cd") == col("CREF.Comorbidity_Snomed_Cd"), "left")
         .join(cds_aea_diag, col("AEA.cds_aea_id") == col("DIA.cds_aea_id"), "left")
-        .join(ecd_ref_diagnosis, col("DIA.Diag_ECD_Cd") == col("REF.diagnosis_Snomed_cd"), "left")
+        .join(diagnosis, col("DIA.Diag_ECD_Cd") == col("REF.diagnosis_Snomed_cd"), "left")
         .filter((col("AEA.ADC_UPDT") > max_adc_updt) | (col("DEM.ADC_UPDT") > max_adc_updt))
         .select(
             col("DEM.PERSON_ID").cast(LongType()).alias("PERSONID"),
@@ -4516,14 +4539,24 @@ def emergencyd_incr():
             col("DEM.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
             col("AEA.ARRIVAL_DT_TM").cast(StringType()).alias("Arrival_Dt_Tm"),
             col("AEA.DEPARTURE_TM").cast(StringType()).alias("Departure_Dt_Tm"),
-            col("AEA.DISCHARGE_STATUS_CD").cast(IntegerType()).alias("Dischage_Status_CD"),
+            col("AEA.DISCHARGE_STATUS_CD").cast(StringType()).alias("Dischage_Status_CD"),
             col("d.DISCHARGE_STATUS_DESC").cast(StringType()).alias("Discharge_Status_Desc"),
-            col("AEA.Discharge_destination_Cd").cast(IntegerType()).alias("Discharge_Dest_CD"),
+            col("AEA.Discharge_destination_Cd").cast(StringType()).alias("Discharge_Dest_CD"),
             col("e.DISCHARGE_DESTINATION_DESC").cast(StringType()).alias("Discharge_Dest_Desc"),
-            col("DIA.DIAG_CD").cast(StringType()).alias("Diag_Code"),
-            col("REF.Diagnosis_Snomed_Cd").cast(IntegerType()).alias("SNOMED_CD"),
-            col("REF.Diagnosis_Snomed_Desc").cast(StringType()).alias("SNOMED_Desc"),
-            greatest(col("AEA.ADC_UPDT"), col("DEM.ADC_UPDT"), col("DIA.ADC_UPDT")).alias("ADC_UPDT")
+            col("AEA.CHIEF_COMPLAINT_CD").cast(StringType()).alias("Chief_Complaint_Code"),
+            col("CCREF.Chief_Complaint_Desc").cast(StringType()).alias("Chief_Complaint_SNOMED_Desc"),
+            col("INV.Invest_ECD_Cd").cast(StringType()).alias("Investigation_SNOMED_CD"),
+            col("IREF.Investigation_Snomed_Desc").cast(StringType()).alias("Investigation_SNOMED_Desc"),
+            col("TRT.Treat_ECD_Cd").cast(StringType()).alias("Treatment_SNOMED_CD"),
+            col("TREF.Treatment_Snomed_Desc").cast(StringType()).alias("Treatment_SNOMED_Desc"),
+            col("COM.Comorbidity_Cd").cast(StringType()).alias("Comorbidity_SNOMED_CD"),
+            col("CREF.Comorbidity_Desc").cast(StringType()).alias("Comorbidity_SNOMED_Desc"),
+            col("DIA.Diag_ECD_Cd").cast(StringType()).alias("Diag_SNOMED_CD"),
+            col("REF.Diagnosis_Snomed_Desc").cast(StringType()).alias("Diag_SNOMED_Desc"),
+            greatest(
+                col("AEA.ADC_UPDT"), 
+                col("DEM.ADC_UPDT")
+            ).alias("ADC_UPDT")
         )
     )
 
@@ -4537,7 +4570,6 @@ def emergencyd_update():
         .table("LIVE.rde_emergencyd_incr")
     )
 
-
 dlt.create_target_table(
     name = "rde_emergencyd",
     comment=emergency_comment,
@@ -4546,14 +4578,112 @@ dlt.create_target_table(
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "pipelines.autoOptimize.managed": "true",
-        "pipelines.autoOptimize.zOrderCols": "PERSONID,Arrival_Dt_Tm,Diag_Code"
+        "pipelines.autoOptimize.zOrderCols": "PERSONID,Arrival_Dt_Tm,Diag_SNOMED_CD"
     }
 )
 
 dlt.apply_changes(
     target = "rde_emergencyd",
     source = "emergencyd_update",
-    keys = ["PERSONID", "Arrival_Dt_Tm", "Diag_Code"],
+    keys = ["PERSONID", "Arrival_Dt_Tm", "Diag_SNOMED_CD"],
+    sequence_by = "ADC_UPDT",
+    apply_as_deletes = None,
+    except_column_list = [],
+    stored_as_scd_type = 1
+)
+
+# COMMAND ----------
+
+emergency_findings_comment = "Details of clinical findings, observations, and assessments during emergency department visits."
+
+schema_rde_emergency_findings = StructType([
+    StructField("PERSONID", LongType(), True, metadata={"comment": "Uniquely identifies individual in millenium."}),
+    StructField("MRN", StringType(), True, metadata={"comment": "Local identifier to identify a person"}),
+    StructField("Finding_SNOMED_Cd", StringType(), True, metadata={"comment": "SNOMED code for clinical finding"}),
+    StructField("Finding_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of clinical finding SNOMED code"}),
+    StructField("Observation_SNOMED_Cd", StringType(), True, metadata={"comment": "SNOMED code for observation"}),
+    StructField("Observation_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of observation SNOMED code"}),
+    StructField("Obsev_Value", StringType(), True, metadata={"comment": "Value of the observation"}),
+    StructField("UCUM_Unit_of_Measurement", StringType(), True, metadata={"comment": "Unit of measurement for observation"}),
+    StructField("Cd_Observ_TM", StringType(), True, metadata={"comment": "Time of observation"}),
+    StructField("Assessment_tool_SNOMED_Cd", StringType(), True, metadata={"comment": "SNOMED code for assessment tool"}),
+    StructField("Assessment_tool_SNOMED_Desc", StringType(), True, metadata={"comment": "Description of assessment tool SNOMED code"}),
+    StructField("Person_Score", StringType(), True, metadata={"comment": "Score from assessment"}),
+    StructField("Assmnt_Tool_Val_TM", StringType(), True, metadata={"comment": "Time of assessment tool validation"}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": "Last update timestamp"})
+])
+
+@dlt.table(name="rde_emergency_findings_incr", table_properties={
+        "skipChangeCommits": "true"}, temporary=True)
+def emergency_findings_incr():
+    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_emergency_findings")
+
+    cds_aea = spark.table("4_prod.raw.cds_aea").alias("AEA")
+    patient_demographics = dlt.read("rde_patient_demographics").alias("DEM")
+    coded_clinc_finding = spark.table("4_prod.raw.cds_aea_coded_clinc_finding").alias("CCF")
+    coded_clinc_observ = spark.table("4_prod.raw.cds_aea_coded_clinc_observ").alias("CCO")
+    mill_dir_snomed_observ = spark.table("3_lookup.dwh.lkp_mill_dir_snomed").alias("sno")
+    mill_dir_snomed_finding = spark.table("3_lookup.dwh.lkp_mill_dir_snomed").alias("snf")
+    coded_scored_assmnt = spark.table("4_prod.raw.cds_aea_coded_scored_assmnt").alias("CCSA")
+    mill_dir_snomed_assmnt = spark.table("3_lookup.dwh.lkp_mill_dir_snomed").alias("snsa")
+
+    return (
+        cds_aea
+        .join(patient_demographics, col("AEA.mrn") == col("DEM.MRN"), "inner")
+        .join(coded_clinc_finding, col("AEA.CDS_AEA_ID") == col("CCF.CDS_AEA_ID"), "left")
+        .join(mill_dir_snomed_finding, col("CCF.Cd_Finding_Smd") == col("snf.SNOMED_CD"), "left")
+        .join(coded_clinc_observ, col("CCF.CDS_AEA_ID") == col("CCO.CDS_AEA_ID"), "left")  # Using CCF as in original SQL
+        .join(mill_dir_snomed_observ, col("CCO.Cd_Observ_Smd") == col("sno.SNOMED_CD"), "left")
+        .join(coded_scored_assmnt, col("CCF.CDS_AEA_ID") == col("CCSA.CDS_AEA_ID"), "left")  # Using CCF as in original SQL
+        .join(mill_dir_snomed_assmnt, col("CCSA.Cd_Assmnt_Tool_Type_Smd") == col("snsa.SNOMED_CD"), "left")
+        .filter((col("AEA.ADC_UPDT") > max_adc_updt) | (col("DEM.ADC_UPDT") > max_adc_updt))
+        .select(
+            col("DEM.PERSON_ID").cast(LongType()).alias("PERSONID"),
+            col("AEA.MRN").cast(StringType()).alias("MRN"),
+            col("CCF.Cd_Finding_Smd").cast(StringType()).alias("Finding_SNOMED_Cd"),
+            col("snf.SOURCE_STRING").cast(StringType()).alias("Finding_SNOMED_Desc"),
+            col("CCO.Cd_Observ_Smd").cast(StringType()).alias("Observation_SNOMED_Cd"),
+            col("sno.SOURCE_STRING").cast(StringType()).alias("Observation_SNOMED_Desc"),
+            col("CCO.Obsev_Value").cast(StringType()).alias("Obsev_Value"),
+            col("CCO.UCUM_Unit_of_Measurement").cast(StringType()).alias("UCUM_Unit_of_Measurement"),
+            col("CCO.Cd_Observ_TM").cast(StringType()).alias("Cd_Observ_TM"),
+            col("CCSA.Cd_Assmnt_Tool_Type_Smd").cast(StringType()).alias("Assessment_tool_SNOMED_Cd"),
+            col("snsa.SOURCE_STRING").cast(StringType()).alias("Assessment_tool_SNOMED_Desc"),
+            col("CCSA.Person_Score").cast(StringType()).alias("Person_Score"),
+            col("CCSA.Assmnt_Tool_Val_TM").cast(StringType()).alias("Assmnt_Tool_Val_TM"),
+            greatest(
+                col("AEA.ADC_UPDT"), 
+                col("DEM.ADC_UPDT")
+            ).alias("ADC_UPDT")
+        )
+    )
+
+@dlt.view(name="emergency_findings_update")
+def emergency_findings_update():
+    return (
+        spark.readStream
+        .option("forceDeleteReadCheckpoint", "true")
+        .option("ignoreDeletes", "true")
+        .option("ignoreChanges", "true")
+        .table("LIVE.rde_emergency_findings_incr")
+    )
+
+dlt.create_target_table(
+    name = "rde_emergency_findings",
+    comment = emergency_findings_comment,
+    schema = schema_rde_emergency_findings,
+    table_properties = {
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.managed": "true",
+        "pipelines.autoOptimize.zOrderCols": "PERSONID,MRN,Finding_SNOMED_Cd"
+    }
+)
+
+dlt.apply_changes(
+    target = "rde_emergency_findings",
+    source = "emergency_findings_update",
+    keys = ["PERSONID", "MRN", "Finding_SNOMED_Cd", "Observation_SNOMED_Cd", "Assessment_tool_SNOMED_Cd"],
     sequence_by = "ADC_UPDT",
     apply_as_deletes = None,
     except_column_list = [],

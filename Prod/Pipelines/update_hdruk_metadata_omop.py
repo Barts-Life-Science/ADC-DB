@@ -262,8 +262,8 @@ hdruk_300_str = \
     "modified": "###CURR_DATE_STR###T00:00:00.000Z",
     "revisions": [{"url": "https://web.dev.hdruk.cloud//dataset/1098?version=1.0.0","version": "1.0.0"}],
     "summary": {
-        "title": "Barts Health NHS OMOP Dataset",
-        "abstract": "Barts Health NHS OMOP Dataset",
+        "title": "Barts Health NHS Trust OMOP Dataset",
+        "abstract": "Barts Health NHS Trust OMOP Dataset",
         "contactPoint": "BartsHealth.ResearchDataRequest@nhs.net",
         "keywords": ["Hospital Inpatient data","Outpatient","Pathology","Radiology","Maternity","Critical Care","Pharmacy"],
         "alternateIdentifiers": null,
@@ -469,12 +469,6 @@ print(response)
 
 # COMMAND ----------
 
-import json
-response_json = json.loads(response.text)
-response_json
-
-# COMMAND ----------
-
 import requests
 
 api_path = "https://api.healthdatagateway.org/api/v1/integrations/datasets/1098"
@@ -489,3 +483,25 @@ response = requests.put(
     json={"metadata":hdruk_300_json}
 )
 print(response.status_code)
+
+# COMMAND ----------
+
+import json
+response_json = json.loads(response.text)
+response_json
+
+# COMMAND ----------
+
+import json
+import requests
+
+headers = {
+    "Content-Type": "application/json",
+}
+
+traser_uri = "https://hdr-gateway-traser-dev-qmnkcg5qjq-ew.a.run.app"
+response = requests.post(
+    f"{traser_uri}/find?with_errors=1", headers=headers, json=hdruk_300_json
+)
+
+print(json.dumps(response.json(), indent=6))

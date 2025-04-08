@@ -292,8 +292,8 @@ hdruk_300_str = \
     "modified": "###CURR_DATE_STR###T00:00:00.000Z",
     "revisions": [{"url": "https://web.dev.hdruk.cloud//dataset/992?version=1.0.0","version": "1.0.0"}],
     "summary": {
-        "title": "Barts Health NHS Cerner Millenium Electronic Patient Record",
-        "abstract": "Barts Health NHS Cerner Millenium Electronic Patient Record.",
+        "title": "Barts Health NHS Trust Cerner Millenium Electronic Patient Record",
+        "abstract": "Barts Health NHS Trust Cerner Millenium Electronic Patient Record.",
         "contactPoint": "BartsHealth.ResearchDataRequest@nhs.net",
         "keywords": ["Hospital Inpatient data","Outpatient","Pathology","Radiology","Maternity","Critical Care","Pharmacy"],
         "alternateIdentifiers": null,
@@ -522,3 +522,33 @@ response = requests.put(
     json={"metadata":hdruk_300_json}
 )
 print(response.status_code)
+
+# COMMAND ----------
+
+print(response.json())
+
+# COMMAND ----------
+
+import json
+import requests
+
+headers = {
+    "Content-Type": "application/json",
+}
+
+traser_uri = "https://hdr-gateway-traser-dev-qmnkcg5qjq-ew.a.run.app"
+response = requests.post(
+    f"{traser_uri}/find?with_errors=1", headers=headers, json=hdruk_300_json
+)
+
+print(json.dumps(response.json(), indent=6))
+
+# COMMAND ----------
+
+print(json.dumps(hdruk_300_json, indent=6))
+
+# COMMAND ----------
+
+import json
+with open('/Volumes/1_inland/evan_demo/misc/hdruk300_mill.json', 'w', encoding='utf-8') as f:
+    json.dump(hdruk_300_json, f, ensure_ascii=False, indent=4)

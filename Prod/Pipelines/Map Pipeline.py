@@ -98,11 +98,13 @@ def update_table(source_df, target_table, index_column):
 def create_address_mapping_incr():
     """
     Creates an incremental address mapping table that processes only new or modified records.
+    Includes LSOA, IMD Decile, and IMD Quintile for each address.
     
     Returns:
-        DataFrame: Processed address records with standardized format
+        DataFrame: Processed address records with standardized format and deprivation metrics
     """
 
+    # Let get_max_timestamp handle the case if table doesn't exist
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_address")
     
     # Define window for selecting most recent valid address
@@ -111,31 +113,52 @@ def create_address_mapping_incr():
         desc("BEG_EFFECTIVE_DT_TM")
     )
     
-    # Get base address data with filtering
+    # Get base address data with filtering - select only the columns we need
     base_addresses = (
         spark.table("4_prod.raw.mill_address")
         .filter(
             (col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION")) & 
             (col("ACTIVE_IND") == 1) & 
             (col("END_EFFECTIVE_DT_TM") > current_date()) &
-            (col("ADC_UPDT") > max_adc_updt)  # Only process new/modified records
+            (col("ADC_UPDT") > max_adc_updt)  # Use non-qualified name as we're directly in mill_address context
+        )
+        .select(
+            "ADDRESS_ID", 
+            "PARENT_ENTITY_NAME", 
+            "PARENT_ENTITY_ID", 
+            "ZIPCODE", 
+            "CITY", 
+            "street_addr", 
+            "street_addr2", 
+            "street_addr3", 
+            "country_cd", 
+            "BEG_EFFECTIVE_DT_TM", 
+            "ADC_UPDT"
         )
     )
     
     # Get country lookup data
-    country_lookup = spark.table("3_lookup.mill.mill_code_value")
+    country_lookup = (
+        spark.table("3_lookup.mill.mill_code_value")
+        .select(
+            col("CODE_VALUE").alias("country_code_value"),
+            col("DESCRIPTION").alias("country_description")
+        )
+    )
     
+    # Initial address processing
     processed_addresses = (
         base_addresses
         # Join with country lookup
         .join(
-            country_lookup.select("CODE_VALUE", "DESCRIPTION"),
-            col("country_cd") == col("CODE_VALUE"),
+            country_lookup,
+            col("country_cd") == col("country_code_value"),
             "left"
         )
         # Select most recent valid address
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
+        .drop("row")
         # Format street address for organizations
         .withColumn(
             "full_street_address",
@@ -148,12 +171,157 @@ def create_address_mapping_incr():
                 )
             )
         )
+        # Clean zipcode for matching (removing spaces)
+        .withColumn("clean_zipcode", regexp_replace(col("ZIPCODE"), r'\s+', ''))
         # Apply privacy masking for personal addresses
         .withColumn(
             "masked_zipcode",
             when(col("PARENT_ENTITY_NAME") == "PERSON", 
                 substring(col("ZIPCODE"), 1, 3))
             .otherwise(col("ZIPCODE"))
+        )
+        # Select only the columns we need to continue
+        .select(
+            "ADDRESS_ID",
+            "PARENT_ENTITY_NAME",
+            "PARENT_ENTITY_ID",
+            "masked_zipcode",
+            "CITY",
+            "full_street_address",
+            "clean_zipcode",
+            "ADC_UPDT",
+            col("country_description").alias("country_description")
+        )
+    )
+    
+    # Get postcode to LSOA mapping with only the needed columns
+    postcode_maps = (
+        spark.table("3_lookup.imd.postcode_maps")
+        .select(
+            col("pcd7"),
+            col("lsoa21cd")
+        )
+        .withColumn("clean_pcd7", regexp_replace(col("pcd7"), r'\s+', ''))
+    )
+    
+    # First, try to match based on the full postcode (up to 7 characters)
+    with_lsoa_full = (
+        processed_addresses
+        .join(
+            postcode_maps,
+            substring(col("clean_zipcode"), 1, 7) == col("clean_pcd7"),
+            "left"
+        )
+        .select(
+            processed_addresses["*"],
+            col("lsoa21cd").alias("full_match_lsoa21cd")
+        )
+    )
+
+    # Split into matched and unmatched for the second matching attempt
+    matched_df = with_lsoa_full.filter(col("full_match_lsoa21cd").isNotNull())
+    unmatched_df = with_lsoa_full.filter(col("full_match_lsoa21cd").isNull())
+
+    # Create a 3-character version of the postcode for partial matching
+    postcode_maps_3char = (
+        postcode_maps
+        .withColumn("pcd_3char", substring(col("clean_pcd7"), 1, 3))
+        .select("pcd_3char", "lsoa21cd")
+    )
+    
+    # Add 3-char zipcode to unmatched dataframe
+    unmatched_with_3char = (
+        unmatched_df
+        .withColumn("zipcode_3char", substring(col("clean_zipcode"), 1, 3))
+    )
+
+    # Create window for picking the first match
+    window_spec = Window.partitionBy("PARENT_ENTITY_ID").orderBy("pcd_3char")
+    
+    # First dataframe: matched on full postcode
+    # Add final_lsoa21cd to matched records
+    matched_with_final = (
+        matched_df
+        .withColumn("final_lsoa21cd", col("full_match_lsoa21cd"))
+    )
+    
+    # Second dataframe: try to match on partial postcode
+    unmatched_with_final = (
+        unmatched_with_3char
+        .join(
+            postcode_maps_3char,
+            col("zipcode_3char") == col("pcd_3char"),
+            "left"
+        )
+        .withColumn("row_number", row_number().over(window_spec))
+        .filter(col("row_number") == 1)
+        .drop("row_number")
+        .withColumn("final_lsoa21cd", 
+            coalesce(col("full_match_lsoa21cd"), col("lsoa21cd"))
+        )
+    )
+    
+    # Define common columns to ensure identical schemas
+    common_columns = [
+        "ADDRESS_ID",
+        "PARENT_ENTITY_NAME",
+        "PARENT_ENTITY_ID",
+        "masked_zipcode",
+        "CITY",
+        "full_street_address",
+        "ADC_UPDT",
+        "country_description",
+        "final_lsoa21cd"
+    ]
+    
+    # Select only the common columns from both dataframes
+    matched_final = matched_with_final.select(*common_columns)
+    unmatched_final = unmatched_with_final.select(*common_columns)
+    
+    # Combine the matched and newly matched dataframes with identical schemas
+    with_lsoa_combined = matched_final.union(unmatched_final)
+    
+    # Get IMD data
+    imd_table = (
+        spark.table("3_lookup.imd.imd_2019")
+        .filter(
+            (col("DateCode") == 2019) &
+            (regexp_replace(col("Measurement"), " ", "") == "Decile") &
+            (col("Indices_of_Deprivation") == "a. Index of Multiple Deprivation (IMD)")
+        )
+        .select(
+            col("FeatureCode"),
+            col("Value")
+        )
+    )
+    
+    # Join with IMD data to get the decile
+    with_imd = (
+        with_lsoa_combined
+        .join(
+            broadcast(imd_table), 
+            col("final_lsoa21cd") == col("FeatureCode"), 
+            "left"
+        )
+    )
+    
+    # Add IMD Decile and Quintile columns
+    final_df = (
+        with_imd
+        # Add LSOA column
+        .withColumn("LSOA", col("final_lsoa21cd"))
+        # Add IMD Decile column (ensure it's a string type for consistency)
+        .withColumn("IMD_Decile", coalesce(col("Value").cast("string"), lit("Unknown")))
+        # Calculate IMD Quintile from Decile
+        .withColumn(
+            "IMD_Quintile",
+            when(col("Value").isNull(), lit("Unknown"))
+            .when(col("Value").isin(1, 2), lit("1"))
+            .when(col("Value").isin(3, 4), lit("2"))
+            .when(col("Value").isin(5, 6), lit("3"))
+            .when(col("Value").isin(7, 8), lit("4"))
+            .when(col("Value").isin(9, 10), lit("5"))
+            .otherwise(lit("Unknown"))
         )
         # Select final columns
         .select(
@@ -163,13 +331,15 @@ def create_address_mapping_incr():
             "masked_zipcode",
             "CITY",
             "full_street_address",
+            "LSOA",
+            "IMD_Decile",
+            "IMD_Quintile",
             "ADC_UPDT",
-            coalesce(col("DESCRIPTION"), col("country_cd")).alias("country_cd")
+            col("country_description").alias("country_cd")
         )
     )
     
-    return processed_addresses
-
+    return final_df
 
 # COMMAND ----------
 
@@ -1422,17 +1592,37 @@ def add_standardized_columns(df, standardization_cases):
     })
 
 def create_base_medication_administrations_incr():
-    """Creates base medication administration records with all joins"""
-    
+    """Creates base medication administration records with all joins, handling freetext entries."""
 
+    freetext_synonym_id = 789453129
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_med_admin")
-    
+
     def add_code_value_lookup(df, cd_column, alias_prefix):
         """Helper function to add code value lookups"""
-        code_value = spark.table("3_lookup.mill.mill_code_value")
+        # Define the lookup table and apply the alias immediately
+        code_value_lookup_df = spark.table("3_lookup.mill.mill_code_value").alias(f"{alias_prefix}_CV")
+
+        # Get the column from the input dataframe to join on
+        df_join_col = col(cd_column)
+
+        # Get the target join column from the aliased lookup dataframe
+        lookup_join_col = col(f"{alias_prefix}_CV.CODE_VALUE")
+
+        # --- Correction Here ---
+        # Access the schema of the *original* table before aliasing, or just use the known column name
+        # Assuming the column name in '3_lookup.mill.mill_code_value' is indeed 'CODE_VALUE'
+        try:
+            # Get the data type of the CODE_VALUE column from the lookup table's schema
+            code_value_target_type = spark.table("3_lookup.mill.mill_code_value").schema["CODE_VALUE"].dataType
+        except KeyError:
+             # Fallback or raise a more specific error if 'CODE_VALUE' might not exist
+             print(f"Warning: 'CODE_VALUE' column not found in 3_lookup.mill.mill_code_value schema. Assuming StringType for join cast.")
+             code_value_target_type = StringType() # Or handle as an error
+
+        # Perform the join, casting the input df column to the lookup table's column type
         return df.join(
-            code_value.alias(f"{alias_prefix}_CV"),
-            col(cd_column) == col(f"{alias_prefix}_CV.CODE_VALUE"),
+            code_value_lookup_df, # Use the aliased dataframe
+            df_join_col.cast(code_value_target_type) == lookup_join_col, # Join condition using aliased column
             "left"
         )
 
@@ -1446,22 +1636,25 @@ def create_base_medication_administrations_incr():
                     Window.partitionBy("RXCUI").orderBy("CODE_LENGTH")))
                 .filter(col("rn") == 1)
                 .select("RXCUI", "CODE", "STR")
-                .alias("SHORTEST_SNOMED"))
+               ) # Alias added later where used
 
     # Get base tables with aliases and filtering
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").alias("CE")
     med_admin_event = spark.table("4_prod.raw.mill_med_admin_event").alias("MAE") \
-        .filter((col("EVENT_TYPE_CD").isNotNull()) & (col("EVENT_TYPE_CD") != 0))
+        .filter((col("MAE.EVENT_TYPE_CD").isNotNull()) & (col("MAE.EVENT_TYPE_CD") != 0))
     encounter = spark.table("4_prod.raw.mill_encounter").alias("ENC")
     ce_med_result = spark.table("4_prod.raw.mill_ce_med_result").alias("MR")
     orders = spark.table("4_prod.raw.mill_orders").alias("ORDERS")
+    # Assuming OI.STRENGTH_UNIT and OI.VOLUME_UNIT are IntegerType or compatible
     order_ingredient = spark.table("4_prod.raw.mill_order_ingredient").alias("OI")
     order_catalog_synonym = spark.table("3_lookup.mill.mill_order_catalog_synonym").alias("OSYN")
-    order_catalog = spark.table("3_lookup.mill.mill_order_catalog").alias("OCAT")
-    rxnorm = spark.table("3_lookup.rxnorm.rxnconso").alias("RXN")
+    order_catalog = spark.table("3_lookup.mill.mill_order_catalog") # Alias added later
+    rxnorm = spark.table("3_lookup.rxnorm.rxnconso") # Alias added later
+    shortest_snomed = get_shortest_snomed_codes() # Get the dataframe
 
     # Window specs
     ce_window = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
+    oi_window = Window.partitionBy("ORDER_ID", "SYNONYM_ID").orderBy("ACTION_SEQUENCE")
 
     # Get list of relevant event IDs
     med_events = med_admin_event.select("EVENT_ID")
@@ -1471,16 +1664,14 @@ def create_base_medication_administrations_incr():
     # Get unit conversion maps and standardization cases
     weight_conversions, volume_conversions = get_unit_conversion_maps_med_admin()
     standardization_cases = create_standardization_expressions_med_admin(
-        weight_conversions, 
+        weight_conversions,
         volume_conversions
     )
 
-
-
-    result_df = (
+    base_joins = (
         clinical_event.filter(
             (col("CE.VALID_UNTIL_DT_TM") > current_timestamp()) &
-            (col("CE.ADC_UPDT") > max_adc_updt) 
+            (col("CE.ADC_UPDT") > max_adc_updt)
         )
         .join(all_med_events, "EVENT_ID", "inner")
         .join(med_admin_event, col("CE.EVENT_ID") == col("MAE.EVENT_ID"), "left")
@@ -1495,159 +1686,230 @@ def create_base_medication_administrations_incr():
             col("CE.ORDER_ID") == col("ORDERS.ORDER_ID"),
             "left"
         )
+        # --- Standard Joins (for non-freetext) ---
         .join(
-            order_ingredient.alias("OI")
-            .withColumn(
-                "oi_rn",
-                F.row_number().over(
-                    Window.partitionBy("ORDER_ID", "SYNONYM_ID")
-                    .orderBy("ACTION_SEQUENCE")
-                )
-            )
+            order_ingredient
+            .withColumn("oi_rn", F.row_number().over(oi_window))
             .filter(col("oi_rn") == 1),
-            (col("ORDERS.TEMPLATE_ORDER_ID") == col("OI.ORDER_ID")) & 
-            (col("ORDERS.SYNONYM_ID") == col("OI.SYNONYM_ID")),
-            "left"
-        )
-        .join(order_catalog.alias("OCAT"), 
-              col("ORDERS.CATALOG_CD") == col("OCAT.CATALOG_CD"), 
-              "left")
-        .join(order_catalog_synonym.alias("OSYN"), 
-              col("ORDERS.SYNONYM_ID") == col("OSYN.SYNONYM_ID"), 
-              "left")
-        
-        # RxNorm and SNOMED lookups through Multum
-        .join(
-            rxnorm.filter(col("SAB") == "MMSL"),  # Get Multum mappings from RxNorm
-            when(col("OCAT.CKI").like("MUL.ORD%"), 
-                 substring_index(col("OCAT.CKI"), "!", -1)) == col("RXN.CODE"),
+            (col("ORDERS.TEMPLATE_ORDER_ID") == col("OI.ORDER_ID")) &
+            (col("ORDERS.SYNONYM_ID") == col("OI.SYNONYM_ID")) &
+            (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
             "left"
         )
         .join(
-            get_shortest_snomed_codes(),
-            col("RXN.RXCUI") == col("SHORTEST_SNOMED.RXCUI"),
+             order_catalog.alias("OCAT_STD"),
+             (col("ORDERS.CATALOG_CD") == col("OCAT_STD.CATALOG_CD")) &
+             (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
+             "left"
+        )
+        .join(
+            order_catalog_synonym,
+            (col("ORDERS.SYNONYM_ID") == col("OSYN.SYNONYM_ID")) &
+            (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
             "left"
         )
-        
-        # Add all code value lookups
+        # --- Freetext Specific Joins ---
+        .join(
+            order_catalog.alias("OCAT_FT"),
+            (lower(col("ORDERS.ORDER_MNEMONIC")) == lower(col("OCAT_FT.PRIMARY_MNEMONIC"))) &
+            (col("ORDERS.SYNONYM_ID") == freetext_synonym_id),
+            "left"
+        )
+        # --- RxNorm and SNOMED lookups (handle both standard and freetext) ---
+        .join(
+            rxnorm.alias("RXN_STD").filter(col("RXN_STD.SAB") == "MMSL"),
+            when(col("OCAT_STD.CKI").like("MUL.ORD%"),
+                 substring_index(col("OCAT_STD.CKI"), "!", -1)) == col("RXN_STD.CODE"),
+            "left"
+        )
+        .join(
+            shortest_snomed.alias("SNOMED_STD"),
+            col("RXN_STD.RXCUI") == col("SNOMED_STD.RXCUI"),
+            "left"
+        )
+        .join(
+            rxnorm.alias("RXN_FT").filter(col("RXN_FT.SAB") == "MMSL"),
+            when(col("OCAT_FT.CKI").like("MUL.ORD%"),
+                 substring_index(col("OCAT_FT.CKI"), "!", -1)) == col("RXN_FT.CODE"),
+            "left"
+        )
+        .join(
+            shortest_snomed.alias("SNOMED_FT"),
+            col("RXN_FT.RXCUI") == col("SNOMED_FT.RXCUI"),
+            "left"
+        )
+        # --- Pre-calculate conditional unit codes ---
+        .withColumn(
+             "_cond_strength_unit_cd",
+             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) # Use original type of OI.STRENGTH_UNIT if known, else IntegerType
+             .otherwise(col("OI.STRENGTH_UNIT"))
+         )
+        .withColumn(
+             "_cond_volume_unit_cd",
+             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) # Use original type of OI.VOLUME_UNIT if known, else IntegerType
+             .otherwise(col("OI.VOLUME_UNIT"))
+         )
+    )
+
+    # Add code value lookups AFTER defining conditional codes if needed,
+    # but the original placement joining on OI.* should still work.
+    # Let's keep the original lookup logic for now.
+    lookups_added = (
+        base_joins
         .transform(lambda df: add_code_value_lookup(df, "MAE.EVENT_TYPE_CD", "EVENT_TYPE"))
         .transform(lambda df: add_code_value_lookup(df, "MR.ADMIN_ROUTE_CD", "ADMIN_ROUTE"))
         .transform(lambda df: add_code_value_lookup(df, "MR.INFUSION_UNIT_CD", "INFUSION_UNIT"))
         .transform(lambda df: add_code_value_lookup(df, "MR.REFUSAL_CD", "REFUSAL"))
         .transform(lambda df: add_code_value_lookup(df, "MAE.POSITION_CD", "POSITION"))
         .transform(lambda df: add_code_value_lookup(df, "MAE.NURSE_UNIT_CD", "NURSE_UNIT"))
+        # These lookups still join on the original OI columns. The CV columns will be null if OI.* was null (freetext case)
         .transform(lambda df: add_code_value_lookup(df, "OI.STRENGTH_UNIT", "STRENGTH_UNIT"))
         .transform(lambda df: add_code_value_lookup(df, "OI.VOLUME_UNIT", "VOLUME_UNIT"))
         .transform(lambda df: add_code_value_lookup(df, "CE.RESULT_STATUS_CD", "RESULT_STATUS"))
         .transform(lambda df: add_code_value_lookup(df, "MR.DOSAGE_UNIT_CD", "DOSAGE_UNIT"))
         .transform(lambda df: add_code_value_lookup(df, "MR.INFUSED_VOLUME_UNIT_CD", "INFUSED_VOLUME_UNIT"))
-        
-        .select(
+    )
+
+    result_df = (
+        lookups_added.select(
             # Identifiers
             col("CE.PERSON_ID").cast(LongType()),
             col("CE.ENCNTR_ID").cast(LongType()),
             col("CE.EVENT_ID").cast(LongType()),
             col("CE.ORDER_ID").cast(LongType()),
-            
+
             # Status codes and their lookups
             col("MAE.EVENT_TYPE_CD").cast(IntegerType()),
-            F.when(col("EVENT_TYPE_CD").isNull() | (col("EVENT_TYPE_CD") == 0), None)
-             .otherwise(coalesce("EVENT_TYPE_CV.DISPLAY", "EVENT_TYPE_CV.CDF_MEANING"))
+            F.when(col("MAE.EVENT_TYPE_CD").isNull() | (col("MAE.EVENT_TYPE_CD") == 0), None)
+             .otherwise(coalesce(col("EVENT_TYPE_CV.DISPLAY"), col("EVENT_TYPE_CV.CDF_MEANING")))
              .cast(StringType()).alias("EVENT_TYPE_DISPLAY"),
-            
+
             col("CE.RESULT_STATUS_CD").cast(IntegerType()),
-            F.when(col("RESULT_STATUS_CD").isNull() | (col("RESULT_STATUS_CD") == 0), None)
-             .otherwise(coalesce("RESULT_STATUS_CV.DISPLAY", "RESULT_STATUS_CV.CDF_MEANING"))
+            F.when(col("CE.RESULT_STATUS_CD").isNull() | (col("CE.RESULT_STATUS_CD") == 0), None)
+             .otherwise(coalesce(col("RESULT_STATUS_CV.DISPLAY"), col("RESULT_STATUS_CV.CDF_MEANING")))
              .cast(StringType()).alias("RESULT_STATUS_DISPLAY"),
-            
+
             # Timing Information
-            coalesce("MAE.BEG_DT_TM", "MR.ADMIN_START_DT_TM", "CE.EVENT_START_DT_TM").cast(TimestampType()).alias("ADMIN_START_DT_TM"),
-            coalesce("MAE.END_DT_TM", "MR.ADMIN_END_DT_TM", "CE.EVENT_END_DT_TM").cast(TimestampType()).alias("ADMIN_END_DT_TM"),
-            
-            # Order Information
-            col("OI.SYNONYM_ID").cast(LongType()).alias("ORDER_SYNONYM_ID"),
-            col("OCAT.CKI").cast(StringType()).alias("ORDER_CKI"),
-            when(col("OCAT.CKI").like("MUL.ORD%"), 
-                 substring_index(col("OCAT.CKI"), "!", -1)).cast(StringType()).alias("MULTUM"),
-            
-            # RxNorm and SNOMED columns
-            col("RXN.RXCUI").cast(StringType()).alias("RXNORM_CUI"),
-            col("RXN.STR").cast(StringType()).alias("RXNORM_STR"),
-            col("SHORTEST_SNOMED.CODE").cast(StringType()).alias("SNOMED_CODE"),
-            col("SHORTEST_SNOMED.STR").cast(StringType()).alias("SNOMED_STR"),
-            
-            col("OSYN.MNEMONIC").cast(StringType()).alias("ORDER_MNEMONIC"),
-            col("OI.ORDER_DETAIL_DISPLAY_LINE").cast(StringType()).alias("ORDER_DETAIL"),
-            
-            # Dosing Information
-            col("OI.STRENGTH").cast(FloatType()).alias("ORDER_STRENGTH"),
-            col("OI.STRENGTH_UNIT").cast(IntegerType()).alias("ORDER_STRENGTH_UNIT_CD"),
-            F.when(col("ORDER_STRENGTH_UNIT_CD").isNull() | (col("ORDER_STRENGTH_UNIT_CD") == 0), None)
-             .otherwise(coalesce("STRENGTH_UNIT_CV.DISPLAY", "STRENGTH_UNIT_CV.CDF_MEANING"))
+            coalesce(col("MAE.BEG_DT_TM"), col("MR.ADMIN_START_DT_TM"), col("CE.EVENT_START_DT_TM")).cast(TimestampType()).alias("ADMIN_START_DT_TM"),
+            coalesce(col("MAE.END_DT_TM"), col("MR.ADMIN_END_DT_TM"), col("CE.EVENT_END_DT_TM")).cast(TimestampType()).alias("ADMIN_END_DT_TM"),
+
+            # --- Conditional Order Information ---
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
+                .otherwise(col("OI.SYNONYM_ID")).cast(LongType()).alias("ORDER_SYNONYM_ID"),
+
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI"))
+                .otherwise(col("OCAT_STD.CKI")).cast(StringType()).alias("ORDER_CKI"),
+
+            when(
+                (when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI")).otherwise(col("OCAT_STD.CKI"))).like("MUL.ORD%"),
+                 substring_index(when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI")).otherwise(col("OCAT_STD.CKI")), "!", -1)
+                ).cast(StringType()).alias("MULTUM"),
+
+            # --- Conditional RxNorm and SNOMED columns ---
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("RXN_FT.RXCUI"))
+                .otherwise(col("RXN_STD.RXCUI")).cast(StringType()).alias("RXNORM_CUI"),
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("RXN_FT.STR"))
+                .otherwise(col("RXN_STD.STR")).cast(StringType()).alias("RXNORM_STR"),
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("SNOMED_FT.CODE"))
+                .otherwise(col("SNOMED_STD.CODE")).cast(StringType()).alias("SNOMED_CODE"),
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("SNOMED_FT.STR"))
+                .otherwise(col("SNOMED_STD.STR")).cast(StringType()).alias("SNOMED_STR"),
+
+            # --- Conditional Order Details ---
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("ORDERS.ORDER_MNEMONIC"))
+                .otherwise(col("OSYN.MNEMONIC")).cast(StringType()).alias("ORDER_MNEMONIC"),
+
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
+                .otherwise(col("OI.ORDER_DETAIL_DISPLAY_LINE")).cast(StringType()).alias("ORDER_DETAIL"),
+
+            # --- Conditional Dosing Information (using pre-calculated codes) ---
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
+                .otherwise(col("OI.STRENGTH")).cast(FloatType()).alias("ORDER_STRENGTH"),
+
+            # Use the pre-calculated conditional code directly
+            col("_cond_strength_unit_cd").alias("ORDER_STRENGTH_UNIT_CD"),
+
+            # Use the simple condition on the pre-calculated code for the display value
+            F.when(
+                col("_cond_strength_unit_cd").isNull() | (col("_cond_strength_unit_cd") == 0),
+                None
+             )
+             .otherwise(coalesce(col("STRENGTH_UNIT_CV.DISPLAY"), col("STRENGTH_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("ORDER_STRENGTH_UNIT_DISPLAY"),
-            
-            col("OI.VOLUME").cast(FloatType()).alias("ORDER_VOLUME"),
-            col("OI.VOLUME_UNIT").cast(IntegerType()).alias("ORDER_VOLUME_UNIT_CD"),
-            F.when(col("ORDER_VOLUME_UNIT_CD").isNull() | (col("ORDER_VOLUME_UNIT_CD") == 0), None)
-             .otherwise(coalesce("VOLUME_UNIT_CV.DISPLAY", "VOLUME_UNIT_CV.CDF_MEANING"))
+
+            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
+                .otherwise(col("OI.VOLUME")).cast(FloatType()).alias("ORDER_VOLUME"),
+
+            # Use the pre-calculated conditional code directly
+            col("_cond_volume_unit_cd").alias("ORDER_VOLUME_UNIT_CD"),
+
+            # Use the simple condition on the pre-calculated code for the display value
+             F.when(
+                col("_cond_volume_unit_cd").isNull() | (col("_cond_volume_unit_cd") == 0),
+                None
+             )
+             .otherwise(coalesce(col("VOLUME_UNIT_CV.DISPLAY"), col("VOLUME_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("ORDER_VOLUME_UNIT_DISPLAY"),
-            
-            # Administration Details
+
+            # --- Administration Details ---
             col("MR.ADMIN_ROUTE_CD").cast(IntegerType()),
-            F.when(col("ADMIN_ROUTE_CD").isNull() | (col("ADMIN_ROUTE_CD") == 0), None)
-             .otherwise(coalesce("ADMIN_ROUTE_CV.DISPLAY", "ADMIN_ROUTE_CV.CDF_MEANING"))
+            F.when(col("MR.ADMIN_ROUTE_CD").isNull() | (col("MR.ADMIN_ROUTE_CD") == 0), None)
+             .otherwise(coalesce(col("ADMIN_ROUTE_CV.DISPLAY"), col("ADMIN_ROUTE_CV.CDF_MEANING")))
              .cast(StringType()).alias("ADMIN_ROUTE_DISPLAY"),
-            
+
             col("MR.INITIAL_DOSAGE").cast(FloatType()).alias("INITIAL_DOSAGE"),
             col("MR.DOSAGE_UNIT_CD").cast(IntegerType()).alias("INITIAL_DOSAGE_UNIT_CD"),
-            F.when(col("INITIAL_DOSAGE_UNIT_CD").isNull() | (col("INITIAL_DOSAGE_UNIT_CD") == 0), None)
-             .otherwise(coalesce("DOSAGE_UNIT_CV.DISPLAY", "DOSAGE_UNIT_CV.CDF_MEANING"))
+            F.when(col("MR.DOSAGE_UNIT_CD").isNull() | (col("MR.DOSAGE_UNIT_CD") == 0), None)
+             .otherwise(coalesce(col("DOSAGE_UNIT_CV.DISPLAY"), col("DOSAGE_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("INITIAL_DOSAGE_UNIT_DISPLAY"),
-            
+
             col("MR.ADMIN_DOSAGE").cast(FloatType()).alias("ADMIN_DOSAGE"),
-            col("MR.DOSAGE_UNIT_CD").cast(IntegerType()).alias("ADMIN_DOSAGE_UNIT_CD"),
-            F.when(col("ADMIN_DOSAGE_UNIT_CD").isNull() | (col("ADMIN_DOSAGE_UNIT_CD") == 0), None)
-             .otherwise(coalesce("DOSAGE_UNIT_CV.DISPLAY", "DOSAGE_UNIT_CV.CDF_MEANING"))
+            col("MR.DOSAGE_UNIT_CD").cast(IntegerType()).alias("ADMIN_DOSAGE_UNIT_CD"), # Re-using alias
+            F.when(col("MR.DOSAGE_UNIT_CD").isNull() | (col("MR.DOSAGE_UNIT_CD") == 0), None)
+             .otherwise(coalesce(col("DOSAGE_UNIT_CV.DISPLAY"), col("DOSAGE_UNIT_CV.CDF_MEANING"))) # Re-using alias
              .cast(StringType()).alias("ADMIN_DOSAGE_UNIT_DISPLAY"),
-            
+
             # Volume Information
             col("MR.INITIAL_VOLUME").cast(FloatType()).alias("INITIAL_VOLUME"),
             col("MR.INFUSED_VOLUME").cast(FloatType()).alias("INFUSED_VOLUME"),
             col("MR.INFUSED_VOLUME_UNIT_CD").cast(IntegerType()).alias("INFUSED_VOLUME_UNIT_CD"),
-            F.when(col("INFUSED_VOLUME_UNIT_CD").isNull() | (col("INFUSED_VOLUME_UNIT_CD") == 0), None)
-             .otherwise(coalesce("INFUSED_VOLUME_UNIT_CV.DISPLAY", "INFUSED_VOLUME_UNIT_CV.CDF_MEANING"))
+            F.when(col("MR.INFUSED_VOLUME_UNIT_CD").isNull() | (col("MR.INFUSED_VOLUME_UNIT_CD") == 0), None)
+             .otherwise(coalesce(col("INFUSED_VOLUME_UNIT_CV.DISPLAY"), col("INFUSED_VOLUME_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("INFUSED_VOLUME_UNIT_DISPLAY"),
-            
+
             # Infusion Details
             col("MR.INFUSION_RATE").cast(FloatType()).alias("INFUSION_RATE"),
             col("MR.INFUSION_UNIT_CD").cast(IntegerType()).alias("INFUSION_UNIT_CD"),
-            F.when(col("INFUSION_UNIT_CD").isNull() | (col("INFUSION_UNIT_CD") == 0), None)
-             .otherwise(coalesce("INFUSION_UNIT_CV.DISPLAY", "INFUSION_UNIT_CV.CDF_MEANING"))
+            F.when(col("MR.INFUSION_UNIT_CD").isNull() | (col("MR.INFUSION_UNIT_CD") == 0), None)
+             .otherwise(coalesce(col("INFUSION_UNIT_CV.DISPLAY"), col("INFUSION_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("INFUSION_UNIT_DISPLAY"),
 
             col("MAE.NURSE_UNIT_CD").cast(IntegerType()).alias("NURSE_UNIT_CD"),
-            F.when(col("NURSE_UNIT_CD").isNull() | (col("NURSE_UNIT_CD") == 0), None)
-             .otherwise(coalesce("NURSE_UNIT_CV.DISPLAY", "NURSE_UNIT_CV.CDF_MEANING"))
+            F.when(col("MAE.NURSE_UNIT_CD").isNull() | (col("MAE.NURSE_UNIT_CD") == 0), None)
+             .otherwise(coalesce(col("NURSE_UNIT_CV.DISPLAY"), col("NURSE_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("NURSE_UNIT_DISPLAY"),
 
             # Provider Information
             col("MAE.POSITION_CD").cast(IntegerType()).alias("POSITION_CD"),
-            F.when(col("POSITION_CD").isNull() | (col("POSITION_CD") == 0), None)
-             .otherwise(coalesce("POSITION_CV.DISPLAY", "POSITION_CV.CDF_MEANING"))
+            F.when(col("MAE.POSITION_CD").isNull() | (col("MAE.POSITION_CD") == 0), None)
+             .otherwise(coalesce(col("POSITION_CV.DISPLAY"), col("POSITION_CV.CDF_MEANING")))
              .cast(StringType()).alias("POSITION_DISPLAY"),
-            
+
             col("MAE.PRSNL_ID").cast(LongType()).alias("PRSNL_ID"),
-            
+
             # Update Tracking
             F.greatest(
                 col("CE.ADC_UPDT"),
                 col("MAE.ADC_UPDT"),
                 col("MR.ADC_UPDT"),
-                col("OI.ADC_UPDT")
+                when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(TimestampType()))
+                    .otherwise(col("OI.ADC_UPDT"))
             ).alias("ADC_UPDT")
-        ).distinct()
+        )
+        .drop("_cond_strength_unit_cd", "_cond_volume_unit_cd") # Drop temporary columns
+        .distinct()
     )
-    
+
     # Add standardized columns and return
     return add_standardized_columns(result_df, standardization_cases)
 
