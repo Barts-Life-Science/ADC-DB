@@ -564,3 +564,19 @@ response = requests.put(
     json={"metadata":hdruk_300_json}
 )
 print(response.status_code)
+
+# COMMAND ----------
+
+import json
+import requests
+
+headers = {
+    "Content-Type": "application/json",
+}
+
+traser_uri = "https://hdr-gateway-traser-dev-qmnkcg5qjq-ew.a.run.app"
+response = requests.post(
+    f"{traser_uri}/find?with_errors=1", headers=headers, json=hdruk_300_json
+)
+
+print(json.dumps(response.json(), indent=6))

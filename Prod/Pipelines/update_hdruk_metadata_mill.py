@@ -502,6 +502,11 @@ print(response)
 
 # COMMAND ----------
 
+with open('/Volumes/1_inland/evan_demo/misc/hdruk_retrieved_mill.json', 'w', encoding='utf-8') as f:
+    json.dump(response.json(), f, ensure_ascii=False, indent=4)
+
+# COMMAND ----------
+
 import json
 response_json = json.loads(response.text)
 response_json
