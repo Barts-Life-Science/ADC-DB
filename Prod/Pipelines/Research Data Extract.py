@@ -136,6 +136,35 @@ def lookup_address():
 
 # COMMAND ----------
 
+@dlt.table(
+    name="current_blob_content",
+    comment="Current blob content with one row per event_id",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+        "pipelines.autoOptimize.zOrderCols": "event_id"
+    }
+)
+def lookup_blob_content():
+    window = Window.partitionBy("event_id").orderBy(
+        col("valid_until_dt_tm").desc(),
+        col("updt_dt_tm").desc()
+    )
+
+    return (
+        spark.table("4_prod.bronze.mill_blob_text")
+
+        .filter(col("STATUS") == "Decoded")
+
+        .withColumn("row", row_number().over(window))
+
+        .filter(col("row") == 1)
+
+        .drop("row")
+    )
+
+# COMMAND ----------
+
 demographics_comment = "Contains the basic demographic details of each patient included in the extract." 
 
 schema_rde_patient_demographics = StructType([
@@ -1218,7 +1247,7 @@ def pathology_incr():
     order_catalogue = spark.table("3_lookup.mill.mill_order_catalog").alias("CAT")
     clinical_event = spark.table("4_prod.raw.mill_clinical_event")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
-    blob_content = spark.table("4_prod.raw.pi_cde_blob_content").alias("d")
+    blob_content = dlt.read("current_blob_content").alias("d")
     encounter = dlt.read("rde_encounter").alias("ENC")
 
     clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
@@ -1262,7 +1291,7 @@ def pathology_incr():
             col("EVE.NORMAL_LOW").cast(StringType()).alias("ResLower"),
             col("RESFind.CODE_DESC_TXT").cast(StringType()).alias("Resultfinding"),
             col("EVE.EVENT_START_DT_TM").cast(StringType()).alias("ReportDate"),
-            blob_content.BLOB_CONTENTS.cast(StringType()).alias("Report"),
+            blob_content.BLOB_TEXT.cast(StringType()).alias("Report"),
             col("ORDStat.CODE_DESC_TXT").cast(StringType()).alias("OrderStatus"),
             col("RESstat.CODE_DESC_TXT").cast(StringType()).alias("ResStatus"),
             order_catalogue.CONCEPT_CKI.cast(StringType()).alias("SnomedCode"),
@@ -1667,7 +1696,7 @@ def radiology_incr():
     clinical_event = spark.table("4_prod.raw.mill_clinical_event")
     orders = spark.table("4_prod.raw.mill_orders").alias("ORD")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
-    blob_content = spark.table("4_prod.raw.pi_cde_blob_content").alias("B")
+    blob_content = dlt.read("current_blob_content").alias("B")
     encounter = dlt.read("rde_encounter").alias("ENC")
     nhsi_exam_mapping = spark.table("4_prod.raw.tbl_nhsi_exam_mapping").alias("M")
 
@@ -1709,7 +1738,7 @@ def radiology_incr():
             when(col("EVE.RESULT_VAL").cast("double").isNull(), lit(0)).otherwise(lit(1)).alias("ResultNumeric"),
             col("EVE.EVENT_START_DT_TM").cast(StringType()).alias("ExamStart"),
             col("EVE.EVENT_END_DT_TM").cast(StringType()).alias("ExamEnd"),
-            col("B.BLOB_CONTENTS").cast(StringType()).alias("ReportText"),
+            col("B.BLOB_TEXT").cast(StringType()).alias("ReportText"),
             col("LO.CODE_DESC_TXT").cast(StringType()).alias("LastOrderStatus"),
             col("R.CODE_DESC_TXT").cast(StringType()).alias("RecordStatus"),
             col("ER.CODE_DESC_TXT").cast(StringType()).alias("ResultStatus"),
@@ -1888,7 +1917,7 @@ schema_rde_blobdataset = StructType([
 def blobdataset_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_blobdataset")
 
-    blob_content = spark.table("4_prod.raw.pi_cde_blob_content").alias("B")
+    blob_content = dlt.read("current_blob_content").alias("B")
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).alias("CE")
     encounter = dlt.read("rde_encounter").alias("E")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
@@ -1914,7 +1943,7 @@ def blobdataset_incr():
             col("CE2.EVENT_TAG").cast(StringType()).alias("MainTagText"),
             col("CE.EVENT_TITLE_TEXT").cast(StringType()).alias("ChildEvent"),
             col("CE.EVENT_TAG").cast(StringType()).alias("ChildTagText"),
-            col("B.BLOB_CONTENTS").cast(StringType()).alias("BlobContents"),
+            col("B.BLOB_TEXT").cast(StringType()).alias("BlobContents"),
             col("Evntcd.CODE_DISP_TXT").cast(StringType()).alias("EventDesc"),
             col("CE.RESULT_VAL").cast(StringType()).alias("EventResultText"),
             col("CE.RESULT_VAL").cast(DoubleType()).alias("EventResultNBR"),

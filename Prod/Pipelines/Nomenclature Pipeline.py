@@ -9,7 +9,7 @@ from pyspark.sql.window import Window
 from datetime import datetime
 from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, functions as F
 from functools import reduce
 from delta.tables import DeltaTable
 
@@ -851,72 +851,119 @@ def generate_match_levels(df, code_col):
         F.expr("substring(match_level_1, 1, length(match_level_1) - 2)")
     )
 
-def add_omop_preference(df, source_code_col, target_code_col, source_concepts, target_concepts, omop_rels):
+def add_omop_preference(
+        df: DataFrame,
+        source_code_col: str,
+        target_code_col: str,
+        source_concepts: DataFrame,
+        target_concepts: DataFrame,
+        omop_rels: DataFrame
+    ) -> DataFrame:
     """
-    Adds OMOP mapping preferences to a DataFrame by joining with OMOP concept and relationship tables.
-    
-    Args:
-        df: Source DataFrame containing codes to be mapped
-        source_code_col: Name of the column containing source codes
-        target_code_col: Name of the column containing target codes
-        source_concepts: OMOP source concepts DataFrame
-        target_concepts: OMOP target concepts DataFrame
-        omop_rels: OMOP relationship reference DataFrame
-    
-    Returns:
-        DataFrame: Original DataFrame enriched with OMOP mapping preferences
+    Enriches the incoming DataFrame with a flag (omop_mapped = 1/0) that shows
+    whether the pair <source-code , target-code> is an OMOP-validated mapping
+    according to concept and concept_relationship tables.
+
+    Parameters
+    ----------
+    df                : DataFrame   – records that have already been paired
+                                       ( source_code_col  ->  target_code_col )
+    source_code_col   : str         – column in df that contains the “source / SCUI”  code
+    target_code_col   : str         – column in df that contains the “target / TCUI”  code
+    source_concepts   : DataFrame   – OMOP concept table (all vocabularies);
+                                       only concept_id and concept_code are required
+    target_concepts   : DataFrame   – OMOP concept table (can be the same object as
+                                       source_concepts, but passed separately for clarity)
+    omop_rels         : DataFrame   – concept_relationship filtered to the
+                                       relationship_id(s) you accept as valid
+                                       (e.g. “Maps to”, “Mapped from”)
+
+    Returns
+    -------
+    DataFrame  – original rows + column  omop_mapped  (1 = preferred; 0 = not preferred)
     """
-    # Prepare concepts DataFrames
-    source_concepts = source_concepts.select(
-        F.col("concept_id").alias("source_concept_id"),
-        F.col("concept_code").alias("source_concept_code")
-    )
-    
-    target_concepts = target_concepts.select(
-        F.col("concept_id").alias("target_concept_id"),
-        F.col("concept_code").alias("target_concept_code")
-    )
-    
-    # Join source codes with OMOP concepts
-    with_source_concept = df.join(
-        source_concepts,
-        F.col(source_code_col) == F.col("source_concept_code"),
-        "left"
-    )
-    print(f"Count of with source concepts: {with_source_concept.count()}")
-    with_source_concept.show(5)
-    target_concepts.show(5)
-    # Join target codes with OMOP concepts
-    with_target_concept = with_source_concept.join(
-        target_concepts,
-        F.col(target_code_col).cast(StringType()) == F.col("target_concept_code").cast(StringType()),
-        "left"
-    )
-    print(f"Count of with target concepts: {with_target_concept.count()}")
-    
-    # Validate relationships and add preference flag
-    return with_target_concept.join(
-        omop_rels,
-        (
-            # Check for direct mapping relationship
-            (F.col("source_concept_id") == omop_rels.concept_id_1) &
-            (F.col("target_concept_id") == omop_rels.concept_id_2)
-        ) |
-        (
-            # Check for reverse mapping relationship
-            (F.col("source_concept_id") == omop_rels.concept_id_2) &
-            (F.col("target_concept_id") == omop_rels.concept_id_1)
-        ),
-        "left"
-    ).select(
-        df["*"],
-        # Add binary flag for OMOP-validated mappings
-        F.when(
-            F.col("relationship_id").isNotNull(),
-            F.lit(1)
-        ).otherwise(F.lit(0)).alias("omop_mapped")
+
+    # ------------------------------------------------------------------ #
+    # 1.  Prepare the reference DataFrames (keep only what is necessary) #
+    # ------------------------------------------------------------------ #
+    src = (
+        source_concepts
+        .select(
+            F.col("concept_id").alias("src_concept_id"),
+            F.col("concept_code").alias("src_concept_code")
+        )
+        .dropDuplicates(["src_concept_code"])
+        .alias("src")
     )
 
+    tgt = (
+        target_concepts
+        .select(
+            F.col("concept_id").alias("tgt_concept_id"),
+            F.col("concept_code").alias("tgt_concept_code")
+        )
+        .dropDuplicates(["tgt_concept_code"])
+        .alias("tgt")
+    )
+
+    rel = (
+        omop_rels
+        .select(
+            F.col("concept_id_1").alias("rel_cid_1"),
+            F.col("concept_id_2").alias("rel_cid_2"),
+            "relationship_id"
+        )
+        .alias("rel")
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2.  Attach OMOP concept_id for the source code                      #
+    # ------------------------------------------------------------------ #
+    base = df.alias("base")
+
+    with_src_cid = base.join(
+        src,
+        F.col(f"base.{source_code_col}").cast(StringType())
+        == F.col("src.src_concept_code").cast(StringType()),
+        "left"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 3.  Attach OMOP concept_id for the target code                      #
+    # ------------------------------------------------------------------ #
+    with_tgt_cid = with_src_cid.join(
+        tgt,
+        F.col(f"base.{target_code_col}").cast(StringType())
+        == F.col("tgt.tgt_concept_code").cast(StringType()),
+        "left"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 4.  Check if (src_cid , tgt_cid) appears in concept_relationship    #
+    #     in either direction; if yes → omop_mapped = 1                   #
+    # ------------------------------------------------------------------ #
+    validated = with_tgt_cid.join(
+        rel,
+        (
+            (F.col("src_concept_id") == F.col("rel_cid_1"))
+            & (F.col("tgt_concept_id") == F.col("rel_cid_2"))
+        )
+        | (
+            (F.col("src_concept_id") == F.col("rel_cid_2"))
+            & (F.col("tgt_concept_id") == F.col("rel_cid_1"))
+        ),
+        "left"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 5.  Add the flag and return                                         #
+    # ------------------------------------------------------------------ #
+    return validated.select(
+        base["*"],
+        F.when(F.col("relationship_id").isNotNull(), F.lit(1))
+         .otherwise(F.lit(0))
+         .alias("omop_mapped")
+    )
 
 # COMMAND ----------
 
@@ -1259,29 +1306,39 @@ def create_snomed_mapping_incr():
 
     # Process direct matches for ICD10
     icd10_direct_matches = icd10_base_df.join(
-        icd_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
-        F.col("standardized_found_cui") == F.col("standardized_scui"),
-        "left"
+    icd_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
+    F.col("standardized_found_cui") == F.col("standardized_scui"),
+    "left"
     ).select(
-        icd10_base_df["*"],
-        icd_map.SCUI.alias("SCUI"),
-        icd_map.TCUI.alias("matched_snomed_code"),
-        F.lit(False).alias("has_omop_map")
+    icd10_base_df["*"],
+    icd_map.SCUI.cast("string").alias("SCUI"),                 # Cast SCUI
+    icd_map.TCUI.cast("string").alias("matched_snomed_code"), # Cast TCUI
+    F.lit(False).alias("has_omop_map")
     )
-
+    print("Here")
     # Process direct matches for OPCS4
     opcs4_direct_matches = opcs4_base_df.join(
-        opcs_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
-        F.col("standardized_found_cui") == F.col("standardized_scui"),
-        "left"
+    opcs_map.withColumn("standardized_scui", standardize_code_udf(F.col("SCUI"))),
+    F.col("standardized_found_cui") == F.col("standardized_scui"),
+    "left"
     ).select(
-        opcs4_base_df["*"],
-        opcs_map.SCUI.alias("SCUI"),
-        opcs_map.TCUI.alias("matched_snomed_code"),
-        F.lit(False).alias("has_omop_map")
+    opcs4_base_df["*"],
+    opcs_map.SCUI.cast("string").alias("SCUI"),                 # Cast SCUI
+    opcs_map.TCUI.cast("string").alias("matched_snomed_code"), # Cast TCUI
+    F.lit(False).alias("has_omop_map")
     )
+    print("Here2")
+    print("--- ICD10 Direct Matches Schema ---")
+    icd10_direct_matches.printSchema()
+
+    print("\n--- OPCS4 Direct Matches Schema ---")
+    opcs4_direct_matches.printSchema()
+
+# Check if schemas are identical (will print True or False)
+    print(f"\nSchemas Identical? {icd10_direct_matches.schema == opcs4_direct_matches.schema}")
+
     
-    direct_matches = icd10_direct_matches.unionAll(opcs4_direct_matches)
+    direct_matches = icd10_direct_matches.unionByName(opcs4_direct_matches)
     print(f"Direct matches found: {direct_matches.filter(F.col('matched_snomed_code').isNotNull()).count()}")
     
     direct_with_omop = add_omop_preference(

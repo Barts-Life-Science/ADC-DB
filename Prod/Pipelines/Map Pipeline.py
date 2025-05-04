@@ -2,6 +2,7 @@
 from pyspark.sql.functions import *
 from pyspark.sql.functions import max as spark_max
 from pyspark.sql.window import Window
+from delta.tables import DeltaTable
 from datetime import datetime
 from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
@@ -12,86 +13,71 @@ from functools import reduce
 
 
 
-def get_max_timestamp(table_name):
+def get_max_timestamp(table_name: str,
+                      ts_column: str = "ADC_UPDT",
+                      default_date: datetime = datetime(1980, 1, 1)
+                     ) -> datetime:
     """
-    Retrieves the maximum timestamp from a given table.
-    Falls back to ADC_UPDT if _row_modified doesn't exist.
-    If no date is found, returns January 1, 1980 as a default date.
-    
-    Args:
-        table_name (str): Name of the table to query
-    
-    Returns:
-        datetime: Maximum timestamp or default date
+    Returns the greatest value of `ts_column` in `table_name`.
+    If the table or the column does not exist the supplied default is returned.
     """
     try:
-        default_date = datetime(1980, 1, 1)
-        
         if not table_exists(table_name):
             return default_date
-            
-        # Try to get ADC_UPDT directly
-        result = spark.sql(f"SELECT MAX(ADC_UPDT) AS max_date FROM {table_name}")
-        max_date = result.select(max("max_date").alias("max_date")).first()["max_date"]
-        
-        return max_date if max_date is not None else default_date
-        
+
+        # use the DataFrame API – no need to build a SQL string
+        max_row = (
+            spark.table(table_name)
+                 .select(F.max(ts_column).alias("max_ts"))
+                 .first()
+        )
+
+        return max_row.max_ts or default_date
     except Exception as e:
-        print(f"Error getting max timestamp from {table_name}: {str(e)}")
+        print(f"Warning: could not read {ts_column} from {table_name}: {e}")
         return default_date
     
 
 
-def table_exists(table_name):
-    try:
-        result = spark.sql(f"SELECT 1 FROM {table_name} LIMIT 1")
-        return result.first() is not None
-    except:
-        return False
+def table_exists(table_name: str) -> bool:
+    """
+    Checks whether a table exists without triggering an AnalysisException.
+    Works with fully-qualified names: <catalog>.<schema>.<table>
+    """
+    # Spark 3.4+ – Databricks – works with Unity Catalog
+    return spark.catalog.tableExists(table_name)
 
 # COMMAND ----------
 
+
 def update_table(source_df, target_table, index_column):
     """
-    Generic function to update a Delta table using SQL MERGE
-    
-    Args:
-        source_df (DataFrame): Source DataFrame with new/updated records
-        target_table (str): Target table name to update (fully qualified)
-        index_column (str): Name of the column to use as merge key
+    Up-sert `source_df` into `target_table` on `index_column`.
+    Works in Shared / UC clusters (no RDD use).
     """
+
+    if source_df.isEmpty():          
+        return
     if(source_df.count() == 0):
         return
+
     if table_exists(target_table):
-        # Create temporary view of source data
-        temp_view_name = f"temp_source_{target_table.replace('.', '_')}"
-        source_df.createOrReplaceTempView(temp_view_name)
-        
-        # Construct and execute MERGE statement
-        merge_sql = f"""
-        MERGE INTO {target_table} as target
-        USING {temp_view_name} as source
-        ON target.{index_column} = source.{index_column}
-        WHEN MATCHED THEN
-            UPDATE SET *
-        WHEN NOT MATCHED THEN
-            INSERT *
-        """
-        
-        try:
-            spark.sql(merge_sql)
-        finally:
-            # Clean up temporary view
-            spark.sql(f"DROP VIEW IF EXISTS {temp_view_name}")
+        tgt = DeltaTable.forName(spark, target_table)
+        (tgt.alias("t")
+            .merge(source_df.alias("s"),
+                   f"t.{index_column} = s.{index_column}")
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute())
     else:
-        # If table doesn't exist, create it from source
-        source_df.write.format("delta") \
-            .option("delta.enableChangeDataFeed", "true") \
-            .option("delta.enableRowTracking", "true") \
-            .option("delta.autoOptimize.optimizeWrite", "true") \
-            .option("delta.autoOptimize.autoCompact", "true") \
-            .mode("overwrite") \
-            .saveAsTable(target_table)
+        (source_df.write
+                  .format("delta")
+                  .option("delta.enableChangeDataFeed", "true")
+                  .option("delta.enableRowTracking", "true")
+                  .option("delta.autoOptimize.optimizeWrite", "true")
+                  .option("delta.autoOptimize.autoCompact", "true")
+                  .mode("overwrite")
+                  .saveAsTable(target_table))
 
 # COMMAND ----------
 
