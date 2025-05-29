@@ -575,23 +575,31 @@ def stag_pacs_requestquestion():
         SELECT
             RequestId,
             RequestQuestion,
+            --SPLIT(
+            --    RequestQuestion, 
+            --    r'----- '
+            --) AS SplitRequestQuestionArray,
             SPLIT(
                 RequestQuestion, 
-                r'----- '
-            ) AS SplitRequestQuestionArray
+                r'\n----- '
+            ) AS SplitRequestQuestionArray,
+            REGEXP_COUNT(
+                RequestQuestion,
+                r'----- ([^\n\-\,\.]{1,40}) ------'
+            ) AS RequestQuestionExamCodeCount
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
         """)
     df = df.withColumn("RequestQuestionSplitCount", F.size(F.col("SplitRequestQuestionArray")))
-    df = df.withColumn("RequestQuestionSplitCount", F.coalesce(F.col("RequestQuestionSplitCount"), F.lit(-1)))
+    #df = df.withColumn("RequestQuestionSplitCount", F.coalesce(F.col("RequestQuestionSplitCount"), F.lit(-1)))
     # Each array element maps to a new row
-    df = df.select(df["*"], F.explode_outer(F.col("SplitRequestQuestionArray")).alias("SplitRequestQuestion"))
+    df = df.select(df["*"], F.posexplode_outer(F.col("SplitRequestQuestionArray")).alias("SplitRequestQuestionSeqNum", "SplitRequestQuestion"))
+    df = df.withColumn("SplitRequestQuestion", F.when(F.col("SplitRequestQuestionSeqNum")>0, F.concat(F.lit("----- "), F.col("SplitRequestQuestion"))).otherwise(F.col("SplitRequestQuestion")))
 
-
-    df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
-    df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'([^\n\-]+) ------', 1))
-    df = df.withColumn("RequestQuestionExamCode", F.when(F.length(F.col("RequestQuestionExamCode"))>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
+    #df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
+    df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'----- ([^\n\-\,\.]{1,40}) ------', 1))
+    df = df.withColumn("RequestQuestionExamCode", F.when(F.col("RequestQuestionExamCodeCount")>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
     
 
@@ -629,7 +637,7 @@ def stag_pacs_requestanamnesis():
     df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
     df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
-    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'([^\n\-]+) ------', 1))
+    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'([^\n\-\,\.]{1,40}) ------', 1))
     df = df.withColumn("RequestAnamnesisExamCode", F.when(F.length(F.col("RequestAnamnesisExamCode"))>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
