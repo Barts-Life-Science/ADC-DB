@@ -600,7 +600,7 @@ def stag_pacs_requestquestion():
     #df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
     df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'----- ([^\n\-\,\.]{1,40}) ------', 1))
     df = df.withColumn("RequestQuestionExamCode", F.when(F.col("RequestQuestionExamCodeCount")>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
-    df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("RequestId")))
+    df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("SplitRequestQuestionSeqNum")))
     
 
     return df
@@ -622,10 +622,18 @@ def stag_pacs_requestanamnesis():
         SELECT
             RequestId,
             RequestAnamnesis,
-            SPLIT( -- split order is not guaranteed
+            --SPLIT( -- split order is not guaranteed
+            --    RequestAnamnesis,
+            --    r'----- '
+            --) AS SplitRequestAnamnesisArray
+            SPLIT(
+                RequestAnamnesis, 
+                r'\n----- '
+            ) AS SplitRequestAnamnesisArray,
+            REGEXP_COUNT(
                 RequestAnamnesis,
-                r'----- '
-            ) AS SplitRequestAnamnesisArray
+                r'----- ([^\n\-\,\.]{1,40}) ------'
+            ) AS RequestAnamnesisExamCodeCount
         FROM 4_prod.raw.pacs_requests
         WHERE 
             ADC_Deleted IS NULL
@@ -634,13 +642,14 @@ def stag_pacs_requestanamnesis():
     df = df.withColumn("RequestAnamnesisSplitCount", F.size(F.col("SplitRequestAnamnesisArray")))
     df = df.withColumn("RequestAnamnesisSplitCount", F.coalesce(F.col("RequestAnamnesisSplitCount"), F.lit(-1)))
     # Each array element maps to a new row
-    df = df.select(df["*"], F.explode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesis"))
+    df = df.select(df["*"], F.posexplode_outer(F.col("SplitRequestAnamnesisArray")).alias("SplitRequestAnamnesisSeqNum","SplitRequestAnamnesis"))
+    df = df.withColumn("SplitRequestAnamnesis", F.when(F.col("SplitRequestAnamnesisSeqNum")>0, F.concat(F.lit("----- "), F.col("SplitRequestAnamnesis"))).otherwise(F.col("SplitRequestAnamnesis")))
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
-    df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
-    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'([^\n\-\,\.]{1,40}) ------', 1))
-    df = df.withColumn("RequestAnamnesisExamCode", F.when(F.length(F.col("RequestAnamnesisExamCode"))>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
+    #df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
+    df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'----- ([^\n\-\,\.]{1,40}) ------', 1))
+    df = df.withColumn("RequestAnamnesisExamCode", F.when(F.col("RequestAnamnesisExamCodeCount")>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
     # TODO: Add index to array after regexp instead of this
-    df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("RequestId")))
+    df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("SplitRequestAnamnesisSeqNum")))
     # add another col to show whether examcode is in the right format
     return df
 
