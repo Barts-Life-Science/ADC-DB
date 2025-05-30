@@ -1,5 +1,7 @@
 from pyspark.sql import functions as F
 
+
+
 """
 stag_mill_clinical_event_pacs
 """
@@ -74,4 +76,6 @@ def createExamIdStrBlacklist():
 
 def nullExamIdStrByList(exam_id_str_col, blacklist):
     return F.when(exam_id_str_col.isin(blacklist), F.lit(None)).otherwise(exam_id_str_col)
+
+
 

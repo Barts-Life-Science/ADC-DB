@@ -1,4 +1,8 @@
 # Databricks notebook source
+
+
+# COMMAND ----------
+
 import dlt
 from pyspark.sql import functions as F
 from pyspark.sql.window import *
@@ -18,10 +22,6 @@ import pacs_data_transformations as DT
 #spark.udf.register("transformExamAccessionNumber", DT.transformExamAccessionNumber)
 
 # COMMAND ----------
-
-
-    
-    
 
 
 
@@ -291,116 +291,141 @@ def intmd_mill_clinical_event_pacs():
 
 # COMMAND ----------
 
-@dlt.table(
-    name="intmd_pacs_examcode",
-    comment="Map examcode to exam modality for staging pacs_examinations",
-    table_properties={
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "temporary":"true"
-    }
-)
-def intmd_pacs_examcode():
-    df = spark.sql(
-        """
-        WITH uni AS (
-            SELECT DISTINCT
-                ExaminationCode AS RawExamCode
-            FROM LIVE.stag_pacs_examinations
-            UNION
-            SELECT DISTINCT
-                RequestQuestionExamCode AS RawExamCode
-            FROM LIVE.stag_pacs_requestquestion
-            UNION
-            SELECT DISTINCT
-                RequestAnamnesisExamCode AS RawExamCode
-            FROM LIVE.stag_pacs_requestanamnesis
-            UNION
-            SELECT DISTINCT
-                MillExamCode AS RawExamCode
-            FROM LIVE.stag_mill_clinical_event_pacs
-        ),
-        exam AS (
-            SELECT
-                ExaminationCode AS ExamCode,
-                MODE(ExaminationModality) AS ExamModality,
-                MODE(ExaminationBodyPart) AS ExamBodyPart,
-                COUNT(*) AS NumRowsInPacsExam
-            FROM LIVE.stag_pacs_examinations
-            GROUP BY ExaminationCode
-        ),
-        exam2 AS (
-            SELECT
-                ExaminationCode AS ExamCode,
-                MODE(ExaminationModality) AS ExamModality2
-            FROM LIVE.stag_pacs_examinations AS e
-            LEFT JOIN exam
-            ON e.ExaminationCode = exam.ExamCode
-            WHERE exam.ExamModality != ExaminationModality
-            GROUP BY ExaminationCode
-        ),
-        ce1 AS (
-            SELECT
-                EVENT_TITLE_TEXT AS MillEventTitleText,
-                MODE(MillExamCode) AS MillExamCode
-            FROM LIVE.stag_mill_clinical_event_pacs
-            GROUP BY EVENT_TITLE_TEXT
-        ),
-        ce2 AS (
-            SELECT
-                MillExamCode,
-                MODE(EVENT_TITLE_TEXT) AS MillEventTitleText,
-                COUNT(*) AS NumRowsInMillCE
-            FROM LIVE.stag_mill_clinical_event_pacs
-            GROUP BY MillExamCode
-        ),
-        rqq AS (
-            SELECT
-                RequestQuestionExamCode,
-                COUNT(*) AS NumRowsInRequestQuestion
-            FROM LIVE.stag_pacs_requestquestion
-            GROUP BY RequestQuestionExamCode
-        ),
-        rqa AS (
-            SELECT
-                RequestAnamnesisExamCode,
-                COUNT(*) AS NumRowsInRequestAnamnesis
-            FROM LIVE.stag_pacs_requestanamnesis
-            GROUP BY RequestAnamnesisExamCode
-        )
-        SELECT
-            RawExamCode,
-            ce1.MillExamCode,
-            COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
-            ExamModality,
-            ExamModality2,
-            COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
-            ExamBodyPart,
-            rqq.NumRowsInRequestQuestion,
-            rqa.NumRowsInRequestAnamnesis,
-            exam.NumRowsInPacsExam,
-            ce2.NumRowsInMillCE
-        FROM uni
-        LEFT JOIN ce1
-        ON uni.RawExamCode = ce1.MillEventTitleText
-        LEFT JOIN ce2
-        ON uni.RawExamCode = ce2.MillExamCode
-        LEFT JOIN exam
-        ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = exam.ExamCode
-        LEFT JOIN rqq
-        ON uni.RawExamCode = rqq.RequestQuestionExamCode
-        LEFT JOIN rqa
-        ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
-        LEFT JOIN exam2
-        ON exam2.ExamCode = uni.RawExamCode
-        """
-    )
-    df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
-    lkp = spark.read.table("LIVE.pacs_examcode_dict").select("short_code")
-    df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
-    df = df.withColumn("IsExamCodeInLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
-    df = df.drop("short_code")
-    return df
+# MAGIC
+# MAGIC % pip install databricks-langchain
+# MAGIC from databricks_langchain import DatabricksVectorSearch
+# MAGIC from databricks_langchain import ChatDatabricks
+# MAGIC
+# MAGIC # This function needs to be in the same cell as the caller
+# MAGIC def findExamCodeWithAI(raw_input):
+# MAGIC     vector_store = DatabricksVectorSearch(index_name="1_inland.sectra.pacs_examcode_concat_vs_index")
+# MAGIC     retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+# MAGIC     ret_docs = retriever.invoke(raw_input)
+# MAGIC     n_docs = len(ret_docs)
+# MAGIC     doc_contents = [ret_docs[i].page_content for i in range(n_docs)]
+# MAGIC     context = 'Context:\n' + '\n'.join(doc_contents)
+# MAGIC     chat_model = ChatDatabricks(
+# MAGIC         endpoint="azure_openai_gpt4o",
+# MAGIC         temperature=0.1,
+# MAGIC         max_tokens=250,
+# MAGIC     )
+# MAGIC     response = chat_model.invoke(context+f"\nQuestion: Choose the best short code for '{raw_input}'. In the first line, output the best short code if found. Otherwise output Unknown. In the second line, output the reason. Please note: +C means contrast. If contrast is not specified then choose a non-contrast short code.")
+# MAGIC     try:
+# MAGIC         return F.lit(response.content)
+# MAGIC     except:
+# MAGIC         return F.lit("Error")
+# MAGIC
+# MAGIC @dlt.table(
+# MAGIC     name="intmd_pacs_examcode",
+# MAGIC     comment="Map examcode to exam modality for staging pacs_examinations",
+# MAGIC     table_properties={
+# MAGIC         "delta.enableChangeDataFeed": "true",
+# MAGIC         "delta.enableRowTracking": "true",
+# MAGIC         "temporary":"true"
+# MAGIC     }
+# MAGIC )
+# MAGIC def intmd_pacs_examcode():
+# MAGIC     df = spark.sql(
+# MAGIC         """
+# MAGIC         WITH uni AS (
+# MAGIC             SELECT DISTINCT
+# MAGIC                 ExaminationCode AS RawExamCode
+# MAGIC             FROM LIVE.stag_pacs_examinations
+# MAGIC             UNION
+# MAGIC             SELECT DISTINCT
+# MAGIC                 RequestQuestionExamCode AS RawExamCode
+# MAGIC             FROM LIVE.stag_pacs_requestquestion
+# MAGIC             UNION
+# MAGIC             SELECT DISTINCT
+# MAGIC                 RequestAnamnesisExamCode AS RawExamCode
+# MAGIC             FROM LIVE.stag_pacs_requestanamnesis
+# MAGIC             UNION
+# MAGIC             SELECT DISTINCT
+# MAGIC                 MillExamCode AS RawExamCode
+# MAGIC             FROM LIVE.stag_mill_clinical_event_pacs
+# MAGIC         ),
+# MAGIC         exam AS (
+# MAGIC             SELECT
+# MAGIC                 ExaminationCode AS ExamCode,
+# MAGIC                 MODE(ExaminationModality) AS ExamModality,
+# MAGIC                 MODE(ExaminationBodyPart) AS ExamBodyPart,
+# MAGIC                 COUNT(*) AS NumRowsInPacsExam
+# MAGIC             FROM LIVE.stag_pacs_examinations
+# MAGIC             GROUP BY ExaminationCode
+# MAGIC         ),
+# MAGIC         exam2 AS (
+# MAGIC             SELECT
+# MAGIC                 ExaminationCode AS ExamCode,
+# MAGIC                 MODE(ExaminationModality) AS ExamModality2
+# MAGIC             FROM LIVE.stag_pacs_examinations AS e
+# MAGIC             LEFT JOIN exam
+# MAGIC             ON e.ExaminationCode = exam.ExamCode
+# MAGIC             WHERE exam.ExamModality != ExaminationModality
+# MAGIC             GROUP BY ExaminationCode
+# MAGIC         ),
+# MAGIC         ce1 AS (
+# MAGIC             SELECT
+# MAGIC                 EVENT_TITLE_TEXT AS MillEventTitleText,
+# MAGIC                 MODE(MillExamCode) AS MillExamCode
+# MAGIC             FROM LIVE.stag_mill_clinical_event_pacs
+# MAGIC             GROUP BY EVENT_TITLE_TEXT
+# MAGIC         ),
+# MAGIC         ce2 AS (
+# MAGIC             SELECT
+# MAGIC                 MillExamCode,
+# MAGIC                 MODE(EVENT_TITLE_TEXT) AS MillEventTitleText,
+# MAGIC                 COUNT(*) AS NumRowsInMillCE
+# MAGIC             FROM LIVE.stag_mill_clinical_event_pacs
+# MAGIC             GROUP BY MillExamCode
+# MAGIC         ),
+# MAGIC         rqq AS (
+# MAGIC             SELECT
+# MAGIC                 RequestQuestionExamCode,
+# MAGIC                 COUNT(*) AS NumRowsInRequestQuestion
+# MAGIC             FROM LIVE.stag_pacs_requestquestion
+# MAGIC             GROUP BY RequestQuestionExamCode
+# MAGIC         ),
+# MAGIC         rqa AS (
+# MAGIC             SELECT
+# MAGIC                 RequestAnamnesisExamCode,
+# MAGIC                 COUNT(*) AS NumRowsInRequestAnamnesis
+# MAGIC             FROM LIVE.stag_pacs_requestanamnesis
+# MAGIC             GROUP BY RequestAnamnesisExamCode
+# MAGIC         )
+# MAGIC         SELECT
+# MAGIC             RawExamCode,
+# MAGIC             ce1.MillExamCode,
+# MAGIC             COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
+# MAGIC             ExamModality,
+# MAGIC             ExamModality2,
+# MAGIC             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
+# MAGIC             ExamBodyPart,
+# MAGIC             rqq.NumRowsInRequestQuestion,
+# MAGIC             rqa.NumRowsInRequestAnamnesis,
+# MAGIC             exam.NumRowsInPacsExam,
+# MAGIC             ce2.NumRowsInMillCE
+# MAGIC         FROM uni
+# MAGIC         LEFT JOIN ce1
+# MAGIC         ON uni.RawExamCode = ce1.MillEventTitleText
+# MAGIC         LEFT JOIN ce2
+# MAGIC         ON uni.RawExamCode = ce2.MillExamCode
+# MAGIC         LEFT JOIN exam
+# MAGIC         ON COALESCE(ce1.MillExamCode, uni.RawExamCode) = exam.ExamCode
+# MAGIC         LEFT JOIN rqq
+# MAGIC         ON uni.RawExamCode = rqq.RequestQuestionExamCode
+# MAGIC         LEFT JOIN rqa
+# MAGIC         ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
+# MAGIC         LEFT JOIN exam2
+# MAGIC         ON exam2.ExamCode = uni.RawExamCode
+# MAGIC         """
+# MAGIC     )
+# MAGIC     df = df.withColumn("AIExamCode", F.when(F.col("RawExamCode").like("% %"), findExamCodeWithAI(F.col("RawExamCode")).otherwise(F.lit(None))))
+# MAGIC     df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
+# MAGIC     lkp = spark.read.table("LIVE.pacs_examcode_dict").select("short_code")
+# MAGIC     df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
+# MAGIC     df = df.withColumn("IsExamCodeInLkp", F.when(F.col("short_code").isNotNull(), F.lit(True)).otherwise(F.lit(False)))
+# MAGIC     df = df.drop("short_code")
+# MAGIC     return df
 
 # COMMAND ----------
 
