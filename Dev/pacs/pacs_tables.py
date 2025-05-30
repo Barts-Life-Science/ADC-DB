@@ -1,6 +1,5 @@
 # Databricks notebook source
-# MAGIC %pip install databricks-langchain
-# MAGIC
+
 
 # COMMAND ----------
 
@@ -293,27 +292,6 @@ def intmd_mill_clinical_event_pacs():
 # COMMAND ----------
 
 
-from databricks_langchain import DatabricksVectorSearch
-from databricks_langchain import ChatDatabricks
-
-# This function needs to be in the same cell as the caller
-def findExamCodeWithAI(raw_input):
-    vector_store = DatabricksVectorSearch(index_name="1_inland.sectra.pacs_examcode_concat_vs_index")
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-    ret_docs = retriever.invoke(raw_input)
-    n_docs = len(ret_docs)
-    doc_contents = [ret_docs[i].page_content for i in range(n_docs)]
-    context = 'Context:\n' + '\n'.join(doc_contents)
-    chat_model = ChatDatabricks(
-        endpoint="azure_openai_gpt4o",
-        temperature=0.1,
-        max_tokens=250,
-    )
-    response = chat_model.invoke(context+f"\nQuestion: Choose the best short code for '{raw_input}'. In the first line, output the best short code if found. Otherwise output Unknown. In the second line, output the reason. Please note: +C means contrast. If contrast is not specified then choose a non-contrast short code.")
-    try:
-        return F.lit(response.content)
-    except:
-        return F.lit("Error")
 
 @dlt.table(
     name="intmd_pacs_examcode",
@@ -419,7 +397,6 @@ def intmd_pacs_examcode():
         ON exam2.ExamCode = uni.RawExamCode
         """
     )
-    df = df.withColumn("AIExamCode", F.when(F.col("RawExamCode").like("% %"), findExamCodeWithAI(F.col("RawExamCode")).otherwise(F.lit(None))))
     df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
     lkp = spark.read.table("LIVE.pacs_examcode_dict").select("short_code")
     df = df.join(lkp.alias("lkp"), F.col("ExamCode") == F.col("lkp.short_code"), "left")
