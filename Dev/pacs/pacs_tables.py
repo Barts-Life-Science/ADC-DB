@@ -599,7 +599,7 @@ def stag_pacs_requestquestion():
 
     #df = df.filter("LENGTH(SplitRequestQuestion) > 0 OR RequestQuestionSplitCount <= 1")
     df = df.withColumn("RequestQuestionExamCode", F.regexp_extract(F.col("SplitRequestQuestion"), r'----- ([^\n\-\,\.]{1,40}) ------', 1))
-    df = df.withColumn("RequestQuestionExamCode", F.when(F.col("RequestQuestionExamCodeCount")>0, F.col("RequestQuestionExamCode")).otherwise(F.lit(None)))
+    df = df.withColumn("RequestQuestionExamCode", F.when(F.col("RequestQuestionExamCodeCount")>0, F.rtrim(F.ltrim(F.col("RequestQuestionExamCode")))).otherwise(F.lit(None)))
     df = df.withColumn("RequestQuestionExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestQuestionExamCode").orderBy("SplitRequestQuestionSeqNum")))
     
 
@@ -647,7 +647,7 @@ def stag_pacs_requestanamnesis():
     # Drop empty output SplitRequestAnamnesis unless the input RequestAnamnesis is empty
     #df = df.filter("LENGTH(SplitRequestAnamnesis) > 0 OR RequestAnamnesisSplitCount <= 1")
     df = df.withColumn("RequestAnamnesisExamCode", F.regexp_extract(F.col("SplitRequestAnamnesis"), r'----- ([^\n\-\,\.]{1,40}) ------', 1))
-    df = df.withColumn("RequestAnamnesisExamCode", F.when(F.col("RequestAnamnesisExamCodeCount")>0, F.col("RequestAnamnesisExamCode")).otherwise(F.lit(None)))
+    df = df.withColumn("RequestAnamnesisExamCode", F.when(F.col("RequestAnamnesisExamCodeCount")>0, F.rtrim(F.ltrim(F.col("RequestAnamnesisExamCode")))).otherwise(F.lit(None)))
     # TODO: Add index to array after regexp instead of this
     df = df.withColumn("RequestAnamnesisExamCodeSeq", F.row_number().over(Window.partitionBy("RequestId", "RequestAnamnesisExamCode").orderBy("SplitRequestAnamnesisSeqNum")))
     # add another col to show whether examcode is in the right format
@@ -944,5 +944,78 @@ def all_pacs_ref_nbr():
             ExaminationDate
         FROM LIVE.intmd_pacs_examinations
             
+    """)
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="stag_extracted_accession_nbr",
+    comment="Accession number successfully extracted from PACS",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def stag_extracted_accession_nbr():
+    files = dbutils.fs.ls("/Volumes/4_prod/pacs/base/extracted_accession_numbers/")
+    
+    for i, f in enumerate(files):
+        if i == 0:
+            df = spark.read.format("csv").option("header", "true").load(f.path).select(F.col("AccessionNbr"))
+        else:
+            df = df.union(spark.read.format("csv").option("header", "true").load(f.path).select(F.col("AccessionNbr")))
+
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="all_pacs_ref_stat",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def all_pacs_ref_stat():
+    df = spark.sql("""
+        WITH m AS (
+            SELECT DISTINCT
+                MillAccessionNbr AS RefNbr,
+                'mill_clinical_event' AS SrcTable
+            FROM LIVE.intmd_mill_clinical_event_pacs
+        ),
+        r AS (
+            SELECT DISTINCT
+                RequestIdString AS RefNbr,
+                'pacs_requests' AS SrcTable
+            FROM LIVE.intmd_pacs_requestexam
+        ),
+        e AS (
+            SELECT DISTINCT
+                ExamRefNbr AS RefNbr,
+                'pacs_examinations' AS SrcTable
+            FROM LIVE.intmd_pacs_examinations
+        ),
+        ext AS (
+            SELECT DISTINCT
+                AccessionNbr AS RefNbr,
+                'extracted' AS SrcTable
+            FROM LIVE.stag_extracted_accession_nbr
+        )
+        SELECT
+            COALESCE(m.RefNbr, r.RefNbr, e.RefNbr) AS RefNbr,
+            IFF(m.SrcTable IS NULL, 0, 1) AS IsRecordedInMillCE,
+            IFF(r.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsRequest,
+            IFF(e.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsExam,
+            IFF(ext.SrcTable IS NULL, 0, 1) AS IsExtracted
+        FROM m
+        FULL OUTER JOIN r
+        ON m.RefNbr = r.RefNbr
+        FULL OUTER JOIN e
+        ON m.RefNbr = e.RefNbr
+        LEFT JOIN ext
+        ON COALESCE(m.RefNbr, r.RefNbr, e.RefNbr) = ext.RefNbr
     """)
     return df
