@@ -971,6 +971,27 @@ def stag_extracted_accession_nbr():
 # COMMAND ----------
 
 @dlt.table(
+    name="stag_requested_accession_nbr",
+    comment="Accession number requested from PACS",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def stag_requested_accession_nbr():
+    files = dbutils.fs.ls("/Volumes/4_prod/pacs/base/requested_accession_numbers/")
+    
+    for i, f in enumerate(files):
+        if i == 0:
+            df = spark.read.format("csv").option("header", "true").load(f.path).select(F.col("Accession Number").alias("AccessionNbr"))
+        else:
+            df = df.union(spark.read.format("csv").option("header", "true").load(f.path).select(F.col("Accession Number").alias("AccessionNbr")))
+
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
     name="all_pacs_ref_stat",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
@@ -998,24 +1019,42 @@ def all_pacs_ref_stat():
                 'pacs_examinations' AS SrcTable
             FROM LIVE.intmd_pacs_examinations
         ),
+        full AS (
+            SELECT
+                COALESCE(m.RefNbr, r.RefNbr, e.RefNbr) AS RefNbr,
+                IFF(m.SrcTable IS NULL, 0, 1) AS IsRecordedInMillCE,
+                IFF(r.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsRequest,
+                IFF(e.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsExam
+            FROM m
+            FULL OUTER JOIN r
+            ON m.RefNbr = r.RefNbr
+            FULL OUTER JOIN e
+            ON m.RefNbr = e.RefNbr
+        ),
         ext AS (
             SELECT DISTINCT
                 AccessionNbr AS RefNbr,
                 'extracted' AS SrcTable
             FROM LIVE.stag_extracted_accession_nbr
+        ),
+        ne AS (
+            SELECT DISTINCT
+                AccessionNbr AS RefNbr,
+                'requestedButNotExtracted' AS SrcTable
+            FROM LIVE.stag_requested_accession_nbr AS rq
+            LEFT JOIN ext
+            ON rq.AccessionNbr = ext.RefNbr
+            WHERE ext.RefNbr IS NULL
+
         )
         SELECT
-            COALESCE(m.RefNbr, r.RefNbr, e.RefNbr) AS RefNbr,
-            IFF(m.SrcTable IS NULL, 0, 1) AS IsRecordedInMillCE,
-            IFF(r.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsRequest,
-            IFF(e.SrcTable IS NULL, 0, 1) AS IsRecordedInPacsExam,
-            IFF(ext.SrcTable IS NULL, 0, 1) AS IsExtracted
-        FROM m
-        FULL OUTER JOIN r
-        ON m.RefNbr = r.RefNbr
-        FULL OUTER JOIN e
-        ON m.RefNbr = e.RefNbr
+            full.*,
+            IFF(ext.SrcTable IS NULL, 0, 1) AS IsExtracted,
+            IFF(ne.SrcTable IS NULL, 0, 1) AS IsNotExtracted
+        FROM full
         LEFT JOIN ext
-        ON COALESCE(m.RefNbr, r.RefNbr, e.RefNbr) = ext.RefNbr
+        ON full.RefNbr = ext.RefNbr
+        LEFT JOIN ne
+        ON full.RefNbr = ne.RefNbr
     """)
     return df
