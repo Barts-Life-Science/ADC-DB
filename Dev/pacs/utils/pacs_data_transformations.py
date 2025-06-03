@@ -53,6 +53,7 @@ stag_pacs_examinations
 def transformExamAccessionNumber(exam_access_nbr_col, exam_id_str_col):
     x = F.when(exam_access_nbr_col.eqNullSafe(F.lit('VALUE_TOO_LONG')), F.lit(None)).otherwise(exam_access_nbr_col)
     x = F.when(exam_id_str_col.eqNullSafe(F.right(x, F.length(exam_id_str_col))), F.left(x, F.length(x)-F.length(exam_id_str_col))).otherwise(F.lit(None))
+    x = F.when(exam_access_nbr_col.eqNullSafe(F.lit('VALUE_TOO_LONG')), exam_id_str_col).otherwise(x)
     x = F.when(F.length(x).eqNullSafe(0), F.lit(None)).otherwise(x)
     return x
 

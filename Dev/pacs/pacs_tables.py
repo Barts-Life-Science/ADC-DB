@@ -431,8 +431,10 @@ def stag_pacs_examinations():
         """
     )
     df = df.withColumn('ExaminationAccessionNumber_t', DT.transformExamAccessionNumber(F.col('ExaminationAccessionNumber'), F.col('ExaminationIdString')))
-    df = df.withColumn('ExaminationIdString_t', DT.nullExamIdStrByList(F.col('ExaminationIdString'), DT.createExamIdStrBlacklist()))
-    df = df.withColumn('ExamRefNbr', F.coalesce(F.col('ExaminationAccessionNumber_t'), F.col('ExaminationIdString_t'), F.col('ExaminationText1')))
+    #df = df.withColumn('ExaminationIdString_t', DT.nullExamIdStrByList(F.col('ExaminationIdString'), DT.createExamIdStrBlacklist()))
+    df = df.withColumn('ExaminationIdString_t', F.col('ExaminationIdString'))
+    #df = df.withColumn('ExamRefNbr', F.coalesce(F.col('ExaminationAccessionNumber_t'), F.col('ExaminationIdString_t'), F.col('ExaminationText1')))
+    df = df.withColumn('ExamRefNbr', F.col('ExaminationAccessionNumber_t'))
     return df
 
 # COMMAND ----------
