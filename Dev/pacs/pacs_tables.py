@@ -495,11 +495,11 @@ def intmd_pacs_examinations():
             er.*,
             r.RequestId,
             r.RequestIdString,
-            ce.MillAccessionNbr,
-            ce.MillClinicalEventId,
-            ce.MillEventId,
+            COALESCE(ce.MillAccessionNbr, ce2.MillAccessionNbr) AS MillAccessionNbr,
+            COALESCE(ce.MillClinicalEventId, ce2.MillClinicalEventId) AS MillClinicalEventId,
+            COALESCE(ce.MillEventId, ce2.MillEventId) AS MillEventId,
             pa.MillPersonId,
-            COALESCE(pa.MillPersonId, ce.MillPersonId) AS MillPersonId_t,
+            COALESCE(pa.MillPersonId, ce.MillPersonId, ce2.MillPersonId) AS MillPersonId_t,
             COALESCE(ce_examcode.MillExamCode, e.ExaminationCode) AS ExaminationCode_t
         FROM LIVE.stag_pacs_examinations AS e
         LEFT JOIN er
@@ -508,6 +508,8 @@ def intmd_pacs_examinations():
         ON er.ExaminationReportRequestId = r.RequestId
         LEFT JOIN ce -- TODO: this should join with ExamRefNbr too
         ON ce.MillAccessionNbr = r.RequestIdString
+        LEFT JOIN ce AS ce2
+        ON ce2.MillAccessionNbr = e.ExamRefNbr
         LEFT JOIN pa
         ON e.ExaminationPatientId = pa.PacsPatientId
         LEFT JOIN ce_examcode
