@@ -426,8 +426,8 @@ hdruk_300_str = \
         ],
         "syntheticDataWebLink": null
     },
-    "demographicFrequency": {},
-    "omics": {}
+    "demographicFrequency": null,
+    "omics": null
 }
 '''
 

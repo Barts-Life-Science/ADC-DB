@@ -442,7 +442,9 @@ hdruk_300_str = \
             }
         ],
         "syntheticDataWebLink": null
-    }
+    },
+    "demographicFrequency": null,
+    "omics": null
 }
 '''
 
