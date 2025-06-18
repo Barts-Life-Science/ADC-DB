@@ -369,11 +369,17 @@ def intmd_pacs_examcode():
                 COUNT(*) AS NumRowsInRequestAnamnesis
             FROM LIVE.stag_pacs_requestanamnesis
             GROUP BY RequestAnamnesisExamCode
+        ),
+        ai_ec AS (
+            SELECT vs_input, MAX(ValidatedAIExamCode) AS AIExamCode
+            FROM 4_prod.pacs_ai.predicted_pacs_examcode
+            GROUP BY vs_input
         )
         SELECT
             RawExamCode,
             ce1.MillExamCode,
-            COALESCE(ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
+            ai_ec.AIExamCode,
+            COALESCE(ai_ec.AIExamCode, ce1.MillExamCode, uni.RawExamCode) AS ExamCode,
             ExamModality,
             ExamModality2,
             COALESCE(ce1.MillEventTitleText, ce2.MillEventTitleText) AS MillEventTitleText,
@@ -395,6 +401,8 @@ def intmd_pacs_examcode():
         ON uni.RawExamCode = rqa.RequestAnamnesisExamCode
         LEFT JOIN exam2
         ON exam2.ExamCode = uni.RawExamCode
+        LEFT JOIN ai_ec
+        ON ai_ec.vs_input = Uni.RawExamCode
         """
     )
     df = df.withColumn("ExamCode", F.when(F.col("ExamCode").like("Z%"), F.right(F.col("ExamCode"), F.length(F.col("ExamCode"))-1)).otherwise(F.col("ExamCode")))
