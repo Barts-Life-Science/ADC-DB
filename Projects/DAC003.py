@@ -270,11 +270,11 @@
 
 # COMMAND ----------
 
-#ADAMS Project
+#Breast cancer one stop
 
 project_identifier = 'dac003'
 
-rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology']
+rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology']
 
 max_ig_risk = 3
 max_ig_severity = 2
