@@ -1071,3 +1071,52 @@ def all_pacs_ref_stat():
         ON full.RefNbr = ne.RefNbr
     """)
     return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="final_pacs_data",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def final_pacs_data():
+    df = spark.sql("""
+        WITH an AS (
+            SELECT DISTINCT
+                MillAccessionNbr AS AccessionNbr
+            FROM LIVE.intmd_mill_clinical_event_pacs
+
+            UNION
+            SELECT DISTINCT
+                RequestIdString AS AccessionNbr
+            FROM LIVE.intmd_pacs_requestexam
+
+            UNION
+            SELECT DISTINCT
+                ExamRefNbr AS AccessionNbr
+            FROM LIVE.intmd_pacs_examinations
+        ),
+        ce AS (
+            SELECT DISTINCT
+                MillAccessionNbr,
+                MAX(Clinical_Event_ID) AS Clinical_Event_ID,
+                MAX(MillExamCode) AS ExamCode,
+                MAX(MillPersonId) AS MillPersonId,
+                MAX(PacsPatientId),
+                MAX(MillEventDate) AS ExamDate
+            FROM LIVE.intmd_mill_clinical_event_pacs
+            GROUP BY MillAccessionNbr
+        )
+        SELECT
+            an.AccessionNbr,
+            ce.Clinical_Event_ID,
+            ce.ExamCode,
+            ce.MillPersonId 
+        FROM an
+        LEFT JOIN ce
+        ON an.AccessionNbr = ce.MillAccessionNbr
+    """)
+    return df
