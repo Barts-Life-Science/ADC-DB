@@ -1100,20 +1100,30 @@ def final_pacs_data():
             FROM LIVE.intmd_pacs_examinations
         ),
         ce AS (
-            SELECT DISTINCT
+            SELECT
                 MillAccessionNbr,
-                MAX(Clinical_Event_ID) AS Clinical_Event_ID,
-                MAX(MillExamCode) AS ExamCode,
-                MAX(MillPersonId) AS MillPersonId,
-                MAX(PacsPatientId),
-                MAX(MillEventDate) AS ExamDate
+                Clinical_Event_ID,
+                EVENT_ID,
+                MillExamCode,
+                ROW_NUMBER() OVER (
+                    PARTITION BY MillAccessionNbr, MillExamCode
+                    ORDER BY Clinical_Event_Id ASC
+                ) AS ExamSeq,
+                MillPersonId,
+                PacsPatientId,
+                MillEventDate
             FROM LIVE.intmd_mill_clinical_event_pacs
-            GROUP BY MillAccessionNbr
+        ),
+        req AS (
+            SELECT
+                RequestIdString
+            FROM LIVE.intmd_pacs_requestexam
         )
         SELECT
             an.AccessionNbr,
             ce.Clinical_Event_ID,
-            ce.ExamCode,
+            ce.EVENT_ID,
+            ce.MillExamCode,
             ce.MillPersonId 
         FROM an
         LEFT JOIN ce
