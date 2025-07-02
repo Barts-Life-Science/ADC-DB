@@ -1084,49 +1084,76 @@ def all_pacs_ref_stat():
 )
 def final_pacs_data():
     df = spark.sql("""
-        WITH an AS (
-            SELECT DISTINCT
-                MillAccessionNbr AS AccessionNbr
-            FROM LIVE.intmd_mill_clinical_event_pacs
-
-            UNION
-            SELECT DISTINCT
-                RequestIdString AS AccessionNbr
-            FROM LIVE.intmd_pacs_requestexam
-
-            UNION
-            SELECT DISTINCT
-                ExamRefNbr AS AccessionNbr
-            FROM LIVE.intmd_pacs_examinations
-        ),
-        ce AS (
+        WITH ce AS (
             SELECT
-                MillAccessionNbr,
+                MillAccessionNbr AS AccessionNbr,
                 Clinical_Event_ID,
                 EVENT_ID,
-                MillExamCode,
+                MillExamCode AS ExamCode,
                 ROW_NUMBER() OVER (
                     PARTITION BY MillAccessionNbr, MillExamCode
                     ORDER BY Clinical_Event_Id ASC
-                ) AS ExamSeq,
+                ) AS ExamCodeSeq,
                 MillPersonId,
                 PacsPatientId,
                 MillEventDate
             FROM LIVE.intmd_mill_clinical_event_pacs
+            WHERE MillEventClass = 'Radiology'
         ),
         req AS (
             SELECT
-                RequestIdString
+                RequestIdString AS AccessionNbr,
+                RequestExamCode AS ExamCode,
+                RequestExamCodeSeq AS ExamCodeSeq,
+                RequestId,
+                SplitRequestQuestion AS RequestQuestion,
+                SplitRequestAnamnesis AS RequestAnamnesis
             FROM LIVE.intmd_pacs_requestexam
+        ),
+        uni AS (
+            SELECT
+                AccessionNbr,
+                ExamCode,
+                ExamCodeSeq
+            FROM ce
+
+            UNION
+
+            SELECT
+                AccessionNbr,
+                ExamCode,
+                ExamCodeSeq
+            FROM req
         )
         SELECT
-            an.AccessionNbr,
+            u.AccessionNbr,
+            u.ExamCode,
+            u.ExamCodeSeq,
             ce.Clinical_Event_ID,
             ce.EVENT_ID,
-            ce.MillExamCode,
-            ce.MillPersonId 
-        FROM an
+            ce.MillPersonId,
+            req.RequestId,
+            req.RequestQuestion,
+            req.RequestAnamnesis
+        FROM (SELECT DISTINCT * FROM uni) AS u
         LEFT JOIN ce
-        ON an.AccessionNbr = ce.MillAccessionNbr
+        ON 
+            u.AccessionNbr = ce.AccessionNbr
+            AND (
+                u.ExamCode = ce.ExamCode OR
+                (
+                    u.ExamCode IS NULL AND ce.ExamCode IS NULL
+                )
+            )
+            AND u.ExamCodeSeq = ce.ExamCodeSeq
+        LEFT JOIN req
+        ON
+            u.AccessionNbr = req.AccessionNbr
+            AND (
+                u.ExamCode = req.ExamCode OR (
+                    u.ExamCode IS NULL AND req.ExamCode IS NULL
+                )
+            )
+            AND u.ExamCodeSeq = req.ExamCodeSeq
     """)
     return df
