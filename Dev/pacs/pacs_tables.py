@@ -1110,6 +1110,18 @@ def final_pacs_data():
                 SplitRequestAnamnesis AS RequestAnamnesis
             FROM LIVE.intmd_pacs_requestexam
         ),
+        exa AS (
+            SELECT
+                ExaminationRequestId,
+                ExaminationCode_t AS ExaminationCode,
+                ExaminationIdString,
+                ROw_NUMBER() OVER (
+                    PARTITION BY ExaminationRequestId, ExaminationCode_t
+                    ORDER BY ExaminationId ASC
+                ) AS ExamCodeSeq
+            FROM LIVE.intmd_pacs_examinations
+            WHERE ExaminationRequestId IS NOT NULL
+        ),
         uni AS (
             SELECT
                 AccessionNbr,
@@ -1127,6 +1139,7 @@ def final_pacs_data():
         )
         SELECT
             u.AccessionNbr,
+            exa.ExaminationIdString,
             u.ExamCode,
             u.ExamCodeSeq,
             ce.Clinical_Event_ID,
@@ -1155,5 +1168,15 @@ def final_pacs_data():
                 )
             )
             AND u.ExamCodeSeq = req.ExamCodeSeq
+        LEFT JOIN exa
+        ON
+            exa.ExaminationRequestId = req.RequestId
+            AND (
+                exa.ExaminationCode = req.ExamCode OR (
+                    exa.ExaminationCode IS NULL AND req.ExamCode IS NULL
+                )
+            )
+            AND exa.ExamCodeSeq = req.ExamCodeSeq
+
     """)
     return df
