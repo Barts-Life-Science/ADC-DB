@@ -1103,7 +1103,7 @@ def final_pacs_data():
         req AS (
             SELECT
                 RequestIdString AS AccessionNbr,
-                RequestExamCode AS ExamCode,
+                RequestExamCode_t AS ExamCode,
                 RequestExamCodeSeq AS ExamCodeSeq,
                 RequestId,
                 SplitRequestQuestion AS RequestQuestion,
@@ -1136,6 +1136,7 @@ def final_pacs_data():
                 ExamCode,
                 ExamCodeSeq
             FROM req
+            WHERE ExamCode IS NOT NULL
         )
         SELECT
             u.AccessionNbr,
@@ -1163,18 +1164,14 @@ def final_pacs_data():
         ON
             u.AccessionNbr = req.AccessionNbr
             AND (
-                u.ExamCode = req.ExamCode OR (
-                    u.ExamCode IS NULL AND req.ExamCode IS NULL
-                )
+                u.ExamCode = req.ExamCode OR req.ExamCode IS NULL
             )
             AND u.ExamCodeSeq = req.ExamCodeSeq
         LEFT JOIN exa
         ON
             exa.ExaminationRequestId = req.RequestId
             AND (
-                exa.ExaminationCode = req.ExamCode OR (
-                    exa.ExaminationCode IS NULL AND req.ExamCode IS NULL
-                )
+                exa.ExaminationCode = req.ExamCode OR req.ExamCode IS NULL
             )
             AND exa.ExamCodeSeq = req.ExamCodeSeq
 
