@@ -282,7 +282,8 @@ def intmd_mill_clinical_event_pacs():
             MillExamCode,
             MillEventDate,
             MillEventClass,
-            MillEventReltn
+            MillEventReltn,
+            COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr
         FROM LIVE.stag_mill_clinical_event_pacs AS ce
         LEFT JOIN pacs_pid
         ON ce.MillPersonId = pacs_pid.MillPersonId
@@ -1075,14 +1076,14 @@ def all_pacs_ref_stat():
 # COMMAND ----------
 
 @dlt.table(
-    name="final_pacs_data",
+    name="joined_pacs_data",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
     }
 )
-def final_pacs_data():
+def joined_pacs_data():
     df = spark.sql("""
         WITH ce AS (
             SELECT
@@ -1175,5 +1176,56 @@ def final_pacs_data():
             )
             AND exa.ExamCodeSeq = req.ExamCodeSeq
 
+    """)
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="mill_pacs_data",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def mill_pacs_data():
+    df = spark.sql("""
+        WITH ce AS (
+            SELECT
+                MillAccessionNbr AS AccessionNbr,
+                Clinical_Event_ID,
+                EVENT_ID,
+                MillExamCode AS ExamCode,
+                REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
+                MillPersonId,
+                PacsPatientId,
+                MillEventDate
+            FROM LIVE.intmd_mill_clinical_event_pacs
+            WHERE MillEventClass = 'Radiology'
+        ),
+        req AS (
+            SELECT
+                RequestIdString AS AccessionNbr,
+                RequestExamCode_t AS ExamCode,
+                RequestExamCodeSeq AS ExamCodeSeq,
+                MAX(RequestId) AS RequestId,
+                MAX(SplitRequestQuestion) AS RequestQuestion,
+                MAX(SplitRequestAnamnesis) AS RequestAnamnesis
+            FROM LIVE.intmd_pacs_requestexam
+            GROUP BY AccessionNbr, ExamCode, ExamCodeSeq
+        )
+        SELECT
+            ce.*,
+            req.RequestId,
+            req.RequestQuestion,
+            req.RequestAnamnesis
+        FROM ce
+        LEFT JOIN req
+        ON
+            ce.AccessionNbr = req.AccessionNbr
+            AND ce.ExamCode = req.ExamCode
+            AND ce.ExamCodeSeq = req.ExamCodeSeq
+      
     """)
     return df
