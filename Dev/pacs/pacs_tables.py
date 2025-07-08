@@ -1198,6 +1198,7 @@ def mill_pacs_data():
                 EVENT_ID,
                 MillExamCode AS ExamCode,
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
+                MillRefNbr,
                 MillPersonId,
                 PacsPatientId,
                 MillEventDate
@@ -1214,18 +1215,36 @@ def mill_pacs_data():
                 MAX(SplitRequestAnamnesis) AS RequestAnamnesis
             FROM LIVE.intmd_pacs_requestexam
             GROUP BY AccessionNbr, ExamCode, ExamCodeSeq
+        ),
+        exa AS (
+            SELECT
+                ExaminationRequestId,
+                ExaminationCode_t AS ExaminationCode,
+                ExaminationIdString,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ExaminationRequestId, ExaminationCode_t
+                    ORDER BY ExaminationId ASC
+                ) AS ExamCodeSeq
+            FROM LIVE.intmd_pacs_examinations
+            WHERE ExaminationRequestId IS NOT NULL
         )
         SELECT
             ce.*,
             req.RequestId,
             req.RequestQuestion,
-            req.RequestAnamnesis
+            req.RequestAnamnesis,
+            exa.ExaminationIdString
         FROM ce
         LEFT JOIN req
         ON
             ce.AccessionNbr = req.AccessionNbr
             AND ce.ExamCode = req.ExamCode
             AND ce.ExamCodeSeq = req.ExamCodeSeq
+        LEFT JOIN exa
+        ON 
+            exa.ExaminationRequestId = req.RequestId
+            AND exa.ExaminationCode = ce.ExamCode
+            AND exa.ExamCodeSeq = ce.ExamCodeSeq
       
     """)
     return df
