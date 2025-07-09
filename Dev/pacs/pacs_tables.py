@@ -1182,14 +1182,14 @@ def joined_pacs_data():
 # COMMAND ----------
 
 @dlt.table(
-    name="mill_pacs_data",
+    name="mill_pacs_data_expanded",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
     }
 )
-def mill_pacs_data():
+def mill_pacs_data_expanded():
     df = spark.sql("""
         WITH ce AS (
             SELECT
@@ -1238,7 +1238,7 @@ def mill_pacs_data():
         LEFT JOIN req
         ON
             ce.AccessionNbr = req.AccessionNbr
-            AND ce.ExamCode = req.ExamCode
+            AND (ce.ExamCode = req.ExamCode OR req.ExamCode IS NULL)
             AND ce.ExamCodeSeq = req.ExamCodeSeq
         LEFT JOIN exa
         ON 
@@ -1246,5 +1246,24 @@ def mill_pacs_data():
             AND exa.ExaminationCode = ce.ExamCode
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
       
+    """)
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="mill_pacs_data_expanded_quality",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def mill_pacs_data_expanded_quality():
+    df = spark.sql("""
+        SELECT
+            SUM(CAST(ISNULL(RequestId) AS INT))/COUNT(*) AS RequestIdNullPercentage,
+            SUM(CAST(ISNULL(ExaminationIdString) AS INT))/COUNT(*) AS ExaminationIdNullPercentage
+        FROM LIVE.mill_pacs_data_expanded
     """)
     return df
