@@ -1221,19 +1221,31 @@ def mill_pacs_data_expanded():
                 ExaminationRequestId,
                 ExaminationCode_t AS ExaminationCode,
                 ExaminationIdString,
+                ExaminationModality,
+                ExaminationBodyPart,
                 ROW_NUMBER() OVER (
                     PARTITION BY ExaminationRequestId, ExaminationCode_t
                     ORDER BY ExaminationId ASC
                 ) AS ExamCodeSeq
             FROM LIVE.intmd_pacs_examinations
             WHERE ExaminationRequestId IS NOT NULL
+        ),
+        rep AS (
+            SELECT
+                MillAccessionNbr,
+                COUNT(DISTINCT CE_BLOB_CONTENT_KEY) AS PacsReportCount
+            FROM LIVE.pacs_blob_content
+            GROUP BY MillAccessionNbr
         )
         SELECT
             ce.*,
             req.RequestId,
             req.RequestQuestion,
             req.RequestAnamnesis,
-            exa.ExaminationIdString
+            exa.ExaminationIdString,
+            exa.ExaminationModality,
+            exa.ExaminationBodyPart,
+            rep.PacsReportCount
         FROM ce
         LEFT JOIN req
         ON
@@ -1245,7 +1257,8 @@ def mill_pacs_data_expanded():
             exa.ExaminationRequestId = req.RequestId
             AND exa.ExaminationCode = ce.ExamCode
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
-      
+        LEFT JOIN rep
+        ON ce.AccessionNbr = rep.MillAccessionNbr
     """)
     return df
 
