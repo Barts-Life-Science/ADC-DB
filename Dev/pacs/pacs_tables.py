@@ -1223,6 +1223,7 @@ def mill_pacs_data_expanded():
                 ExaminationIdString,
                 ExaminationModality,
                 ExaminationBodyPart,
+                ExaminationStudyUid,
                 ROW_NUMBER() OVER (
                     PARTITION BY ExaminationRequestId, ExaminationCode_t
                     ORDER BY ExaminationId ASC
@@ -1243,6 +1244,7 @@ def mill_pacs_data_expanded():
             req.RequestQuestion,
             req.RequestAnamnesis,
             exa.ExaminationIdString,
+            exa.ExaminationStudyUid,
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
             rep.PacsReportCount
