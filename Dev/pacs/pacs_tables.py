@@ -1221,6 +1221,7 @@ def mill_pacs_data_expanded():
                 ExaminationRequestId,
                 ExaminationCode_t AS ExaminationCode,
                 ExaminationIdString,
+                ExaminationDescription,
                 ExaminationModality,
                 ExaminationBodyPart,
                 ExaminationStudyUid,
@@ -1245,6 +1246,7 @@ def mill_pacs_data_expanded():
             req.RequestAnamnesis,
             exa.ExaminationIdString,
             exa.ExaminationStudyUid,
+            exa.ExaminationDescription,
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
             rep.PacsReportCount
