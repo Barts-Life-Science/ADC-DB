@@ -276,6 +276,7 @@ def intmd_mill_clinical_event_pacs():
         SELECT
             CLINICAL_EVENT_ID,
             EVENT_ID,
+            EVENT_TITLE_TEXT AS MillEventTitleText,
             ce.MillPersonId,
             PacsPatientId,
             MillAccessionNbr,
