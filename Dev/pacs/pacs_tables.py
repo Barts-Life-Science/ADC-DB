@@ -1246,7 +1246,7 @@ def mill_pacs_data_expanded():
             req.RequestAnamnesis,
             exa.ExaminationIdString,
             exa.ExaminationStudyUid,
-            exa.ExaminationDescription,
+            exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
             rep.PacsReportCount
