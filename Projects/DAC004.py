@@ -10,15 +10,29 @@ max_ig_severity = 3
 columns_to_exclude = ['ADC_UPDT']
 
 cohort_sql = f"""
-CREATE OR REPLACE VIEW 6_mgmt.cohorts.{project_identifier} AS
-SELECT 
-    DISTINCT pa.PERSON_ID AS PERSON_ID,
-    CAST(NULL AS STRING) AS SUBCOHORT
-FROM 4_prod.raw.mill_person_alias pa
-WHERE pa.ALIAS IN (
-    SELECT Identifier 
-    FROM 6_mgmt.cohort_lookup.dac004_adams
+CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac004 AS
+WITH matched_aliases AS (
+  SELECT DISTINCT l.Identifier, pa.PERSON_ID
+  FROM 6_mgmt.cohort_lookup.dac004_lookup l
+  JOIN 4_prod.raw.mill_person_alias pa
+  ON REGEXP_REPLACE(l.Identifier, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
+),
+matched_persons AS (
+  SELECT DISTINCT 
+    l.Identifier,
+    p.PERSON_ID
+  FROM 6_mgmt.cohort_lookup.dac004_lookup l
+  JOIN 4_prod.raw.mill_person p
+  ON UPPER(l.Name) = CONCAT(p.NAME_FIRST_KEY, ' ', p.NAME_LAST_KEY)
+  AND TO_DATE(l.dob, 'dd/MM/yyyy') = DATE(p.BIRTH_DT_TM)
 )
+SELECT DISTINCT
+  COALESCE(ma.PERSON_ID, mp.PERSON_ID) as PERSON_ID,
+  CAST(NULL as STRING) as subcohort
+FROM 6_mgmt.cohort_lookup.dac004_lookup l
+LEFT JOIN matched_aliases ma ON l.Identifier = ma.Identifier
+LEFT JOIN matched_persons mp ON l.Identifier = mp.Identifier
+WHERE COALESCE(ma.PERSON_ID, mp.PERSON_ID) IS NOT NULL;
 """
 spark.sql(cohort_sql)
 
