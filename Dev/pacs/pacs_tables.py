@@ -1185,24 +1185,78 @@ def joined_pacs_data():
 from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType, TimestampType
 
 schema = StructType([
-    StructField("AccessionNbr", StringType(), True, {'comment': "Identifier for PACS image data retrieval"}),  # Identifier for PACS image data retrieval
-    StructField("Clinical_Event_ID", LongType(), True, {'comment': "Clinical event identifier"}),  # Identifier linked to Mill_Clinical_Event table
-    StructField("EVENT_ID", LongType(), True, {'comment': "Event identifier"}),  # Event identifier
-    StructField("ExamCode", StringType(), True, {'comment': "Examination code"}),  # Examination code
-    StructField("ExamCodeSeq", StringType(), True, {'comment': "Sequence number for exam code"}),  # Sequence number for exam code
-    StructField("MillRefNbr", StringType(), True, {'comment': "Mill reference number"}),  # Mill reference number
-    StructField("MillPersonId", LongType(), True, {'comment': "Person identifier in Mill system"}),  # Person identifier in Mill system
-    StructField("PacsPatientId", LongType(), True, {'comment': "PACS patient identifier"}),  # PACS patient identifier
-    StructField("MillEventDate", TimestampType(), True, {'comment': "Event date in Mill system"}),  # Event date in Mill system
-    StructField("RequestId", LongType(), True, {'comment': "Request identifier"}),  # Request identifier
-    StructField("RequestQuestion", StringType(), True, {'comment': "Request question text"}),  # Request question text
-    StructField("RequestAnamnesis", StringType(), True, {'comment': "Request anamnesis text"}),  # Request anamnesis text
-    StructField("ExaminationIdString", StringType(), True, {'comment': "Examination ID as string"}),  # Examination ID as string
-    StructField("ExaminationStudyUid", StringType(), True, {'comment': "Examination study UID"}),  # Examination study UID
-    StructField("ExaminationDescription", StringType(), True, {'comment': "Description of examination"}),  # Description of examination
-    StructField("ExaminationModality", StringType(), True, {'comment': "Examination modality"}),  # Examination modality
-    StructField("ExaminationBodyPart", StringType(), True, {'comment': "Body part examined"}),  # Body part examined
-    StructField("PacsReportCount", IntegerType(), True, {'comment': "Count of PACS reports"}),  # Count of PACS reports
+    StructField(
+        "AccessionNbr", StringType(), True,
+        {'comment': "Unique accession number assigned to a PACS imaging request, used to retrieve image data and link records across systems."}
+    ),
+    StructField(
+        "Clinical_Event_ID", LongType(), True,
+        {'comment': "Primary key for the clinical event in the Mill_Clinical_Event table, representing a unique clinical encounter or procedure."}
+    ),
+    StructField(
+        "EVENT_ID", LongType(), True,
+        {'comment': "Unique identifier for the event within the Mill system, used to join with event-level metadata and logs."}
+    ),
+    StructField(
+        "ExamCode", StringType(), True,
+        {'comment': "Standardized code representing the type of examination or imaging procedure performed (e.g., CT, MRI, X-ray)."}
+    ),
+    StructField(
+        "ExamCodeSeq", StringType(), True,
+        {'comment': "Sequence number or index for the exam code, distinguishing multiple exams of the same type within a single accession or event."}
+    ),
+    StructField(
+        "MillRefNbr", StringType(), True,
+        {'comment': "Reference number in the Mill system, often a concatenation of accession and exam code, used for cross-referencing and traceability."}
+    ),
+    StructField(
+        "MillPersonId", LongType(), True,
+        {'comment': "Unique identifier for the patient or person in the Mill system, enabling linkage to demographic and clinical data."}
+    ),
+    StructField(
+        "PacsPatientId", LongType(), True,
+        {'comment': "Unique patient identifier in the PACS system, used to associate imaging data with the correct patient record."}
+    ),
+    StructField(
+        "MillEventDate", TimestampType(), True,
+        {'comment': "Timestamp of the event in the Mill system, typically representing when the clinical event or imaging procedure occurred."}
+    ),
+    StructField(
+        "RequestId", LongType(), True,
+        {'comment': "Unique identifier for the imaging request, linking to order details and request metadata in the PACS or Mill system."}
+    ),
+    StructField(
+        "RequestQuestion", StringType(), True,
+        {'comment': "Text of the clinical question or reason for the imaging request, providing context for the examination."}
+    ),
+    StructField(
+        "RequestAnamnesis", StringType(), True,
+        {'comment': "Detailed patient history or clinical background provided with the imaging request, supporting diagnostic interpretation."}
+    ),
+    StructField(
+        "ExaminationIdString", StringType(), True,
+        {'comment': "String representation of the examination ID, uniquely identifying a specific imaging examination instance."}
+    ),
+    StructField(
+        "ExaminationStudyUid", StringType(), True,
+        {'comment': "Unique identifier (UID) for the imaging study, typically a DICOM Study Instance UID, used for interoperability and image retrieval."}
+    ),
+    StructField(
+        "ExaminationDescription", StringType(), True,
+        {'comment': "Free-text or standardized description of the examination, summarizing the procedure or body part imaged."}
+    ),
+    StructField(
+        "ExaminationModality", StringType(), True,
+        {'comment': "Type of imaging modality used (e.g., CT, MR, US), indicating the technology or equipment for the examination."}
+    ),
+    StructField(
+        "ExaminationBodyPart", StringType(), True,
+        {'comment': "Anatomical region or body part examined during the imaging procedure, aiding in clinical context and reporting."}
+    ),
+    StructField(
+        "PacsReportCount", IntegerType(), True,
+        {'comment': "Number of PACS reports or imaging documents associated with the accession number, indicating reporting completeness."}
+    ),
 ])
 
 # COMMAND ----------
