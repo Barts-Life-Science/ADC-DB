@@ -1182,13 +1182,39 @@ def joined_pacs_data():
 
 # COMMAND ----------
 
+from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType, TimestampType
+
+schema = StructType([
+    StructField("AccessionNbr", StringType(), True, {'comment': "Identifier for PACS image data retrieval"}),
+    StructField("Clinical_Event_ID", LongType(), True, {'comment': "Identifier linked to Mill_Clinical_Event table"}),
+    StructField("EVENT_ID", LongType(), True),
+    StructField("ExamCode", StringType(), True),
+    StructField("ExamCodeSeq", StringType(), True),
+    StructField("MillRefNbr", StringType(), True),
+    StructField("MillPersonId", LongType(), True),
+    StructField("PacsPatientId", LongType(), True),
+    StructField("MillEventDate", TimestampType(), True),
+    StructField("RequestId", LongType(), True),
+    StructField("RequestQuestion", StringType(), True),
+    StructField("RequestAnamnesis", StringType(), True),
+    StructField("ExaminationIdString", StringType(), True),
+    StructField("ExaminationStudyUid", StringType(), True),
+    StructField("ExaminationDescription", StringType(), True),
+    StructField("ExaminationModality", StringType(), True),
+    StructField("ExaminationBodyPart", StringType(), True),
+    StructField("PacsReportCount", IntegerType(), True)
+])
+
+# COMMAND ----------
+
 @dlt.table(
     name="mill_pacs_data_expanded",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
-    }
+    },
+    schema=schema
 )
 def mill_pacs_data_expanded():
     df = spark.sql("""
@@ -1201,7 +1227,7 @@ def mill_pacs_data_expanded():
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
                 MillRefNbr,
                 MillPersonId,
-                PacsPatientId,
+                CAST(PacsPatientId AS BIGINT) AS PacsPatientId,
                 MillEventDate
             FROM LIVE.intmd_mill_clinical_event_pacs
             WHERE MillEventClass = 'Radiology'
@@ -1211,7 +1237,7 @@ def mill_pacs_data_expanded():
                 RequestIdString AS AccessionNbr,
                 RequestExamCode_t AS ExamCode,
                 RequestExamCodeSeq AS ExamCodeSeq,
-                MAX(RequestId) AS RequestId,
+                CAST(MAX(RequestId) AS BIGINT) AS RequestId,
                 MAX(SplitRequestQuestion) AS RequestQuestion,
                 MAX(SplitRequestAnamnesis) AS RequestAnamnesis
             FROM LIVE.intmd_pacs_requestexam
@@ -1250,7 +1276,7 @@ def mill_pacs_data_expanded():
             exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
-            rep.PacsReportCount
+            CAST(rep.PacsReportCount AS INT) AS PacsReportCount
         FROM ce
         LEFT JOIN req
         ON
