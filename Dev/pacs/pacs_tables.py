@@ -1185,24 +1185,24 @@ def joined_pacs_data():
 from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType, TimestampType
 
 schema = StructType([
-    StructField("AccessionNbr", StringType(), True, {'comment': "Identifier for PACS image data retrieval"}),
-    StructField("Clinical_Event_ID", LongType(), True, {'comment': "Identifier linked to Mill_Clinical_Event table"}),
-    StructField("EVENT_ID", LongType(), True),
-    StructField("ExamCode", StringType(), True),
-    StructField("ExamCodeSeq", StringType(), True),
-    StructField("MillRefNbr", StringType(), True),
-    StructField("MillPersonId", LongType(), True),
-    StructField("PacsPatientId", LongType(), True),
-    StructField("MillEventDate", TimestampType(), True),
-    StructField("RequestId", LongType(), True),
-    StructField("RequestQuestion", StringType(), True),
-    StructField("RequestAnamnesis", StringType(), True),
-    StructField("ExaminationIdString", StringType(), True),
-    StructField("ExaminationStudyUid", StringType(), True),
-    StructField("ExaminationDescription", StringType(), True),
-    StructField("ExaminationModality", StringType(), True),
-    StructField("ExaminationBodyPart", StringType(), True),
-    StructField("PacsReportCount", IntegerType(), True)
+    StructField("AccessionNbr", StringType(), True, {'comment': "Identifier for PACS image data retrieval"}),  # Identifier for PACS image data retrieval
+    StructField("Clinical_Event_ID", LongType(), True, {'comment': "Clinical event identifier"}),  # Identifier linked to Mill_Clinical_Event table
+    StructField("EVENT_ID", LongType(), True, {'comment': "Event identifier"}),  # Event identifier
+    StructField("ExamCode", StringType(), True, {'comment': "Examination code"}),  # Examination code
+    StructField("ExamCodeSeq", StringType(), True, {'comment': "Sequence number for exam code"}),  # Sequence number for exam code
+    StructField("MillRefNbr", StringType(), True, {'comment': "Mill reference number"}),  # Mill reference number
+    StructField("MillPersonId", LongType(), True, {'comment': "Person identifier in Mill system"}),  # Person identifier in Mill system
+    StructField("PacsPatientId", LongType(), True, {'comment': "PACS patient identifier"}),  # PACS patient identifier
+    StructField("MillEventDate", TimestampType(), True, {'comment': "Event date in Mill system"}),  # Event date in Mill system
+    StructField("RequestId", LongType(), True, {'comment': "Request identifier"}),  # Request identifier
+    StructField("RequestQuestion", StringType(), True, {'comment': "Request question text"}),  # Request question text
+    StructField("RequestAnamnesis", StringType(), True, {'comment': "Request anamnesis text"}),  # Request anamnesis text
+    StructField("ExaminationIdString", StringType(), True, {'comment': "Examination ID as string"}),  # Examination ID as string
+    StructField("ExaminationStudyUid", StringType(), True, {'comment': "Examination study UID"}),  # Examination study UID
+    StructField("ExaminationDescription", StringType(), True, {'comment': "Description of examination"}),  # Description of examination
+    StructField("ExaminationModality", StringType(), True, {'comment': "Examination modality"}),  # Examination modality
+    StructField("ExaminationBodyPart", StringType(), True, {'comment': "Body part examined"}),  # Body part examined
+    StructField("PacsReportCount", IntegerType(), True, {'comment': "Count of PACS reports"}),  # Count of PACS reports
 ])
 
 # COMMAND ----------
