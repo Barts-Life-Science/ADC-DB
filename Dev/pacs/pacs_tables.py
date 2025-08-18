@@ -1187,19 +1187,19 @@ from pyspark.sql.types import StructType, StructField, StringType, LongType, Int
 schema = StructType([
     StructField(
         "AccessionNbr", StringType(), True,
-        {'comment': "Unique accession number assigned to a PACS imaging request, used to retrieve image data and link records across systems."}
+        {'comment': "PACS Accession number for retrieving image data and linking records across systems."}
     ),
     StructField(
         "Clinical_Event_ID", LongType(), True,
-        {'comment': "Primary key for the clinical event in the Mill_Clinical_Event table, representing a unique clinical encounter or procedure."}
+        {'comment': "Identifiers to link with clinical event records in the Millenium EHR system."}
     ),
     StructField(
         "EVENT_ID", LongType(), True,
-        {'comment': "Unique identifier for the event within the Mill system, used to join with event-level metadata and logs."}
+        {'comment': "Identifiers to link with event records in the Millenium EHR system."}
     ),
     StructField(
         "ExamCode", StringType(), True,
-        {'comment': "Standardized code representing the type of examination or imaging procedure performed (e.g., CT, MRI, X-ray)."}
+        {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
     ),
     StructField(
         "ExamCodeSeq", StringType(), True,
@@ -1207,23 +1207,23 @@ schema = StructType([
     ),
     StructField(
         "MillRefNbr", StringType(), True,
-        {'comment': "Reference number in the Mill system, often a concatenation of accession and exam code, used for cross-referencing and traceability."}
+        {'comment': "Reference number recorded in Mill_Clinical_Event, often a concatenation of accession and exam code, used for cross-referencing and traceability."}
     ),
     StructField(
         "MillPersonId", LongType(), True,
-        {'comment': "Unique identifier for the patient or person in the Mill system, enabling linkage to demographic and clinical data."}
+        {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
     ),
     StructField(
         "PacsPatientId", LongType(), True,
-        {'comment': "Unique patient identifier in the PACS system, used to associate imaging data with the correct patient record."}
+        {'comment': "Unique patient identifier in the PACS system."}
     ),
     StructField(
         "MillEventDate", TimestampType(), True,
-        {'comment': "Timestamp of the event in the Mill system, typically representing when the clinical event or imaging procedure occurred."}
+        {'comment': "Timestamp of the imaging examination event in the Millennium EHR system, typically representing when the clinical event or imaging procedure occurred."}
     ),
     StructField(
         "RequestId", LongType(), True,
-        {'comment': "Unique identifier for the imaging request, linking to order details and request metadata in the PACS or Mill system."}
+        {'comment': "Unique identifier for the imaging request in the PACS."}
     ),
     StructField(
         "RequestQuestion", StringType(), True,
