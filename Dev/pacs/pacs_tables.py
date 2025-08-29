@@ -276,6 +276,7 @@ def intmd_mill_clinical_event_pacs():
         SELECT
             CLINICAL_EVENT_ID,
             EVENT_ID,
+            ENCNTR_ID,
             EVENT_TITLE_TEXT AS MillEventTitleText,
             ce.MillPersonId,
             PacsPatientId,
@@ -1198,6 +1199,10 @@ schema = StructType([
         {'comment': "Identifiers to link with event records in the Millenium EHR system."}
     ),
     StructField(
+        "ENCNTR_ID", LongType(), True,
+        {'comment': "Identifiers to link with encounter records in the Millenium EHR system."}
+    ),
+    StructField(
         "ExamCode", StringType(), True,
         {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
     ),
@@ -1277,6 +1282,7 @@ def mill_pacs_data_expanded():
                 MillAccessionNbr AS AccessionNbr,
                 Clinical_Event_ID,
                 EVENT_ID,
+                ENCNTR_ID,
                 MillExamCode AS ExamCode,
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
                 MillRefNbr,
