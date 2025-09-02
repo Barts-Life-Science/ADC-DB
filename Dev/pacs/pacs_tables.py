@@ -275,6 +275,7 @@ def intmd_mill_clinical_event_pacs():
         )
         SELECT
             CLINICAL_EVENT_ID,
+            PARENT_EVENT_ID,
             EVENT_ID,
             ENCNTR_ID,
             EVENT_TITLE_TEXT AS MillEventTitleText,
@@ -283,6 +284,7 @@ def intmd_mill_clinical_event_pacs():
             MillAccessionNbr,
             MillExamCode,
             MillEventDate,
+            EVENT_TAG,
             MillEventClass,
             MillEventReltn,
             COALESCE(SERIES_REF_NBR, REFERENCE_NBR) AS MillRefNbr
@@ -1203,6 +1205,10 @@ schema = StructType([
         {'comment': "Identifiers to link with encounter records in the Millenium EHR system."}
     ),
     StructField(
+        "PARENT_EVENT_ID", LongType(), True,
+        {'comment': "Identifiers to link with parent event records in the Millenium EHR system."}
+    ),
+    StructField(
         "ExamCode", StringType(), True,
         {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
     ),
@@ -1261,7 +1267,8 @@ schema = StructType([
     StructField(
         "PacsReportCount", IntegerType(), True,
         {'comment': "Number of PACS reports or imaging documents associated with the accession number, indicating reporting completeness."}
-    ),
+    )
+
 ])
 
 # COMMAND ----------
@@ -1283,6 +1290,7 @@ def mill_pacs_data_expanded():
                 Clinical_Event_ID,
                 EVENT_ID,
                 ENCNTR_ID,
+                PARENT_EVENT_ID,
                 MillExamCode AS ExamCode,
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
                 MillRefNbr,
@@ -1335,8 +1343,7 @@ def mill_pacs_data_expanded():
             exa.ExaminationStudyUid,
             exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
-            exa.ExaminationBodyPart,
-            CAST(rep.PacsReportCount AS INT) AS PacsReportCount
+            exa.ExaminationBodyPart
         FROM ce
         LEFT JOIN req
         ON
@@ -1348,8 +1355,6 @@ def mill_pacs_data_expanded():
             exa.ExaminationRequestId = req.RequestId
             AND exa.ExaminationCode = ce.ExamCode
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
-        LEFT JOIN rep
-        ON ce.AccessionNbr = rep.MillAccessionNbr
     """)
     return df
 
