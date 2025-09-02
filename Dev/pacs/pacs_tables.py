@@ -1275,7 +1275,7 @@ schema = StructType([
 
 @dlt.table(
     name="mill_pacs_data_expanded",
-    comment="mill_clinical_event joined with pacs_requests",
+    comment="mill_clinical_event joined with PACS tables",
     table_properties={
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true"
@@ -1355,6 +1355,56 @@ def mill_pacs_data_expanded():
             exa.ExaminationRequestId = req.RequestId
             AND exa.ExaminationCode = ce.ExamCode
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
+    """)
+    return df
+
+# COMMAND ----------
+
+
+schema = StructType([
+    StructField(
+        "ReportEventId", LongType(), True,
+        {'comment': "Identifiers to link with event records in the Millenium EHR system."}
+    ),
+    StructField(
+        "ReportEncntrId", LongType(), True,
+        {'comment': "Identifiers to link with encounter records in the Millenium EHR system."}
+    ),
+    StructField(
+        "AccessionNbr", StringType(), True,
+        {'comment': "PACS Accession number for retrieving image data and linking records across systems."}
+    ),
+    StructField(
+        "ExamCode", StringType(), True,
+        {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
+    )
+
+])
+
+# COMMAND ----------
+
+@dlt.table(
+    name="mill_pacs_data_expanded_report",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    },
+    schema=schema
+)
+def mill_pacs_data_expanded_report():
+    df = spark.sql("""
+        SELECT DISTINCT
+            b.EVENTID AS ReportEventId,
+            b.ENCNTR_ID AS ReportEncntrId,
+            c.MillAccessionNbr AS AccessionNbr,
+            c.MillExamCode AS ExamCode
+        FROM 4_prod.rde.rde_blobdataset AS b
+        INNER JOIN LIVE.intmd_mill_clinical_event_pacs AS c
+        ON b.EVENTID = c.EVENT_ID
+        WHERE
+            b.MainEventDesc = 'RADRPT'
+            AND c.MillEventClass = 'Document'
     """)
     return df
 
