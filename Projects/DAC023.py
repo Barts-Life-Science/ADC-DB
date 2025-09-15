@@ -1,23 +1,30 @@
 # Databricks notebook source
-#Dentist hospital
+#CLAUDE Breast Cancer Biobank Project
 
-project_identifier = 'dar021'
+project_identifier = 'dac023'
 
-rde_tables = ['rde_all_procedures', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_family_history', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders']
+rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_emergency_findings', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_mat_nnu_episodes', 'rde_mat_nnu_exam', 'rde_mat_nnu_nccmds', 'rde_measurements', 'rde_medadmin', 'rde_mill_powertrials', 'rde_msds_booking', 'rde_msds_carecontact', 'rde_msds_delivery', 'rde_msds_diagnosis', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_powerforms', 'rde_radiology', 'rde_raw_pathology', 'rde_scr_careplan', 'rde_scr_deftreatment', 'rde_scr_demographics', 'rde_scr_diagnosis', 'rde_scr_investigations', 'rde_scr_pathology', 'rde_scr_referrals', 'rde_scr_trackingcomments']
 
-max_ig_risk = 3
-max_ig_severity = 2
+max_ig_risk = 4
+max_ig_severity = 4
 columns_to_exclude = ['ADC_UPDT']
 
 cohort_sql = f"""
-CREATE OR REPLACE VIEW 6_mgmt.cohorts.{project_identifier} AS
-SELECT 
-    DISTINCT me.PERSON_ID AS PERSON_ID,
-    CAST(NULL AS STRING) AS SUBCOHORT
-FROM 4_prod.raw.mill_encounter me
-INNER JOIN 4_prod.bronze.map_care_site mcs 
-    ON me.LOC_NURSE_UNIT_CD = mcs.CARE_SITE_CD
-WHERE mcs.building_name = 'Dental Hospital'
+CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac023 AS
+WITH matched_aliases AS (
+  SELECT DISTINCT 
+    l.nhs_number, 
+    TRY_CAST(pa.PERSON_ID AS BIGINT) as PERSON_ID  -- Returns NULL for non-numeric
+  FROM 6_mgmt.cohort_lookup.dac023_lookup l
+  JOIN 4_prod.raw.mill_person_alias pa
+  ON REGEXP_REPLACE(l.nhs_number, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
+)
+SELECT DISTINCT
+  ma.PERSON_ID as PERSON_ID,
+  CAST(NULL as STRING) as subcohort
+FROM 6_mgmt.cohort_lookup.dac023_lookup l
+JOIN matched_aliases ma ON l.nhs_number = ma.nhs_number
+WHERE ma.PERSON_ID IS NOT NULL;
 """
 spark.sql(cohort_sql)
 

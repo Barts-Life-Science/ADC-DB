@@ -602,9 +602,9 @@ def create_nomenclature_mapping_incr():
         .filter(
             (col("ACTIVE_IND") == 1) & 
             (col("END_EFFECTIVE_DT_TM").isNull() | (col("END_EFFECTIVE_DT_TM") > current_timestamp())) &
-            (col("ADC_UPDT") > max_adc_updt) &
-            (col("source_identifier").isNotNull()) &
-            (trim(col("source_identifier")) != "")
+            (col("ADC_UPDT") > max_adc_updt)# &
+            #(col("source_identifier").isNotNull()) &
+            #(trim(col("source_identifier")) != "")
         )
     )
     

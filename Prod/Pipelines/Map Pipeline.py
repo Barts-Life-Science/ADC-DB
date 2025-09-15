@@ -215,14 +215,13 @@ def create_address_mapping_incr():
         spark.table("4_prod.raw.mill_address")
         .filter(
             (col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION")) & 
-            (col("ACTIVE_IND") == 1) & 
-            (col("END_EFFECTIVE_DT_TM") > current_date()) &
             (col("ADC_UPDT") > max_adc_updt)
         )
         .select(
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID", 
             "ZIPCODE", "CITY", "street_addr", "street_addr2", 
-            "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", "ADC_UPDT"
+            "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", 
+            "ACTIVE_IND", "END_EFFECTIVE_DT_TM", "ADC_UPDT"
         )
     )
     
@@ -285,6 +284,7 @@ def create_address_mapping_incr():
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
             "masked_zipcode", "CITY", "full_street_address", "clean_zipcode",
             "standardized_address", "building_number", "flat", "building_name",
+            "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",  # FIX: Added these columns
             "ADC_UPDT", col("country_description").alias("country_description")
         )
         # CRITICAL FIX: Ensure unique ADDRESS_ID
@@ -543,11 +543,12 @@ def create_address_mapping_incr():
         )
     )
     
-    # Define columns for union
+    # Define columns for union - all columns must exist in both dataframes
     common_columns = [
         "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
         "masked_zipcode", "CITY", "full_street_address", "ADC_UPDT",
         "country_description", "final_lsoa21cd", "UPRN", 
+        "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",
         "LATITUDE", "LONGITUDE", "match_algorithm", "match_confidence"
     ]
     
@@ -619,6 +620,9 @@ def create_address_mapping_incr():
             "match_algorithm",
             "match_confidence",
             "match_quality",
+            "BEG_EFFECTIVE_DT_TM", 
+            "ACTIVE_IND", 
+            "END_EFFECTIVE_DT_TM",
             "ADC_UPDT",
             col("country_description").alias("country_cd")
         )
@@ -647,7 +651,6 @@ def verify_no_duplicates(df, key_column):
     else:
         print(f"✓ No duplicate {key_column} values found")
         return True
-
 
 
 # COMMAND ----------
@@ -684,18 +687,22 @@ def create_person_mapping_incr():
     
     # Get latest address for each person
     latest_addresses = (
-        spark.table("4_prod.bronze.map_address")
-        .filter(col("PARENT_ENTITY_NAME") == "PERSON")
-        .withColumn(
-            "row_num",
-            row_number().over(
-                Window.partitionBy("PARENT_ENTITY_ID")
-                .orderBy(col("ADC_UPDT").desc())
-            )
+    spark.table("4_prod.bronze.map_address")
+    .filter(
+        (col("PARENT_ENTITY_NAME") == "PERSON") &
+        (col("ACTIVE_IND") == 1) & 
+        (col("END_EFFECTIVE_DT_TM") > current_date())
+    )
+    .withColumn(
+        "row_num",
+        row_number().over(
+            Window.partitionBy("PARENT_ENTITY_ID")
+            .orderBy(col("ADC_UPDT").desc())
         )
-        .filter(col("row_num") == 1)
-        .select("PARENT_ENTITY_ID", "ADDRESS_ID")
-        .alias("addr")
+    )
+    .filter(col("row_num") == 1)
+    .select("PARENT_ENTITY_ID", "ADDRESS_ID")
+    .alias("addr")
     )
     
     # Get base person data with filtering
@@ -818,7 +825,24 @@ def create_care_site_mapping_incr():
     locations = spark.table("4_prod.raw.mill_location").alias("loc")
     code_values = spark.table("3_lookup.mill.mill_code_value").alias("cv")
     organizations = spark.table("4_prod.raw.mill_organization").alias("org")
-    address_lookup = spark.table("4_prod.bronze.map_address").alias("al")
+
+    current_addresses = (
+    spark.table("4_prod.bronze.map_address")
+    .filter(
+        (col("ACTIVE_IND") == 1) & 
+        (col("END_EFFECTIVE_DT_TM") > current_date())
+    )
+    .withColumn(
+        "row_num",
+        row_number().over(
+            Window.partitionBy("PARENT_ENTITY_ID")
+            .orderBy(col("ADC_UPDT").desc())
+        )
+    )
+    .filter(col("row_num") == 1)
+    .select("PARENT_ENTITY_ID", "ADDRESS_ID", "PARENT_ENTITY_NAME", "ADC_UPDT")
+    .alias("al")
+    )
     
     # Get building and facility references
     buildings = create_building_locations()
@@ -874,7 +898,7 @@ def create_care_site_mapping_incr():
         
         # Join organization address
         .join(
-            address_lookup.filter(col("PARENT_ENTITY_NAME") == "ORGANIZATION")
+            current_addresses.filter(col("PARENT_ENTITY_NAME") == "ORGANIZATION")
             .select("PARENT_ENTITY_ID", "ADC_UPDT", "ADDRESS_ID"),
             col("org.ORGANIZATION_ID") == col("PARENT_ENTITY_ID"),
             "left"

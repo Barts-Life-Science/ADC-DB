@@ -287,6 +287,8 @@ def create_address_mapping_incr():
             "standardized_address", "building_number", "flat", "building_name",
             "ADC_UPDT", col("country_description").alias("country_description")
         )
+        # CRITICAL FIX: Ensure unique ADDRESS_ID
+        .dropDuplicates(["ADDRESS_ID"])
     )
     
     # Enhanced UPRN matching with multiple algorithms
@@ -329,6 +331,12 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(1))
         .withColumn("match_confidence", lit(1.0))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
+        # FIX: Handle multiple UPRN matches per ADDRESS_ID by selecting best match
+        .withColumn("rank", row_number().over(
+            Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
+        ))
+        .filter(col("rank") == 1)
+        .drop("rank")
     )
     
     # Get unmatched from algorithm 1
@@ -348,13 +356,15 @@ def create_address_mapping_incr():
             (col("p.building_number") != ""),
             "inner"
         )
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("p.ADDRESS_ID").orderBy("a.UPRN")
-        ))
-        .filter(col("rank") == 1)
         .withColumn("match_algorithm", lit(2))
         .withColumn("match_confidence", lit(0.95))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
+        # FIX: Ensure unique ADDRESS_ID
+        .withColumn("rank", row_number().over(
+            Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
+        ))
+        .filter(col("rank") == 1)
+        .drop("rank")
     )
     
     # Get unmatched from algorithm 2
@@ -377,13 +387,15 @@ def create_address_mapping_incr():
             when(col("p.building_number") == col("a.ab_building_number"), 0.9)
             .otherwise(0.85)
         )
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("p.ADDRESS_ID").orderBy(desc("similarity"))
-        ))
-        .filter(col("rank") == 1)
         .withColumn("match_algorithm", lit(3))
         .withColumn("match_confidence", col("similarity"))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
+        # FIX: Ensure unique ADDRESS_ID
+        .withColumn("rank", row_number().over(
+            Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
+        ))
+        .filter(col("rank") == 1)
+        .drop("rank")
     )
     
     # Get unmatched from algorithm 3
@@ -406,13 +418,15 @@ def create_address_mapping_incr():
                    greatest(length(col("p.standardized_address")), length("a.ab_standardized_address")))
         )
         .filter(col("address_similarity") >= 0.85)
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("p.ADDRESS_ID").orderBy(desc("address_similarity"))
-        ))
-        .filter(col("rank") == 1)
         .withColumn("match_algorithm", lit(4))
         .withColumn("match_confidence", col("address_similarity") * 0.9)
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
+        # FIX: Ensure unique ADDRESS_ID
+        .withColumn("rank", row_number().over(
+            Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
+        ))
+        .filter(col("rank") == 1)
+        .drop("rank")
     )
     
     # Get unmatched from algorithm 4
@@ -435,13 +449,15 @@ def create_address_mapping_incr():
                    greatest(length(col("p.standardized_address")), length("a.ab_standardized_address")))
         )
         .filter(col("address_similarity") >= 0.9)
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("p.ADDRESS_ID").orderBy(desc("address_similarity"))
-        ))
-        .filter(col("rank") == 1)
         .withColumn("match_algorithm", lit(5))
         .withColumn("match_confidence", col("address_similarity") * 0.8)
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
+        # FIX: Ensure unique ADDRESS_ID
+        .withColumn("rank", row_number().over(
+            Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
+        ))
+        .filter(col("rank") == 1)
+        .drop("rank")
     )
     
     # Combine all unmatched records
@@ -496,6 +512,8 @@ def create_address_mapping_incr():
         postcode_maps
         .withColumn("pcd_3char", substring(col("clean_pcd7"), 1, 3))
         .select("pcd_3char", "lsoa21cd")
+        # FIX: Remove duplicate postcodes to avoid multiple matches
+        .dropDuplicates(["pcd_3char"])
     )
     
     unmatched_with_3char = (
@@ -547,6 +565,8 @@ def create_address_mapping_incr():
             (col("Indices_of_Deprivation") == "a. Index of Multiple Deprivation (IMD)")
         )
         .select(col("FeatureCode"), col("Value"))
+        # FIX: Ensure unique LSOA codes
+        .dropDuplicates(["FeatureCode"])
     )
     
     # Join with IMD data
@@ -602,17 +622,46 @@ def create_address_mapping_incr():
             "ADC_UPDT",
             col("country_description").alias("country_cd")
         )
+        # FINAL FIX: Ensure ADDRESS_ID is unique in final output
+        .dropDuplicates(["ADDRESS_ID"])
     )
+    
+    # Optional: Add validation to verify uniqueness
+    duplicate_count = final_df.groupBy("ADDRESS_ID").count().filter(col("count") > 1).count()
+    if duplicate_count > 0:
+        raise ValueError(f"Found {duplicate_count} duplicate ADDRESS_IDs in final dataframe")
     
     return final_df
 
+
+# Additional debugging function to check for duplicates before merge
+def verify_no_duplicates(df, key_column):
+    """Verify that the dataframe has no duplicate keys"""
+    duplicate_df = df.groupBy(key_column).count().filter(col("count") > 1)
+    duplicate_count = duplicate_df.count()
+    
+    if duplicate_count > 0:
+        print(f"WARNING: Found {duplicate_count} duplicate {key_column} values")
+        duplicate_df.show(10, truncate=False)
+        return False
+    else:
+        print(f"✓ No duplicate {key_column} values found")
+        return True
+
+
+
 # COMMAND ----------
 
-
+# Usage:
 updates_df = create_address_mapping_incr()
+
+# Verify before merge
+if verify_no_duplicates(updates_df, "ADDRESS_ID"):
+    update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID")
+else:
+    print("Merge aborted due to duplicates. Please investigate.")
     
 
-update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID")
 
 # COMMAND ----------
 
@@ -1091,13 +1140,13 @@ def get_event_times():
     Returns:
         DataFrame: Event time boundaries with encounter ID
     """
-    from pyspark.sql.functions import current_timestamp, year
+    from pyspark.sql.functions import current_timestamp, year, col, min, max
 
     return (
         spark.table("4_prod.raw.mill_clinical_event")
         .where(
             (year("CLINSIG_UPDT_DT_TM") >= 1950) &
-            ("CLINSIG_UPDT_DT_TM" <= current_timestamp())
+            (col("CLINSIG_UPDT_DT_TM") <= current_timestamp())  # Added col() here
         )
         .groupBy("ENCNTR_ID")
         .agg(
@@ -2508,17 +2557,22 @@ def augment_snomed_codes(med_df, refs):
     return final_df
 
 
-
 def add_omop_mappings(med_df):
     """
     Adds OMOP concept mappings to the medication administration records.
     Includes direct code mappings and name-based matching with fallbacks.
     """
-
+    print("Inside add_omop_mappings function...")
+    
     concepts = spark.table("3_lookup.omop.concept")
     
+    # Debug: Check Multum concept codes format
+    print("Checking Multum concept codes in OMOP...")
+    multum_sample = concepts.filter(col("vocabulary_id") == "Multum").select("concept_code").distinct().limit(10).collect()
+    print(f"Sample Multum concept codes: {[row.concept_code for row in multum_sample]}")
+    
     # Create separate concept DataFrames for each vocabulary
-    # Add ranking within each vocabulary based on standard_concept
+    # For Multum, keep as string - no casting
     multum_concepts = (
         concepts.filter(col("vocabulary_id") == "Multum")
         .withColumn("rank", row_number().over(
@@ -2531,7 +2585,7 @@ def add_omop_mappings(med_df):
         ))
         .filter(col("rank") == 1)
         .select(
-            col("concept_code").alias("multum_code"),
+            col("concept_code").alias("multum_code"),  # Keep as string
             col("concept_id").alias("multum_concept_id"),
             col("concept_name").alias("multum_concept_name"),
             col("standard_concept").alias("multum_standard_concept")
@@ -2647,19 +2701,16 @@ def add_omop_mappings(med_df):
         )
     )
     
+    print("Starting joins for OMOP mappings...")
     
     # Join with med_df in sequence, using left joins
+    # NO CASTING - just string comparison for MULTUM
     mapped_df = (
         med_df
-        # Convert MULTUM to integer for joining
-        .withColumn("MULTUM_INT", 
-            when(col("MULTUM").isNotNull(), 
-                col("MULTUM").cast("integer"))
-        )
-        # Join with Multum concepts
+        # Join with Multum concepts using string comparison
         .join(
             multum_concepts,
-            col("MULTUM_INT") == col("multum_code").cast("integer"),
+            col("MULTUM") == col("multum_code"),  # Direct string comparison
             "left"
         )
         # Join with RxNorm concepts
@@ -2764,7 +2815,7 @@ def add_omop_mappings(med_df):
     
     # Drop intermediate columns
     columns_to_drop = [
-        "MULTUM_INT", "multum_code", "multum_concept_id", "multum_concept_name", "multum_standard_concept",
+        "multum_code", "multum_concept_id", "multum_concept_name", "multum_standard_concept",
         "rxnorm_code", "rxnorm_concept_id", "rxnorm_concept_name", "rxnorm_standard_concept",
         "rxnorm_ext_code", "rxnorm_ext_concept_id", "rxnorm_ext_concept_name", "rxnorm_ext_standard_concept",
         "snomed_concept_code", "snomed_concept_id", "snomed_concept_name", "snomed_standard_concept",
@@ -2773,13 +2824,18 @@ def add_omop_mappings(med_df):
         "simplified_concept_id", "simplified_concept_name", "simplified_vocabulary", "simplified_standard_concept", "simplified_name_lower"
     ]
     
+    print("OMOP mapping joins completed, dropping intermediate columns...")
+    
     return mapped_df.drop(*columns_to_drop)
+
 
 def backfill_snomed_from_omop(df):
     """
     Attempts to find SNOMED codes for records that have OMOP concepts but no SNOMED codes
     by looking up mappings from the OMOP concept to SNOMED.
     """
+    print("Inside backfill_snomed_from_omop function...")
+    
     # Get OMOP concept relationships for SNOMED
     concept_relationships = (
         spark.table("3_lookup.omop.concept_relationship")
@@ -2819,7 +2875,20 @@ def backfill_snomed_from_omop(df):
           (col("OMOP_CONCEPT_ID").isNotNull()))
     )
     
-    if needs_backfill.count() > 0:
+    print(f"Checking if backfill is needed...")
+    try:
+        needs_backfill_count = needs_backfill.count()
+        print(f"Records needing backfill: {needs_backfill_count}")
+    except Exception as e:
+        print(f"Error during needs_backfill count: {str(e)}")
+        print("The error is likely in the filter/count operation")
+        # Try to identify problematic data
+        print("Attempting to show schema...")
+        df.printSchema()
+        raise
+    
+    if needs_backfill_count > 0:
+        print("Performing backfill joins...")
         # Find SNOMED mappings for the OMOP concepts
         backfilled = (
             needs_backfill
@@ -2880,7 +2949,6 @@ def process_med_admin_incremental():
     try:
         print(f"Starting medication administration incremental processing at {datetime.now()}")
         
-
         base_df = create_base_medication_administrations_incr()
         
         if base_df.count() > 0:
@@ -2889,20 +2957,38 @@ def process_med_admin_incremental():
             # Initialize reference tables
             refs = MedAdminReferenceTables()
             
+            # Debug: Check MULTUM column values
+            print("Checking MULTUM column values...")
+            multum_values = base_df.select("MULTUM").distinct().limit(20).collect()
+            print(f"Sample MULTUM values: {[row.MULTUM for row in multum_values]}")
+            
             # Add SNOMED codes
+            print("Starting SNOMED code mappings...")
             with_snomed = augment_snomed_codes(base_df, refs)
             print("Added SNOMED code mappings")
             
             # Add OMOP mappings
+            print("Starting OMOP concept mappings...")
             with_omop = add_omop_mappings(with_snomed)
             print("Added OMOP concept mappings")
-
+            
+            # Debug: Check if we can access the dataframe
+            print("Checking if OMOP mapping completed successfully...")
+            try:
+                omop_count = with_omop.filter(col("OMOP_CONCEPT_ID").isNotNull()).count()
+                print(f"Records with OMOP mappings: {omop_count}")
+            except Exception as e:
+                print(f"Error during OMOP count check: {str(e)}")
+                print("Error might be in OMOP mapping function")
+                raise
 
             # Backfill missing SNOMED codes from OMOP mappings
+            print("Starting backfill of missing SNOMED codes...")
             with_backfill = backfill_snomed_from_omop(with_omop)
             print("Backfilled missing SNOMED codes from OMOP mappings")
 
             # Deduplicate records prioritizing status 25, Authorized
+            print("Starting deduplication...")
             final_df = (with_backfill
                        .withColumn("priority",
                            when(col("RESULT_STATUS_CD") == 25, 1)
@@ -2921,7 +3007,7 @@ def process_med_admin_incremental():
                        .filter(col("row_num") == 1)
                        .drop("priority", "row_num"))
             
-
+            print("Deduplication complete, updating table...")
             update_table(final_df.distinct(), "4_prod.bronze.map_med_admin", "EVENT_ID")
             print("Successfully updated medication administration mapping table")
         else:
@@ -2929,6 +3015,8 @@ def process_med_admin_incremental():
             
     except Exception as e:
         print(f"Error processing medication administration updates: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise
 
 process_med_admin_incremental()
@@ -3475,12 +3563,9 @@ def process_numeric_events_incremental():
                 string_results
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
                 .select(
-                    "EVENT_ID",
-                    "UNIT_OF_MEASURE_CD",
-                    when(
-                        col("STRING_RESULT_TEXT").cast("double").isNotNull(),
-                        col("STRING_RESULT_TEXT").cast("double")
-                    ).alias("NUMERIC_RESULT")
+                     "EVENT_ID",
+                     "UNIT_OF_MEASURE_CD",
+                     expr("try_cast(STRING_RESULT_TEXT as double)").alias("NUMERIC_RESULT")
                 )
                 .filter(col("NUMERIC_RESULT").isNotNull())
             )
@@ -3562,8 +3647,8 @@ def process_numeric_events_incremental():
                 col("entry_desc").alias("ENTRY_MODE_DISPLAY"),
                 
                 # Reference ranges
-                col("ce.NORMAL_LOW").cast(FloatType()),
-                col("ce.NORMAL_HIGH").cast(FloatType()),
+                expr("try_cast(ce.NORMAL_LOW as float)").alias("NORMAL_LOW"),
+                expr("try_cast(ce.NORMAL_HIGH as float)").alias("NORMAL_HIGH"),
                 
                 # Timestamps
                 col("ce.PERFORMED_DT_TM").cast(TimestampType()),
@@ -4066,11 +4151,15 @@ def process_text_events_incremental():
             # Get valid text results
             text_results = (
                 string_results
-                .filter(col("STRING_RESULT_TEXT").cast("double").isNull())
                 .select(
                     "EVENT_ID",
                     "UNIT_OF_MEASURE_CD",
                     col("STRING_RESULT_TEXT").alias("TEXT_RESULT")
+                )
+                # Keep only non-numeric text results
+                .filter(
+                    col("TEXT_RESULT").isNotNull() & 
+                    expr("try_cast(TEXT_RESULT as double)").isNull()
                 )
             )
             
