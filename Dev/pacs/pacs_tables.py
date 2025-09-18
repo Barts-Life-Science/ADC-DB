@@ -1317,14 +1317,16 @@ def mill_pacs_data_expanded():
                 ExaminationCode_t AS ExaminationCode,
                 ExaminationIdString,
                 ExaminationDescription,
-                ExaminationModality,
-                ExaminationBodyPart,
+                COALESCE(ExaminationModality, ec.ExamModality) AS ExaminationModality,
+                COALESCE(ExaminationBodyPart, ec.ExamBodyPart) AS ExaminationBodyPart,
                 ExaminationStudyUid,
                 ROW_NUMBER() OVER (
                     PARTITION BY ExaminationRequestId, ExaminationCode_t
                     ORDER BY ExaminationId ASC
                 ) AS ExamCodeSeq
-            FROM LIVE.intmd_pacs_examinations
+            FROM LIVE.intmd_pacs_examinations AS e
+            LEFT JOIN LIVE.intmd_pacs_examcode AS ec
+            ON e.ExaminationCode_t = ec.MillExamCode
             WHERE ExaminationRequestId IS NOT NULL
         ),
         rep AS (
