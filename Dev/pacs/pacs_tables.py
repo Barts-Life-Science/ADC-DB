@@ -1326,7 +1326,7 @@ def mill_pacs_data_expanded():
                 ) AS ExamCodeSeq
             FROM LIVE.intmd_pacs_examinations AS e
             LEFT JOIN LIVE.intmd_pacs_examcode AS ec
-            ON e.ExaminationCode_t = ec.MillExamCode
+            ON e.ExaminationCode_t = ec.RawExamCode
             WHERE ExaminationRequestId IS NOT NULL
         ),
         rep AS (
