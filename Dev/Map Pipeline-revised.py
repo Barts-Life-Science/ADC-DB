@@ -78,8 +78,116 @@ def update_table(source_df, target_table, index_column):
                   .option("delta.autoOptimize.autoCompact", "true")
                   .mode("overwrite")
                   .saveAsTable(target_table))
+        
+def escape_comment(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\\", "\\\\").replace("'", "''")
+
+def update_metadata(target_table: str, target_schema: StructType, table_comment: str = None):
+    """
+    Update metadata of an existing table:
+    - Updates column names, data types, and comments.
+    - Updates table comment.
+    Raises an error if the table does not exist.
+    """
+    if not table_exists(target_table):
+        raise ValueError(f"Target table `{target_table}` does not exist. Cannot update metadata.")
+
+    # Update columns (name, type, comment)
+    for f in target_schema.fields:
+        col_name = f.name
+        col_type = f.dataType.simpleString()
+        col_comment = f.metadata.get("comment", None)
+
+
+        safe_comment = escape_comment(col_comment)
+        spark.sql(
+            f"""
+            ALTER TABLE {target_table}
+            CHANGE COLUMN `{col_name}` `{col_name}` {col_type} COMMENT "{safe_comment}"
+            """
+        )
+        
+    print(f"[INFO] Updated column names, types, and comments for {target_table}.")
+
+    # Update table comment
+    if table_comment and isinstance(table_comment, str):
+        safe_comment = escape_comment(table_comment)
+        spark.sql(
+            f"""
+            ALTER TABLE {target_table}
+            SET TBLPROPERTIES ('comment' = '{safe_comment}')
+            """
+        )
+        print(f"[INFO] Updated table comment for {target_table}.")
 
 # COMMAND ----------
+
+map_address_comment = "Contains address information linked to various entities such as individuals or organizations." 
+
+schema_map_address = StructType([
+    StructField("ADDRESS_ID", LongType(), True, metadata={
+        "comment": "The address ID is the primary key of the address table."
+    }),
+    StructField("PARENT_ENTITY_NAME", StringType(), True, metadata={
+        "comment": "The upper case name of the table to which this address row is related (i.e., PERSON, PRSNL, ORGANIZATION, etc.)"
+    }),
+    StructField("PARENT_ENTITY_ID", LongType(), True, metadata={
+        "comment": "The value of the primary identifier of the table to which the address row is related (i.e., person_id, organization_id, etc.)"
+    }),
+    StructField("masked_zipcode", StringType(), True, metadata={
+        "comment": "Partially masked version of the postcode for privacy protection."
+    }),
+    StructField("CITY", StringType(), True, metadata={
+        "comment": "The city field is the text name of the city associated with the address row."
+    }),
+    StructField("full_street_address", StringType(), True, metadata={
+        "comment": "Concatenated street address."
+    }),
+    StructField("LSOA", StringType(), True, metadata={
+        "comment": "LSOA stands for Lower Layer Super Output Area, which is a geographic area used for small area statistics in the UK."
+    }),
+    StructField("IMD_Decile", StringType(), True, metadata={
+        "comment": "IMD_Decile is used to store the Index of Multiple Deprivation (IMD) decile value."
+    }),
+    StructField("IMD_Quintile", StringType(), True, metadata={
+        "comment": "IMD_Quintile is used to store the Index of Multiple Deprivation (IMD) quintile value."
+    }),
+    StructField("UPRN", LongType(), True, metadata={
+        "comment": "Unique Property Reference Number - unique identifier for every spatial address in Great Britain (1-999999999999)."
+    }),
+    StructField("LATITUDE", DoubleType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("LONGITUDE", DoubleType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("match_algorithm", IntegerType(), True, metadata={
+        "comment": "The algorithm used to match an address record with a corresponding record in the addressbase data. Each algorithm corresponds to a specific matching strategy employed to link the address information, providing insights into the method used to determine the match between the address records. match_algorithm = 0: no match; match_algorithm = 1: Exact match (postcode + number + building); match_algorithm = 2: Postcode + number only (no building name); match_algorithm = 3: Field swap - building name in thoroughfare; match_algorithm =  4: Fuzzy match with Levenshtein distance; match_algorithm = 5: Postcode district match with high address similarity."
+    }),
+    StructField("match_confidence", DoubleType(), True, metadata={
+        "comment": "It represents a numeric score (typically between 0 and 1) that quantifies how closely an address record matches a reference address in the addressbase data, with higher values indicating a stronger or more certain match."
+    }),
+    StructField("match_quality", StringType(), True, metadata={
+        "comment": "It provides a descriptive label indicating the type or quality of the address match, based on the matching algorithm used to link the address to the reference data."
+    }),
+    StructField("BEG_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "The date and time for which this table row becomes effective. Normally, this will be the date and time the row is added, but could be a past or future date and time."
+    }),
+    StructField("ACTIVE_IND", LongType(), True, metadata={
+        "comment": "The table row is active or inactive. A row is generally active unless it is in an inactive state such as logically deleted, combined away, pending purge, etc."
+    }),
+    StructField("END_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "The date/time after which the row is no longer valid as active current data.  This may be valued with the date that the row became inactive."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+    StructField("country_cd", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    })
+])
 
 def create_address_mapping_incr():
     """
@@ -215,14 +323,13 @@ def create_address_mapping_incr():
         spark.table("4_prod.raw.mill_address")
         .filter(
             (col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION")) & 
-            (col("ACTIVE_IND") == 1) & 
-            (col("END_EFFECTIVE_DT_TM") > current_date()) &
             (col("ADC_UPDT") > max_adc_updt)
         )
         .select(
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID", 
             "ZIPCODE", "CITY", "street_addr", "street_addr2", 
-            "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", "ADC_UPDT"
+            "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", 
+            "ACTIVE_IND", "END_EFFECTIVE_DT_TM", "ADC_UPDT"
         )
     )
     
@@ -285,6 +392,7 @@ def create_address_mapping_incr():
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
             "masked_zipcode", "CITY", "full_street_address", "clean_zipcode",
             "standardized_address", "building_number", "flat", "building_name",
+            "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",  # FIX: Added these columns
             "ADC_UPDT", col("country_description").alias("country_description")
         )
         # CRITICAL FIX: Ensure unique ADDRESS_ID
@@ -543,11 +651,12 @@ def create_address_mapping_incr():
         )
     )
     
-    # Define columns for union
+    # Define columns for union - all columns must exist in both dataframes
     common_columns = [
         "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
         "masked_zipcode", "CITY", "full_street_address", "ADC_UPDT",
         "country_description", "final_lsoa21cd", "UPRN", 
+        "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",
         "LATITUDE", "LONGITUDE", "match_algorithm", "match_confidence"
     ]
     
@@ -619,6 +728,9 @@ def create_address_mapping_incr():
             "match_algorithm",
             "match_confidence",
             "match_quality",
+            "BEG_EFFECTIVE_DT_TM", 
+            "ACTIVE_IND", 
+            "END_EFFECTIVE_DT_TM",
             "ADC_UPDT",
             col("country_description").alias("country_cd")
         )
@@ -649,7 +761,6 @@ def verify_no_duplicates(df, key_column):
         return True
 
 
-
 # COMMAND ----------
 
 # Usage:
@@ -658,12 +769,56 @@ updates_df = create_address_mapping_incr()
 # Verify before merge
 if verify_no_duplicates(updates_df, "ADDRESS_ID"):
     update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID")
+    update_metadata("4_prod.bronze.map_address", schema_map_address, map_address_comment)
+
 else:
     print("Merge aborted due to duplicates. Please investigate.")
     
 
 
 # COMMAND ----------
+
+map_person_comment = "The table contains demographic information about individuals, including identifiers such as person ID, gender, birth year, and ethnicity, address ID linking to the address table." 
+
+schema_map_person = StructType([
+    StructField(
+        name="person_id",
+        dataType=DoubleType(),
+        nullable=False,
+        metadata={"comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."}
+    ),
+    StructField(
+        name="gender_cd",
+        dataType=DoubleType(),
+        nullable=True,
+        metadata={"comment": "The sex/gender that the patient is considered to have for administration and record keeping purposes. This is typically asserted by the patient when they present to administrative users. This may not match the biological sex as determined by anatomy or genetics, or the individual's preferred identification (gender identity)."}
+    ),
+    StructField(
+        name="birth_year",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "The year of birth."}
+    ),
+    StructField(
+        name="ethnicity_cd",
+        dataType=DoubleType(),
+        nullable=True,
+        metadata={"comment": "Identifies a religious, national, racial, or cultural group of the person."}
+    ),
+    StructField(
+        name="address_id",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "The address ID is the primary key of the address table."}
+    ),
+    StructField(
+        name="ADC_UPDT",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Timestamp of last update."}
+    )
+])
+
 
 def create_person_mapping_incr():
     """
@@ -684,18 +839,22 @@ def create_person_mapping_incr():
     
     # Get latest address for each person
     latest_addresses = (
-        spark.table("4_prod.bronze.map_address")
-        .filter(col("PARENT_ENTITY_NAME") == "PERSON")
-        .withColumn(
-            "row_num",
-            row_number().over(
-                Window.partitionBy("PARENT_ENTITY_ID")
-                .orderBy(col("ADC_UPDT").desc())
-            )
+    spark.table("4_prod.bronze.map_address")
+    .filter(
+        (col("PARENT_ENTITY_NAME") == "PERSON") &
+        (col("ACTIVE_IND") == 1) & 
+        (col("END_EFFECTIVE_DT_TM") > current_date())
+    )
+    .withColumn(
+        "row_num",
+        row_number().over(
+            Window.partitionBy("PARENT_ENTITY_ID")
+            .orderBy(col("ADC_UPDT").desc())
         )
-        .filter(col("row_num") == 1)
-        .select("PARENT_ENTITY_ID", "ADDRESS_ID")
-        .alias("addr")
+    )
+    .filter(col("row_num") == 1)
+    .select("PARENT_ENTITY_ID", "ADDRESS_ID")
+    .alias("addr")
     )
     
     # Get base person data with filtering
@@ -769,9 +928,49 @@ updates_df = create_person_mapping_incr()
     
 
 update_table(updates_df, "4_prod.bronze.map_person", "person_id")
+update_metadata("4_prod.bronze.map_person",schema_map_person,map_person_comment)
 
 
 # COMMAND ----------
+
+map_care_site_comment = "The table contains information about patient care locations within a healthcare facility. It includes details such as the care site code, location type, and organization name."
+
+schema_map_care_site = StructType([
+    StructField("care_site_cd", DoubleType(), True, metadata={
+        "comment": "The field identifies the current permanent location of the patient. The location for an inpatient will be valued with the lowest level location type in the hierarchy of facility, building, nurse unit, room, bed."
+        }),
+    StructField("location_type_cd", DoubleType(), True, metadata={
+        "comment": "Location type defines the kind of location (I.e., nurse unit, room, inventory location,  etc.).  Location types have Cerner defined meanings in the common data foundation."
+    }),
+    StructField("care_site_name", StringType(), True, metadata={
+        "comment": "The display string for the code_value."
+    }),
+    StructField("building_cd", DoubleType(), True, metadata={
+        "comment": "The code identifying the building associated with a care site."
+    }),
+    StructField("building_name", StringType(), True, metadata={
+        "comment": "The display string for the code_value."
+    }),
+    StructField("facility_cd", DoubleType(), True, metadata={
+        "comment": "The code identifying the facility associated with a care site."
+    }),
+    StructField("facility_name", StringType(), True, metadata={
+        "comment": "The display string for the code_value."
+    }),
+    StructField("ORGANIZATION_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the organization table.  It is an internal system assigned number."
+    }),
+    StructField("organization_name", StringType(), True, metadata={
+        "comment": "The name of the organization."
+    }),
+    StructField("address_id", LongType(), True, metadata={
+        "comment": "The address ID is the primary key of the address table."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    })
+])
+
 
 def create_building_locations():
     """
@@ -818,7 +1017,24 @@ def create_care_site_mapping_incr():
     locations = spark.table("4_prod.raw.mill_location").alias("loc")
     code_values = spark.table("3_lookup.mill.mill_code_value").alias("cv")
     organizations = spark.table("4_prod.raw.mill_organization").alias("org")
-    address_lookup = spark.table("4_prod.bronze.map_address").alias("al")
+
+    current_addresses = (
+    spark.table("4_prod.bronze.map_address")
+    .filter(
+        (col("ACTIVE_IND") == 1) & 
+        (col("END_EFFECTIVE_DT_TM") > current_date())
+    )
+    .withColumn(
+        "row_num",
+        row_number().over(
+            Window.partitionBy("PARENT_ENTITY_ID")
+            .orderBy(col("ADC_UPDT").desc())
+        )
+    )
+    .filter(col("row_num") == 1)
+    .select("PARENT_ENTITY_ID", "ADDRESS_ID", "PARENT_ENTITY_NAME", "ADC_UPDT")
+    .alias("al")
+    )
     
     # Get building and facility references
     buildings = create_building_locations()
@@ -874,7 +1090,7 @@ def create_care_site_mapping_incr():
         
         # Join organization address
         .join(
-            address_lookup.filter(col("PARENT_ENTITY_NAME") == "ORGANIZATION")
+            current_addresses.filter(col("PARENT_ENTITY_NAME") == "ORGANIZATION")
             .select("PARENT_ENTITY_ID", "ADC_UPDT", "ADDRESS_ID"),
             col("org.ORGANIZATION_ID") == col("PARENT_ENTITY_ID"),
             "left"
@@ -922,9 +1138,45 @@ updates_df = create_care_site_mapping_incr()
     
 
 update_table(updates_df, "4_prod.bronze.map_care_site", "care_site_cd")
-
+update_metadata("4_prod.bronze.map_care_site",schema_map_care_site, map_care_site_comment)
 
 # COMMAND ----------
+
+map_medical_personnel_comment = "The table contains information about personnel, specifically focusing on their roles and affiliations within the healthcare system. It includes details such as whether a person is a physician, their position, and their primary care site. This data can be used for managing personnel assignments, analyzing staffing needs, and ensuring appropriate access to applications and tasks based on position."
+
+schema_map_medical_personnel = StructType([
+    StructField("PERSON_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("PHYSICIAN_IND", DoubleType(), True, metadata={
+        "comment": "Set to TRUE, if the personnel is a physician.  Otherwise, set to FALSE."
+    }),
+    StructField("POSITION_CD", DoubleType(), True, metadata={
+        "comment": "The position is used to determine the applications and tasks the personnel is authorized to use."
+    }),
+    StructField("position_name", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("primary_care_site_cd", DoubleType(), True, metadata={
+        "comment": "This field is the current patient location with a location type of nurse unit."
+    }),
+    StructField("primary_care_site_name", StringType(), True, metadata={
+        "comment": "The display string for the code_value"
+    }),
+    StructField("SRVCATEGORY", StringType(), True, metadata={
+        "comment": "The groups of service category."
+    }),
+    StructField("SURGSPEC", StringType(), True, metadata={
+        "comment": "The groups of surgical specialty."
+    }),
+    StructField("MEDSERVICE", StringType(), True, metadata={
+        "comment": "The groups of medical service lines."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    })
+])
+
 
 def create_group_types():
     """
@@ -1127,9 +1379,83 @@ def create_medical_personnel_mapping_incr():
 updates_df = create_medical_personnel_mapping_incr()
 
 update_table(updates_df, "4_prod.bronze.map_medical_personnel", "PERSON_ID")
+update_metadata("4_prod.bronze.map_medical_personnel",schema_map_medical_personnel,map_medical_personnel_comment
+)
 
 
 # COMMAND ----------
+
+map_encounter_comment = "The table contains data related to patient encounters. It includes details such as the unique identifier for each encounter, timestamps for arrival and departure, encounter classifications, types, and statuses. This data can be used to analyze patient flow, understand the types of services provided, and track patient admissions and discharges across different units and specialties."
+
+
+schema_map_encounter = StructType([
+    StructField("ENCNTR_ID", DoubleType(), True, metadata={
+        "comment": "Unique identifier for the Encounter table."
+    }),
+    StructField("PERSON_ID", DoubleType(), True, metadata={
+        "comment": "Person whom this encounter is for."
+    }),
+    StructField("ARRIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "The actual date/time that the patient arrived at the facility. At the time of registration, if this field is null then it should be valued with the reg_dt_tm. Otherwise, the actual arrival date/time is captured."
+    }),
+    StructField("DEPART_DT_TM", TimestampType(), True, metadata={
+        "comment": "The actual date/time that the patient left from the facility. In many cases, this field may be null unless the user process requires capturing this data."
+    }),
+    StructField("ENCNTR_CLASS_CD", DoubleType(), True, metadata={
+        "comment": "Encounter class defines how this encounter row is being used in relation to the person table."
+    }),
+    StructField("encntr_class_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("ENCNTR_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "Categorizes the encounter into a logical group or type. Examples may include inpatient, outpatient, etc."
+    }),
+    StructField("encntr_type_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("ENCNTR_STATUS_CD", DoubleType(), True, metadata={
+        "comment": "Encounter status identifies the state of a particular encounter type from the time it is initiated until it is complete.  (i.e., temporary, preliminary, active, discharged (complete), cancelled)."
+    }),
+    StructField("encntr_status_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("ADMIT_SRC_CD", DoubleType(), True, metadata={
+        "comment": "Admit source identifies the place from which the patient came before being admitted. (i.e., transfer from another hospital)."
+    }),
+    StructField("admit_src_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("DISCH_TO_LOCTN_CD", DoubleType(), True, metadata={
+        "comment": "The location to which the patient was discharged such as another hospital or nursing home."
+    }),
+    StructField("disch_loctn_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("MED_SERVICE_CD", DoubleType(), True, metadata={
+        "comment": "The type or category of medical service that the patient is receiving in relation to their encounter.  The category may be of treatment type, surgery, general resources, or others."
+    }),
+    StructField("med_service_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("LOC_NURSE_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "This field is the current patient location with a location type of nurse unit."
+    }),
+    StructField("nurse_unit_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("SPECIALTY_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "The specialty unit associated with the program service"
+    }),
+    StructField("specialty_unit_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("REG_PRSNL_ID", DoubleType(), True, metadata={
+        "comment": "The internal person ID of the personnel that performed the registration or admission.  If the reg_dt_tm is valued, then this field must be valued."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    })
+])
 
 # Helper function to get event time boundaries for encounters
 def get_event_times():
@@ -1309,9 +1635,132 @@ updates_df = create_encounter_mapping_incr()
     
  
 update_table(updates_df, "4_prod.bronze.map_encounter", "ENCNTR_ID")
-
+update_metadata("4_prod.bronze.map_encounter",schema_map_encounter,map_encounter_comment)
 
 # COMMAND ----------
+
+
+map_diagnosis_comment = "The table contains data related to medical diagnoses associated with individuals and their encounters. It includes information such as diagnosis dates, types, priorities, and classifications. This data can be used for analyzing diagnosis trends, understanding patient care patterns, and evaluating the effectiveness of clinical services."
+
+schema_map_diagnosis = StructType([
+    StructField("DIAGNOSIS_ID", DoubleType(), True, metadata={
+        "comment": "The primary key for the Diagnosis table."
+    }),
+    StructField("PERSON_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."
+    }),
+    StructField("ENCNTR_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table.  It is an internal system assigned number."
+    }),
+    StructField("DIAG_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time for which the Diagnosis was saved."
+    }),
+    StructField("earliest_diagnosis_date", TimestampType(), True, metadata={
+        "comment": "The earliest recorded date on which a diagnosis was made for the patient."
+    }),
+    StructField("DIAG_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "The type of diagnosis."
+    }),
+    StructField("diag_type_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("DIAG_PRIORITY", DoubleType(), True, metadata={
+        "comment": "Priority of diagnoses as determined by application."
+    }),
+    StructField("RANKING_CD", DoubleType(), True, metadata={
+        "comment": "Codified ranking description."
+    }),
+    StructField("DIAG_PRSNL_ID", DoubleType(), True, metadata={
+        "comment": "Prsnl_id of person that added the diagnosis."
+    }),
+    StructField("CLINICAL_SERVICE_CD", DoubleType(), True, metadata={
+        "comment": "Associates the clinical diagnosis to a particular setting of care within an encounter."
+    }),
+    StructField("clinical_service_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("CONFIRMATION_STATUS_CD", DoubleType(), True, metadata={
+        "comment": "Describes the definitiveness and clinical status of the diagnosis."
+    }),
+    StructField("confirmation_status_desc", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("CLASSIFICATION_CD", DoubleType(), True, metadata={
+        "comment": "Classification of the clinical diagnosis by the area of focus."
+    }),
+    StructField("classification_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("NOMENCLATURE_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the nomenclature table. It is an internal system assigned number."
+    }),
+    StructField("SOURCE_IDENTIFIER", StringType(), True, metadata={
+        "comment": "The code, or key, from the source vocabulary that contributed the string to the nomenclature."
+    }),
+    StructField("SOURCE_STRING", StringType(), True, metadata={
+        "comment": "Variable length string that may include alphanumeric characters and punctuation."
+    }),
+    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+        "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
+    }),
+    StructField("source_vocabulary_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+        "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
+    }),
+    StructField("vocab_axis_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CONCEPT_CKI", StringType(), True, metadata={
+        "comment": "Concept CKI is the functional Concept Identifier; it is the codified means within Millennium to identify key medical concepts to support information processing, clinical decision support, executable knowledge and knowledge presentation. Composed of a source and an identifier."
+    }),
+    StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
+        "comment": "A unique identifier for each Concept across all domains."
+    }),
+    StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+    }),
+    StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
+    }),
+    StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for each domain."
+    }),
+    StructField("SNOMED_CODE", LongType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("SNOMED_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+    }),
+    StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
+    }),
+    StructField("ICD10_CODE", StringType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("ICD10_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the ICD10 code mapping for each nomenclature entry."
+    }),
+    StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
+    }),
+    StructField("ICD10_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a ICD10 code that provides additional meaning and context to the code."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    })
+    
+])
+
+
 
 def create_diagnosis_mapping_incr():
     """
@@ -1488,9 +1937,146 @@ updates_df = create_diagnosis_mapping_incr()
 
 
 update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID")
+update_metadata("4_prod.bronze.map_diagnosis",schema_map_diagnosis,map_diagnosis_comment)
 
 
 # COMMAND ----------
+
+map_problem_comment = "The table contains information about various problems associated with individuals. It includes details such as the onset date and time of the problem, active status updates, and classification codes that categorize the problems. This data can be used to track problem occurrences, analyze trends over time, and manage problem resolution processes effectively."
+
+
+schema_map_problem = StructType([
+    StructField("PROBLEM_ID", LongType(), True, metadata={
+        "comment": "Uniquely defines a problem within the problem table.  The problem_id can be associated with multiple problem instances.  When a new problem is added to the problem table the problem_id is assigned to the problem_instance_id."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number."
+    }),
+    StructField("NOMENCLATURE_ID", LongType(), True, metadata={
+        "comment": "Unique identifier for nomenclature item."
+    }),
+    StructField("ONSET_DT_TM", TimestampType(), True, metadata={
+        "comment": "The date and time that the problem began."
+    }),
+    StructField("earliest_problem_date", TimestampType(), True, metadata={
+        "comment": "The earliest date and time when a problem was recorded for a given person and nomenclature"
+    }),
+    StructField("ACTIVE_STATUS_DT_TM", TimestampType(), True, metadata={
+        "comment": "The date and time that the active_status_cd was set."
+    }),
+    StructField("ACTIVE_STATUS_PRSNL_ID", LongType(), True, metadata={
+        "comment": "The person who caused the active_status_cd to be set or change."
+    }),
+    StructField("DATA_STATUS_DT_TM", TimestampType(), True, metadata={
+        "comment": "The date and time that the data_status_cd was set."
+    }),
+    StructField("DATA_STATUS_PRSNL_ID", DoubleType(), True, metadata={
+        "comment": "The person who caused the data_status_cd to be set or change."
+    }),
+    StructField("UPDATE_ENCNTR_ID", LongType(), True, metadata={
+        "comment": "The value of the unique primary identifierof the encounter table. Represents the last encounter id on which the problem was modified"
+    }),
+    StructField("ORIGINATING_ENCNTR_ID", LongType(), True, metadata={
+        "comment": "The value of the unique primary identifierof the encounter table. Represents the originating encounter id on which the problem was first documented"
+    }),
+    StructField("CONFIRMATION_STATUS_CD", DoubleType(), True, metadata={
+        "comment": "Indicates the verification status of the problem."
+    }),
+    StructField("confirmation_status_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CLASSIFICATION_CD", DoubleType(), True, metadata={
+        "comment": "Identifies the kind of problem.  Used to categorize the problem so that it may be managed and viewed independently within different applications."
+    }),
+    StructField("classification_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("RANKING_CD", DoubleType(), True, metadata={
+        "comment": "A user-defined prioritization of the problem."
+    }),
+    StructField("SOURCE_IDENTIFIER", StringType(), True, metadata={
+        "comment": "The code, or key, from the source vocabulary that contributed the string to the nomenclature."
+    }),
+    StructField("SOURCE_STRING", StringType(), True, metadata={
+        "comment": "Variable length string that may include alphanumeric characters and punctuation."
+    }),
+    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+        "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
+    }),
+    StructField("source_vocabulary_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+        "comment": "Vocabulary AXIS codes related to SNOMEDColumn"
+    }),
+    StructField("vocab_axis_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CONCEPT_CKI_PROCESSED", StringType(), True, metadata={
+        "comment": "The processed version of the CONCEPT_CKI field."
+    }),
+    StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
+        "comment": "A unique identifier for each Concept across all domains."
+    }),
+    StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+    }),
+    StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
+    }),
+    StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for each domain."
+    }),
+    StructField("SNOMED_CODE", LongType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("SNOMED_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+    }),
+    StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
+    }),
+    StructField("ICD10_CODE", StringType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("ICD10_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the ICD10 code mapping for each nomenclature entry."
+    }),
+    StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
+    }),
+    StructField("ICD10_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a ICD10 code that provides additional meaning and context to the code."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Last update timestamp."
+    }),
+    StructField("CALC_DT_TM", TimestampType(), True, metadata={
+        "comment": "The calculated date and time for the problem, representing the onset date and time."
+    }),
+    StructField("CALC_ENCNTR", LongType(), True, metadata={
+        "comment": "The calculated encounter ID associated with a specific problem entry."
+        }),
+    StructField("CALC_ENC_WITHIN", LongType(), True, metadata={
+        "comment": "The calculated encounter ID associated with a specific problem entry where the problem event occurred within the encounter time frame."
+        }),
+    StructField("CALC_ENC_BEFORE", LongType(), True, metadata={
+        "comment": "The calculated encounter ID associated with a specific problem entry where the problem event occurred before the encounter time frame."
+        }),
+    StructField("CALC_ENC_AFTER", LongType(), True, metadata={
+        "comment": "calculated encounter ID associated with a specific problem entry where the problem event occurred after the encounter time frame."
+        })
+
+ 
+])
+
+
 
 def create_problem_code_lookup(code_values, alias_name, desc_alias):
     """
@@ -1822,9 +2408,173 @@ updates_df = create_problem_mapping_incr().distinct()
 
 update_table(updates_df, "4_prod.bronze.map_problem", "PROBLEM_ID")
 
+update_metadata("4_prod.bronze.map_problem",schema_map_problem,map_problem_comment)
 
 
 # COMMAND ----------
+
+map_med_admin_comment = "The table contains data related to medical orders and events associated with patients. It includes information such as the person and encounter identifiers, event details, order specifics, and timestamps for administrative actions. This data can be used for tracking patient orders, analyzing treatment events, and understanding the outcomes of various medical interventions."
+
+schema_map_med_admin = StructType([
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the Event Table."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the Order Table."
+    }),
+    StructField("EVENT_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Identifies what type of event was audited. Values can be code_value for TASKPURGED, TASKCOMPLETE, NOTDONE, or NOTGIVEN from code_set 4000040."
+    }),
+    StructField("EVENT_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("RESULT_STATUS_CD", IntegerType(), True, metadata={
+        "comment": "Result status code. Valid values: authenticated, unauthenticated, unknown, cancelled, pending, in lab, active, modified, superseded, transcribed, not done."
+    }),
+    StructField("RESULT_STATUS_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("ADMIN_START_DT_TM", TimestampType(), True, metadata={
+        "comment": "The time at which this medication administration became active for continuous administrations. For intermittent, it is the time the administration happened."
+    }),
+    StructField("ADMIN_END_DT_TM", TimestampType(), True, metadata={
+        "comment": "For continuous administrations, this field is the end of the time period in which this administration was active. If the administration is currently active, this field will be NULL. For intermittent administrations, this field does not apply."
+    }),
+    StructField("ORDER_SYNONYM_ID", LongType(), True, metadata={
+        "comment": "Millenium identifier of the drug."
+    }),
+    StructField("ORDER_CKI", StringType(), True, metadata={
+        "comment": "The CKI tied to the medication order."
+    }),
+    StructField("MULTUM", StringType(), True, metadata={
+        "comment": "The Multum drug code associated with the medication order."
+    }),
+    StructField("RXNORM_CUI", StringType(), True, metadata={
+        "comment": "The RxNorm Concept Unique Identifier (CUI) associated with the medication order."
+    }),
+    StructField("RXNORM_STR", StringType(), True, metadata={
+        "comment": "Provides additional context by displaying the description or name of the medication corresponding to the RxNorm code."
+    }),
+    StructField("SNOMED_CODE", StringType(), True, metadata={"comment": ""}),
+    StructField("SNOMED_STR", StringType(), True, metadata={
+        "comment": "The description associated with the SNOMED code for the medication order."
+    }),
+    StructField("ORDER_MNEMONIC", StringType(), True, metadata={
+        "comment": "The mnemonic mostly used by department personnel, for example, Lab Technicians, Pharmacists. For Pharmacy orders, this field is not populated until product is assigned by Pharmacy Technician or Pharmacist.  The field is truncated and will contain a maximum of 99 characters.  Ellipses are not appended if the field is truncated."
+    }),
+    StructField("ORDER_DETAIL", StringType(), True, metadata={
+        "comment": "Free text information describing the order."
+    }),
+    StructField("ORDER_STRENGTH", FloatType(), True, metadata={
+        "comment": "Strength for the order ingredient."
+    }),
+    StructField("ORDER_STRENGTH_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "The unit of measure for the strength of the order ingredient."
+    }),
+    StructField("ORDER_STRENGTH_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("ORDER_VOLUME", FloatType(), True, metadata={
+        "comment": "Volume for the order ingredient."
+    }),
+    StructField("ORDER_VOLUME_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "The unit of measure for the volumn of the order ingredient."
+    }),
+    StructField("ORDER_VOLUME_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("ADMIN_ROUTE_CD", IntegerType(), True, metadata={
+        "comment": "Route of administration. i.e. PO, TOP, IM."
+    }),
+    StructField("ADMIN_ROUTE_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("INITIAL_DOSAGE", FloatType(), True, metadata={
+        "comment": "Initial volume or quantity of the administered dose."
+    }),
+    StructField("INITIAL_DOSAGE_UNIT_CD", IntegerType(), True, metadata={
+        "comment": "Unit of measurement for dosage. i.e. tablet, ml."
+    }),
+    StructField("INITIAL_DOSAGE_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("ADMIN_DOSAGE", FloatType(), True, metadata={
+        "comment": "Actual volume or quantity of administration."
+    }),
+    StructField("ADMIN_DOSAGE_UNIT_CD", IntegerType(), True, metadata={
+        "comment": "Unit of measurement for dosage. i.e. tablet, ml."
+    }),
+    StructField("ADMIN_DOSAGE_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("INITIAL_VOLUME", FloatType(), True, metadata={
+        "comment": "Total volume medication and diluent at the beginning of the administration."
+    }),
+    StructField("INFUSED_VOLUME", FloatType(), True, metadata={
+        "comment": "The volume at any one point in time that remains in the IV Bag."
+    }),
+    StructField("INFUSED_VOLUME_UNIT_CD", IntegerType(), True, metadata={
+        "comment": "Unit of measure for infused volume."
+    }),
+    StructField("INFUSED_VOLUME_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("INFUSION_RATE", FloatType(), True, metadata={
+        "comment": "For continuously administered medications, IV or IVP, the infusion rate and unit is used to capture the flow rate of the medication into the patient."
+    }),
+    StructField("INFUSION_UNIT_CD", IntegerType(), True, metadata={
+        "comment": "The unit of measure for volume or quantity of the medication. i.e. ml, drip, tablet."
+    }),
+    StructField("INFUSION_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("NURSE_UNIT_CD", IntegerType(), True, metadata={
+        "comment": "The nurse unit of the device the user is using to enter the medication admin event."
+    }),
+    StructField("NURSE_UNIT_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("POSITION_CD", IntegerType(), True, metadata={
+        "comment": "The position is used to determine the applications and tasks the personnel is authorized to use."
+    }),
+    StructField("POSITION_DISPLAY", StringType(), True, metadata={
+        "comment": "Display value for the code."
+    }),
+    StructField("PRSNL_ID", LongType(), True, metadata={
+        "comment": "The ID of the user documenting the medication admin event."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Last update timestamp"
+    }),
+    StructField("DOSE_IN_MG", DoubleType(), True, metadata={
+        "comment": "The standardized medication dose expressed in milligrams (mg)."
+    }),
+    StructField("DOSE_IN_ML", DoubleType(), True, metadata={
+        "comment": "The standardized medication dose expressed in milliliters (mL)."
+    }),
+    StructField("DOSE_UNIT_CATEGORY", StringType(), True, metadata={
+        "comment": "It classifies the medication dose unit as weight-based (mg), volume-based (mL), units, discrete forms (like tablet or puff), or other, based on the content of the ADMIN_DOSAGE_UNIT_DISPLAY column."
+    }),
+    StructField("SNOMED_SOURCE", StringType(), True, metadata={
+        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+    }),
+    StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
+        "comment": "A unique identifier for each Concept across all domains."
+    }),
+    StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+    }),
+    StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_TYPE", StringType(), True, metadata={"comment": "It indicates the source or method of the OMOP concept mapping for each record."})
+])
 
 def get_unit_conversion_maps_med_admin():
     """Returns dictionaries for unit conversions"""
@@ -3009,6 +3759,7 @@ def process_med_admin_incremental():
             
             print("Deduplication complete, updating table...")
             update_table(final_df.distinct(), "4_prod.bronze.map_med_admin", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_med_admin",schema_map_med_admin,map_med_admin_comment)
             print("Successfully updated medication administration mapping table")
         else:
             print("No new records to process")
@@ -3022,6 +3773,112 @@ def process_med_admin_incremental():
 process_med_admin_incremental()
 
 # COMMAND ----------
+
+map_procedure_comment = "The table contains data related to medical procedures performed during patient encounters. It includes information such as procedure IDs, timestamps, and associated clinical services. This data can be used for analyzing procedure trends, understanding resource utilization, and tracking patient care processes. Additionally, it captures details about the source of the data and provides descriptions for various codes, which can aid in data interpretation and reporting."
+
+schema_map_procedure = StructType([
+    StructField("PROCEDURE_ID", LongType(), True, metadata={
+        "comment": "Procedure id is the primary unique identification number of the procedure table.  It is an internal system assigned sequence number."
+    }),
+    StructField("ACTIVE_STATUS_PRSNL_ID", LongType(), True, metadata={
+        "comment": "The person who caused the active_status_cd to be set or change."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("NOMENCLATURE_ID", DoubleType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the nomenclature table. It is an internal system assigned number."
+    }),
+    StructField("ENCNTR_SLICE_ID", LongType(), True, metadata={
+        "comment": "Encounter slice identifier."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated. This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("contributor_system_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CLINICAL_SERVICE_CD", DoubleType(), True, metadata={
+        "comment": "The code associates a procedure to a clinical service."
+    }),
+    StructField("clinical_service_desc", StringType(), True, metadata={
+        "comment": "Description for the clinical service code."
+    }),
+    StructField("active_status_desc", StringType(), True, metadata={
+        "comment": "Description for the active status code."
+    }),
+    StructField("PROC_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date and time when the procedure was performed."
+    }),
+    StructField("PROC_MINUTES", DoubleType(), True, metadata={
+        "comment": "The amount of time in minutes the procedure took to complete."
+    }),
+    StructField("PROCEDURE_NOTE", StringType(), True, metadata={
+        "comment": "Free-text note for the procedure."
+    }),
+    StructField("SOURCE_IDENTIFIER", StringType(), True, metadata={
+        "comment": "The code, or key, from the source vocabulary that contributed the string to the nomenclature."
+    }),
+    StructField("SOURCE_STRING", StringType(), True, metadata={
+        "comment": "Variable length string that may include alphanumeric characters and punctuation."
+    }),
+    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+        "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
+    }),
+    StructField("source_vocabulary_desc", StringType(), True, metadata={
+        "comment": "Description for the source vocabulary code."
+    }),
+    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+        "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
+    }),
+    StructField("vocab_axis_desc", StringType(), True, metadata={
+        "comment": "Description for the vocabulary AXIS code."
+    }),
+    StructField("CONCEPT_CKI", StringType(), True, metadata={
+        "comment": "Concept CKI is the functional Concept Identifier; it is the codified means within Millennium to identify key medical concepts to support information processing, clinical decision support, executable knowledge and knowledge presentation. Composed of a source and an identifier."
+        }),
+    StructField("OMOP_CONCEPT_ID", LongType(), True, metadata={
+        "comment": "A unique identifier for each Concept across all domains."
+    }),
+    StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+    }),
+    StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
+         "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID." 
+    }),
+    StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
+         "comment": "A unique identifier for each domain."
+    }),
+    StructField("SNOMED_CODE", LongType(), True, metadata={"comment": ""}),
+    StructField("SNOMED_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+    }),
+    StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
+    }),
+    StructField("OPCS4_CODE", StringType(), True, metadata={"comment": ""}),
+    StructField("OPCS4_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the OPCS4 code mapping for each nomenclature entry." 
+    }),
+    StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
+         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
+    }),
+    StructField("OPCS4_TERM", StringType(), True, metadata={
+        "The term associated with the OPCS4 code that provides additional meaning and context to the code."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp for the last update."
+    })
+])
 
 def cast_procedure_ids_to_long(df):
     """
@@ -3200,6 +4057,7 @@ def process_procedure_incremental():
             
             # Update target table
             update_table(final_df, "4_prod.bronze.map_procedure", "PROCEDURE_ID")
+            update_metadata("8_dev.bronze.map_procedure",schema_map_procedure,map_procedure_comment)
             print("Successfully updated procedure mapping table")
             
         else:
@@ -3213,6 +4071,41 @@ def process_procedure_incremental():
 process_procedure_incremental()
 
 # COMMAND ----------
+
+map_death_comment = "The table contains data related to deceased individuals, including timestamps for various events such as the last encounter and the date of death. It also includes information on the source and method of death identification. This data can be used for analyzing mortality trends, understanding patient histories, and improving record-keeping processes."
+
+schema_map_death = StructType([
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("DECEASED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date and time of death."
+    }),
+    StructField("LAST_ENCNTR_DT_TM", TimestampType(), True, metadata={
+        "comment": "It represents the timestamp of the last encounter associated with a deceased individual."
+    }),
+    StructField("LAST_CE_DT_TM", TimestampType(), True, metadata={
+        "comment": "It represents the most recent update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates."
+    }),
+    StructField("CALC_DEATH_DATE", TimestampType(), True, metadata={
+        "comment": "Calculated death date."
+    }),
+    StructField("DECEASED_SOURCE_CD", IntegerType(), True, metadata={
+        "comment": "It defines the particular source that gave deceased information concerning a person. For example, from a Formal (Death Certificate) or Informal (no Death Certificate) source."
+    }),
+    StructField("DECEASED_SOURCE_DESC", StringType(), True, metadata={
+        "comment": "Description of the code."
+    }),
+    StructField("DECEASED_ID_METHOD_CD", IntegerType(), True, metadata={
+        "comment": "It stores code values defining the specific way a patient was confirmed as being deceased. Possible values  include Death Certificate, Physician Reported, etc. The code values are closely tied, workflow-wise, to the Deceased_Source_Cd which records if a patient was identified as being deceased from a Formal (Death Certificate) or Informal (no Death Certificate) source and the Deceased_Notify_Source_Cd which records who or what provided the information regarding the patient's deceased status."
+    }),
+    StructField("DECEASED_METHOD_DESC", StringType(), True, metadata={
+        "comment": "Description of the code."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    })
+])
 
 def get_last_clinical_events_for_death():
     """
@@ -3334,6 +4227,7 @@ def process_death_incremental():
             
             # Update target table
             update_table(processed_deaths, "4_prod.bronze.map_death", "PERSON_ID")
+            update_metadata("4_prod.bronze.map_death",schema_map_death,map_death_comment)
             print("Successfully updated death mapping table")
             
         else:
@@ -3347,6 +4241,148 @@ def process_death_incremental():
 process_death_incremental()
 
 # COMMAND ----------
+
+map_numeric_events_comment = "The table contains data related to various events associated with encounters and orders. It includes identifiers for events, encounters, and persons, as well as details about the event type, results, and contributing systems. This data can be used for tracking event occurrences, analyzing performance metrics, and understanding the relationships between different entities in the system."
+
+
+schema_map_numeric_events = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of the Event Table."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of Order Table."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel id of provider who performed this result."
+    }),
+    StructField("NUMERIC_RESULT", FloatType(), True, metadata={
+        "comment": "The numerical value of the event result."
+    }),
+    StructField("UNIT_OF_MEASURE_CD", IntegerType(), True, metadata={
+        "comment": "Unit of measurement for result."
+    }),
+    StructField("UNIT_OF_MEASURE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("EVENT_CD", IntegerType(), True, metadata={
+        "comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."
+    }),
+    StructField("EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "Foreign key to the order_catalog table. Catalog_cd does not exist in the code_value table and does not have a code set."
+    }),
+    StructField("CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Used to store the internal code for the catalog type. Used as a filtering mechanism for rows on theorder catalog table."
+    }),
+    StructField("CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated.  This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("PARENT_EVENT_ID", LongType(), True, metadata={
+        "comment": "Provides a mechanism for logical grouping of events.  i.e. supergroup and group tests.  Same as event_id if current row is the highest level parent."
+    }),
+    StructField("NORMALCY_CD", IntegerType(), True, metadata={
+        "comment": "States whether the result is normal.  This can be used to determine whether to display the event tag in different color on the flowsheet. For group results, this represents an ""overall"" normalcy. i.e. Is any result in the group abnormal?  Also allows different purge criteria to be applied based on result."
+    }),
+    StructField("NORMALCY_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("ENTRY_MODE_CD", IntegerType(), True, metadata={
+        "comment": "Used to identify the method in which a result was entered."
+    }),
+    StructField("ENTRY_MODE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("NORMAL_LOW", FloatType(), True, metadata={
+        "comment": "Normal low value"
+    }),
+    StructField("NORMAL_HIGH", FloatType(), True, metadata={
+        "comment": "Normal high value"
+    }),
+    StructField("PERFORMED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date this result was performed (or authored)."
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
+    }),
+    StructField("PARENT_EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title associated with the parent event."
+    }),
+    StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
+        "comment": "The code value of the parent event."
+    }),
+    StructField("PARENT_EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the order catalog item of the parent event."
+    }),
+    StructField("PARENT_CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("PARENT_CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the catalog type of the parent event."
+    }),
+    StructField("PARENT_CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+    StructField("OMOP_MANUAL_TABLE", StringType(), True, metadata={
+        "comment": "The name of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_COLUMN", StringType(), True, metadata={
+        "comment": "The field of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT", StringType(), True, metadata={
+        "comment": "The concept_id of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_UNITS", StringType(), True, metadata={
+        "comment": "The OMOP concept ID for the unit of measurement."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "The name or description of the OMOP concept id."
+    }),
+    StructField("OMOP_MANUAL_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for the domain."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_CLASS", StringType(), True, metadata={
+        "comment": "The identifier for the class or category of the OMOP concept."
+    })
+])
+
 
 def add_manual_omop_mappings_numeric(df, barts_mapfile, concepts):
     """
@@ -3675,6 +4711,7 @@ def process_numeric_events_incremental():
             
 
             update_table(final_df, "4_prod.bronze.map_numeric_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_numeric_events", schema_map_numeric_events,map_numeric_events_comment)
             print("Successfully updated numeric events mapping table")
             
         else:
@@ -3688,6 +4725,114 @@ def process_numeric_events_incremental():
 process_numeric_events_incremental()
 
 # COMMAND ----------
+
+
+map_date_events_comment = "The table contains data related to various events associated with individuals and orders. It includes details such as event identifiers, timestamps, and descriptions of the events and their classifications. This data can be used for tracking event occurrences, analyzing interactions between individuals and orders, and understanding the context of these events through their classifications and descriptions."
+
+schema_map_date_events = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of the Event Table."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of Order Table."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel id of provider who performed this result."
+    }),
+
+    StructField("RESULT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Timestamp that records the date and time for the clinical result."
+    }),
+    StructField("EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("EVENT_CD", IntegerType(), True, metadata={
+        "comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."
+    }),
+    StructField("EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "Foreign key to the order_catalog table. Catalog_cd does not exist in the code_value table and does not have a code set."
+    }),
+    StructField("CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Used to store the internal code for the catalog type. Used as a filtering mechanism for rows on theorder catalog table."
+    }),
+    StructField("CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated.  This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("PARENT_EVENT_ID", LongType(), True, metadata={
+        "comment": "Provides a mechanism for logical grouping of events. i.e. supergroup and group tests. Same as event_id if current row is the highest level parent."
+    }),
+    StructField("NORMALCY_CD", IntegerType(), True, metadata={
+        "comment": "States whether the result is normal.  This can be used to determine whether to display the event tag in different color on the flowsheet. For group results, this represents an ""overall"" normalcy. i.e. Is any result in the group abnormal?  Also allows different purge criteria to be applied based on result."
+    }),
+    StructField("NORMALCY_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("ENTRY_MODE_CD", IntegerType(), True, metadata={
+        "comment": "Used to identify the method in which a result was entered."
+    }),
+    StructField("ENTRY_MODE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PERFORMED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date this result was performed (or authored)."
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
+    }),
+    StructField("PARENT_EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title associated with the parent event."
+    }),
+    StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
+        "comment": "The code value of the parent event."
+    }),
+    StructField("PARENT_EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "The catalog code of the parent event."
+    }),
+    StructField("PARENT_CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("PARENT_CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the catalog type of the parent event."
+    }),
+    StructField("PARENT_CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+])
+
+
 
 def create_date_event_code_lookup(code_values, alias_suffix):
     """
@@ -3900,6 +5045,7 @@ def process_date_events_incremental():
             
 
             update_table(result_df, "4_prod.bronze.map_date_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_date_events",schema_map_date_events,map_date_events_comment)
             print("Successfully updated date events mapping table")
             
         else:
@@ -3913,6 +5059,141 @@ def process_date_events_incremental():
 process_date_events_incremental()
 
 # COMMAND ----------
+
+map_text_events_comment = "The table contains data related to various events associated with encounters and orders. It includes identifiers for events, encounters, and persons, as well as details about the event type and its contributors. This data can be used for tracking event occurrences, analyzing interactions within the system, and understanding the relationships between different entities involved in the events."
+
+schema_map_text_events = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of the Event Table."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of Order Table."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel id of provider who performed this result."
+    }),
+    StructField("TEXT_RESULT", StringType(), True, metadata={
+        "comment": "The textual result value for the clinical event."
+    }),
+    StructField("UNIT_OF_MEASURE_CD", IntegerType(), True, metadata={
+        "comment": "The code value for the unit of measurement."
+    }),
+    StructField("UNIT_OF_MEASURE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("EVENT_CD", IntegerType(), True, metadata={
+        "comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."
+    }),
+    StructField("EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "Foreign key to the order_catalog table. Catalog_cd does not exist in the code_value table and does not have a code set."
+    }),
+    StructField("CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable"
+    }),
+    StructField("CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Used to store the internal code for the catalog type. Used as a filtering mechanism for rows on theorder catalog table."
+    }),
+    StructField("CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated.  This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("PARENT_EVENT_ID", LongType(), True, metadata={
+        "comment": "Provides a mechanism for logical grouping of events.  i.e. supergroup and group tests.  Same as event_id if current row is the highest level parent."
+    }),
+    StructField("NORMALCY_CD", IntegerType(), True, metadata={
+        "comment": "States whether the result is normal.  This can be used to determine whether to display the event tag in different color on the flowsheet. For group results, this represents an ""overall"" normalcy. i.e. Is any result in the group abnormal?  Also allows different purge criteria to be applied based on result."
+    }),
+    StructField("NORMALCY_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("ENTRY_MODE_CD", IntegerType(), True, metadata={
+        "comment": "Used to identify the method in which a result was entered."
+    }),
+    StructField("ENTRY_MODE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PERFORMED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date this result was performed (or authored)."
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
+    }),
+    StructField("PARENT_EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for the parent event."
+    }),
+    StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
+        "comment": "The code value of the parent event."
+    }),
+    StructField("PARENT_EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "The catalog code of the parent event."
+    }),
+    StructField("PARENT_CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("PARENT_CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the catalog type of the parent event."
+    }),
+    StructField("PARENT_CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+    StructField("OMOP_MANUAL_TABLE", StringType(), True, metadata={
+        "comment": "The name of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_COLUMN", StringType(), True, metadata={
+        "comment": "The field of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT", StringType(), True, metadata={
+        "comment": "The concept_id of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_VALUE_CONCEPT", StringType(), True, metadata={
+        "comment": "The manually mapped OMOP concept ID representing the value of a text for standardized use in the OMOP CDM."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "The name or description of the OMOP concept id."
+    }),
+    StructField("OMOP_MANUAL_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for the domain."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_CLASS", StringType(), True, metadata={
+        "comment": "The identifier for the class or category of the OMOP concept."
+    })
+])
+
 
 def create_text_event_code_lookup(code_values, alias_suffix):
     """
@@ -4264,6 +5545,7 @@ def process_text_events_incremental():
             
 
             update_table(final_df, "4_prod.bronze.map_text_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_text_events",schema_map_text_events,map_text_events_comment)
             print("Successfully updated text events mapping table")
             
         else:
@@ -4277,6 +5559,184 @@ def process_text_events_incremental():
 process_text_events_incremental()
 
 # COMMAND ----------
+
+map_nomen_events_comment = "The table contains data related to various events associated with encounters and orders. It includes identifiers for events, encounters, and persons, as well as details about the event type and its classification. This data can be used for tracking event occurrences, analyzing interactions within the system, and understanding the relationships between different entities involved in the events."
+
+schema_map_nomen_events = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of the Event Table."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of Order Table."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel id of provider who performed this result."
+    }),
+    StructField("EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("EVENT_CD", IntegerType(), True, metadata={
+        "comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."
+    }),
+    StructField("EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "Foreign key to the order_catalog table. Catalog_cd does not exist in the code_value table and does not have a code set."
+    }),
+    StructField("CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable"
+    }),
+    StructField("CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Used to store the internal code for the catalog type. Used as a filtering mechanism for rows on theorder catalog table."
+    }),
+
+    StructField("CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated.  This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("PARENT_EVENT_ID", LongType(), True, metadata={
+        "comment": "Provides a mechanism for logical grouping of events.  i.e. supergroup and group tests.  Same as event_id if current row is the highest level parent."
+    }),
+    StructField("NORMALCY_CD", IntegerType(), True, metadata={
+        "comment": "States whether the result is normal.  This can be used to determine whether to display the event tag in different color on the flowsheet. For group results, this represents an ""overall"" normalcy. i.e. Is any result in the group abnormal?  Also allows different purge criteria to be applied based on result."
+    }),
+    StructField("NORMALCY_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("ENTRY_MODE_CD", IntegerType(), True, metadata={
+        "comment": "Used to identify the method in which a result was entered."
+    }),
+    StructField("ENTRY_MODE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value"
+    }),
+    StructField("PERFORMED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date this result was performed (or authored)."
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
+    }),
+    StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
+        "comment": "The code value of the parent event."
+    }),
+    StructField("PARENT_EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the order catalog item of the parent event."
+    }),
+    StructField("PARENT_CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("PARENT_CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the catalog type of the parent event."
+    }),
+    StructField("PARENT_CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("SOURCE_IDENTIFIER", StringType(), True, metadata={
+        "comment": "The code, or key, from the source vocabulary that contributed the string to the nomenclature."
+    }),
+    StructField("SOURCE_STRING", StringType(), True, metadata={
+        "comment": "Variable length string that may include alphanumeric characters and punctuation."
+        }),
+    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+        "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
+    }),
+    StructField("SOURCE_VOCABULARY_DESC", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+        "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
+    }),
+    StructField("vocab_axis_desc", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CONCEPT_CKI", StringType(), True, metadata={
+        "comment": "Concept CKI is the functional Concept Identifier; it is the codified means within Millennium to identify key medical concepts to support information processing, clinical decision support, executable knowledge and knowledge presentation. Composed of a source and an identifier.  For example, if the concept source is ""SNOMED"" and the concept identifier is ""123""."
+    }),
+    StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
+        "comment": "A unique identifier for each Concept across all domains."
+    }),
+    StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+    }),
+    StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
+    }),
+    StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for each domain."
+    }),
+    StructField("OMOP_CONCEPT_CLASS", StringType(), True, metadata={
+        "comment": "The attribute or concept class of the Concept."
+    }),
+    StructField("SNOMED_CODE", LongType(), True, metadata={
+        "comment": ""
+    }),
+    StructField("SNOMED_TYPE", StringType(), True, metadata={
+        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+    }),
+    StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_TERM", StringType(), True, metadata={
+        "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+    StructField("OMOP_MANUAL_TABLE", StringType(), True, metadata={
+        "comment": "The name of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_COLUMN", StringType(), True, metadata={
+        "comment": "The field of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT", StringType(), True, metadata={
+        "comment": "The concept_id of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_VALUE_CONCEPT", StringType(), True, metadata={
+        "comment": "The manually mapped OMOP concept ID representing the value of a text for standardized use in the OMOP CDM."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "The name or description of the OMOP concept id."
+    }),
+    StructField("OMOP_MANUAL_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for the domain."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_CLASS", StringType(), True, metadata={
+        "comment": "The identifier for the class or category of the OMOP concept."
+    })
+])
+
 
 def create_nomen_code_lookup(code_values, alias_suffix):
     """
@@ -4690,6 +6150,8 @@ def process_nomen_events_incremental():
             
 
             update_table(final_df, "4_prod.bronze.map_nomen_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_nomen_events",schema_map_nomen_events,map_nomen_events_comment)
+
             print("Successfully updated nomenclature events mapping table")
             
         else:
@@ -4703,6 +6165,145 @@ def process_nomen_events_incremental():
 process_nomen_events_incremental()
 
 # COMMAND ----------
+
+map_coded_events_comment = "The table contains data related to various events and their outcomes within a system. It includes identifiers for events, encounters, and persons, as well as details about the results of these events. This data can be used for tracking event performance, analyzing outcomes, and understanding the context of different events. Use cases include reporting on event success rates, identifying trends in event types, and evaluating the contributions of different systems."
+
+schema_map_coded_events = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of the Event Table."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the encounter table. It is an internal system assigned number."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
+    }),
+    StructField("ORDER_ID", LongType(), True, metadata={
+        "comment": "The unique primary identifier of Order Table."
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel id of provider who performed this result."
+    }),
+    StructField("RESULT_CD", IntegerType(), True, metadata={
+        "comment": "Allows the use of a code value instead of a nomenclature id. The code set of the code_value is user defined."
+    }),
+    StructField("RESULT_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("RESULT_MEANING", StringType(), True, metadata={
+        "comment": "The actual string value for the cdf meaning."
+    }),
+    StructField("RESULT_SET", DoubleType(), True, metadata={
+        "comment": "A non-nomenclature option. Code set of result_cd if it is not null."
+    }),
+    StructField("EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("EVENT_CD", IntegerType(), True, metadata={
+        "comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."
+    }),
+    StructField("EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "Foreign key to the order_catalog table. Catalog_cd does not exist in the code_value table and does not have a code set."
+    }),
+    StructField("CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "Used to store the internal code for the catalog type. Used as a filtering mechanism for rows on theorder catalog table."
+    }),
+    StructField("CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
+        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+        "comment": "Contributor system identifies the source feed of data from which a row was populated.  This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
+    }),
+    StructField("CONTRIBUTOR_SYSTEM_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("PARENT_EVENT_ID", LongType(), True, metadata={
+        "comment": "Provides a mechanism for logical grouping of events.  i.e. supergroup and group tests.  Same as event_id if current row is the highest level parent."
+    }),
+    StructField("NORMALCY_CD", IntegerType(), True, metadata={
+        "comment": "States whether the result is normal.  This can be used to determine whether to display the event tag in different color on the flowsheet. For group results, this represents an ""overall"" normalcy. i.e. Is any result in the group abnormal?  Also allows different purge criteria to be applied based on result."
+    }),
+    StructField("NORMALCY_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("ENTRY_MODE_CD", IntegerType(), True, metadata={
+        "comment": "Used to identify the method in which a result was entered."
+    }),
+    StructField("ENTRY_MODE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PERFORMED_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date this result was performed (or authored)."
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
+    }),
+    StructField("PARENT_EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),
+    StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
+        "comment": "The code value of the parent event."
+    }),
+    StructField("PARENT_EVENT_CD_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_CATALOG_CD", IntegerType(), True, metadata={
+        "comment": "The catalog code of the parent event."
+    }),
+    StructField("PARENT_CATALOG_DISPLAY", StringType(), True, metadata={
+        "comment": "The description of the Orderable."
+    }),
+    StructField("PARENT_CATALOG_TYPE_CD", IntegerType(), True, metadata={
+        "comment": "The internal code for the catalog type of the parent event."
+    }),
+    StructField("PARENT_CATALOG_TYPE_DISPLAY", StringType(), True, metadata={
+        "comment": "The description for the code value."
+    }),
+    StructField("PARENT_REFERENCE_NBR", StringType(), True, metadata={
+        "comment": "The combination of the reference nbr and the contributor system code provides a unique identifier to the origin of the data."
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+    StructField("OMOP_MANUAL_TABLE", StringType(), True, metadata={
+        "comment": "The name of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_COLUMN", StringType(), True, metadata={
+        "comment": "The field of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT", StringType(), True, metadata={
+        "comment": "The concept_id of the OMOP Common Data Model table."
+    }),
+    StructField("OMOP_MANUAL_VALUE_CONCEPT", StringType(), True, metadata={
+        "comment": "The manually mapped OMOP concept ID representing the value of a text for standardized use in the OMOP CDM."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_NAME", StringType(), True, metadata={
+        "comment": "The name or description of the OMOP concept id."
+    }),
+    StructField("OMOP_MANUAL_STANDARD_CONCEPT", StringType(), True, metadata={
+        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_DOMAIN", StringType(), True, metadata={
+        "comment": "A unique identifier for the domain."
+    }),
+    StructField("OMOP_MANUAL_CONCEPT_CLASS", StringType(), True, metadata={
+        "comment": "The identifier for the class or category of the OMOP concept."
+    })
+
+])
+
 
 def create_coded_event_code_lookup(code_values, alias_suffix):
     """
@@ -5082,6 +6683,7 @@ def process_coded_events_incremental():
             
 
             update_table(final_df, "4_prod.bronze.map_coded_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_coded_events",schema_map_coded_events,map_coded_events_comment)
             print("Successfully updated coded events mapping table")
             
         else:

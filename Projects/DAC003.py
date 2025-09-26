@@ -274,11 +274,13 @@
 
 project_identifier = 'dac003'
 
-rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology']
+rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_blobdataset', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology']
+
+map_tables = ['map_address']
 
 max_ig_risk = 3
 max_ig_severity = 2
-columns_to_exclude = ['ADC_UPDT']
+columns_to_exclude = ['ADC_UPDT', 'full_street_address', 'UPRN', 'LATITUDE', 'LONGITUDE', 'match_algorithm', 'match_confidence', 'match_quality']
 
 cohort_sql = f"""
 CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac003 AS
@@ -329,12 +331,16 @@ if existing_views_df.count() > 0:
         spark.sql(f"DROP VIEW IF EXISTS {project_identifier}.{view_name}")
         print(f"Dropped view: {project_identifier}.{view_name}")
 
-def get_columns_with_high_tags(table_name):
+
+def get_columns_with_high_tags(schema_name, table_name):
+    """
+    Get columns with high ig_risk or ig_severity tags for any schema/table.
+    """
     # Get columns with high ig_risk
     high_risk_columns = spark.sql(f"""
         SELECT column_name
         FROM 4_prod.information_schema.column_tags
-        WHERE schema_name = 'rde'
+        WHERE schema_name = '{schema_name}'
         AND table_name = '{table_name}'
         AND tag_name = 'ig_risk'
         AND tag_value > {max_ig_risk}
@@ -344,81 +350,141 @@ def get_columns_with_high_tags(table_name):
     high_severity_columns = spark.sql(f"""
         SELECT column_name
         FROM 4_prod.information_schema.column_tags
-        WHERE schema_name = 'rde'
+        WHERE schema_name = '{schema_name}'
         AND table_name = '{table_name}'
         AND tag_name = 'ig_severity'
         AND tag_value > {max_ig_severity}
     """).toPandas()['column_name'].tolist()
 
-    # Convert the combined list to a set before returning
     return high_risk_columns + high_severity_columns
 
-# Function to get column names excluding specified columns and columns with high tags
-def get_columns_except_excluded(table_name):
+
+
+def get_columns_except_excluded(catalog, schema, table_name, use_alias=None):
+    """
+    Get column names excluding specified columns and columns with high tags.
+    If use_alias is provided, prepend it to column names (e.g., 'm.column_name').
+    """
     # Get all columns from the table
-    all_columns = spark.table(f"4_prod.rde.{table_name}").columns
+    full_table_path = f"{catalog}.{schema}.{table_name}"
+    all_columns = spark.table(full_table_path).columns
     
     # Get columns with high risk or severity tags
-    high_tag_columns = get_columns_with_high_tags(table_name)
-
-    all_exluded_columns = high_tag_columns + columns_to_exclude
+    high_tag_columns = get_columns_with_high_tags(schema, table_name)
+    
+    all_excluded_columns = high_tag_columns + columns_to_exclude
     
     # Filter out excluded columns using set difference
-    filtered_columns = list(set(all_columns) - set(all_exluded_columns))
+    filtered_columns = list(set(all_columns) - set(all_excluded_columns))
     
-    # Convert back to sorted list and join
-    return ", ".join(sorted(filtered_columns))
-
-# Function to determine the person ID column name
-def get_person_id_column(table_name):
-    columns = spark.table(f"4_prod.rde.{table_name}").columns
-    if 'PERSON_ID' in columns:
-        return 'PERSON_ID'
-    elif 'PERSONID' in columns:
-        return 'PERSONID'
-    elif 'Person_ID' in columns:
-        return 'Person_ID'
+    # Sort and format columns
+    sorted_columns = sorted(filtered_columns)
+    
+    if use_alias:
+        return ", ".join([f"{use_alias}.{col}" for col in sorted_columns])
     else:
-        return None
+        return ", ".join(sorted_columns)
+
+
+
+
+def find_person_id_column(full_table_path):
+    """
+    Finds the person ID column in a table given its full path.
+    Searches for common variations of the person identifier column name.
+    """
+    columns = spark.table(full_table_path).columns
+    # Comprehensive list of potential person ID column names
+    potential_columns = [
+        'PERSON_ID', 'person_id', 'Person_ID', 'personid', 
+        'PERSONID', 'PersonID', 'participant_id', 'PARENT_ENTITY_ID'
+    ]
+    
+    for col in potential_columns:
+        if col in columns:
+            return col
+            
+    # Fallback: fuzzy match for any column containing 'person' and 'id'
+    for col in columns:
+        col_lower = col.lower()
+        if 'person' in col_lower and 'id' in col_lower:
+            return col
+            
+    return None
+
+
+#----------- RDE Table Processing -----------
 
 for table in rde_tables:
-    # Get columns string
-    columns = get_columns_except_excluded(table)
+    person_id_col = find_person_id_column(f"4_prod.rde.{table}")
     
-    # Get the appropriate person ID column name
-    person_id_col = get_person_id_column(table)
+    # Get filtered columns (excluding high IG tags and specified columns)
+    columns = get_columns_except_excluded('4_prod', 'rde', table, use_alias='s')
     
     if person_id_col:
-        # Create view SQL with cohort filtering
-        view_sql = f"""
-        CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
-        AS
-        WITH source_data AS (
-            SELECT {columns}
-            FROM 4_prod.rde.{table}
-        )
-        SELECT s.*
-        FROM source_data s
-        INNER JOIN 6_mgmt.cohorts.{project_identifier} c
-        ON s.{person_id_col} = c.PERSON_ID
-        """
-    else:
-        # If no person ID column exists, create view without filtering
         view_sql = f"""
         CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
         AS
         SELECT {columns}
-        FROM 4_prod.rde.{table}
+        FROM 4_prod.rde.{table} s
+        INNER JOIN 6_mgmt.cohorts.{project_identifier} c
+        ON s.{person_id_col} = c.PERSON_ID
         """
-        print(f"Warning: No person ID column found in {table}. Creating view without cohort filtering.")
+    else:
+        view_sql = f"""
+        CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
+        AS
+        SELECT {columns}
+        FROM 4_prod.rde.{table} s
+        """
+        print(f"Warning: No person ID column found in rde.{table}. Creating view without cohort filtering.")
     
-    # Execute the SQL
     spark.sql(view_sql)
-    
     print(f"Created view: 5_projects.{project_identifier}.{table}")
 
+#----------- Generic Table Processing Function for bronze, raw, omop, etc. -----------
+def process_and_create_views(tables, source_catalog, source_schema, project_identifier):
+    """
+    Generic function to create cohort-filtered views for a list of tables
+    from a specific source location with column exclusion and IG tag filtering.
+    """
+    for table in tables:
+        full_table_path = f"{source_catalog}.{source_schema}.{table}"
+        person_id_col = find_person_id_column(full_table_path)
+        
+        # Get filtered columns (excluding high IG tags and specified columns)
+        columns = get_columns_except_excluded(source_catalog, source_schema, table, use_alias='m')
+        
+        if person_id_col:
+            view_sql = f"""
+            CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
+            AS
+            SELECT {columns}
+            FROM {full_table_path} m
+            INNER JOIN 6_mgmt.cohorts.{project_identifier} c
+            ON m.{person_id_col} = c.PERSON_ID
+            """
+            spark.sql(view_sql)
+            print(f"Created view: 5_projects.{project_identifier}.{table}")
+        else:
+            # Still create view but without cohort filtering if no person ID column
+            view_sql = f"""
+            CREATE OR REPLACE VIEW 5_projects.{project_identifier}.{table}
+            AS
+            SELECT {columns}
+            FROM {full_table_path} m
+            """
+            spark.sql(view_sql)
+            print(f"Warning: No person ID column found in {full_table_path}. Creating view without cohort filtering.")
 
-# Create schema view
+#----------- Process map, mill, and omop Tables using the Generic Function -----------
+
+process_and_create_views(map_tables, '4_prod', 'bronze', project_identifier)
+
+
+
+#----------- Create Final Schema View -----------
+
 schema_sql = f"""
 CREATE OR REPLACE VIEW 5_projects.{project_identifier}.schema AS
 SELECT 
