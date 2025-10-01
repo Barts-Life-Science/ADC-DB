@@ -1494,8 +1494,8 @@ def create_diagnosis_mapping_incr():
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
         col("SNOMED_TERM"),
         col("ICD10_CODE"),
-        col("ICD10_TYPE"),
-        col("ICD10_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
+        col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
         col("ICD10_TERM"),
         # Use greatest ADC_UPDT between diagnosis and nomenclature
         greatest(
@@ -1829,8 +1829,8 @@ def create_problem_mapping_incr():
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
         "SNOMED_TERM",
         "ICD10_CODE",
-        "ICD10_TYPE",
-        col("ICD10_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
+        col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
         "ICD10_TERM",
         "prob.ADC_UPDT",
         "CALC_DT_TM",
@@ -3216,8 +3216,8 @@ def process_procedure_incremental():
                 col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
                 "SNOMED_TERM",
                 "OPCS4_CODE",
-                "OPCS4_TYPE",
-                col("OPCS4_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+                col("OPCS4_CODE_TYPE").alias("OPCS4_TYPE"),
+                col("OPCS4_CODE_MATCH_COUNT").alias("OPCS4_MATCH_NUMBER"),
                 "OPCS4_TERM",
                 col("proc.ADC_UPDT").alias("ADC_UPDT")
             )
