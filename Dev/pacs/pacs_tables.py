@@ -1265,8 +1265,8 @@ schema = StructType([
         {'comment': "Anatomical region or body part examined during the imaging procedure, aiding in clinical context and reporting."}
     ),
     StructField(
-        "PacsReportCount", IntegerType(), True,
-        {'comment': "Number of PACS reports or imaging documents associated with the accession number, indicating reporting completeness."}
+        "Laterality", StringType(), True,
+        {'comment': "Laterality of examined body part."}
     )
 
 ])
@@ -1345,7 +1345,8 @@ def mill_pacs_data_expanded():
             exa.ExaminationStudyUid,
             exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
-            exa.ExaminationBodyPart
+            exa.ExaminationBodyPart,
+            REPLACE(dc.laterality, ' (qualifier value)', '') AS laterality
         FROM ce
         LEFT JOIN req
         ON
@@ -1357,6 +1358,8 @@ def mill_pacs_data_expanded():
             exa.ExaminationRequestId = req.RequestId
             AND exa.ExaminationCode = ce.ExamCode
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
+        LEFT JOIN LIVE.pacs_examcode_dict AS dc
+        ON ce.ExamCode = dc.short_code
     """)
 
     return df
