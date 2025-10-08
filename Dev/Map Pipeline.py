@@ -8,6 +8,7 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
+from pyspark.sql.types import StructType, StructField
 
 # COMMAND ----------
 
@@ -28,7 +29,7 @@ def get_max_timestamp(table_name: str,
         # use the DataFrame API – no need to build a SQL string
         max_row = (
             spark.table(table_name)
-                 .select(F.max(ts_column).alias("max_ts"))
+                 .select(F.max(ts_column).alias("max_ts"))    
                  .first()
         )
 
@@ -46,6 +47,81 @@ def table_exists(table_name: str) -> bool:
     """
     # Spark 3.4+ – Databricks – works with Unity Catalog
     return spark.catalog.tableExists(table_name)
+
+# COMMAND ----------
+
+
+def update_table(source_df, target_table, index_column):
+    """
+    Up-sert `source_df` into `target_table` on `index_column`.
+    Works in Shared / UC clusters (no RDD use).
+    """
+
+    if source_df.isEmpty():          
+        return
+    if(source_df.count() == 0):
+        return
+
+    if table_exists(target_table):
+        tgt = DeltaTable.forName(spark, target_table)
+        (tgt.alias("t")
+            .merge(source_df.alias("s"),
+                   f"t.{index_column} = s.{index_column}")
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute())
+    else:
+        (source_df.write
+                  .format("delta")
+                  .option("delta.enableChangeDataFeed", "true")
+                  .option("delta.enableRowTracking", "true")
+                  .option("delta.autoOptimize.optimizeWrite", "true")
+                  .option("delta.autoOptimize.autoCompact", "true")
+                  .mode("overwrite")
+                  .saveAsTable(target_table))
+        
+def escape_comment(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\\", "\\\\").replace("'", "''")
+
+def update_metadata(target_table: str, target_schema: StructType, table_comment: str = None):
+    """
+    Update metadata of an existing table:
+    - Updates column names, data types, and comments.
+    - Updates table comment.
+    Raises an error if the table does not exist.
+    """
+    if not table_exists(target_table):
+        raise ValueError(f"Target table `{target_table}` does not exist. Cannot update metadata.")
+
+    # Update columns (name, type, comment)
+    for f in target_schema.fields:
+        col_name = f.name
+        col_type = f.dataType.simpleString()
+        col_comment = f.metadata.get("comment", None)
+
+
+        safe_comment = escape_comment(col_comment)
+        spark.sql(
+            f"""
+            ALTER TABLE {target_table}
+            CHANGE COLUMN `{col_name}` `{col_name}` {col_type} COMMENT "{safe_comment}"
+            """
+        )
+        
+    print(f"[INFO] Updated column names, types, and comments for {target_table}.")
+
+    # Update table comment
+    if table_comment and isinstance(table_comment, str):
+        safe_comment = escape_comment(table_comment)
+        spark.sql(
+            f"""
+            ALTER TABLE {target_table}
+            SET TBLPROPERTIES ('comment' = '{safe_comment}')
+            """
+        )
+        print(f"[INFO] Updated table comment for {target_table}.")
 
 # COMMAND ----------
 
@@ -116,11 +192,7 @@ def detect_schema_changes(target_table: str, target_schema: StructType = None, t
 # ============================================================================
 # Schema Application
 # ============================================================================
-def escape_comment(text: str) -> str:
-    if not text:
-        return ""
-    return text.replace("\\", "\\\\").replace("'", "''")
-    
+
 def apply_schema_changes(target_table: str, changes: dict):
     """
     Apply detected schema changes efficiently.
@@ -255,7 +327,7 @@ def apply_column_comments(target_table: str, schema: StructType):
 # Main Update Function
 # ============================================================================
 
-def update_table(source_df, target_table: str, index_column: str, 
+def update_table_new(source_df, target_table: str, index_column: str, 
                  target_schema: StructType = None, table_comment: str = None):
     """
     Up-sert `source_df` into `target_table` on `index_column`.
@@ -273,6 +345,11 @@ def update_table(source_df, target_table: str, index_column: str,
     - target_schema: Optional StructType to enforce schema
     - table_comment: Optional table comment
     """
+    
+    # Check for empty DataFrame
+    if source_df.isEmpty() or source_df.count() == 0:          
+        print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
+        return
 
     if table_exists(target_table):
         # ========== Existing Table Path ==========
@@ -288,31 +365,25 @@ def update_table(source_df, target_table: str, index_column: str,
             else:
                 print(f"[INFO] No schema changes needed for {target_table}")
         
-        # Check for empty DataFrame
-         
-        if source_df.isEmpty() or source_df.count() == 0:          
-            print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
-            return
-        else:
-            # Perform merge operation
-            print(f"[INFO] Performing merge on {target_table} using column {index_column}")
-            tgt = DeltaTable.forName(spark, target_table)
-            (
-                tgt.alias("t")
-                .merge(source_df.alias("s"),
-                       f"t.{index_column} = s.{index_column}")
-                .whenMatchedUpdateAll()
-                .whenNotMatchedInsertAll()
-                .execute()
-            )
+        # Perform merge operation
+        print(f"[INFO] Performing merge on {target_table} using column {index_column}")
+        tgt = DeltaTable.forName(spark, target_table)
+        (tgt.alias("t")
+            .merge(source_df.alias("s"),
+                   f"t.{index_column} = s.{index_column}")
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute())
         
-            print(f"[INFO] Successfully merged data into {target_table}")
+        print(f"[INFO] Successfully merged data into {target_table}")
         
     else:
         # ========== New Table Path ==========
         print(f"[INFO] Table {target_table} does not exist. Creating new table...")
         create_table_with_schema(source_df, target_table, target_schema, table_comment)
         print(f"[INFO] Successfully created and populated {target_table}")
+
+
 
 
 # COMMAND ----------
@@ -381,6 +452,7 @@ schema_map_address = StructType([
         "comment": "The description for the code value."
     })
 ])
+
 
 def create_address_mapping_incr():
     """
@@ -961,7 +1033,9 @@ updates_df = create_address_mapping_incr()
 
 # Verify before merge
 if verify_no_duplicates(updates_df, "ADDRESS_ID"):
-    update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID", schema_map_address, map_address_comment)
+    update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID")
+    update_metadata("4_prod.bronze.map_address", schema_map_address, map_address_comment)
+
 else:
     print("Merge aborted due to duplicates. Please investigate.")
     
@@ -1118,7 +1192,8 @@ def create_person_mapping_incr():
 updates_df = create_person_mapping_incr()
     
 
-update_table(updates_df, "4_prod.bronze.map_person", "person_id", schema_map_person, map_person_comment)
+update_table(updates_df, "4_prod.bronze.map_person", "person_id")
+update_metadata("4_prod.bronze.map_person",schema_map_person,map_person_comment)
 
 
 # COMMAND ----------
@@ -1160,6 +1235,7 @@ schema_map_care_site = StructType([
         "comment": "Timestamp of last update."
     })
 ])
+
 
 def create_building_locations():
     """
@@ -1326,8 +1402,8 @@ def create_care_site_mapping_incr():
 updates_df = create_care_site_mapping_incr()
     
 
-update_table(updates_df, "4_prod.bronze.map_care_site", "care_site_cd", schema_map_care_site, map_care_site_comment)
-
+update_table(updates_df, "4_prod.bronze.map_care_site", "care_site_cd")
+update_metadata("4_prod.bronze.map_care_site",schema_map_care_site, map_care_site_comment)
 
 # COMMAND ----------
 
@@ -1365,6 +1441,7 @@ schema_map_medical_personnel = StructType([
         "comment": "Timestamp of last update."
     })
 ])
+
 
 def create_group_types():
     """
@@ -1566,7 +1643,9 @@ def create_medical_personnel_mapping_incr():
 
 updates_df = create_medical_personnel_mapping_incr()
 
-update_table(updates_df, "4_prod.bronze.map_medical_personnel", "PERSON_ID", schema_map_medical_personnel, map_medical_personnel_comment)
+update_table(updates_df, "4_prod.bronze.map_medical_personnel", "PERSON_ID")
+update_metadata("4_prod.bronze.map_medical_personnel",schema_map_medical_personnel,map_medical_personnel_comment
+)
 
 
 # COMMAND ----------
@@ -1820,8 +1899,8 @@ def create_encounter_mapping_incr():
 updates_df = create_encounter_mapping_incr()
     
  
-update_table(updates_df, "4_prod.bronze.map_encounter", "ENCNTR_ID", schema_map_encounter, map_encounter_comment)
-
+update_table(updates_df, "4_prod.bronze.map_encounter", "ENCNTR_ID")
+update_metadata("4_prod.bronze.map_encounter",schema_map_encounter,map_encounter_comment)
 
 # COMMAND ----------
 
@@ -1945,6 +2024,8 @@ schema_map_diagnosis = StructType([
     })
     
 ])
+
+
 
 def create_diagnosis_mapping_incr():
     """
@@ -2103,8 +2184,8 @@ def create_diagnosis_mapping_incr():
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
         col("SNOMED_TERM"),
         col("ICD10_CODE"),
-        col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
-        col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        col("ICD10_TYPE"),
+        col("ICD10_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
         col("ICD10_TERM"),
         # Use greatest ADC_UPDT between diagnosis and nomenclature
         greatest(
@@ -2120,7 +2201,8 @@ updates_df = create_diagnosis_mapping_incr()
 
 
 
-update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID", schema_map_diagnosis, map_diagnosis_comment)
+update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID")
+update_metadata("4_prod.bronze.map_diagnosis",schema_map_diagnosis,map_diagnosis_comment)
 
 
 # COMMAND ----------
@@ -2258,6 +2340,8 @@ schema_map_problem = StructType([
 
  
 ])
+
+
 
 def create_problem_code_lookup(code_values, alias_name, desc_alias):
     """
@@ -2572,8 +2656,8 @@ def create_problem_mapping_incr():
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
         "SNOMED_TERM",
         "ICD10_CODE",
-        col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
-        col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        "ICD10_TYPE",
+        col("ICD10_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
         "ICD10_TERM",
         "prob.ADC_UPDT",
         "CALC_DT_TM",
@@ -2587,8 +2671,9 @@ def create_problem_mapping_incr():
 updates_df = create_problem_mapping_incr().distinct()
     
 
-update_table(updates_df, "4_prod.bronze.map_problem", "PROBLEM_ID", schema_map_problem, map_problem_comment)
+update_table(updates_df, "4_prod.bronze.map_problem", "PROBLEM_ID")
 
+update_metadata("4_prod.bronze.map_problem",schema_map_problem,map_problem_comment)
 
 
 # COMMAND ----------
@@ -3938,7 +4023,8 @@ def process_med_admin_incremental():
                        .drop("priority", "row_num"))
             
             print("Deduplication complete, updating table...")
-            update_table(final_df.distinct(), "4_prod.bronze.map_med_admin", "EVENT_ID", schema_map_med_admin, map_med_admin_comment )
+            update_table(final_df.distinct(), "4_prod.bronze.map_med_admin", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_med_admin",schema_map_med_admin,map_med_admin_comment)
             print("Successfully updated medication administration mapping table")
         else:
             print("No new records to process")
@@ -4058,7 +4144,6 @@ schema_map_procedure = StructType([
         "comment": "Timestamp for the last update."
     })
 ])
-
 
 def cast_procedure_ids_to_long(df):
     """
@@ -4229,14 +4314,15 @@ def process_procedure_incremental():
                 col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
                 "SNOMED_TERM",
                 "OPCS4_CODE",
-                col("OPCS4_CODE_TYPE").alias("OPCS4_TYPE"),
-                col("OPCS4_CODE_MATCH_COUNT").alias("OPCS4_MATCH_NUMBER"),
+                "OPCS4_TYPE",
+                col("OPCS4_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
                 "OPCS4_TERM",
                 col("proc.ADC_UPDT").alias("ADC_UPDT")
             )
             
             # Update target table
-            update_table(final_df, "4_prod.bronze.map_procedure", "PROCEDURE_ID", schema_map_procedure, map_procedure_comment)
+            update_table(final_df, "4_prod.bronze.map_procedure", "PROCEDURE_ID")
+            update_metadata("8_dev.bronze.map_procedure",schema_map_procedure,map_procedure_comment)
             print("Successfully updated procedure mapping table")
             
         else:
@@ -4405,7 +4491,8 @@ def process_death_incremental():
             )
             
             # Update target table
-            update_table(processed_deaths, "4_prod.bronze.map_death", "PERSON_ID", schema_map_death, map_death_comment)
+            update_table(processed_deaths, "4_prod.bronze.map_death", "PERSON_ID")
+            update_metadata("4_prod.bronze.map_death",schema_map_death,map_death_comment)
             print("Successfully updated death mapping table")
             
         else:
@@ -4888,7 +4975,8 @@ def process_numeric_events_incremental():
             )
             
 
-            update_table(final_df, "4_prod.bronze.map_numeric_events", "EVENT_ID", schema_map_numeric_events, map_numeric_events_comment)
+            update_table(final_df, "4_prod.bronze.map_numeric_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_numeric_events", schema_map_numeric_events,map_numeric_events_comment)
             print("Successfully updated numeric events mapping table")
             
         else:
@@ -4902,6 +4990,7 @@ def process_numeric_events_incremental():
 process_numeric_events_incremental()
 
 # COMMAND ----------
+
 
 map_date_events_comment = "The table contains data related to various events associated with individuals and orders. It includes details such as event identifiers, timestamps, and descriptions of the events and their classifications. This data can be used for tracking event occurrences, analyzing interactions between individuals and orders, and understanding the context of these events through their classifications and descriptions."
 
@@ -5007,6 +5096,8 @@ schema_map_date_events = StructType([
         "comment": "Timestamp of last update."
     }),
 ])
+
+
 
 def create_date_event_code_lookup(code_values, alias_suffix):
     """
@@ -5218,7 +5309,8 @@ def process_date_events_incremental():
             )
             
 
-            update_table(result_df, "4_prod.bronze.map_date_events", "EVENT_ID", schema_map_date_events, map_date_events_comment)
+            update_table(result_df, "4_prod.bronze.map_date_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_date_events",schema_map_date_events,map_date_events_comment)
             print("Successfully updated date events mapping table")
             
         else:
@@ -5366,6 +5458,7 @@ schema_map_text_events = StructType([
         "comment": "The identifier for the class or category of the OMOP concept."
     })
 ])
+
 
 def create_text_event_code_lookup(code_values, alias_suffix):
     """
@@ -5716,7 +5809,8 @@ def process_text_events_incremental():
             )
             
 
-            update_table(final_df, "4_prod.bronze.map_text_events", "EVENT_ID", schema_map_text_events, map_text_events_comment)
+            update_table(final_df, "4_prod.bronze.map_text_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_text_events",schema_map_text_events,map_text_events_comment)
             print("Successfully updated text events mapping table")
             
         else:
@@ -5907,6 +6001,7 @@ schema_map_nomen_events = StructType([
         "comment": "The identifier for the class or category of the OMOP concept."
     })
 ])
+
 
 def create_nomen_code_lookup(code_values, alias_suffix):
     """
@@ -6319,7 +6414,9 @@ def process_nomen_events_incremental():
             )
             
 
-            update_table(final_df, "4_prod.bronze.map_nomen_events", "EVENT_ID", schema_map_nomen_events,  map_nomen_events_comment)
+            update_table(final_df, "4_prod.bronze.map_nomen_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_nomen_events",schema_map_nomen_events,map_nomen_events_comment)
+
             print("Successfully updated nomenclature events mapping table")
             
         else:
@@ -6471,6 +6568,7 @@ schema_map_coded_events = StructType([
     })
 
 ])
+
 
 def create_coded_event_code_lookup(code_values, alias_suffix):
     """
@@ -6849,7 +6947,8 @@ def process_coded_events_incremental():
             )
             
 
-            update_table(final_df, "4_prod.bronze.map_coded_events", "EVENT_ID", schema_map_coded_events, map_coded_events_comment)
+            update_table(final_df, "4_prod.bronze.map_coded_events", "EVENT_ID")
+            update_metadata("4_prod.bronze.map_coded_events",schema_map_coded_events,map_coded_events_comment)
             print("Successfully updated coded events mapping table")
             
         else:
