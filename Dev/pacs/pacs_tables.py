@@ -1267,6 +1267,14 @@ schema = StructType([
     StructField(
         "Laterality", StringType(), True,
         {'comment': "Laterality of examined body part."}
+    ),
+    StructField(
+        "Mrn", StringType(), True,
+        {'comment': "Patient MRN identifier."}
+    ),
+    StructField(
+        "NhsNumber", StringType(), True,
+        {'comment': "Patient NHS number."}
     )
 
 ])
@@ -1328,6 +1336,14 @@ def mill_pacs_data_expanded():
             LEFT JOIN LIVE.intmd_pacs_examcode AS ec
             ON e.ExaminationCode_t = ec.RawExamCode
             WHERE ExaminationRequestId IS NOT NULL
+        ),
+        ali AS (
+            SELECT
+                MillPersonId,
+                MAX(Mrn) AS Mrn,
+                MAX(NhsNumber) AS NhsNumber
+            FROM LIVE.intmd_pacs_patient_alias
+            GROUP BY MillPersonId
         )
         --,
         --rep AS (
@@ -1347,7 +1363,9 @@ def mill_pacs_data_expanded():
             exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
-            REPLACE(dc.laterality, ' (qualifier value)', '') AS laterality
+            REPLACE(dc.laterality, ' (qualifier value)', '') AS laterality,
+            ali.Mrn,
+            ali.NhsNumber
         FROM ce
         LEFT JOIN req
         ON
@@ -1361,6 +1379,9 @@ def mill_pacs_data_expanded():
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
         LEFT JOIN LIVE.pacs_examcode_dict AS dc
         ON ce.ExamCode = dc.short_code
+        LEFT JOIN ali
+        ON
+            ce.MillPersonId = ali.MillPersonId
     """)
 
     return df
