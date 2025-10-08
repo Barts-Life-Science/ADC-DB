@@ -1328,14 +1328,15 @@ def mill_pacs_data_expanded():
             LEFT JOIN LIVE.intmd_pacs_examcode AS ec
             ON e.ExaminationCode_t = ec.RawExamCode
             WHERE ExaminationRequestId IS NOT NULL
-        ),
-        rep AS (
-            SELECT
-                MillAccessionNbr,
-                COUNT(DISTINCT CE_BLOB_CONTENT_KEY) AS PacsReportCount
-            FROM LIVE.pacs_blob_content
-            GROUP BY MillAccessionNbr
         )
+        --,
+        --rep AS (
+        --    SELECT
+        --        MillAccessionNbr,
+        --        COUNT(DISTINCT CE_BLOB_CONTENT_KEY) AS PacsReportCount
+        --    FROM LIVE.pacs_blob_content
+        --    GROUP BY MillAccessionNbr
+        --)
         SELECT
             ce.*,
             req.RequestId,
