@@ -1424,7 +1424,7 @@ schema = StructType([
 # COMMAND ----------
 
 @dlt.table(
-    name="mill_pacs_data_expanded_report",
+    name="imaging_report",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
