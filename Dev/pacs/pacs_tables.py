@@ -1440,8 +1440,8 @@ def mill_pacs_data_expanded_report():
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
             c.MillExamCode AS ExamCode,
-            NULL AS BlobContents,
-            NULL AS AnonymizedText
+            NULL AS BlobContents, -- placeholder: fetch data from rde_blobdataset
+            NULL AS AnonymizedText -- placeholder: fetch data from rde_blobdataset
         FROM 4_prod.rde.rde_blobdataset AS b
         INNER JOIN LIVE.intmd_mill_clinical_event_pacs AS c
         ON b.EVENTID = c.EVENT_ID AND b.PERSON_ID = c.MillPersonId
