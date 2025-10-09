@@ -1409,6 +1409,14 @@ schema = StructType([
     StructField(
         "ExamCode", StringType(), True,
         {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
+    ),
+    StructField(
+        "BlobContents", StringType(), True,
+        {'comment': "Imaging report text."}
+    ),
+    StructField(
+        "AnonymizedText", StringType(), True,
+        {'comment': "Anonymized imaging report text."}
     )
 
 ])
@@ -1431,7 +1439,9 @@ def mill_pacs_data_expanded_report():
             b.EVENTID AS ReportEventId,
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
-            c.MillExamCode AS ExamCode
+            c.MillExamCode AS ExamCode,
+            NULL AS BlobContents,
+            NULL AS AnonymizedText
         FROM 4_prod.rde.rde_blobdataset AS b
         INNER JOIN LIVE.intmd_mill_clinical_event_pacs AS c
         ON b.EVENTID = c.EVENT_ID AND b.PERSON_ID = c.MillPersonId
