@@ -1410,6 +1410,14 @@ schema = StructType([
         "ExamCode", StringType(), True,
         {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
     ),
+     StructField(
+        "Mrn", StringType(), True,
+        {'comment': "Patient MRN identifier."}
+    ),
+    StructField(
+        "Nhs_Number", StringType(), True,
+        {'comment': "Patient NHS number."}
+    ),
     StructField(
         "BlobContents", StringType(), True,
         {'comment': "Imaging report text."}
@@ -1440,6 +1448,8 @@ def mill_pacs_data_expanded_report():
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
             c.MillExamCode AS ExamCode,
+            b.Mrn,
+            b.Nhs_Number,
             NULL AS BlobContents, -- placeholder: fetch data from rde_blobdataset
             NULL AS AnonymizedText -- placeholder: fetch data from rde_blobdataset
         FROM 4_prod.rde.rde_blobdataset AS b
