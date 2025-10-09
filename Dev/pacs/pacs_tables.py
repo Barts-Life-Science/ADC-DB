@@ -1282,7 +1282,7 @@ schema = StructType([
 # COMMAND ----------
 
 @dlt.table(
-    name="barts_imaging_metadata",
+    name="imaging_metadata",
     comment="Medical imaging metadata available at Barts Health NHS Trust.",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -1476,6 +1476,6 @@ def mill_pacs_data_expanded_quality():
         SELECT
             SUM(CAST(ISNULL(RequestId) AS INT))/COUNT(*) AS RequestIdNullPercentage,
             SUM(CAST(ISNULL(ExaminationIdString) AS INT))/COUNT(*) AS ExaminationIdNullPercentage
-        FROM LIVE.barts_imaging_metadata
+        FROM LIVE.imaging_metadata
     """)
     return df
