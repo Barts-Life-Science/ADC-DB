@@ -1221,7 +1221,7 @@ schema = StructType([
         {'comment': "Reference number recorded in Mill_Clinical_Event, often a concatenation of accession and exam code, used for cross-referencing and traceability."}
     ),
     StructField(
-        "MillPersonId", LongType(), True,
+        "PersonId", LongType(), True,
         {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
     ),
     StructField(
@@ -1302,7 +1302,7 @@ def mill_pacs_data_expanded():
                 MillExamCode AS ExamCode,
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
                 MillRefNbr,
-                MillPersonId,
+                MillPersonId AS PersonId,
                 CAST(PacsPatientId AS BIGINT) AS PacsPatientId,
                 MillEventDate
             FROM LIVE.intmd_mill_clinical_event_pacs
@@ -1381,7 +1381,7 @@ def mill_pacs_data_expanded():
         ON ce.ExamCode = dc.short_code
         LEFT JOIN ali
         ON
-            ce.MillPersonId = ali.MillPersonId
+            ce.PersonId = ali.MillPersonId
     """)
 
     return df
@@ -1391,7 +1391,7 @@ def mill_pacs_data_expanded():
 
 schema = StructType([
     StructField(
-        "MillPersonId", LongType(), True,
+        "PersonId", LongType(), True,
         {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
     ), 
     StructField(
@@ -1443,7 +1443,7 @@ schema = StructType([
 def mill_pacs_data_expanded_report():
     df = spark.sql("""
         SELECT DISTINCT
-            b.PERSON_ID AS MillPersonId,
+            b.PERSON_ID AS PersonId,
             b.EVENTID AS ReportEventId,
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
