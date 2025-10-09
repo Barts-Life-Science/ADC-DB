@@ -1391,6 +1391,10 @@ def mill_pacs_data_expanded():
 
 schema = StructType([
     StructField(
+        "MillPersonId", LongType(), True,
+        {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
+    ), 
+    StructField(
         "ReportEventId", LongType(), True,
         {'comment': "Identifiers to link with event records in the Millenium EHR system."}
     ),
@@ -1423,13 +1427,14 @@ schema = StructType([
 def mill_pacs_data_expanded_report():
     df = spark.sql("""
         SELECT DISTINCT
+            b.PERSON_ID AS MillPersonId,
             b.EVENTID AS ReportEventId,
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
             c.MillExamCode AS ExamCode
         FROM 4_prod.rde.rde_blobdataset AS b
         INNER JOIN LIVE.intmd_mill_clinical_event_pacs AS c
-        ON b.EVENTID = c.EVENT_ID
+        ON b.EVENTID = c.EVENT_ID AND b.PERSON_ID = c.MillPersonId
         WHERE
             b.MainEventDesc = 'RADRPT'
             AND c.MillEventClass = 'Document'
