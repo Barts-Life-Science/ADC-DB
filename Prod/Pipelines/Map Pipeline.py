@@ -1863,13 +1863,13 @@ schema_map_diagnosis = StructType([
         "comment": "Associates the clinical diagnosis to a particular setting of care within an encounter."
     }),
     StructField("clinical_service_desc", StringType(), True, metadata={
-        "comment": "The description for the code value"
+        "comment": "The description for the code value."
     }),
     StructField("CONFIRMATION_STATUS_CD", DoubleType(), True, metadata={
         "comment": "Describes the definitiveness and clinical status of the diagnosis."
     }),
     StructField("confirmation_status_desc", StringType(), True, metadata={
-        "comment": "The description for the code value"
+        "comment": "The description for the code value."
     }),
     StructField("CLASSIFICATION_CD", DoubleType(), True, metadata={
         "comment": "Classification of the clinical diagnosis by the area of focus."
@@ -1886,13 +1886,13 @@ schema_map_diagnosis = StructType([
     StructField("SOURCE_STRING", StringType(), True, metadata={
         "comment": "Variable length string that may include alphanumeric characters and punctuation."
     }),
-    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+    StructField("SOURCE_VOCABULARY_CD", DecimalType(38, 18), True, metadata={
         "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
     }),
     StructField("source_vocabulary_desc", StringType(), True, metadata={
         "comment": "The description for the code value."
     }),
-    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+    StructField("VOCAB_AXIS_CD", DecimalType(38, 18), True, metadata={
         "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
     }),
     StructField("vocab_axis_desc", StringType(), True, metadata={
@@ -2183,13 +2183,13 @@ schema_map_problem = StructType([
     StructField("SOURCE_STRING", StringType(), True, metadata={
         "comment": "Variable length string that may include alphanumeric characters and punctuation."
     }),
-    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+    StructField("SOURCE_VOCABULARY_CD", DecimalType(38, 18), True, metadata={
         "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
     }),
     StructField("source_vocabulary_desc", StringType(), True, metadata={
         "comment": "The description for the code value."
     }),
-    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+    StructField("VOCAB_AXIS_CD", DecimalType(38, 18), True, metadata={
         "comment": "Vocabulary AXIS codes related to SNOMEDColumn"
     }),
     StructField("vocab_axis_desc", StringType(), True, metadata={
@@ -3968,13 +3968,13 @@ schema_map_procedure = StructType([
     StructField("PERSON_ID", LongType(), True, metadata={
         "comment": "This is the value of the unique primary identifier of the person table. It is an internal system assigned number."
     }),
-    StructField("NOMENCLATURE_ID", DoubleType(), True, metadata={
+    StructField("NOMENCLATURE_ID", LongType(), True, metadata={
         "comment": "This is the value of the unique primary identifier of the nomenclature table. It is an internal system assigned number."
     }),
     StructField("ENCNTR_SLICE_ID", LongType(), True, metadata={
         "comment": "Encounter slice identifier."
     }),
-    StructField("CONTRIBUTOR_SYSTEM_CD", IntegerType(), True, metadata={
+    StructField("CONTRIBUTOR_SYSTEM_CD", DoubleType(), True, metadata={
         "comment": "Contributor system identifies the source feed of data from which a row was populated. This is mainly used to determine how to update a set of data that may have originated from more than one source feed."
     }),
     StructField("contributor_system_desc", StringType(), True, metadata={
@@ -4004,13 +4004,13 @@ schema_map_procedure = StructType([
     StructField("SOURCE_STRING", StringType(), True, metadata={
         "comment": "Variable length string that may include alphanumeric characters and punctuation."
     }),
-    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+    StructField("SOURCE_VOCABULARY_CD", DecimalType(38, 18), True, metadata={
         "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
     }),
     StructField("source_vocabulary_desc", StringType(), True, metadata={
         "comment": "Description for the source vocabulary code."
     }),
-    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+    StructField("VOCAB_AXIS_CD", DecimalType(38, 18), True, metadata={
         "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
     }),
     StructField("vocab_axis_desc", StringType(), True, metadata={
@@ -4019,7 +4019,7 @@ schema_map_procedure = StructType([
     StructField("CONCEPT_CKI", StringType(), True, metadata={
         "comment": "Concept CKI is the functional Concept Identifier; it is the codified means within Millennium to identify key medical concepts to support information processing, clinical decision support, executable knowledge and knowledge presentation. Composed of a source and an identifier."
         }),
-    StructField("OMOP_CONCEPT_ID", LongType(), True, metadata={
+    StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
         "comment": "A unique identifier for each Concept across all domains."
     }),
     StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
@@ -4048,11 +4048,11 @@ schema_map_procedure = StructType([
     StructField("OPCS4_TYPE", StringType(), True, metadata={
         "comment": "The method or source of the OPCS4 code mapping for each nomenclature entry." 
     }),
-    StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
-         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
+    StructField("OPCS4_MATCH_NUMBER", LongType(), True, metadata={
+        "comment": "The number of matches found for each NOMENCLATURE_ID in the context of OPCS4 codes."
     }),
     StructField("OPCS4_TERM", StringType(), True, metadata={
-        "The term associated with the OPCS4 code that provides additional meaning and context to the code."
+        "comment": "The term associated with the OPCS4 code that provides additional meaning and context to the code."
     }),
     StructField("ADC_UPDT", TimestampType(), True, metadata={
         "comment": "Timestamp for the last update."
@@ -4234,7 +4234,7 @@ def process_procedure_incremental():
                 "OPCS4_TERM",
                 col("proc.ADC_UPDT").alias("ADC_UPDT")
             )
-            
+
             # Update target table
             update_table(final_df, "4_prod.bronze.map_procedure", "PROCEDURE_ID", schema_map_procedure, map_procedure_comment)
             print("Successfully updated procedure mapping table")
@@ -5746,8 +5746,8 @@ schema_map_nomen_events = StructType([
     StructField("ORDER_ID", LongType(), True, metadata={
         "comment": "The unique primary identifier of Order Table."
     }),
-    StructField("EVENT_CLASS_CD", IntegerType(), True, metadata={
-        "comment": "Coded value which specifies how the event is stored in and retrieved from the event table's sub-tables. For example, Event_Class_CDs identify events as numeric results, textual results, calculations, medications, etc."
+    StructField("NOMENCLATURE_ID", LongType(), True, metadata={
+        "comment": "This is the value of the unique primary identifier of the nomenclature table. It is an internal system assigned number."
     }),
     StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
         "comment": "Personnel id of provider who performed this result."
@@ -5807,6 +5807,9 @@ schema_map_nomen_events = StructType([
     StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
         "comment": "Represents the update date/time that tracks when clinically significant updates are made to the Clinical Event and should only be used to check for updates. This field is used to notify audiences when a clinically significant update is made to an existing clinical event, such as when XR Clinical Reporting re-prints a lab result due to an update of the result value or when a result is resent to a provider's Message Center with the result update. This date should NOT be displayed as the clinically."
     }),
+    StructField("PARENT_EVENT_TITLE_TEXT", StringType(), True, metadata={
+        "comment": "The title for document results."
+    }),    
     StructField("PARENT_EVENT_CD", IntegerType(), True, metadata={
         "comment": "The code value of the parent event."
     }),
@@ -5834,16 +5837,16 @@ schema_map_nomen_events = StructType([
     StructField("SOURCE_STRING", StringType(), True, metadata={
         "comment": "Variable length string that may include alphanumeric characters and punctuation."
         }),
-    StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+    StructField("SOURCE_VOCABULARY_CD", DecimalType(38, 18), True, metadata={
         "comment": "The external vocabulary or lexicon that contributed the string, e.g. ICD9, SNOMED, etc."
     }),
     StructField("SOURCE_VOCABULARY_DESC", StringType(), True, metadata={
         "comment": "The description for the code value."
     }),
-    StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+    StructField("VOCAB_AXIS_CD", DecimalType(38, 18), True, metadata={
         "comment": "Vocabulary AXIS codes related to SNOMEDColumn."
     }),
-    StructField("vocab_axis_desc", StringType(), True, metadata={
+    StructField("VOCAB_AXIS_DESC", StringType(), True, metadata={
         "comment": "The description for the code value."
     }),
     StructField("CONCEPT_CKI", StringType(), True, metadata={
