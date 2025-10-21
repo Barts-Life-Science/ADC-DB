@@ -123,7 +123,7 @@
 # MAGIC         THEN to_col_json_str(column_name, dataType, sensitive, 'null')
 # MAGIC       ELSE to_col_json_str(column_name, dataType, sensitive, column_description)
 # MAGIC     END AS json_str
-# MAGIC   FROM 1_inland.evan_demo.hdruk_metadata_col_omop
+# MAGIC   FROM 1_inland.evan_demo.hdruk_metadata_col_imaging
 # MAGIC   WHERE
 # MAGIC     (
 # MAGIC       table_catalog = '4_prod'
@@ -430,7 +430,7 @@ hdruk_300_json = json.loads(hdruk_300_str)
 # COMMAND ----------
 
 def update_struct_metadata(metadata_json):
-    df = spark.read.table("1_inland.evan_demo.hdruk_metadata_tab_omop")
+    df = spark.read.table("1_inland.evan_demo.hdruk_metadata_tab_imaging")
     struct_metadata_dict = df.toPandas().to_dict(orient="records")
 
     for i, d in enumerate(struct_metadata_dict):
