@@ -1468,6 +1468,43 @@ def mill_pacs_data_expanded_report():
 # COMMAND ----------
 
 @dlt.table(
+    name="imaging_report_incr",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def imaging_report_incr():
+    df = spark.readStream.format("delta") \
+        .option("readChangeFeed", "true") \
+        .table("4_prod.rde.rde_blobdataset") \
+        .alias("b") \
+        .join(
+            spark.table("LIVE.intmd_mill_clinical_event_pacs").alias("c"),
+            (F.col("b.EVENTID") == F.col("c.EVENT_ID")) & (F.col("b.PERSON_ID") == F.col("c.MillPersonId")),
+            "inner"
+        ) \
+        .filter(
+            (F.col("b.MainEventDesc") == "RADRPT") &
+            (F.col("c.MillEventClass") == "Document")
+        ) \
+        .selectExpr(
+            "b.PERSON_ID AS PersonId",
+            "b.EVENTID AS ReportEventId",
+            "b.ENCNTR_ID AS ReportEncntrId",
+            "c.MillAccessionNbr AS AccessionNbr",
+            "c.MillExamCode AS ExamCode",
+            "b.Mrn",
+            "b.Nhs_Number",
+            "b.BlobContents",
+            "b.AnonymizedText"
+        ).distinct()
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
     name="mill_pacs_data_expanded_quality",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
