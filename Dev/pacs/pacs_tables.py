@@ -72,6 +72,10 @@ def stag_patient_alias():
             WHERE 
                 ACTIVE_IND = 1
                 AND PERSON_ALIAS_TYPE_CD = 10 -- MRN
+                AND ALIAS_POOL_CD IN (
+                    -- Include only Barts MRN
+                    683996, 1115132483, 6200990, 6173940
+                )
             GROUP BY PERSON_ID
         ),
         nhs AS (
