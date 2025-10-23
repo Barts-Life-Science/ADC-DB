@@ -381,7 +381,7 @@ def intmd_pacs_examcode():
         ),
         ai_ec AS (
             SELECT vs_input, MAX(ValidatedAIExamCode) AS AIExamCode
-            FROM 4_prod.pacs_ai.predicted_pacs_examcode
+            FROM 4_prod.pacs_dlt.ai_predicted_pacs_examcode
             GROUP BY vs_input
         )
         SELECT
