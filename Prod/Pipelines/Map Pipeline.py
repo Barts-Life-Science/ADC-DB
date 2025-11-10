@@ -2470,7 +2470,7 @@ def create_problem_mapping_incr():
         .join(
             encounters.select(
                 col("PERSON_ID").alias("enc_person_id"),
-                "ENCNTR_ID", 
+                col("ENCNTR_ID").alias("enc_encntr_id"),
                 "ARRIVE_DT_TM", 
                 "DEPART_DT_TM"
             ),
@@ -2488,15 +2488,15 @@ def create_problem_mapping_incr():
             col("ARRIVE_DT_TM") > col("CALC_DT_TM")
         )
         .withColumn("CALC_ENC_WITHIN",
-            expr("max(case when is_within then ENCNTR_ID else null end)")
+            expr("max(case when is_within then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENC_BEFORE",
-            expr("max(case when is_before then ENCNTR_ID else null end)")
+            expr("max(case when is_before then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENC_AFTER",
-            expr("min(case when is_after then ENCNTR_ID else null end)")
+            expr("min(case when is_after then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENCNTR",

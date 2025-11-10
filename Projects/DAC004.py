@@ -12,27 +12,16 @@ columns_to_exclude = ['ADC_UPDT']
 cohort_sql = f"""
 CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac004 AS
 WITH matched_aliases AS (
-  SELECT DISTINCT l.Identifier, pa.PERSON_ID
+  SELECT DISTINCT l.NHS, pa.PERSON_ID
   FROM 6_mgmt.cohort_lookup.dac004_lookup l
   JOIN 4_prod.raw.mill_person_alias pa
-  ON REGEXP_REPLACE(l.Identifier, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
-),
-matched_persons AS (
-  SELECT DISTINCT 
-    l.Identifier,
-    p.PERSON_ID
-  FROM 6_mgmt.cohort_lookup.dac004_lookup l
-  JOIN 4_prod.raw.mill_person p
-  ON UPPER(l.Name) = CONCAT(p.NAME_FIRST_KEY, ' ', p.NAME_LAST_KEY)
-  AND TO_DATE(l.dob, 'dd/MM/yyyy') = DATE(p.BIRTH_DT_TM)
+  ON REGEXP_REPLACE(l.NHS, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
 )
 SELECT DISTINCT
-  COALESCE(ma.PERSON_ID, mp.PERSON_ID) as PERSON_ID,
+  ma.PERSON_ID,
   CAST(NULL as STRING) as subcohort
 FROM 6_mgmt.cohort_lookup.dac004_lookup l
-LEFT JOIN matched_aliases ma ON l.Identifier = ma.Identifier
-LEFT JOIN matched_persons mp ON l.Identifier = mp.Identifier
-WHERE COALESCE(ma.PERSON_ID, mp.PERSON_ID) IS NOT NULL;
+JOIN matched_aliases ma ON l.NHS = ma.NHS;
 """
 spark.sql(cohort_sql)
 
@@ -157,3 +146,12 @@ ORDER BY table_name, column_name
 """
 spark.sql(schema_sql)
 print(f"Created schema view: 5_projects.{project_identifier}.schema")
+
+
+
+lookup_sql = f"""
+CREATE OR REPLACE VIEW 5_projects.{project_identifier}.lookup AS
+SELECT * FROM 6_mgmt.cohort_lookup.dac004_lookup
+"""
+spark.sql(lookup_sql)
+print(f"Created lookup view: 5_projects.{project_identifier}.lookup")

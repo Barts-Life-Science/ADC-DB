@@ -1571,12 +1571,20 @@ schema_rde_iqemo = StructType([
         StructField("Name", StringType(), True, metadata={"comment": "Name for this Regimen. Must be unique within the organisation."}),
         StructField("DefaultCycles", IntegerType(), True, metadata={"comment": "The default number of cycles to create when booking a course of this regimen."}),
         StructField("ChemoRadiation", BooleanType(), True, metadata={"comment": "indicates if given with radiotherapy."}),
-        StructField("OPCSProcurementCode", StringType(), True, metadata={"comment": "The NHS OPCS procurement code for this item.\
-"}),
-        StructField("OPCSDeliveryCode", StringType(), True, metadata={"comment": "The NHS OPCS delivery code for this item.\
-"}),
+        StructField("OPCSProcurementCode", StringType(), True, metadata={"comment": "The NHS OPCS procurement code for this item."}),
+        StructField("OPCSDeliveryCode", StringType(), True, metadata={"comment": "The NHS OPCS delivery code for this item."}),
         StructField("SactName", StringType(), True, metadata={"comment": "Name for the regimen matching those defined in the national SACT dataset."}),
         StructField("Indication", StringType(), True, metadata={"comment": "A free text description of the Indication for this regimen. Used to detail appropriate usage and displayed when booking courses of this regimen."}),
+        StructField("StartDate", StringType(), True, metadata={"comment": "The Start Date of the treatment course. Based on the start date of the first cycle (which may not be cycle 1!)"}),
+        StructField("EndDate", StringType(), True, metadata={"comment": "The End Date of the course. Set by the stored procedure psp_ChemotherapyCourse_UpdateEndDate."}),
+        StructField("FinalTreatmentDate", StringType(), True, metadata={"comment": "The final day of treatment. Not the same as EndDate which is when the actual treatment will end including TTOs etc"}),
+        StructField("CourseFinished", BooleanType(), True, metadata={"comment": "Indicates if this course is finished. This field is updated as part of a nightly maintenance task that executes psp_ChemotherapyCourse_UpdateFinished"}),
+        StructField("PlannedCycles", IntegerType(), True, metadata={"comment": "The number of cycles that were planned. Required for NHS SACT report."}),
+        StructField("CycleCancelledFrom", IntegerType(), True, metadata={"comment": "If the remainder of the course was cancelled this indicates the cycle that the course was cancelled from."}),
+        StructField("CourseRegimenName", StringType(), True, metadata={"comment": "The name of the Regimen at the time of course creation."}),
+        StructField("CourseRegimenID", StringType(), True, metadata={"comment": "The ID of the regimen this course was created from."}),
+        StructField("LineOfTreatmentID", IntegerType(), True, metadata={"comment": "The line of treatment based on the table LineOfTreatment. This is set if the treatment intent of the course is palliative"}),
+        StructField("RegimenNumber", IntegerType(), True, metadata={"comment": "An internally generated number that was part of the NHS SACT report"}),
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
 
@@ -1618,6 +1626,16 @@ def iqemo_incr():
             col("RG.OPCSDeliveryCode").cast(StringType()).alias("OPCSDeliveryCode"),
             col("RG.SactName").cast(StringType()).alias("SactName"),
             col("RG.Indication").cast(StringType()).alias("Indication"),
+            col("CC.StartDate").cast(StringType()).alias("StartDate"),
+            col("CC.EndDate").cast(StringType()).alias("EndDate"),
+            col("CC.FinalTreatmentDate").cast(StringType()).alias("FinalTreatmentDate"),
+            col("CC.CourseFinished").cast(BooleanType()).alias("CourseFinished"),
+            col("CC.PlannedCycles").cast(IntegerType()).alias("PlannedCycles"),
+            col("CC.CycleCancelledFrom").cast(IntegerType()).alias("CycleCancelledFrom"),
+            col("CC.RegimenName").cast(StringType()).alias("CourseRegimenName"),
+            col("CC.RegimenID").cast(StringType()).alias("CourseRegimenID"),
+            col("CC.LineOfTreatmentID").cast(IntegerType()).alias("LineOfTreatmentID"),
+            col("CC.RegimenNumber").cast(IntegerType()).alias("RegimenNumber"),
             greatest(col("TC.ADC_UPDT"), col("CC.ADC_UPDT"), col("RG.ADC_UPDT"), col("PT.ADC_UPDT"), col("DEM.ADC_UPDT"), col("PA.ADC_UPDT")).alias("ADC_UPDT")
         ).distinct()
         .filter(col("ADC_UPDT") > max_adc_updt)
