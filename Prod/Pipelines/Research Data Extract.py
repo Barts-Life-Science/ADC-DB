@@ -96,7 +96,11 @@ def lookup_mrn():
     window = Window.partitionBy("PERSON_ID").orderBy(desc("END_EFFECTIVE_DT_TM"))
     return (
         spark.table("4_prod.raw.mill_person_alias")
-        .filter((col("PERSON_ALIAS_TYPE_CD") == 10) & (col("ACTIVE_IND") == 1))
+        .filter(
+            (col("PERSON_ALIAS_TYPE_CD") == 10) & 
+            (col("ACTIVE_IND") == 1) &
+            (col("ALIAS_POOL_CD").isin(683996, 1115132483, 6200990, 6173940))
+        )
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
         .select("PERSON_ID", "ALIAS", "ADC_UPDT")
@@ -1608,7 +1612,7 @@ def iqemo_incr():
         .join(
             person_alias,
             (trim(iqemo_patient.PrimaryIdentifier) == trim(person_alias.ALIAS)) & 
-             (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+             (person_alias.PERSON_ALIAS_TYPE_CD == 10) & (person_alias.ALIAS_POOL_CD.isin(683996, 1115132483, 6200990, 6173940)),
             "left"
         )
         .join(patient_demographics, col("PA.PERSON_ID") == col("DEM.PERSON_ID"), "left")
@@ -2057,7 +2061,7 @@ def pc_procedures_incr():
         .join(
         person_alias,
         (trim(pc_procedures.MRN) == trim(person_alias.ALIAS)) & 
-        (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+        (person_alias.PERSON_ALIAS_TYPE_CD == 10) & (person_alias.ALIAS_POOL_CD.isin(683996, 1115132483, 6200990, 6173940)),
         "inner"
         )
         .join(patient_demographics, person_alias.PERSON_ID == patient_demographics.PERSON_ID, "inner")
@@ -2330,7 +2334,7 @@ def pc_diagnosis_incr():
         .join(
         person_alias,
         (trim(pc_diagnoses.MRN) == trim(person_alias.ALIAS)) & 
-        (person_alias.PERSON_ALIAS_TYPE_CD.cast(IntegerType()) == 10),
+        (person_alias.PERSON_ALIAS_TYPE_CD.cast(IntegerType()) == 10) & (person_alias.ALIAS_POOL_CD.isin(683996, 1115132483, 6200990, 6173940)),
         "inner"
         )
         .join(patient_demographics, person_alias.PERSON_ID.cast(LongType()) == patient_demographics.PERSON_ID, "inner")
@@ -2431,7 +2435,7 @@ def pc_problems_incr():
         .join(
         person_alias,
         (trim(pc_problems.MRN) == trim(person_alias.ALIAS)) & 
-        (person_alias.PERSON_ALIAS_TYPE_CD == 10),
+        (person_alias.PERSON_ALIAS_TYPE_CD == 10) & (person_alias.ALIAS_POOL_CD.isin(683996, 1115132483, 6200990, 6173940)),
         "inner"
         )
         .join(patient_demographics, person_alias.PERSON_ID == patient_demographics.PERSON_ID, "inner")
