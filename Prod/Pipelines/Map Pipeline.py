@@ -6874,3 +6874,377 @@ def process_coded_events_incremental():
 
 
 process_coded_events_incremental()
+
+# COMMAND ----------
+
+map_mat_pregnancy_comment = "Contains detailed clinical and demographic information about pregnancy episodes for each person, including identifiers, maternal characteristics, pregnancy history, antenatal details, lifestyle factors, delivery information, and related clinical observations." 
+
+schema_map_mat_pregnancy = StructType([
+    StructField("Person_ID", LongType(), False, {"comment": "The unique identifier for the mother."}),
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "The unique identifier allocated to each Pregnancy Episode."}),
+    StructField("MRN", StringType(), True, {"comment": "Unique local identifier to identify the person."}),
+    StructField("NHS_Number", StringType(), True, {"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH."}),
+    StructField("Mother_DOB", TimestampType(), True, {"comment": "Date of Birth for the mother."}),
+    StructField("Gravida_NBR", DoubleType(), True, {"comment": "The total number of times a woman has been pregnant."}),
+    StructField("Parity", DoubleType(), True, {"comment": "The number of pregnancies that have resulted in the birth of one or more viable (living or stillborn) infants."}),
+    StructField("PrevLiveBirth_NBR", DoubleType(), True, {"comment": "Number of previous livebirths."}),
+    StructField("PrevMiscarriages_NBR", DoubleType(), True, {"comment": "Number of previous miscarriages."}),
+    StructField("PrevStillBirth_NBR", DoubleType(), True, {"comment": "Number of previous stillbirths."}),
+    StructField("FirstAntenatalAPPTDate", TimestampType(), True, {"comment": "Date of first antenatal appointment."}),
+    StructField("GestAgePregStart", StringType(), True, {"comment": "Gestational age at start of pregnancy record (weeks)."}),
+    StructField("GestAgePregEnd", StringType(), True, {"comment": "Gestational age at end of pregnancy (weeks)."}),
+    StructField("LastMensPeriodDate", TimestampType(), True, {"comment": "Date on which last menstrual period began."}),
+    StructField("AlcoholUnitsPerWeek", DoubleType(), True, {"comment": "Units of alcohol per week."}),
+    StructField("SmokingBooking_CD", IntegerType(), True, {"comment": "Smoking status at booking code."}),
+    StructField("SmokingBooking_DESC", StringType(), True, {"comment": "Smoking status at booking description."}),
+    StructField("SmokingDelivery_CD", IntegerType(), True, {"comment": "Smoking status at delivery code."}),
+    StructField("SmokingDelivery_DESC", StringType(), True, {"comment": "Smoking status at delivery description."}),
+    StructField("SubstanceUse_CD", StringType(), True, {"comment": "Substance use code."}),
+    StructField("SubstanceUse_DESC", StringType(), True, {"comment": "Description of substance use."}),
+    StructField("ExpectedDeliveryDate", TimestampType(), True, {"comment": "Expected delivery date."}),
+    StructField("Height_CM", FloatType(), True, {"comment": "Height in cm."}),
+    StructField("Weight_KG", FloatType(), True, {"comment": "Weight in kg."}),
+    StructField("BMI", FloatType(), True, {"comment": "BMI."}),
+    StructField("FolicAcidSupp_CD", StringType(), True, {"comment": "Folic acid supplement code during pregnancy."}),
+    StructField("FolicAcidSupp_DESC", StringType(), True, {"comment": "Description of folic acid supplement usage."}),
+    StructField("LaborOnsetMethod_CD", IntegerType(), True, {"comment": "Labor onset method code."}),
+    StructField("LaborOnsetMethod_DESC", StringType(), True, {"comment": "Method for labor onset."}),
+    StructField("Augmentation_CD", IntegerType(), True, {"comment": "Augmentation code if labor was augmented."}),
+    StructField("Augmentation_DESC", StringType(), True, {"comment": "Description of augmentation."}),
+    StructField("AnalgesiaDelivery_CD", StringType(), True, {"comment": "Analgesia code used during delivery."}),
+    StructField("AnalgesiaDelivery_DESC", StringType(), True, {"comment": "Details of analgesia used during delivery."}),
+    StructField("AnalgesiaLabour_CD", StringType(), True, {"comment": "Analgesia code used during labor."}),
+    StructField("AnalgesiaLabour_DESC", StringType(), True, {"comment": "Details of analgesia used during labor."}),
+    StructField("AnaesthesiaLabour_CD", StringType(), True, {"comment": "Anaesthesia code used during labor."}),
+    StructField("AnaesthesiaLabour_DESC", StringType(), True, {"comment": "Details of anaesthesia used during labor."}),
+    StructField("PerinealTrauma_CD", StringType(), True, {"comment": "Perineal trauma code."}),
+    StructField("PerinealTrauma_DESC", StringType(), True, {"comment": "Details of any perineal trauma from delivery."}),
+    StructField("Episiotomy_CD", IntegerType(), True, {"comment": "Episiotomy code."}),
+    StructField("Episiotomy_DESC", StringType(), True, {"comment": "Details of any episiotomy performed."}),
+    StructField("BloodLoss", FloatType(), True, {"comment": "Amount of blood lost."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Timestamp of last update."})
+])
+
+
+def create_mat_pregnancy_mapping_incr():
+    """
+    Creates an incremental pregnancy mapping table that processes only new or modified records.
+    
+    Returns:
+        DataFrame: Processed pregnancy records with standardized format
+    """
+   
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_pregnancy")
+
+    # Get source data and reference tables
+    pregnancy = (
+        spark.table("4_prod.raw.mat_pregnancy")
+        .filter(
+            (col("DELETE_IND") == 0) &
+            (col("ADC_UPDT") > max_adc_updt))
+    )
+
+    msds = (
+        spark.table("4_prod.raw.msds101pregbook")
+        .select("PREGNANCYID","LASTMENSTRUALPERIODDATE","FOLICACIDSUPPLEMENT", "PREVIOUSSTILLBIRTHS", "PREVIOUSLIVEBIRTHS")
+        .withColumn(
+            "FolicAcidSupp_DESC",
+            when(col("FOLICACIDSUPPLEMENT") == "01", "Has been taking prior to becoming pregnant")
+            .when(col("FOLICACIDSUPPLEMENT") == "02", "Started taking once pregnancy confirmed")
+            .when(col("FOLICACIDSUPPLEMENT") == "03", "Not taking folic acid supplement")
+            .when(col("FOLICACIDSUPPLEMENT") == "ZZ", "Not Stated(Person asked but declined to provide a response)")
+        )
+    )
+    # Merge the tables togther
+    processed_pregnancy = (
+        pregnancy.alias("PREG")
+        .join(
+            msds.alias("MSDS"),
+            col("PREG.PREGNANCY_ID") == col("MSDS.PREGNANCYID"),
+            "left")
+    )
+
+    final_df = (
+    processed_pregnancy 
+    .select(
+        col("PREG.PERSON_ID").cast(LongType()).alias("Person_ID"),
+        col("PREG.PREGNANCY_ID").cast(LongType()).alias("Pregnancy_ID"),
+        col("PREG.MRN").cast(StringType()).alias("MRN"),
+        col("PREG.NHS").cast(StringType()).alias("NHS_Number"),       
+        col("PREG.MOTHER_DOB_DT_TM").cast(TimestampType()).alias("Mother_DOB"),
+        col("PREG.GRAVIDA_NBR").cast(DoubleType()).alias("Gravida_NBR"),
+        col("PREG.PARA_NBR").cast(DoubleType()).alias("Parity"),     
+        col("MSDS.PREVIOUSLIVEBIRTHS").cast(DoubleType()).alias("PrevLiveBirth_NBR"),
+        col("PREG.HX_PREG_OUTCOME_SPONT_NBR").cast(DoubleType()).alias("PrevMiscarriages_NBR"),  
+        col("MSDS.PREVIOUSSTILLBIRTHS").cast(DoubleType()).alias("PrevStillBirth_NBR"),      
+        col("PREG.FIRST_ANTENATAL_ASSESSMENT_DT_TM").cast(TimestampType()).alias("FirstAntenatalAPPTDate"),
+        col("PREG.GEST_AGE_PREG_START").cast(StringType()).alias("GestAgePregStart"),
+        col("PREG.GEST_AGE_PREG_END").cast(StringType()).alias("GestAgePregEnd"),  
+        col("MSDS.LASTMENSTRUALPERIODDATE").cast(TimestampType()).alias("LastMensPeriodDate"),      
+        col("PREG.ALCOHOL_USE_NBR").cast(DoubleType()).alias("AlcoholUnitsPerWeek"),
+        col("PREG.PREG_TYPE_SCT_CD").cast(StringType()).alias("PregnancyType_CD"),
+        col("PREG.PREG_TYPE_DESC").cast(StringType()).alias("PregnancyType_DESC"),
+        col("PREG.SMOKE_BOOKING_NM_ID").cast(IntegerType()).alias("SmokingBooking_CD"),        
+        col("PREG.SMOKE_BOOKING_DESC").cast(StringType()).alias("SmokingBooking_DESC"),
+        col("PREG.SMOKING_STATUS_DEL_NM_ID").cast(IntegerType()).alias("SmokingDelivery_CD"),  
+        col("PREG.SMOKING_STATUS_DEL_DESC").cast(StringType()).alias("SmokingDelivery_DESC"),
+        col("PREG.REC_SUB_USE_NM_ID").cast(StringType()).alias("SubstanceUse_CD"),
+        col("PREG.REC_SUB_USE_DESC").cast(StringType()).alias("SubstanceUse_DESC"),
+        col("PREG.FINAL_EDD_DT_TM").cast(TimestampType()).alias("ExpectedDeliveryDate"),
+        col("PREG.HT_BOOKING_CM").cast(FloatType()).alias("Height_CM"),
+        col("PREG.WT_BOOKING_KG").cast(FloatType()).alias("Weight_KG"),
+        col("PREG.BMI_BOOKING_DESC").cast(FloatType()).alias("BMI"),
+        col("MSDS.FOLICACIDSUPPLEMENT").cast(StringType()).alias("FolicAcidSupp_CD"),
+        col("MSDS.FolicAcidSupp_DESC").cast(StringType()),                
+        col("PREG.LAB_ONSET_METHOD_NM_ID").cast(IntegerType()).alias("LaborOnsetMethod_CD"),
+        col("PREG.LAB_ONSET_METHOD_DESC").cast(StringType()).alias("LaborOnsetMethod_DESC"),
+        col("PREG.AUGMENTATION_NM_ID").cast(IntegerType()).alias("Augmentation_CD"),
+        col("PREG.AUGMENTATION_DESC").cast(StringType()).alias("Augmentation_DESC"),
+        col("PREG.ANALGESIA_DEL_NM_ID").cast(StringType()).alias("AnalgesiaDelivery_CD"),
+        col("PREG.ANALGESIA_DEL_DESC").cast(StringType()).alias("AnalgesiaDelivery_DESC"),
+        col("PREG.ANALGESIA_LAB_NM_ID").cast(StringType()).alias("AnalgesiaLabour_CD"),        
+        col("PREG.ANALGESIA_LAB_DESC").cast(StringType()).alias("AnalgesiaLabour_DESC"),
+        col("PREG.ANAESTHESIA_LAB_NM_ID").cast(StringType()).alias("AnaesthesiaLabour_CD"),
+        col("PREG.ANAESTHESIA_LAB_DESC").cast(StringType()).alias("AnaesthesiaLabour_DESC"),
+        col("PREG.PERINEAL_TRAUMA_NM_ID").cast(StringType()).alias("PerinealTrauma_CD"),
+        col("PREG.PERINEAL_TRAUMA_DESC").cast(StringType()).alias("PerinealTrauma_DESC"),
+        col("PREG.EPISIOTOMY_NM_ID").cast(IntegerType()).alias("Episiotomy_CD"),
+        col("PREG.EPISIOTOMY_DESC").cast(StringType()).alias("Episiotomy_DESC"),
+        col("PREG.TOTAL_BLOOD_LOSS").cast(FloatType()).alias("BloodLoss"),
+        col("PREG.ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT")
+    ))
+
+    return final_df
+
+updates_df = create_mat_pregnancy_mapping_incr()
+    
+update_table(updates_df, "4_prod.bronze.map_mat_pregnancy", ["Person_ID","Pregnancy_ID"], schema_map_mat_pregnancy, map_mat_pregnancy_comment)
+
+# COMMAND ----------
+
+map_mat_birth_comment = "The table contains data related to newborns and their associated pregnancies. It includes information such as baby identifiers, birth details, and outcomes of deliveries. Possible use cases include analyzing birth trends, tracking pregnancy outcomes, and understanding demographic factors related to childbirth." 
+
+schema_map_mat_birth = StructType([
+    StructField("MotherPerson_ID", LongType(), True, {"comment": "The unique identifier for the mother."}),
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "The unique identifier allocated to each Pregnancy Episode."}),
+    StructField("BabyPerson_ID", LongType(), True, {"comment": "Internal identifier for the baby."}),
+    StructField("Baby_MRN", StringType(), True, {"comment": "MRN for the baby."}),
+    StructField("Baby_NHS", StringType(), True, {"comment": "NHS Number for the baby."}),
+    StructField("BirthOrder", IntegerType(), True, {"comment": "Order in which this baby was born for this labor."}),
+    StructField("BirthNumber", IntegerType(), True, {"comment": "Total number of babies born this labor."}),
+    StructField("FetusNumber", IntegerType(), True, {"comment": "Total number of fetus during the pregnancy."}),
+    StructField("BirthLocation_CD", IntegerType(), True, {"comment": "Location code for the birth."}),
+    StructField("BirthLocation_DESC", StringType(), True, {"comment": "Location description for the birth."}),
+    StructField("BirthDateTime", StringType(), True, {"comment": "Date and time of the birth."}),
+    StructField("DeliveryMethod_CD", IntegerType(), True, {"comment": "Delivery method code."}),
+    StructField("DeliveryMethod_DESC", StringType(), True, {"comment": "Description of the method of delivery."}),
+    StructField("DeliveryOutcome_CD", IntegerType(), True, {"comment": "Delivery outcome code."}),
+    StructField("DeliveryOutcome_DESC", StringType(), True, {"comment": "Description of the outcome of delivery."}),
+    StructField("NeonatalOutcome_CD", IntegerType(), True, {"comment": "Neonatal outcome code."}),
+    StructField("NeonatalOutcome_DESC", StringType(), True, {"comment": "Description of the outcome of birth."}),
+    StructField("PregOutcome_CD", IntegerType(), True, {"comment": "Pregnancy outcome code."}),
+    StructField("PregOutcome_DESC", StringType(), True, {"comment": "Pregnancy outcome description."}),
+    StructField("PresDel_CD", IntegerType(), True, {"comment": "Presentation at delivery code."}),
+    StructField("PresDelDesc", StringType(), True, {"comment": "Description of the presentation at delivery, e.g., vertex."}),
+    StructField("GestationWeeks", IntegerType(), True, {"comment": "Gestation in weeks."}),
+    StructField("GestationDays", IntegerType(), True, {"comment": "Gestation in additional days."}),
+    StructField("BirthWeight", StringType(), True, {"comment": "Weight of baby."}),
+    StructField("BirthSex", StringType(), True, {"comment": "Sex of baby."}),
+    StructField("APGAR1Min", IntegerType(), True, {"comment": "APGAR score at 1 minute."}),
+    StructField("APGAR5Min", IntegerType(), True, {"comment": "APGAR score at 5 minutes."}),
+    StructField("FeedingMethod", StringType(), True, {"comment": "Method of feeding."}),
+    StructField("CongenitalAnomalies", StringType(), True, {"comment": "Any congenital anomalies recorded."}),
+    StructField("MotherComplications", StringType(), True, {"comment": "Details of any complications for the mother."}),
+    StructField("FetalComplications", StringType(), True, {"comment": "Details of any complications for the baby."}),
+    StructField("NeonatalComplications", StringType(), True, {"comment": "Details of any neonatal complications."}),
+    StructField("ResMethod", StringType(), True, {"comment": "Resuscitation method if applicable."}),
+    StructField("MaritalStatusMother", StringType(), True, {"comment": "Marital status of the mother at the time of the pregnancy."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Timestamp of last update."})
+])
+
+
+def create_mat_birth_mapping_incr():
+    """
+    Creates an incremental birth mapping table that processes only new or modified records.
+    
+    Returns:
+        DataFrame: Processed birth records with standardized format
+    """
+   
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_birth")
+
+    mat_birth = (
+        spark.table("4_prod.raw.mat_birth")
+        .filter(
+            (col("DELETE_IND") == 0) &
+            (col("ADC_UPDT") > max_adc_updt))
+        .withColumn("NHS_NBR", regexp_replace(col("NHS"), "-", ""))
+    )
+
+    # Get the rid of the duplicate records
+
+    # Drop the exact duplicates
+    mat_birth = mat_birth.dropDuplicates()
+
+    # Identify near-duplicate rows: rows with the same "PREGNANCY_ID" and "BIRTH_ODR_NBR" are considered possible duplicates (representing the same baby)
+    window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR")
+    mat_birth_check = mat_birth.withColumn("dup_count", F.count("*").over(window))
+
+    # Select rows that are not duplicates
+    non_dups = mat_birth_check.filter(F.col("dup_count") == 1)
+
+    # Retrieve rows where "PREGNANCY_ID" and "BIRTH_ODR_NBR" match, and eliminate any duplicate records.
+    near_dups = (mat_birth_check.filter(col("dup_count") > 1))
+
+    dup_num = near_dups.count()    
+
+    if dup_num > 0:
+        print(f"Found {dup_num} duplicate records sharing the same PREGNANCY_ID and BIRTH_ODR_NBR. Proceeding to clean up these duplicates...")
+
+        # Further check and flag rows where "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS" match.
+        # If any one of "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS" also match, the rows are confirmed as near duplicates. 
+        cols_to_match = ["BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", "NHS"]
+
+        for c in cols_to_match:
+            window_c = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR", c)
+            # flag = 1 if count > 1, else 0
+            near_dups = near_dups.withColumn(
+                f"{c}_match_flag",
+                F.when(F.count("*").over(window_c) > 1, 1).otherwise(0)
+            )
+        near_dups = near_dups.withColumn("match_flags", F.col("BIRTH_DT_TM_match_flag") + F.col("NB_SEX_DESC_match_flag") + F.col("BABY_PERSON_ID_match_flag") + F.col("NHS_match_flag"))
+
+        #  When "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID" and "NHS" do not match any other rows, keep the most recent record
+        no_match = near_dups.filter(col("match_flags") == 0)
+        no_match_num = no_match.count()
+
+        if no_match_num > 0:
+            window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR").orderBy(F.col("Record_Updated_Dt").desc())
+            no_match = no_match.withColumn("update_order", F.row_number().over(window)) 
+            no_match_to_keep = no_match.filter(col("update_order") == 1) \
+                .drop("dup_count","null_count","null_order","BIRTH_DT_TM_match_flag","NB_SEX_DESC_match_flag","BABY_PERSON_ID_match_flag","NHS_match_flag","match_flags", "update_order")
+   
+
+        # If there is a further match on "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS", keep the row with the most complete information
+        any_match = near_dups.filter(col("match_flags") > 0)
+        any_match_num = any_match.count()
+
+        if any_match_num > 0:
+
+            cols_to_check = [c for c in near_dups.columns if c not in ["PREGNANCY_ID", "BIRTH_ODR_NBR"]]
+            any_match = any_match.withColumn(
+                "null_count",
+                reduce(
+                    lambda a, b: a + b,
+                    [F.when(F.col(c).isNull(), 1).otherwise(0) for c in cols_to_check])
+            )
+            
+            window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR").orderBy(F.col("null_count"))
+            any_match_ranked = any_match.withColumn("null_order",F.row_number().over(window))
+            any_match_to_keep = any_match_ranked.filter(F.col("null_order") == 1).drop("dup_count","null_count","null_order","BIRTH_DT_TM_match_flag","NB_SEX_DESC_match_flag","BABY_PERSON_ID_match_flag","NHS_match_flag","match_flags")
+
+        # Double check if there are duplicate records between no_match_to_keep and any_match_to_keep. 
+        common_rows = no_match_to_keep.join(any_match_to_keep, on = ["PREGNANCY_ID", "BIRTH_ODR_NBR"], how = "inner") 
+
+        # When a row appears in both no_match_to_keep and any_match_to_keep, keep the version from any_match_to_keep
+        if common_rows.count() > 0:
+            no_match_to_keep_final = no_match_to_keep.join(
+                any_match_to_keep.select("PREGNANCY_ID", "BIRTH_ODR_NBR").distinct(),
+                on=["PREGNANCY_ID", "BIRTH_ODR_NBR"],
+                how="left_anti"
+            )
+
+        # Merge the cleaned duplicate rows with the rows that were not duplicates
+        mat_birth_final = non_dups.drop("dup_count") \
+            .unionByName(no_match_to_keep_final) \
+            .unionByName(any_match_to_keep).alias("BIRTH")
+    
+    mat_pregnancy = (
+        spark.table("4_prod.raw.mat_pregnancy")
+        .filter(
+            (col("DELETE_IND") == 0))
+        .select("PREGNANCY_ID", "PERSON_ID")
+        .dropDuplicates()
+        ).alias("MOTHER")
+
+    
+    nnu_epi = (
+        spark.table("4_prod.raw.nnu_episodes")
+        .select("NationalIDBaby", "GestationWeeks","GestationDays", "CongenitalAnomalies", "FetusNumber", "MaritalStatusMother", "LastUpdate")
+        .dropDuplicates()
+        .filter((F.col("CongenitalAnomalies").isNotNull()) | (F.col("FetusNumber").isNotNull()))
+        )
+    
+    window = Window.partitionBy("NationalIDBaby")
+    nnu_epi = nnu_epi.withColumn("dup_count", F.count("*").over(window))
+    dup_check = nnu_epi.filter(col("dup_count") > 1)
+
+    # Detect and clean duplicate rows in the table, if any exist
+    if dup_check.count() > 0:
+        non_dups = nnu_epi.filter(col("dup_count") == 1)
+        dups = nnu_epi.filter(col("dup_count") > 1)
+    
+        # Get the rows with most relevant information
+        cols_to_check = ["CongenitalAnomalies", "FetusNumber","MaritalStatusMother", "GestationWeeks","GestationDays"]
+        nnu_epi = nnu_epi.withColumn(
+            "null_count",
+            reduce(
+                lambda a, b: a + b,
+                [F.when(F.col(c).isNull(), 1).otherwise(0) for c in cols_to_check])
+        )
+        # Rank the rows on the order of ascending dup_count, ascending null_count and descending LastUpdate.
+        window = Window.partitionBy("NationalIDBaby").orderBy(F.col("dup_count"),F.col("null_count"),F.col("LastUpdate").desc())
+        nnu_epi_ranked = nnu_epi.withColumn("order",F.row_number().over(window))
+        nnu_epi_final = nnu_epi_ranked.filter(F.col("order") == 1).drop("dup_count","null_count","order").alias("NNU")
+
+    final_df = (
+        mat_birth_final
+        .join(mat_pregnancy, col("BIRTH.PREGNANCY_ID") == col("MOTHER.Pregnancy_ID"), "left")
+        .join(nnu_epi_final, col("BIRTH.NHS_NBR") == col("NNU.NationalIDBaby"), "left")
+        .select(
+            col("MOTHER.Person_ID").cast(LongType()).alias("MotherPerson_ID"),
+            col("BIRTH.PREGNANCY_ID").cast(LongType()).alias("Pregnancy_ID"),
+            col("BIRTH.BABY_PERSON_ID").cast(LongType()).alias("BabyPerson_ID"),
+            col("BIRTH.MRN").cast(StringType()).alias("Baby_MRN"),
+            col("BIRTH.NHS_NBR").cast(StringType()).alias("Baby_NHS"),
+            col("BIRTH.BIRTH_ODR_NBR").cast(IntegerType()).alias("BirthOrder"),
+            col("BIRTH.BIRTH_NBR").cast(IntegerType()).alias("BirthNumber"),
+            col("NNU.FetusNumber").cast(IntegerType()),
+            col("BIRTH.BIRTH_LOC_NM_ID").cast(IntegerType()).alias("BirthLocation_CD"),
+            col("BIRTH.BIRTH_LOC_DESC").cast(StringType()).alias("BirthLocation_DESC"),
+            col("BIRTH.BIRTH_DT_TM").cast(StringType()).alias("BirthDateTime"),
+            col("BIRTH.DEL_METHOD_CD").cast(IntegerType()).alias("DeliveryMethod_CD"),
+            col("BIRTH.DEL_METHOD_DESC").cast(StringType()).alias("DeliveryMethod_DESC"),
+            col("BIRTH.DEL_OUTCOME_CD").cast(IntegerType()).alias("DeliveryOutcome_CD"),
+            col("BIRTH.DEL_OUTCOME_DESC").cast(StringType()).alias("DeliveryOutcome_DESC"),
+            col("BIRTH.NEO_OUTCOME_CD").cast(IntegerType()).alias("NeonatalOutcome_CD"),
+            col("BIRTH.NEO_OUTCOME_DESC").cast(StringType()).alias("NeonatalOutcome_DESC"),
+            col("BIRTH.PREG_OUTCOME_CD").cast(IntegerType()).alias("PregOutcome_CD"),
+            col("BIRTH.PREG_OUTCOME_DESC").cast(StringType()).alias("PregOutcome_DESC"),
+            col("BIRTH.PRES_DEL_NM_ID").cast(IntegerType()).alias("PresDel_CD"),
+            col("BIRTH.PRES_DEL_DESC").cast(StringType()).alias("PresDelDesc"),
+            col("NNU.GestationWeeks").cast(IntegerType()).alias("GestationWeeks"),
+            col("NNU.GestationDays").cast(IntegerType()).alias("GestationDays"),
+            col("BIRTH.BIRTH_WT").cast(StringType()).alias("BirthWeight"),
+            col("BIRTH.NB_SEX_DESC").cast(StringType()).alias("BirthSex"),
+            col("BIRTH.APGAR_1MIN").cast(IntegerType()).alias("APGAR1Min"),
+            col("BIRTH.APGAR_5MIN").cast(IntegerType()).alias("APGAR5Min"),
+            col("BIRTH.FEEDING_METHOD_DESC").cast(StringType()).alias("FeedingMethod"),
+            col("NNU.CongenitalAnomalies").cast(StringType()).alias("CongenitalAnomalies"),
+            col("BIRTH.MOTHER_COMPLICATION_DESC").cast(StringType()).alias("MotherComplications"),
+            col("BIRTH.FETAL_COMPLICATION_DESC").cast(StringType()).alias("FetalComplications"),
+            col("BIRTH.NEONATAL_COMPLICATION_DESC").cast(StringType()).alias("NeonatalComplications"),
+            col("BIRTH.RESUS_METHOD_DESC").cast(StringType()).alias("ResMethod"),
+            col("NNU.MaritalStatusMother").cast(StringType()).alias("MaritalStatusMother"),
+            col("BIRTH.ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT") 
+        )
+    )
+
+    return final_df
+
+updates_df = create_mat_birth_mapping_incr()
+    
+
+update_table(updates_df, "4_prod.bronze.map_mat_birth", ["Pregnancy_ID", "BirthOrder"],schema_map_mat_birth, map_mat_birth_comment)
+
+
