@@ -65,7 +65,8 @@ def detect_schema_changes(target_table: str, target_schema: StructType = None, t
     if target_schema:
         current_schema = spark.table(target_table).schema
         current_fields = {f.name: f for f in current_schema.fields}
-        
+        target_fields = {f.name for f in target_schema.fields}
+
         for target_field in target_schema.fields:
             field_name = target_field.name
             
@@ -96,7 +97,7 @@ def detect_schema_changes(target_table: str, target_schema: StructType = None, t
                     'nullable': target_field.nullable
                 })
                 changes['has_changes'] = True
-    
+
     if table_comment:
         # Check current table comment
         try:
@@ -121,6 +122,7 @@ def escape_comment(text: str) -> str:
         return ""
     return text.replace("\\", "\\\\").replace("'", "''")
     
+
 def apply_schema_changes(target_table: str, changes: dict):
     """
     Apply detected schema changes efficiently.
@@ -137,30 +139,36 @@ def apply_schema_changes(target_table: str, changes: dict):
         updates_applied.append(f"Added column {col['name']}")
     
     # Update existing columns
-    for col in changes['columns_to_update']:
-        if col['type_changed'] and col['comment_changed']:
-            # Both type and comment changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` TYPE {col['type']} 
-                COMMENT '{escape_comment(col['comment'])}'
-            """)
-            updates_applied.append(f"Updated {col['name']} type and comment")
-        elif col['type_changed']:
-            # Only type changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` TYPE {col['type']}
-            """)
-            updates_applied.append(f"Updated {col['name']} type")
-        elif col['comment_changed']:
-            # Only comment changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` COMMENT '{escape_comment(col['comment'])}'
-            """)
-            updates_applied.append(f"Updated {col['name']} comment")
+
+    # Check if any column has a type change
+    type_change_detected = any(col['type_changed'] for col in changes['columns_to_update'])
+
+    if type_change_detected:
+        print(f"Type change detected. Recreating table {target_table}...")
+        df = spark.table(target_table)
+
+        for col in changes['columns_to_update']:
+            if col['type_changed']:
+                df = df.withColumn(col['name'], df[col['name']].cast(col['type']))
+
+        # Drop and recreate the table
+        spark.sql(f"DROP TABLE IF EXISTS {target_table}")
+        df.write.format("delta").saveAsTable(target_table)
+
+        updates_applied.append(f"Recreated {target_table} due to type change")
+
+    # Handle column comment updates separately
+    comment_change_detected = any(col['comment_changed'] for col in changes['columns_to_update'])
     
+    if comment_change_detected:
+        for col in changes['columns_to_update']:
+            if col['comment_changed']:
+                spark.sql(f"""
+                    ALTER TABLE {target_table}
+                    ALTER COLUMN `{col['name']}` COMMENT '{escape_comment(col['comment'])}'
+                """)
+                updates_applied.append(f"Updated {col['name']} comment")
+
     # Update table comment
     if changes['table_comment_update']:
         spark.sql(f"""
@@ -296,11 +304,13 @@ def update_table(source_df, target_table: str, index_column: str,
         else:
             # Perform merge operation
             print(f"[INFO] Performing merge on {target_table} using column {index_column}")
+
+            merge_condition = " AND ".join([f"t.{col} = s.{col}" for col in index_column])
+
             tgt = DeltaTable.forName(spark, target_table)
             (
                 tgt.alias("t")
-                .merge(source_df.alias("s"),
-                       f"t.{index_column} = s.{index_column}")
+                .merge(source_df.alias("s"),merge_condition)
                 .whenMatchedUpdateAll()
                 .whenNotMatchedInsertAll()
                 .execute()
