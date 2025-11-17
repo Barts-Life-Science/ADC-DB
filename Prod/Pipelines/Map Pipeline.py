@@ -19,20 +19,48 @@ def get_max_timestamp(table_name: str,
                      ) -> datetime:
     """
     Returns the greatest value of `ts_column` in `table_name`.
+    If CDF is enabled, uses the earlier of max(ts_column) or table's last update time
+    to guard against future-dated timestamps.
     If the table or the column does not exist the supplied default is returned.
     """
     try:
         if not table_exists(table_name):
             return default_date
-
-        # use the DataFrame API – no need to build a SQL string
+        
+        # Get max value from the timestamp column
         max_row = (
             spark.table(table_name)
                  .select(F.max(ts_column).alias("max_ts"))
                  .first()
         )
-
-        return max_row.max_ts or default_date
+        max_ts_value = max_row.max_ts or default_date
+        
+        # If CDF is enabled, check table's actual last update time as a safeguard
+        if has_cdf_enabled(table_name):
+            try:
+                # Get the table's last modification timestamp from Delta history
+                history = spark.sql(f"DESCRIBE HISTORY {table_name} LIMIT 1").collect()
+                
+                if history and len(history) > 0:
+                    table_last_update = history[0].timestamp
+                    
+                    # Convert to datetime if it's not already
+                    if isinstance(table_last_update, str):
+                        from datetime import datetime
+                        table_last_update = datetime.fromisoformat(table_last_update.replace('Z', '+00:00'))
+                    
+                    # Use the earlier of the two timestamps to be conservative
+                    # This protects against future-dated ADC_UPDT values
+                    if table_last_update < max_ts_value:
+                        print(f"[INFO] {table_name}: Using table update time {table_last_update} instead of max {ts_column} {max_ts_value}")
+                        return table_last_update
+                    
+            except Exception as cdf_error:
+                print(f"[WARN] Could not check CDF history for {table_name}: {cdf_error}")
+                print(f"[INFO] Falling back to max {ts_column} value")
+        
+        return max_ts_value
+        
     except Exception as e:
         print(f"Warning: could not read {ts_column} from {table_name}: {e}")
         return default_date
@@ -46,6 +74,119 @@ def table_exists(table_name: str) -> bool:
     """
     # Spark 3.4+ – Databricks – works with Unity Catalog
     return spark.catalog.tableExists(table_name)
+
+# COMMAND ----------
+
+def get_trust_filter():
+    """Returns the trust filter condition for Barts Health NHS Trust"""
+    return col("Trust") == "Barts"
+
+def has_cdf_enabled(table_name: str) -> bool:
+    """
+    Check if a table has Change Data Feed enabled.
+    
+    Args:
+        table_name: Fully qualified table name
+        
+    Returns:
+        bool: True if CDF is enabled, False otherwise
+    """
+    try:
+        table_props = spark.sql(f"SHOW TBLPROPERTIES {table_name}").collect()
+        cdf_prop = next((row.value for row in table_props if row.key == 'delta.enableChangeDataFeed'), None)
+        return cdf_prop == 'true'
+    except Exception as e:
+        print(f"Warning: Could not check CDF status for {table_name}: {e}")
+        return False
+
+def get_incremental_data_with_cdf(
+    source_table: str,
+    target_table: str,
+    timestamp_column: str = "ADC_UPDT",
+    apply_trust_filter: bool = True,
+    additional_filters = None
+):
+    """
+    Get incremental data using CDF when available, falling back to timestamp filtering.
+    """
+    max_timestamp = get_max_timestamp(target_table, timestamp_column)
+    
+    if has_cdf_enabled(source_table):
+        try:
+            print(f"[INFO] Attempting CDF read for {source_table}")
+            
+            changes_df = (
+                spark.read.format("delta")
+                .option("readChangeFeed", "true")
+                .option("startingTimestamp", max_timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+                .table(source_table)
+            )
+            
+            non_meta_cols = [c for c in changes_df.columns if not c.startswith("_")]
+            window_spec = Window.partitionBy(*non_meta_cols).orderBy(col("_commit_timestamp").desc())
+            
+            incremental_df = (
+                changes_df
+                .filter(col("_change_type").isin("insert", "update_postimage"))
+                .withColumn("_row_num", row_number().over(window_spec))
+                .filter(col("_row_num") == 1)
+                .drop("_change_type", "_commit_version", "_commit_timestamp", "_row_num")
+            )
+            
+            record_count = incremental_df.count()
+            print(f"[SUCCESS] Retrieved {record_count} records via CDF from {source_table}")
+            
+        except Exception as e:
+            # Simplified error message - don't print full stack trace for known fallback scenario
+            error_msg = str(e).split('\n')[0]  # Just first line
+            if "FILE_NOT_FOUND" in error_msg or "PathNotFound" in error_msg:
+                print(f"[WARN] CDF files unavailable for {source_table} (possibly due to file cleanup or shallow clone)")
+            else:
+                print(f"[WARN] CDF read failed for {source_table}: {error_msg}")
+            
+            print(f"[INFO] Using timestamp-based incremental load instead")
+            incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    else:
+        print(f"[INFO] Using timestamp-based incremental load for {source_table}")
+        incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    
+    # Apply trust filter
+    if apply_trust_filter:
+        schema_fields = [f.name for f in incremental_df.schema.fields]
+        
+        if "Trust" in schema_fields:
+            incremental_df = incremental_df.filter(col("Trust") == "Barts")
+            print(f"[INFO] Applied Barts trust filter")
+        # Removed the warning message here - it's not really a problem
+    
+    # Apply additional filters
+    if additional_filters is not None:
+        incremental_df = incremental_df.filter(additional_filters)
+    
+    return incremental_df
+
+def apply_trust_filter_to_df(df, table_name: str = None):
+    """
+    Apply Barts trust filtering to a DataFrame.
+    
+    Args:
+        df: DataFrame to filter
+        table_name: Optional table name for logging
+        
+    Returns:
+        DataFrame: Filtered DataFrame
+    """
+    schema_fields = [f.name for f in df.schema.fields]
+    
+    if "Trust" not in schema_fields:
+        if table_name:
+            print(f"[WARN] Trust column not found in {table_name}, returning unfiltered")
+        return df
+    
+    if table_name:
+        print(f"[INFO] Applied Barts trust filter to {table_name}")
+    
+    return df.filter(col("Trust") == "Barts")
 
 # COMMAND ----------
 
@@ -513,10 +654,12 @@ def create_address_mapping_incr():
     
     # Get base address data with enhanced preprocessing
     base_addresses = (
-        spark.table("4_prod.raw.mill_address")
-        .filter(
-            (col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION")) & 
-            (col("ADC_UPDT") > max_adc_updt)
+        get_incremental_data_with_cdf(
+            source_table="4_prod.raw.mill_address",
+            target_table="4_prod.bronze.map_address",
+            timestamp_column="ADC_UPDT",
+            apply_trust_filter=True,
+            additional_filters=(col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION"))
         )
         .select(
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID", 
@@ -1049,12 +1192,12 @@ def create_person_mapping_incr():
     )
     
     # Get base person data with filtering
-    base_persons = (
-        spark.table("4_prod.raw.mill_person")
-        .filter(
-            (col("active_ind") == 1) &
-            (col("ADC_UPDT") > max_adc_updt)  # Only process new/modified records
-        )
+    base_persons = get_incremental_data_with_cdf(
+    source_table="4_prod.raw.mill_person",
+    target_table="4_prod.bronze.map_person",
+    timestamp_column="ADC_UPDT",
+    apply_trust_filter=True,
+    additional_filters=(col("active_ind") == 1)
     )
     
     # Process and validate person data
@@ -1703,9 +1846,11 @@ def create_encounter_mapping_incr():
     one_week_seconds = 7 * 24 * 60 * 60
     
     # Get base encounter data
-    base_encounters = (
-        spark.table("4_prod.raw.mill_encounter")
-        .filter(col("ADC_UPDT") > max_adc_updt)
+    base_encounters = get_incremental_data_with_cdf(
+    source_table="4_prod.raw.mill_encounter",
+    target_table="4_prod.bronze.map_encounter",
+    timestamp_column="ADC_UPDT",
+    apply_trust_filter=True
     )
     
     # Get reference data
@@ -1964,7 +2109,12 @@ def create_diagnosis_mapping_incr():
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_diagnosis")
     
     # Get base tables
-    diagnosis = spark.table("4_prod.raw.mill_diagnosis").filter(col("ADC_UPDT") > max_adc_updt)
+    diagnosis = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_diagnosis",
+        target_table="4_prod.bronze.map_diagnosis",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
+    )
     nomenclature = spark.table("4_prod.bronze.nomenclature")
     encounter = spark.table("4_prod.bronze.map_encounter")
     code_values = spark.table("3_lookup.mill.mill_code_value")
@@ -2381,7 +2531,12 @@ def create_problem_mapping_incr():
     code_values = spark.table("3_lookup.mill.mill_code_value")
     encounters = spark.table("4_prod.bronze.map_encounter").alias("enc")
     
-    base_problems = problem.filter(col("ADC_UPDT") > max_adc_updt)
+    base_problems = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_problem",
+        target_table="4_prod.bronze.map_problem",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
+    )
 
     earliest_date_window = Window.partitionBy("PERSON_ID", "NOMENCLATURE_ID")
     
@@ -2882,10 +3037,27 @@ def create_base_medication_administrations_incr():
                 .select("RXCUI", "CODE", "STR")
                ) # Alias added later where used
 
-    # Get base tables with aliases and filtering
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").alias("CE")
-    med_admin_event = spark.table("4_prod.raw.mill_med_admin_event").alias("MAE") \
-        .filter((col("MAE.EVENT_TYPE_CD").isNotNull()) & (col("MAE.EVENT_TYPE_CD") != 0))
+
+    clinical_event = (
+    get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_clinical_event",
+        target_table="4_prod.bronze.map_med_admin",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+    )
+    .alias("CE")
+    )
+
+    med_admin_event = (
+    apply_trust_filter_to_df(
+        spark.table("4_prod.raw.mill_med_admin_event"),
+        "4_prod.raw.mill_med_admin_event"
+    )
+    .filter((col("EVENT_TYPE_CD").isNotNull()) & (col("EVENT_TYPE_CD") != 0))
+    .alias("MAE")
+    )
+
     encounter = spark.table("4_prod.raw.mill_encounter").alias("ENC")
     ce_med_result = spark.table("4_prod.raw.mill_ce_med_result").alias("MR")
     orders = spark.table("4_prod.raw.mill_orders").alias("ORDERS")
@@ -4109,8 +4281,11 @@ def process_procedure_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_procedure")
         
         # Get base tables
-        procedures = spark.table("4_prod.raw.mill_procedure").filter(
-            col("ADC_UPDT") > max_adc_updt
+        procedures = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_procedure",
+        target_table="4_prod.bronze.map_procedure",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
         ).alias("proc")
         
         if procedures.count() > 0:
@@ -4688,10 +4863,16 @@ def process_numeric_events_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_numeric_events")
         
         # Get base tables with filtering for new/modified records
-        string_results = spark.table("4_prod.raw.mill_ce_string_result")\
-            .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())\
-            .filter(col("ADC_UPDT") > max_adc_updt)\
-            .alias("sr")
+        string_results = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_string_result",
+        target_table="4_prod.bronze.map_numeric_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        )
+        .alias("sr")
+        )
         
         if string_results.count() > 0:
             print(f"Processing {string_results.count()} updated records")
@@ -5038,12 +5219,14 @@ def process_date_events_incremental():
         
         # Get base date results with filtering
         date_results = (
-            spark.table("4_prod.raw.mill_ce_date_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_ts) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("dr")
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_date_result",
+        target_table="4_prod.bronze.map_date_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_ts)
+        )
+        .alias("dr")
         )
         
         if date_results.count() > 0:
@@ -5547,10 +5730,14 @@ def process_text_events_incremental():
         
         # Get base tables with filtering for new/modified records
         string_results = (
-            spark.table("4_prod.raw.mill_ce_string_result")
-            .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
-            .filter(col("ADC_UPDT") > max_adc_updt)
-            .alias("sr")
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_string_result",
+        target_table="4_prod.bronze.map_text_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        )
+        .alias("sr")
         )
         
         if string_results.count() > 0:
@@ -6091,12 +6278,14 @@ def process_nomen_events_incremental():
         
         # Get base tables with filtering
         coded_results = (
-            spark.table("4_prod.raw.mill_ce_coded_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_timestamp()) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("cr")
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_coded_result",
+        target_table="4_prod.bronze.map_nomen_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        )
+        .alias("cr")
         )
         
         if coded_results.count() > 0:
@@ -6657,12 +6846,14 @@ def process_coded_events_incremental():
         
         # Get base tables with filtering
         coded_results = (
-            spark.table("4_prod.raw.mill_ce_coded_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_timestamp()) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("cr")
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_coded_result",
+        target_table="4_prod.bronze.map_coded_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        )
+        .alias("cr")
         )
         
         if coded_results.count() > 0:
