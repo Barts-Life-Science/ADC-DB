@@ -49,6 +49,98 @@ def table_exists_with_rows(table_name):
 
 # COMMAND ----------
 
+def has_cdf_enabled(table_name: str) -> bool:
+    """
+    Check if a table has Change Data Feed enabled.
+    """
+    try:
+        table_props = spark.sql(f"SHOW TBLPROPERTIES {table_name}").collect()
+        cdf_prop = next((row.value for row in table_props if row.key == 'delta.enableChangeDataFeed'), None)
+        return cdf_prop == 'true'
+    except Exception as e:
+        print(f"Warning: Could not check CDF status for {table_name}: {e}")
+        return False
+
+def get_incremental_data_with_cdf(
+    source_table: str,
+    target_table: str,
+    timestamp_column: str = "ADC_UPDT",
+    apply_trust_filter: bool = True,
+    additional_filters=None
+):
+    """
+    Get incremental data using CDF when available, falling back to timestamp filtering.
+    """
+    max_timestamp = get_max_adc_updt(target_table)
+    
+    if has_cdf_enabled(source_table):
+        try:
+            print(f"[INFO] Attempting CDF read for {source_table}")
+            
+            changes_df = (
+                spark.read.format("delta")
+                .option("readChangeFeed", "true")
+                .option("startingTimestamp", max_timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+                .table(source_table)
+            )
+            
+            non_meta_cols = [c for c in changes_df.columns if not c.startswith("_")]
+            window_spec = Window.partitionBy(*non_meta_cols).orderBy(col("_commit_timestamp").desc())
+            
+            incremental_df = (
+                changes_df
+                .filter(col("_change_type").isin("insert", "update_postimage"))
+                .withColumn("_row_num", row_number().over(window_spec))
+                .filter(col("_row_num") == 1)
+                .drop("_change_type", "_commit_version", "_commit_timestamp", "_row_num")
+            )
+            
+            record_count = incremental_df.count()
+            print(f"[SUCCESS] Retrieved {record_count} records via CDF from {source_table}")
+            
+        except Exception as e:
+            error_msg = str(e).split('\n')[0]
+            if "FILE_NOT_FOUND" in error_msg or "PathNotFound" in error_msg:
+                print(f"[WARN] CDF files unavailable for {source_table} (possibly due to file cleanup or shallow clone)")
+            else:
+                print(f"[WARN] CDF read failed for {source_table}: {error_msg}")
+            
+            print(f"[INFO] Using timestamp-based incremental load instead")
+            incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    else:
+        print(f"[INFO] Using timestamp-based incremental load for {source_table}")
+        incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    
+    if apply_trust_filter:
+        schema_fields = [f.name for f in incremental_df.schema.fields]
+        
+        if "Trust" in schema_fields:
+            incremental_df = incremental_df.filter(col("Trust") == "Barts")
+            print(f"[INFO] Applied Barts trust filter")
+    
+    if additional_filters is not None:
+        incremental_df = incremental_df.filter(additional_filters)
+    
+    return incremental_df
+
+def apply_trust_filter_to_df(df, table_name: str = None):
+    """
+    Apply Barts trust filtering to a DataFrame.
+    """
+    schema_fields = [f.name for f in df.schema.fields]
+    
+    if "Trust" not in schema_fields:
+        if table_name:
+            print(f"[WARN] Trust column not found in {table_name}, returning unfiltered")
+        return df
+    
+    if table_name:
+        print(f"[INFO] Applied Barts trust filter to {table_name}")
+    
+    return df.filter(col("Trust") == "Barts")
+
+# COMMAND ----------
+
 
 @dlt.table(
     name="code_value",
@@ -155,10 +247,13 @@ def lookup_blob_content():
 
     return (
         spark.table("4_prod.bronze.mill_blob_text")
+
         .filter(col("STATUS") == "Decoded")
-        .filter(col("Trust") == "Barts")
+
         .withColumn("row", row_number().over(window))
+
         .filter(col("row") == 1)
+
         .drop("row")
     )
 
@@ -199,18 +294,12 @@ schema_rde_patient_demographics = StructType([
 def patient_demographics_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_patient_demographics")
     
-    pat = spark.table("4_prod.raw.mill_person_patient").alias("Pat").filter(col("active_ind") == 1)
-    pers = spark.table("4_prod.raw.mill_person").alias("Pers").filter(col("active_ind") == 1)
-    address_lookup = dlt.read("current_address").alias("A")
-    nhs_lookup = dlt.read("patient_nhs").alias("NHS")
-    mrn_lookup = dlt.read("patient_mrn").alias("MRN")
-    code_value_lookup = dlt.read("code_value").alias("CV")
+    pat_filtered = get_incremental_data_with_cdf("4_prod.raw.mill_person_patient", "4_prod.rde.rde_patient_demographics", apply_trust_filter=False)
+    pers_filtered = get_incremental_data_with_cdf("4_prod.raw.mill_person", "4_prod.rde.rde_patient_demographics", apply_trust_filter=False)
+    address_filtered = get_incremental_data_with_cdf(dlt.read("current_address"), "4_prod.rde.rde_patient_demographics", apply_trust_filter=False)
+    nhs_filtered = get_incremental_data_with_cdf(dlt.read("patient_nhs"), "4_prod.rde.rde_patient_demographics", apply_trust_filter=False)
+    mrn_filtered = get_incremental_data_with_cdf(dlt.read("patient_mrn"), "4_prod.rde.rde_patient_demographics", apply_trust_filter=False)
     
-    pat_filtered = pat.filter(col("ADC_UPDT") > max_adc_updt)
-    pers_filtered = pers.filter((col("ADC_UPDT") > max_adc_updt))
-    address_filtered = address_lookup.filter(col("ADC_UPDT") > max_adc_updt)
-    nhs_filtered = nhs_lookup.filter(col("ADC_UPDT") > max_adc_updt)
-    mrn_filtered = mrn_lookup.filter(col("ADC_UPDT") > max_adc_updt)
     
     person_ids = (
         pat_filtered.select("PERSON_ID")
@@ -220,6 +309,13 @@ def patient_demographics_incr():
         .union(mrn_filtered.select("PERSON_ID"))
     ).distinct()
     
+    pat = spark.table("4_prod.raw.mill_person_patient").alias("Pat").filter(col("active_ind") == 1)
+    pers = spark.table("4_prod.raw.mill_person").alias("Pers").filter(col("active_ind") == 1)
+    address_lookup = dlt.read("current_address").alias("A")
+    nhs_lookup = dlt.read("patient_nhs").alias("NHS")
+    mrn_lookup = dlt.read("patient_mrn").alias("MRN")
+    code_value_lookup = dlt.read("code_value").alias("CV")
+
     pat_final = pat.join(person_ids, "PERSON_ID", "inner")
     
     return (
@@ -260,7 +356,6 @@ def patient_demographics_incr():
                 col("MRN.ADC_UPDT")
             ).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 
@@ -329,15 +424,19 @@ schema_rde_encounter = StructType([
 def encounter_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_encounter")
 
-    encounter = spark.table("4_prod.raw.mill_encounter").filter(col("Trust") == "Barts")
+    encounter_filtered = get_incremental_data_with_cdf("4_prod.raw.mill_encounter", "4_prod.rde.rde_encounter")
     patient_demographics = dlt.read("rde_patient_demographics").alias("D")
     code_value_lookup = dlt.read("code_value").alias("CV")
     encounter_alias = spark.table("4_prod.raw.mill_encntr_alias")
 
     person_ids = (
-      encounter.filter(col("ADC_UPDT") > max_adc_updt).select("PERSON_ID")
-      .union(patient_demographics.filter(col("ADC_UPDT") > max_adc_updt).select("PERSON_ID")
-    )).distinct()
+      encounter_filtered.select("PERSON_ID")
+      .union(patient_demographics.filter(col("ADC_UPDT") > get_max_timestamp("4_prod.rde.rde_encounter")).select("PERSON_ID"))
+    ).distinct()
+
+    encounter = spark.table("4_prod.raw.mill_encounter")
+    code_value_lookup = dlt.read("code_value").alias("CV")
+    encounter_alias = spark.table("4_prod.raw.mill_encntr_alias")
 
     encounter_final = encounter.join(person_ids, "PERSON_ID", "inner").alias("E")
 
@@ -447,19 +546,22 @@ schema_rde_apc_diagnosis = StructType([
 def apc_diagnosis_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_apc_diagnosis")
 
+    cds_apc_icd_diag_filtered = get_incremental_data_with_cdf("4_prod.raw.cds_apc_icd_diag", "4_prod.rde.rde_apc_diagnosis")
+    cds_apc_filtered = get_incremental_data_with_cdf("4_prod.raw.cds_apc", "4_prod.rde.rde_apc_diagnosis")
+
+    cds_apc_ids = (
+        cds_apc_icd_diag_filtered.select("CDS_APC_ID")
+        .union(cds_apc_filtered.select("CDS_APC_ID"))
+    ).distinct()
+
     cds_apc_icd_diag = spark.table("4_prod.raw.cds_apc_icd_diag")
+    cds_apc_icd_diag_final = cds_apc_icd_diag.join(cds_apc_ids, "CDS_APC_ID", "inner").alias("Icd")
+
     cds_apc = spark.table("4_prod.raw.cds_apc").alias("Apc")
     lkp_icd_diag = spark.table("3_lookup.dwh.lkp_icd_diag").alias("ICDDESC")
     patient_demographics = dlt.read("rde_patient_demographics").alias("Pat")
 
 
-    cds_apc_ids = (
-        cds_apc_icd_diag.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_APC_ID")
-        .union(cds_apc.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_APC_ID"))
-    ).distinct()
-
-
-    cds_apc_icd_diag_final = cds_apc_icd_diag.join(cds_apc_ids, "CDS_APC_ID", "inner").alias("Icd")
 
     return (
         cds_apc_icd_diag_final
@@ -477,7 +579,7 @@ def apc_diagnosis_incr():
             col("Apc.Start_Dt").cast(StringType()).alias("Activity_date"),
             col("Apc.CDS_Activity_Dt").cast(StringType()).alias("CDS_Activity_Dt"),
             greatest(col("Icd.ADC_UPDT"), col("Apc.ADC_UPDT"), col("Pat.ADC_UPDT")).alias("ADC_UPDT")
-        ).filter(col("ADC_UPDT") > max_adc_updt)
+        )
     )
 
 @dlt.view(name="apc_diagnosis_update")
@@ -543,10 +645,17 @@ schema_rde_all_problems = StructType([
 @dlt.table(name="rde_all_problems_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def all_problems_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_all_problems")
+    mill_dir_problem_incr = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_problem",
+        target_table="4_prod.rde.rde_all_problems",
+        apply_trust_filter=True  # Assuming mill_problem has a Trust column
+    ).alias("mil")
 
-    mill_dir_problem = spark.table("4_prod.raw.mill_problem").filter(col("Trust") == "Barts").alias("mil")
+    # Read upstream DLT and filter for relevant updates
+    max_target_timestamp = get_max_timestamp("4_prod.rde.rde_all_problems")
     encounter = dlt.read("rde_encounter").alias("E")
+    
+    # Apply trust filter to lookup table
     mill_dir_nomenclature = spark.table("3_lookup.mill.mill_nomenclature").alias("nom")
 
     return (
@@ -654,21 +763,26 @@ schema_rde_apc_opcs = StructType([
 @dlt.table(name="rde_apc_opcs_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def apc_opcs_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_apc_opcs")
+    target_table = "4_prod.rde.rde_apc_opcs"
+    
+    # Get incremental changes from source tables
+    cds_apc_opcs_proc_incr = get_incremental_data_with_cdf("4_prod.raw.cds_apc_opcs_proc", target_table)
+    cds_apc_incr = get_incremental_data_with_cdf("4_prod.raw.cds_apc", target_table)
 
+    # Union the keys to find all records that need reprocessing
+    cds_apc_ids = (
+        cds_apc_opcs_proc_incr.select("CDS_APC_ID")
+        .union(cds_apc_incr.select("CDS_APC_ID"))
+    ).distinct()
+
+    # Join the incremental keys back to the full source tables
     cds_apc_opcs_proc = spark.table("4_prod.raw.cds_apc_opcs_proc")
+    cds_apc_opcs_proc_final = cds_apc_opcs_proc.join(cds_apc_ids, "CDS_APC_ID", "inner").alias("OPCS")
+    
+    # Read other tables and apply trust filter
     cds_apc = spark.table("4_prod.raw.cds_apc").alias("Apc")
     lkp_opcs_410 = spark.table("3_lookup.dwh.opcs_410").alias("PDesc")
     patient_demographics = dlt.read("rde_patient_demographics").alias("Pat")
-
-
-    cds_apc_ids = (
-        cds_apc_opcs_proc.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_APC_ID")
-        .union(cds_apc.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_APC_ID"))
-    ).distinct()
-
-
-    cds_apc_opcs_proc_final = cds_apc_opcs_proc.join(cds_apc_ids, "CDS_APC_ID", "inner").alias("OPCS")
 
     return (
         cds_apc_opcs_proc_final
@@ -688,7 +802,7 @@ def apc_opcs_incr():
             col("Apc.Start_Dt").cast(StringType()).alias("Activity_date"),
             col("Apc.CDS_Activity_Dt").cast(StringType()).alias("CDS_Activity_Dt"),
             greatest(col("OPCS.ADC_UPDT"), col("Apc.ADC_UPDT"), col("Pat.ADC_UPDT")).alias("ADC_UPDT")
-        ).filter(col("ADC_UPDT") > max_adc_updt)
+        )
     )
 
 @dlt.view(name="apc_opcs_update")
@@ -743,21 +857,26 @@ schema_rde_op_diagnosis = StructType([
 @dlt.table(name="rde_op_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def op_diagnosis_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_op_diagnosis")
+    target_table = "4_prod.rde.rde_op_diagnosis"
 
+    # Get incremental changes from source tables
+    cds_opa_icd_diag_incr = get_incremental_data_with_cdf("4_prod.raw.cds_opa_icd_diag", target_table)
+    cds_op_all_incr = get_incremental_data_with_cdf("4_prod.raw.cds_op_all", target_table)
+
+    # Union the keys
+    cds_opa_ids = (
+        cds_opa_icd_diag_incr.select("CDS_OPA_ID")
+        .union(cds_op_all_incr.select("CDS_OPA_ID"))
+    ).distinct()
+
+    # Join back to full source tables
     cds_opa_icd_diag = spark.table("4_prod.raw.cds_opa_icd_diag")
+    cds_opa_icd_diag_final = cds_opa_icd_diag.join(cds_opa_ids, "CDS_OPA_ID", "inner").alias("Icd")
+
+    # Apply trust filter to source table
     cds_op_all = spark.table("4_prod.raw.cds_op_all").alias("OP")
     lkp_icd_diag = spark.table("3_lookup.dwh.lkp_icd_diag").alias("ICDDESC")
     patient_demographics = dlt.read("rde_patient_demographics").alias("Pat")
-
-
-    cds_opa_ids = (
-        cds_opa_icd_diag.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_OPA_ID")
-        .union(cds_op_all.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_OPA_ID"))
-    ).distinct()
-
-
-    cds_opa_icd_diag_final = cds_opa_icd_diag.join(cds_opa_ids, "CDS_OPA_ID", "inner").alias("Icd")
 
     return (
         cds_opa_icd_diag_final
@@ -775,8 +894,7 @@ def op_diagnosis_incr():
             col("OP.Att_Dt").cast(StringType()).alias("Activity_date"),
             col("OP.CDS_Activity_Dt").cast(StringType()).alias("CDS_Activity_Dt"),
             greatest(col("Icd.ADC_UPDT"), col("OP.ADC_UPDT"), col("Pat.ADC_UPDT")).alias("ADC_UPDT")
-        ).filter(col("ADC_UPDT") > max_adc_updt)
-        .filter(col("Icd.ICD_Diag_Cd").isNotNull())
+        ).filter(col("Icd.ICD_Diag_Cd").isNotNull())
     )
 
 @dlt.view(name="op_diagnosis_update")
@@ -832,19 +950,26 @@ schema_rde_opa_opcs = StructType([
 @dlt.table(name="rde_opa_opcs_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def opa_opcs_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_opa_opcs")
+    target_table = "4_prod.rde.rde_opa_opcs"
 
+    # Get incremental changes using CDF
+    cds_opa_opcs_proc_incr = get_incremental_data_with_cdf("4_prod.raw.cds_opa_opcs_proc", target_table)
+    cds_op_all_incr = get_incremental_data_with_cdf("4_prod.raw.cds_op_all", target_table)
+
+    # Union the keys to find all records that need reprocessing
+    cds_opa_ids = (
+        cds_opa_opcs_proc_incr.select("CDS_OPA_ID")
+        .union(cds_op_all_incr.select("CDS_OPA_ID"))
+    ).distinct()
+
+    # Join back to the full source tables using the incremental keys
     cds_opa_opcs_proc = spark.table("4_prod.raw.cds_opa_opcs_proc")
+    cds_opa_opcs_proc_final = cds_opa_opcs_proc.join(cds_opa_ids, "CDS_OPA_ID", "inner").alias("OPCS")
+
+    # Apply trust filter to other source tables
     cds_op_all = spark.table("4_prod.raw.cds_op_all").alias("OP")
     lkp_opcs_410 = spark.table("3_lookup.dwh.opcs_410").alias("OPDesc")
     patient_demographics = dlt.read("rde_patient_demographics").alias("Pat")
-
-    cds_opa_ids = (
-        cds_opa_opcs_proc.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_OPA_ID")
-        .union(cds_op_all.filter(col("ADC_UPDT") > max_adc_updt).select("CDS_OPA_ID"))
-    ).distinct()
-
-    cds_opa_opcs_proc_final = cds_opa_opcs_proc.join(cds_opa_ids, "CDS_OPA_ID", "inner").alias("OPCS")
 
     return (
         cds_opa_opcs_proc_final
@@ -863,7 +988,7 @@ def opa_opcs_incr():
             col("Pat.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("OP.CDS_Activity_Dt").cast(StringType()).alias("CDS_Activity_Dt"),
             greatest(col("OPCS.ADC_UPDT"), col("OP.ADC_UPDT"), col("Pat.ADC_UPDT")).alias("ADC_UPDT")
-        ).filter(col("ADC_UPDT") > max_adc_updt)
+        )
     )
 
 @dlt.view(name="opa_opcs_update")
@@ -1243,16 +1368,20 @@ schema_rde_pathology = StructType([
 @dlt.table(name="rde_pathology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def pathology_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pathology")
+    clinical_event_final = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_clinical_event",
+        target_table="4_prod.rde.rde_pathology",
+        additional_filters=(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+    ).alias("EVE")
 
-    orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
+    # Apply trust filter to other source tables
+    orders = spark.table("4_prod.raw.mill_orders").alias("ORD")
     order_catalogue = spark.table("3_lookup.mill.mill_order_catalog").alias("CAT")
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
+    
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
     blob_content = dlt.read("current_blob_content").alias("d")
     encounter = dlt.read("rde_encounter").alias("ENC")
-
-    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
+    clinical_event = spark.table("4_prod.raw.mill_clinical_event") # For self-join
 
     joined_data = (
         clinical_event_final
@@ -1302,7 +1431,6 @@ def pathology_incr():
             substring(col("EVE.REFERENCE_NBR"), 1, 11).cast(StringType()).alias("LabNo"),
             greatest(col("EVE.ADC_UPDT"), orders.ADC_UPDT, encounter.ADC_UPDT, order_catalogue.ADC_UPDT).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="pathology_update")
@@ -1369,19 +1497,20 @@ schema_rde_raw_pathology = StructType([
 @dlt.table(name="rde_raw_pathology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def raw_pathology_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_raw_pathology")
+    filtered_pres = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.path_patient_resultlevel",
+        target_table="4_prod.rde.rde_raw_pathology",
+        apply_trust_filter=True # Assuming this table has a Trust column
+    ).alias("PRES")
     
-    pres = spark.table("4_prod.raw.path_patient_resultlevel").alias("PRES")
-    pmrt = spark.table("4_prod.raw.path_master_resultable").alias("PMRT")
-    pmor = spark.table("4_prod.raw.path_master_orderables").alias("PMOR")
-    psl = spark.table("4_prod.raw.path_patient_samplelevel").alias("PSL")
-
-    filtered_pres = pres.filter(col("ADC_UPDT") > max_adc_updt)
-    
+    # Get distinct keys from the incremental data
     updated_lab_nos = filtered_pres.select("LabNo").distinct()
     
+    # Join keys to related tables to get necessary context
+    psl = spark.table("4_prod.raw.path_patient_samplelevel").alias("PSL")
     filtered_psl = psl.join(updated_lab_nos, "LabNo", "inner")
     
+    pmrt = spark.table("4_prod.raw.path_master_resultable").alias("PMRT")
     patient_demographics = dlt.read("rde_patient_demographics").alias("PD")
     
     joined_data = (
@@ -1425,7 +1554,6 @@ def raw_pathology_incr():
             filtered_psl.ClinicalDetails,
             greatest(col("PRES.ADC_UPDT"), col("PSL.ADC_UPDT")).alias("ADC_UPDT")
         ).distinct()
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="raw_pathology_update")
@@ -1714,16 +1842,19 @@ schema_rde_radiology = StructType([
 @dlt.table(name="rde_radiology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def radiology_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_radiology")
+    clinical_event_final = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_clinical_event",
+        target_table="4_prod.rde.rde_radiology",
+        additional_filters=(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+    ).alias("EVE")
 
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
-    orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
+    # Apply trust filter to other source tables
+    orders = spark.table("4_prod.raw.mill_orders").alias("ORD")
+    
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
     blob_content = dlt.read("current_blob_content").alias("B")
     encounter = dlt.read("rde_encounter").alias("ENC")
     nhsi_exam_mapping = spark.table("4_prod.raw.tbl_nhsi_exam_mapping").alias("M")
-
-    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
 
     joined_data = (
         clinical_event_final
@@ -1773,7 +1904,6 @@ def radiology_incr():
             col("EVE.EVENT_ID").cast(LongType()).alias("EventID"),
             greatest(col("EVE.ADC_UPDT"), orders.ADC_UPDT, encounter.ADC_UPDT, col("B.ADC_UPDT"), col("M.ADC_UPDT")).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="radiology_update")
@@ -1837,16 +1967,21 @@ schema_rde_family_history = StructType([
 @dlt.table(name="rde_family_history_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def family_history_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_family_history")
+    family_history_incr_df = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.pi_dir_family_history_activity",
+        target_table="4_prod.rde.rde_family_history"
+    ).alias("F")
 
-    family_history = spark.table("4_prod.raw.pi_dir_family_history_activity").alias("F")
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
+    
+    # Apply trust filters to the lookup tables
     person_patient_person_reltn = spark.table("4_prod.raw.mill_person_person_reltn").alias("REL")
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("R")
+    
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
 
     return (
-        family_history.filter(col("ADC_UPDT") > max_adc_updt)
+        family_history_incr_df
         .join(patient_demographics, col("F.PERSON_ID") == col("E.PERSON_ID"), "inner")
         .join(person_patient_person_reltn, col("F.RELATED_PERSON_ID") == col("REL.RELATED_PERSON_ID"), "left")
         .join(nomenclature_ref, col("F.ACTIVITY_NOMEN") == col("R.NOMENCLATURE_ID"), "left")
@@ -1941,10 +2076,20 @@ schema_rde_blobdataset = StructType([
 @dlt.table(name="rde_blobdataset_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def blobdataset_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_blobdataset")
+    target_table = "4_prod.rde.rde_blobdataset"
+    max_adc_updt = get_max_timestamp(target_table)
 
-    blob_content = dlt.read("current_blob_content").alias("B")
+    # Filter the upstream DLT for new records
+    blob_content_incr = dlt.read("current_blob_content").filter(col("ADC_UPDT") > max_adc_updt).alias("B")
+
+    # Use the incremental event_ids to filter the large clinical_event table
+    event_ids_incr = blob_content_incr.select("EVENT_ID").distinct()
+    
+    # Apply trust filter to clinical event table
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).alias("CE")
+    
+    clinical_event_filtered = clinical_event.join(event_ids_incr, "EVENT_ID", "inner")
+
     encounter = dlt.read("rde_encounter").alias("E")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
 
@@ -2047,14 +2192,18 @@ schema_rde_pc_procedures = StructType([
 @dlt.table(name="rde_pc_procedures_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def pc_procedures_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pc_procedures")
-
-    pc_procedures = spark.table("4_prod.raw.pc_procedures").alias("PCProc")
+    pc_procedures_incr_df = get_incremental_data_with_cdf(
+    source_table="4_prod.raw.pc_procedures",
+    target_table="4_prod.rde.rde_pc_procedures",
+    apply_trust_filter=True
+    ).alias("PCProc")
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
+
+    # Apply trust filter to the alias lookup
     person_alias = spark.table("4_prod.raw.mill_person_alias").alias("PA")
 
     return (
-        pc_procedures.filter(col("ADC_UPDT") > max_adc_updt)
+        pc_procedures_incr_df
         .join(
         person_alias,
         (trim(pc_procedures.MRN) == trim(person_alias.ALIAS)) & 
@@ -2140,14 +2289,17 @@ schema_rde_all_diagnosis = StructType([
 @dlt.table(name="rde_all_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def all_diagnosis_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_all_diagnosis")
-
-    mill_dir_diagnosis = spark.table("4_prod.raw.mill_diagnosis").filter(col("Trust") == "Barts").alias("mil")
+    mill_dir_diagnosis_incr = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_diagnosis",
+        target_table="4_prod.rde.rde_all_diagnosis",
+        apply_trust_filter=True
+    ).alias("mil")
+    
     encounter = dlt.read("rde_encounter").alias("E")
     mill_dir_nomenclature = spark.table("3_lookup.mill.mill_nomenclature").alias("nom")
 
     return (
-        mill_dir_diagnosis.filter(col("ADC_UPDT") > max_adc_updt)
+        mill_dir_diagnosis_incr
         .join(encounter, col("mil.ENCNTR_id") == col("E.ENCNTR_ID"), "inner")
         .join(mill_dir_nomenclature, col("mil.NOMENCLATURE_ID") == col("nom.NOMENCLATURE_ID"), "left")
         .select(
@@ -2229,14 +2381,17 @@ schema_rde_all_procedures = StructType([
 @dlt.table(name="rde_all_procedures_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def all_procedures_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_all_procedures")
+    mill_dir_procedure_incr = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_procedure",
+        target_table="4_prod.rde.rde_all_procedures",
+        apply_trust_filter=True
+    ).alias("mil")
 
-    mill_dir_procedure = spark.table("4_prod.raw.mill_procedure").filter(col("Trust") == "Barts").alias("mil")
     encounter = dlt.read("rde_encounter").alias("E")
     mill_dir_nomenclature = spark.table("3_lookup.mill.mill_nomenclature").alias("nom")
 
     return (
-        mill_dir_procedure.filter(col("ADC_UPDT") > max_adc_updt)
+        mill_dir_procedure_incr
         .join(encounter, col("mil.ENCNTR_id") == col("E.ENCNTR_ID"), "inner")
         .join(mill_dir_nomenclature, col("mil.NOMENCLATURE_ID") == col("nom.NOMENCLATURE_ID"), "left")
         .select(
@@ -2320,14 +2475,16 @@ schema_rde_pc_diagnosis = StructType([
 @dlt.table(name="rde_pc_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def pc_diagnosis_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pc_diagnosis")
-
-    pc_diagnoses = spark.table("4_prod.raw.pc_diagnoses").alias("PR")
+    pc_diagnoses_incr_df = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.pc_diagnoses",
+        target_table="4_prod.rde.rde_pc_diagnosis",
+        apply_trust_filter=True
+    ).alias("PR")
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
     person_alias = spark.table("4_prod.raw.mill_person_alias").alias("PA")
 
     return (
-        pc_diagnoses.filter(col("ADC_UPDT") > max_adc_updt)
+        pc_diagnoses_incr_df
         .join(
         person_alias,
         (trim(pc_diagnoses.MRN) == trim(person_alias.ALIAS)) & 
@@ -2421,14 +2578,16 @@ schema_rde_pc_problems = StructType([
 @dlt.table(name="rde_pc_problems_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def pc_problems_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pc_problems")
-
-    pc_problems = spark.table("4_prod.raw.pc_problems").alias("PCP")
+    pc_problems_incr_df = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.pc_problems",
+        target_table="4_prod.rde.rde_pc_problems",
+        apply_trust_filter=True
+    ).alias("PCP")
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
     person_alias = spark.table("4_prod.raw.mill_person_alias").alias("PA")
 
     return (
-        pc_problems.filter(col("ADC_UPDT") > max_adc_updt)
+        pc_problems_incr_df
         .join(
         person_alias,
         (trim(pc_problems.MRN) == trim(person_alias.ALIAS)) & 
@@ -3055,7 +3214,7 @@ schema_rde_allergydetails = StructType([
 def allergydetails_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_allergydetails")
 
-    allergy = spark.table("4_prod.raw.mill_allergy").filter(col("Trust") == "Barts").alias("A")
+    allergy = spark.table("4_prod.raw.mill_allergy").alias("A")
     encounter = dlt.read("rde_encounter").alias("ENC")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("Det")
@@ -4143,12 +4302,7 @@ def aliases_incr():
             col("PAT.MRN").cast(StringType()).alias("MRN"),
             col("PAT.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
             when(col("AL.PERSON_ALIAS_TYPE_CD").cast(IntegerType()) == 18, "NHS_Number")
-            .when(
-                (col("AL.PERSON_ALIAS_TYPE_CD").cast(IntegerType()) == 10) & 
-                (col("AL.ALIAS_POOL_CD").isin(683996, 1115132483, 6200990, 6173940)), 
-                "MRN"
-            )
-            .when(col("AL.PERSON_ALIAS_TYPE_CD").cast(IntegerType()) == 10, "Non-Barts MRN")
+            .when(col("AL.PERSON_ALIAS_TYPE_CD").cast(IntegerType()) == 10, "MRN")
             .otherwise(None).cast(StringType()).alias("CodeType"),
             col("AL.ALIAS").cast(StringType()).alias("Code"),
             col("AL.BEG_EFFECTIVE_DT_TM").cast(StringType()).alias("IssueDate"),
@@ -4469,7 +4623,7 @@ schema_rde_measurements = StructType([
 def measurements_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_measurements")
 
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts").alias("cce")
+    clinical_event = spark.table("4_prod.raw.mill_clinical_event").alias("cce")
     encounter = dlt.read("rde_encounter").alias("ENC")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
 
@@ -4823,7 +4977,7 @@ schema_rde_medadmin = StructType([
 def medadmin_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_medadmin")
 
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts").alias("CE")
+    clinical_event = spark.table("4_prod.raw.mill_clinical_event").alias("CE")
     med_admin_event = spark.table("4_prod.raw.mill_med_admin_event").alias("MAE")
     encounter = dlt.read("rde_encounter").alias("ENC")
     ce_med_result = spark.table("4_prod.raw.mill_ce_med_result").alias("MR")
@@ -4982,7 +5136,7 @@ schema_rde_pharmacyorders = StructType([
 def pharmacyorders_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_pharmacyorders")
 
-    orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("O")
+    orders = spark.table("4_prod.raw.mill_orders").alias("O")
     encounter = dlt.read("rde_encounter").alias("ENC")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
     order_detail = spark.table("4_prod.raw.mill_order_detail").alias("OD")
@@ -5230,7 +5384,7 @@ schema_rde_mat_nnu_exam = StructType([
 
 @dlt.table(name="rde_mat_nnu_exam_incr", table_properties={"skipChangeCommits": "true"}, temporary=True)
 def mat_nnu_exam_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_mat_nnu_exam")
+    max_adc_updt = get_max_adc_updt("4_prod.raw.nnu_routineexamination") 
 
     nnu_exam = spark.table("4_prod.raw.nnu_routineexamination").alias("NNUExam")
     patient_demographics = dlt.read("rde_patient_demographics").alias("PDEM")
