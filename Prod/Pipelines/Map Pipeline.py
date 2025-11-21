@@ -7063,7 +7063,7 @@ schema_map_mat_birth = StructType([
     StructField("PregOutcome_CD", IntegerType(), True, {"comment": "Pregnancy outcome code."}),
     StructField("PregOutcome_DESC", StringType(), True, {"comment": "Pregnancy outcome description."}),
     StructField("PresDel_CD", IntegerType(), True, {"comment": "Presentation at delivery code."}),
-    StructField("PresDelDesc", StringType(), True, {"comment": "Description of the presentation at delivery, e.g., vertex."}),
+    StructField("PresDel_DESC", StringType(), True, {"comment": "Description of the presentation at delivery, e.g., vertex."}),
     StructField("GestationWeeks", IntegerType(), True, {"comment": "Gestation in weeks."}),
     StructField("GestationDays", IntegerType(), True, {"comment": "Gestation in additional days."}),
     StructField("BirthWeight", StringType(), True, {"comment": "Weight of baby."}),
@@ -7080,141 +7080,109 @@ schema_map_mat_birth = StructType([
     StructField("ADC_UPDT", TimestampType(), True, {"comment": "Timestamp of last update."})
 ])
 
-
 def create_mat_birth_mapping_incr():
+
     """
     Creates an incremental birth mapping table that processes only new or modified records.
     
     Returns:
         DataFrame: Processed birth records with standardized format
     """
-   
+    
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_birth")
 
+    # Load mat_birth
     mat_birth = (
         spark.table("4_prod.raw.mat_birth")
-        .filter(
-            (col("DELETE_IND") == 0) &
-            (col("ADC_UPDT") > max_adc_updt))
-        .withColumn("NHS_NBR", regexp_replace(col("NHS"), "-", ""))
+        .filter((F.col("DELETE_IND") == 0) & (F.col("ADC_UPDT") > max_adc_updt))
+        .withColumn("NHS_NBR", F.regexp_replace(F.col("NHS"), "-", ""))
+        .dropDuplicates()
     )
 
-    # Get the rid of the duplicate records
+    # Detect and clean duplicates in mat_birth
 
-    # Drop the exact duplicates
-    mat_birth = mat_birth.dropDuplicates()
-
-    # Identify near-duplicate rows: rows with the same "PREGNANCY_ID" and "BIRTH_ODR_NBR" are considered possible duplicates (representing the same baby)
-    window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR")
-    mat_birth_check = mat_birth.withColumn("dup_count", F.count("*").over(window))
-
-    # Select rows that are not duplicates
-    non_dups = mat_birth_check.filter(F.col("dup_count") == 1)
-
-    # Retrieve rows where "PREGNANCY_ID" and "BIRTH_ODR_NBR" match, and eliminate any duplicate records.
-    near_dups = (mat_birth_check.filter(col("dup_count") > 1))
-
-    dup_num = near_dups.count()    
-
+    dup_window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR")
+    dup_num = (
+        mat_birth
+        .withColumn("dup_count", F.count("*").over(dup_window))
+        .filter(col("dup_count") > 1)
+        .count())
+    
     if dup_num > 0:
         print(f"Found {dup_num} duplicate records sharing the same PREGNANCY_ID and BIRTH_ODR_NBR. Proceeding to clean up these duplicates...")
 
-        # Further check and flag rows where "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS" match.
-        # If any one of "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS" also match, the rows are confirmed as near duplicates. 
-        cols_to_match = ["BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", "NHS"]
-
-        for c in cols_to_match:
-            window_c = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR", c)
-            # flag = 1 if count > 1, else 0
-            near_dups = near_dups.withColumn(
-                f"{c}_match_flag",
-                F.when(F.count("*").over(window_c) > 1, 1).otherwise(0)
-            )
-        near_dups = near_dups.withColumn("match_flags", F.col("BIRTH_DT_TM_match_flag") + F.col("NB_SEX_DESC_match_flag") + F.col("BABY_PERSON_ID_match_flag") + F.col("NHS_match_flag"))
-
-        #  When "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID" and "NHS" do not match any other rows, keep the most recent record
-        no_match = near_dups.filter(col("match_flags") == 0)
-        no_match_num = no_match.count()
-
-        if no_match_num > 0:
-            window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR").orderBy(F.col("Record_Updated_Dt").desc())
-            no_match = no_match.withColumn("update_order", F.row_number().over(window)) 
-            no_match_to_keep = no_match.filter(col("update_order") == 1) \
-                .drop("dup_count","null_count","null_order","BIRTH_DT_TM_match_flag","NB_SEX_DESC_match_flag","BABY_PERSON_ID_match_flag","NHS_match_flag","match_flags", "update_order")
-   
-
-        # If there is a further match on "BIRTH_DT_TM", "NB_SEX_DESC", "BABY_PERSON_ID", or "NHS", keep the row with the most complete information
-        any_match = near_dups.filter(col("match_flags") > 0)
-        any_match_num = any_match.count()
-
-        if any_match_num > 0:
-
-            cols_to_check = [c for c in near_dups.columns if c not in ["PREGNANCY_ID", "BIRTH_ODR_NBR"]]
-            any_match = any_match.withColumn(
-                "null_count",
-                reduce(
-                    lambda a, b: a + b,
-                    [F.when(F.col(c).isNull(), 1).otherwise(0) for c in cols_to_check])
-            )
-            
-            window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR").orderBy(F.col("null_count"))
-            any_match_ranked = any_match.withColumn("null_order",F.row_number().over(window))
-            any_match_to_keep = any_match_ranked.filter(F.col("null_order") == 1).drop("dup_count","null_count","null_order","BIRTH_DT_TM_match_flag","NB_SEX_DESC_match_flag","BABY_PERSON_ID_match_flag","NHS_match_flag","match_flags")
-
-        # Double check if there are duplicate records between no_match_to_keep and any_match_to_keep. 
-        common_rows = no_match_to_keep.join(any_match_to_keep, on = ["PREGNANCY_ID", "BIRTH_ODR_NBR"], how = "inner") 
-
-        # When a row appears in both no_match_to_keep and any_match_to_keep, keep the version from any_match_to_keep
-        if common_rows.count() > 0:
-            no_match_to_keep_final = no_match_to_keep.join(
-                any_match_to_keep.select("PREGNANCY_ID", "BIRTH_ODR_NBR").distinct(),
-                on=["PREGNANCY_ID", "BIRTH_ODR_NBR"],
-                how="left_anti"
-            )
-
-        # Merge the cleaned duplicate rows with the rows that were not duplicates
-        mat_birth_final = non_dups.drop("dup_count") \
-            .unionByName(no_match_to_keep_final) \
-            .unionByName(any_match_to_keep).alias("BIRTH")
+        order_window = Window.partitionBy(
+            "PREGNANCY_ID", "BIRTH_ODR_NBR"
+        ).orderBy(
+            F.col("BIRTH_DT_TM").isNotNull().cast("int").desc(),
+            F.col("NB_SEX_DESC").isNotNull().cast("int").desc(),
+            F.col("BABY_PERSON_ID").isNotNull().cast("int").desc(),
+            F.col("NHS").isNotNull().cast("int").desc(),
+            F.col("Record_Updated_Dt").desc(),
+        )
     
+        mat_birth_final = (
+            mat_birth
+            .withColumn("rn", F.row_number().over(order_window))
+            .filter("rn = 1")
+            .drop("rn")
+            .alias("BIRTH")
+        )
+
+    else:
+        print("No duplicate records found in mat_birth.")
+        mat_birth_final = mat_birth.alias("BIRTH")
+
+    # Load mat_pregnancy
     mat_pregnancy = (
         spark.table("4_prod.raw.mat_pregnancy")
-        .filter(
-            (col("DELETE_IND") == 0))
+        .filter(F.col("DELETE_IND") == 0)
         .select("PREGNANCY_ID", "PERSON_ID")
         .dropDuplicates()
-        ).alias("MOTHER")
+        .alias("MOTHER")
+    )
 
-    
+    # Load nnu_episodes
     nnu_epi = (
         spark.table("4_prod.raw.nnu_episodes")
-        .select("NationalIDBaby", "GestationWeeks","GestationDays", "CongenitalAnomalies", "FetusNumber", "MaritalStatusMother", "LastUpdate")
+        .select("NationalIDBaby", "GestationWeeks", "GestationDays", "CongenitalAnomalies", "FetusNumber", "MaritalStatusMother", "LastUpdate")
         .dropDuplicates()
         .filter((F.col("CongenitalAnomalies").isNotNull()) | (F.col("FetusNumber").isNotNull()))
-        )
-    
-    window = Window.partitionBy("NationalIDBaby")
-    nnu_epi = nnu_epi.withColumn("dup_count", F.count("*").over(window))
-    dup_check = nnu_epi.filter(col("dup_count") > 1)
+    )
 
-    # Detect and clean duplicate rows in the table, if any exist
-    if dup_check.count() > 0:
-        non_dups = nnu_epi.filter(col("dup_count") == 1)
-        dups = nnu_epi.filter(col("dup_count") > 1)
-    
-        # Get the rows with most relevant information
-        cols_to_check = ["CongenitalAnomalies", "FetusNumber","MaritalStatusMother", "GestationWeeks","GestationDays"]
-        nnu_epi = nnu_epi.withColumn(
-            "null_count",
-            reduce(
-                lambda a, b: a + b,
-                [F.when(F.col(c).isNull(), 1).otherwise(0) for c in cols_to_check])
-        )
-        # Rank the rows on the order of ascending dup_count, ascending null_count and descending LastUpdate.
-        window = Window.partitionBy("NationalIDBaby").orderBy(F.col("dup_count"),F.col("null_count"),F.col("LastUpdate").desc())
-        nnu_epi_ranked = nnu_epi.withColumn("order",F.row_number().over(window))
-        nnu_epi_final = nnu_epi_ranked.filter(F.col("order") == 1).drop("dup_count","null_count","order").alias("NNU")
+    # Detect and clean duplicates in nnu_epi
+    dup_window = Window.partitionBy("NationalIDBaby")
+    dup_num = (
+        nnu_epi
+        .withColumn("dup_count", F.count("*").over(dup_window))
+        .filter(F.col("dup_count") > 1)
+        .count()
+    )
 
+    if dup_num > 0:
+        print(f"Found {dup_num} duplicate records sharing the same NationalIDBaby. Now cleaning the duplicates...")
+
+        nnu_window = Window.partitionBy("NationalIDBaby").orderBy(
+            F.col("CongenitalAnomalies").isNotNull().cast("int").desc(),
+            F.col("FetusNumber").isNotNull().cast("int").desc(),
+            F.col("MaritalStatusMother").isNotNull().cast("int").desc(),
+            F.col("GestationWeeks").isNotNull().cast("int").desc(),
+            F.col("GestationDays").isNotNull().cast("int").desc(),
+            F.col("LastUpdate").desc()
+        )
+
+        nnu_epi_final = (
+            nnu_epi
+            .withColumn("rn", F.row_number().over(nnu_window))
+            .filter(F.col("rn") == 1)
+            .drop("rn")
+            .alias("NNU")
+        )
+    else:
+        print("No duplicate records found in nnu_epi.")
+        nnu_epi_final = nnu_epi.alias("NNU")
+    
+    # Merge all the data together
     final_df = (
         mat_birth_final
         .join(mat_pregnancy, col("BIRTH.PREGNANCY_ID") == col("MOTHER.Pregnancy_ID"), "left")
@@ -7240,7 +7208,7 @@ def create_mat_birth_mapping_incr():
             col("BIRTH.PREG_OUTCOME_CD").cast(IntegerType()).alias("PregOutcome_CD"),
             col("BIRTH.PREG_OUTCOME_DESC").cast(StringType()).alias("PregOutcome_DESC"),
             col("BIRTH.PRES_DEL_NM_ID").cast(IntegerType()).alias("PresDel_CD"),
-            col("BIRTH.PRES_DEL_DESC").cast(StringType()).alias("PresDelDesc"),
+            col("BIRTH.PRES_DEL_DESC").cast(StringType()).alias("PresDel_DESC"),
             col("NNU.GestationWeeks").cast(IntegerType()).alias("GestationWeeks"),
             col("NNU.GestationDays").cast(IntegerType()).alias("GestationDays"),
             col("BIRTH.BIRTH_WT").cast(StringType()).alias("BirthWeight"),
@@ -7261,8 +7229,5 @@ def create_mat_birth_mapping_incr():
     return final_df
 
 updates_df = create_mat_birth_mapping_incr()
-    
 
-update_table(updates_df, "4_prod.bronze.map_mat_birth", ["Pregnancy_ID", "BirthOrder"],schema_map_mat_birth, map_mat_birth_comment)
-
-
+update_table(updates_df,"4_prod.bronze.map_mat_birth",["Pregnancy_ID", "BirthOrder"],schema_map_mat_birth,map_mat_birth_comment)
