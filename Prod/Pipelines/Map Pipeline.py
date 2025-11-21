@@ -7231,3 +7231,234 @@ def create_mat_birth_mapping_incr():
 updates_df = create_mat_birth_mapping_incr()
 
 update_table(updates_df,"4_prod.bronze.map_mat_birth",["Pregnancy_ID", "BirthOrder"],schema_map_mat_birth,map_mat_birth_comment)
+
+# COMMAND ----------
+
+# Obstetric VTE Risk Assessment results during the pregnancy
+map_mat_vte_comment = "The table contains the Obstetric VTE Risk Assessment record during the perinatal period."
+from pyspark.sql.types import StructType, StructField, LongType, FloatType, StringType
+
+schema_map_mat_vte = StructType([
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "Unique identifier for the pregnancy"}),
+    StructField("PERSON_ID", LongType(), True, {"comment": "Unique identifier for the person"}),
+    StructField("FormID", LongType(), True, {"comment": "Identifier for the form submitted"}),
+    StructField("ENCNTR_ID", LongType(), True, {"comment": "Identifier for the encounter"}),
+    StructField("FormDate", TimestampType(), True, {"comment": "Date of submission of the form"}),
+    StructField("Height_Length", FloatType(), True, {"comment": "Height/Length at Obstetric VTE Risk Assessment"}),
+    StructField("Weight", FloatType(), True, {"comment": "Weight at Obstetric VTE Risk Assessment"}),
+    StructField("BMI", FloatType(), True, {"comment": "BMI at Obstetric VTE Risk Assessment"}),
+    StructField("AssessmentType", StringType(), True, {"comment": "Type of Obstetric VTE Risk Assessment"}),
+    StructField("Pre-eclampsia", StringType(), True, {"comment": "Pre-eclampsia status"}),
+    StructField("Age>35_Parity>3", StringType(), True, {"comment": "Age >35 or Parity >3"}),
+    StructField("MultiplePregnancy", StringType(), True, {"comment": "Multiple pregnancy"}),
+    StructField("Smoker", StringType(), True, {"comment": "Smoking status"}),
+    StructField("PreviousVTE", StringType(), True, {"comment": "Previous VTE history"}),
+    StructField("ObVTEObesity", StringType(), True, {"comment": "Obesity status"}),
+    StructField("GrossVaricoseVeins", StringType(), True, {"comment": "Gross varicose veins"}),
+    StructField("FamilyHistory", StringType(), True, {"comment": "Family history of VTE"}),
+    StructField("KnownThrombophilia", StringType(), True, {"comment": "Known thrombophilia"}),
+    StructField("CurrentSystemicInfection", StringType(), True, {"comment": "Current systemic infection"}),
+    StructField("Dehydration_ReducedImmobility_ART_IVF", StringType(), True, {"comment": "Dehydration/reduced mobility/ART/IVF"}),
+    StructField("SurgProcedure", StringType(), True, {"comment": "Surgical procedure within 6 weeks"}),
+    StructField("OHSS", StringType(), True, {"comment": "Ovarian Hyperstimulation Syndrome"}),
+    StructField("Hyperemesis", StringType(), True, {"comment": "Hyperemesis"}),
+    StructField("Comorbidities", StringType(), True, {"comment": "Medical comorbidities"}),
+    StructField("PersonCompletingForm", StringType(), True, {"comment": "Person completing the form"}),
+    StructField("PatientAtRisk", StringType(), True, {"comment": "Patient at risk of VTE"}),
+    StructField("ObstetricVTERiskTotalv2", StringType(), True, {"comment": "Total VTE risk score v2"}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Date of update of the record"})
+])
+
+
+def create_mat_vte_mapping_incr():
+
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_VTE_Assessment")
+
+    # Get the Obstetric VTE Risk Assessment results    
+    doc_response = (
+        spark.table("4_prod.raw.pi_cde_doc_response")        
+        .filter((col("ACTIVE_IND") == 1) & (col("ADC_UPDT") > max_adc_updt))
+        ).alias("DOC")
+    doc_ref = (
+        spark.table("3_lookup.dwh.pi_lkp_cde_doc_ref")
+        .filter((col("ACTIVE_IND") == 1) & (col("ADC_UPDT") > max_adc_updt))
+        ).alias("Dref")
+
+    vte_element = [
+        "Height/Length Measured",
+        "Weight Measured",
+        "BMI",
+        "Obstetric VTE Risk Assessment Type",
+        "Pre-eclampsia",
+        "Age>35 / Parity >3",
+        "Multiple Pregnancy (Twins or more)",
+        "Smoker",
+        "Previous VTE",
+        "Ob VTE Obesity",
+        "Gross Varicose Veins",
+        "Family History of VTE",
+        "VTE Known Thrombophilia",
+        "Current Systemic Infection",
+        "Dehydration/Reduced Immobility/ART/IVF",
+        "Surg procedure in this preg or <=6 weeks",
+        "OHSS (Overian Hyperstimulation Syndrome)",
+        "Hyperemesis",
+        "Medical Comorbidities",
+        "Person Completing Form (VTE)",
+        "Patient at Risk of VTE",
+        "Obstetric VTE Risk Total v2"        
+    ]
+
+    assessment_results = (
+        doc_response
+        .join(doc_ref,col("DOC.DOC_INPUT_ID") == col("Dref.DOC_INPUT_KEY"), "left")
+        .select(
+            col("DOC.PERSON_ID").alias("PERSON_ID"),
+            col("DOC.ENCNTR_ID").alias("ENCNTR_ID"),
+            col("DOC.FORM_EVENT_ID").alias("FormID"),
+            col("Dref.SECTION_DESC_TXT").alias("Section"),
+            col("Dref.ELEMENT_LABEL_TXT").alias("Element"),
+            col("DOC.RESPONSE_VALUE_TXT").alias("Response"),
+            col("DOC.PERFORMED_DT_TM").alias("FormDate"),
+            col("DOC.ADC_UPDT").alias("ADC_UPDT")
+        )
+        .filter(
+            (col("Section") == "Obstetric VTE Risk Assessment") &
+            (col("Element").isin(vte_element))
+        )
+        .groupby("PERSON_ID","FormID","ENCNTR_ID")
+        .agg(
+            *[F.first(when(col("Element") == x, col("Response"))).alias(x) for x in vte_element],
+            F.max(col("FormDate")).alias("LastFormDate"),
+            F.max(col("ADC_UPDT")).alias("ADC_UPDT")
+            )
+        )
+            
+    # Match the possible Pregnancy_ID from pregnancy and birth table
+    pregnancy = (
+        spark.table("8_dev.bronze.map_mat_pregnancy")
+        .select("Person_ID", "Pregnancy_ID", "LastMensPeriodDate", "GestAgePregEnd","FirstAntenatalAPPTDate", "ROMDate","LabOnsetDate")
+        )
+    birth = (
+        spark.table("8_dev.bronze.map_mat_birth")
+        .select("Pregnancy_ID", "BirthDateTime")
+        )
+    
+    # For each Pregnancy_ID in the birth table, keep only one birth record even if multiple births occurred (the latest BirthDateTime is kept, i.e., the last baby).
+    mat_birth_window = Window.partitionBy("PREGNANCY_ID").orderBy(F.col("BirthDateTime").desc())
+
+    birth_final = (
+        birth
+        .withColumn("rn", F.row_number().over(mat_birth_window))
+        .filter("rn = 1")
+        .drop("rn")
+    )
+    
+    pregnancy_final = (
+        pregnancy
+        .join(birth_final, ["Pregnancy_ID"], "left")
+
+        # Add a new column gestation_length_in_day
+        .withColumn("weeks",
+                    F.abs(F.coalesce(F.regexp_extract("GestAgePregEnd", r"(-?\d+)\s*week", 1).cast("int"), F.lit(0))))
+        .withColumn("days",
+                    F.abs(F.coalesce(F.regexp_extract("GestAgePregEnd", r"(-?\d+)\s*day", 1).cast("int"), F.lit(0))))
+        .withColumn("gestational_length_in_day", F.col("weeks") * 7 + F.col("days"))
+
+        # Determine pregnancy_end_date using possible timestamp or calculation: from top to bottom, the most reliable to least reliable
+        .withColumn(
+            "pregnancy_end_date",
+            # Most reliable: BirthDateTime
+            when(F.col("BirthDateTime").isNotNull(), F.col("BirthDateTime"))
+            # Then, labour onset date
+            .when(F.col("LabOnsetDate").isNotNull(), F.col("LabOnsetDate"))
+            # Then, water broke date
+            .when(F.col("ROMDate").isNotNull(), F.col("ROMDate"))
+            # Finally, if none of the above exists using the last menstrual period date + gestation length if gestation length < 356 days; otherwise NULL
+            .when(
+                (F.col("gestational_length_in_day") > 0) &
+                (F.col("gestational_length_in_day") < 365) &
+                (F.col("LastMensPeriodDate").isNotNull()),
+                F.date_add(F.col("LastMensPeriodDate"), F.col("gestational_length_in_day"))
+            )
+            .otherwise(F.lit(None))
+        )
+        # Identify the calculation period used to link to Pregnancy_ID
+        # Calculated_start: from top to bottom, the most reliable to least reliable
+        .withColumn(
+            "calculated_start",
+            # Most reliable: LMP if available
+            when(F.col("LastMensPeriodDate").isNotNull(), F.col("LastMensPeriodDate"))
+            # Then: first antenatal appointment (The vte assessment is usually carried out at first antenntal appointment.)
+            .when(F.col("FirstAntenatalAPPTDate").isNotNull(), F.col("FirstAntenatalAPPTDate"))
+            # Get an estimated pregnancy start date: pregnancy_end_date - gestational_length_in_day
+            .when(
+                F.col("pregnancy_end_date").isNotNull() & 
+                (F.col("gestational_length_in_day") > 0) &
+                (F.col("gestational_length_in_day") < 365),
+                F.date_sub(F.col("pregnancy_end_date"), F.col("gestational_length_in_day"))
+                )
+            .otherwise(F.lit(None))
+        )
+        # Calculated_end: 6 weeks after pregnancy_end_date
+        .withColumn(
+            "calculated_end",
+            F.when(F.col("pregnancy_end_date").isNotNull(),
+                F.date_add(F.col("pregnancy_end_date"), 6 * 7))
+            .otherwise(F.lit(None))
+        )
+        .filter(F.datediff(F.col("calculated_end"), F.col("calculated_start")) <= 365)
+    )
+
+    # Match the possible Pregnancy_ID for each assessment response records
+    processed_df = (
+        assessment_results.alias("a")
+        .join(
+            pregnancy_final.alias("p"),
+            (
+                (F.col("a.Person_ID") == F.col("p.Person_ID")) &
+                (F.col("p.calculated_start").isNotNull()) &
+                (F.col("p.calculated_end").isNotNull()) &
+                (F.col("a.LastFormDate").between(F.col("p.calculated_start"), F.col("p.calculated_end")))
+            ),
+            "left"
+        )
+        .select(F.col("Pregnancy_ID"),F.col("a.*"))
+    )
+
+    final_df = (
+        processed_df
+        .select(
+            col("Pregnancy_ID").cast(LongType()).alias("Pregnancy_ID"),
+            col("PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+            col("FormID").cast(LongType()).alias("FormID"),
+            col("ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
+            col("LastFormDate").cast(TimestampType()).alias("FormDate"),
+            col("Height/Length Measured").cast(FloatType()).alias("Height_Length"),
+            col("Weight Measured").cast(FloatType()).alias("Weight"),
+            col("BMI").cast(FloatType()).alias("BMI"),
+            col("Obstetric VTE Risk Assessment Type").cast(StringType()).alias("AssessmentType"),
+            col("Pre-eclampsia").cast(StringType()).alias("Pre-eclampsia"),
+            col("Age>35 / Parity >3").cast(StringType()).alias("Age>35_Parity>3"),
+            col("Multiple Pregnancy (Twins or more)").cast(StringType()).alias("MultiplePregnancy"),
+            col("Smoker").cast(StringType()).alias("Smoker"),
+            col("Previous VTE").cast(StringType()).alias("PreviousVTE"),
+            col("Ob VTE Obesity").cast(StringType()).alias("ObVTEObesity"),
+            col("Gross Varicose Veins").cast(StringType()).alias("GrossVaricoseVeins"),
+            col("Family History of VTE").cast(StringType()).alias("FamilyHistory"),
+            col("VTE Known Thrombophilia").cast(StringType()).alias("KnownThrombophilia"),
+            col("Current Systemic Infection").cast(StringType()).alias("CurrentSystemicInfection"),
+            col("Dehydration/Reduced Immobility/ART/IVF").cast(StringType()).alias("Dehydration_ReducedImmobility_ART_IVF"),
+            col("Surg procedure in this preg or <=6 weeks").cast(StringType()).alias("SurgProcedure"),
+            col("OHSS (Overian Hyperstimulation Syndrome)").cast(StringType()).alias("OHSS"),
+            col("Hyperemesis").cast(StringType()).alias("Hyperemesis"),
+            col("Medical Comorbidities").cast(StringType()).alias("Comorbidities"),
+            col("Person Completing Form (VTE)").cast(StringType()).alias("PersonCompletingForm"),
+            col("Patient at Risk of VTE").cast(StringType()).alias("PatientAtRisk"),
+            col("Obstetric VTE Risk Total v2").cast(StringType()).alias("ObstetricVTERiskTotalv2"),
+            col("ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT") 
+            ))
+    return final_df
+
+updates_df = create_mat_vte_mapping_incr()
+update_table(updates_df, "8_dev.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "FormID"], schema_map_mat_vte, map_mat_vte_comment)
