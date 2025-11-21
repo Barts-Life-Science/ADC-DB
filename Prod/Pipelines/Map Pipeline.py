@@ -152,8 +152,10 @@ def apply_schema_changes(target_table: str, changes: dict):
                 df = df.withColumn(col['name'], df[col['name']].cast(col['type']))
 
         # Drop and recreate the table
-        spark.sql(f"DROP TABLE IF EXISTS {target_table}")
-        df.write.format("delta").saveAsTable(target_table)
+        df.write.format("delta") \
+            .mode("overwrite") \
+            .option("overwriteSchema", "true") \
+            .saveAsTable(target_table)
 
         updates_applied.append(f"Recreated {target_table} due to type change")
 
@@ -305,7 +307,12 @@ def update_table(source_df, target_table: str, index_column: str,
             # Perform merge operation
             print(f"[INFO] Performing merge on {target_table} using column {index_column}")
 
-            merge_condition = " AND ".join([f"t.{col} = s.{col}" for col in index_column])
+            if isinstance(index_column, str):
+                index_keys = [index_column]
+            else:
+                index_keys = index_column
+
+            merge_condition = " AND ".join([f"t.{col} <=> s.{col}" for col in index_keys])
 
             tgt = DeltaTable.forName(spark, target_table)
             (
