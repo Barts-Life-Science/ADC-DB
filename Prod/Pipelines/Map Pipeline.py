@@ -146,11 +146,22 @@ def apply_schema_changes(target_table: str, changes: dict):
     if type_change_detected:
         print(f"Type change detected. Recreating table {target_table}...")
         df = spark.table(target_table)
+        cols_to_cast = [col['name'] for col in changes['columns_to_update'] if col['type_changed']]
+        pre_counts = df.select([F.count(F.col(c)).alias(c) for c in cols_to_cast]).collect()[0].asDict()
 
         for col in changes['columns_to_update']:
             if col['type_changed']:
                 df = df.withColumn(col['name'], df[col['name']].cast(col['type']))
-
+        
+        # Now check the data loss after changing the data type
+        post_counts = df.select([F.count(F.col(c)).alias(c) for c in cols_to_cast]).collect()[0].asDict()
+        losses = {c: pre_counts[c] - post_counts[c] for c in cols_to_cast if pre_counts[c] - post_counts[c] > 0}
+                
+        if losses:
+            raise ValueError(f"Data loss detected during cast: {losses}")
+        else:
+            print("✔ All type casts completed without introducing NULLs.")
+        
         # Drop and recreate the table
         df.write.format("delta") \
             .mode("overwrite") \
