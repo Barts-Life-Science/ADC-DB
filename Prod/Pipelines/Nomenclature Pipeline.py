@@ -1836,6 +1836,438 @@ else:
 
 # COMMAND ----------
 
+# =============================================================================
+# INGREDIENT EMBEDDING TABLES CREATION & UPDATE
+# =============================================================================
+
+def sync_and_embed_ingredients(source_df, target_table_name, batch_size=500):
+    """
+    Syncs unique terms from a source DataFrame to a target Delta table and generates embeddings.
+    
+    1. Normalizes source terms to Title Case.
+    2. Creates target table if it doesn't exist.
+    3. Identifies terms present in source but missing in target.
+    4. Generates embeddings in batches.
+    5. Merges new records into target table.
+    """
+    print(f"\nProcessing {target_table_name}...")
+    
+    # 1. Normalize Source Data (Title Case for Case Insensitivity)
+    # Expects source_df to have a column named 'term'
+    source_clean = source_df.select(
+        F.initcap(F.lower(F.trim(F.col("term")))).alias("term")
+    ).filter(
+        F.col("term").isNotNull() & (F.col("term") != "")
+    ).distinct()
+    
+    # 2. Create Target Table if not exists
+    if not SparkSession.getActiveSession().catalog.tableExists(target_table_name):
+        print(f"  Creating new table: {target_table_name}")
+        empty_schema = StructType([
+            StructField("term", StringType(), False),
+            StructField("embedding_vector", ArrayType(FloatType()), True),
+            StructField("model_version", StringType(), True),
+            StructField("updated_at", TimestampType(), True)
+        ])
+        spark.createDataFrame([], empty_schema).write \
+            .format("delta") \
+            .mode("error") \
+            .saveAsTable(target_table_name)
+    
+    # 3. Identify New Terms (Left Anti Join)
+    target_df = spark.table(target_table_name)
+    
+    # Find terms in source that are NOT in target
+    new_terms_df = source_clean.join(
+        target_df, 
+        source_clean.term == target_df.term, 
+        "left_anti"
+    )
+    
+    new_terms_list = [row['term'] for row in new_terms_df.collect()]
+    count = len(new_terms_list)
+    
+    if count == 0:
+        print("  ✓ Table is up to date. No new terms to embed.")
+        return
+
+    print(f"  Found {count} new terms to embed.")
+    
+    # 4. Process in Batches
+    processed_count = 0
+    
+    # Initialize Delta Table wrapper for merging
+    delta_table = DeltaTable.forName(spark, target_table_name)
+    
+    for i in range(0, count, batch_size):
+        batch_terms = new_terms_list[i:i + batch_size]
+        print(f"  Batch {i//batch_size + 1}: Embedding {len(batch_terms)} terms...")
+        
+        try:
+            # Generate Embeddings
+            embeddings = get_embedding(batch_terms)
+            
+            # Prepare Data for Merge
+            # Note: casting embedding to float array to match schema
+            batch_data = []
+            timestamp = datetime.now()
+            
+            for term, vec in zip(batch_terms, embeddings):
+                batch_data.append({
+                    "term": term,
+                    "embedding_vector": [float(x) for x in vec],
+                    "model_version": "text-embedding-3-large", 
+                    "updated_at": timestamp
+                })
+                
+            batch_df = spark.createDataFrame(batch_data)
+            
+            # 5. Merge into Delta Table
+            (delta_table.alias("tgt")
+                .merge(
+                    batch_df.alias("src"),
+                    "tgt.term = src.term"
+                )
+                .whenMatchedUpdate(set={
+                    "embedding_vector": "src.embedding_vector",
+                    "updated_at": "src.updated_at"
+                })
+                .whenNotMatchedInsert(values={
+                    "term": "src.term",
+                    "embedding_vector": "src.embedding_vector",
+                    "model_version": "src.model_version",
+                    "updated_at": "src.updated_at"
+                })
+                .execute()
+            )
+            
+            processed_count += len(batch_data)
+            
+            # Rate limit protection
+            time.sleep(0.2)
+            
+        except Exception as e:
+            print(f"  ✗ Error processing batch: {str(e)}")
+            # Continue to next batch rather than failing entire job
+            continue
+
+    print(f"  ✓ Finished. Added {processed_count} new embeddings to {target_table_name}.")
+
+# -------------------------------------------------------
+# 1. Process Barts Ingredients (Enhanced Fallback Logic)
+# -------------------------------------------------------
+BARTS_TABLE = "3_lookup.embeddings.barts_ingredients"
+
+def get_enhanced_barts_source():
+    # 1. Get Base Drug Catalog (Multum Drugs only)
+    # Filtering for CKI 'MUL.ORD!d%' ensures we target drugs
+    df_catalog = spark.table("3_lookup.mill.mill_order_catalog") \
+        .filter(F.col("CKI").like("MUL.ORD!d%")) \
+        .select("CATALOG_CD", "PRIMARY_MNEMONIC")
+
+    # 2. Get Synonyms
+    df_synonyms = spark.table("3_lookup.mill.mill_order_catalog_synonym") \
+        .select("CATALOG_CD", "SYNONYM_ID", "MNEMONIC")
+
+    # 3. Get Ingredients
+    # Note: HNA_ORDER_MNEMONIC in this table usually holds the ingredient name
+    df_ingredients = spark.table("4_prod.raw.mill_order_ingredient") \
+        .select("SYNONYM_ID", "HNA_ORDER_MNEMONIC")
+
+    # 4. Join and Apply Fallback Logic
+    # Priority: Ingredient Name -> Synonym Mnemonic -> Catalog Primary Mnemonic
+    df_enhanced_source = df_catalog.join(df_synonyms, "CATALOG_CD", "inner") \
+        .join(df_ingredients, "SYNONYM_ID", "left") \
+        .select(
+            F.coalesce(
+                F.col("mill_order_ingredient.HNA_ORDER_MNEMONIC"), 
+                F.col("mill_order_catalog_synonym.MNEMONIC"), 
+                F.col("mill_order_catalog.PRIMARY_MNEMONIC")
+            ).alias("term")
+        ) \
+        .filter(F.col("term").isNotNull() & (F.col("term") != "")) \
+        .distinct()
+        
+    return df_enhanced_source
+
+df_barts_source_enhanced = get_enhanced_barts_source()
+sync_and_embed_ingredients(df_barts_source_enhanced, BARTS_TABLE)
+
+# -------------------------------------------------------
+# 2. Process OMOP Ingredients (dm+d specific)
+# -------------------------------------------------------
+OMOP_TABLE = "3_lookup.embeddings.omop_ingredients"
+
+# Get distinct concept names for dm+d Ingredients
+df_omop_source = spark.table("3_lookup.omop.concept") \
+    .filter(
+        (F.col("vocabulary_id") == "dm+d") & 
+        (F.col("concept_class_id").isin("Ingredient", "Multiple Ingredients"))
+    ) \
+    .select(F.col("concept_name").alias("term"))
+
+sync_and_embed_ingredients(df_omop_source, OMOP_TABLE)
+
+
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import *
+from delta.tables import DeltaTable
+import numpy as np
+import pandas as pd
+
+TARGET_TABLE = "3_lookup.mill.map_med_lookup"
+
+def update_med_lookup_table_incr():
+    print(f"Starting optimized intelligent update for {TARGET_TABLE}...")
+    
+    # ---------------------------------------------------------
+    # 0. ENSURE TABLE EXISTS
+    # ---------------------------------------------------------
+    if not SparkSession.getActiveSession().catalog.tableExists(TARGET_TABLE):
+        print(f"  Creating empty table: {TARGET_TABLE}")
+        schema = StructType([
+            StructField("SYNONYM_ID", LongType(), True),
+            StructField("HNA_ORDER_MNEMONIC", StringType(), True),
+            StructField("MULTUM_CODE", StringType(), True),
+            StructField("RXNORM_CODE", StringType(), True),
+            StructField("SNOMED_CODE", StringType(), True),
+            StructField("MAPPED_OMOP_CONCEPT_ID", IntegerType(), True),
+            StructField("MAPPED_OMOP_CONCEPT_TERM", StringType(), True),
+            StructField("SIMILARITY_OMOP_CONCEPT_ID", IntegerType(), True),
+            StructField("SIMILARITY_OMOP_CONCEPT_TERM", StringType(), True),
+            StructField("SIMILARITY_SCORE", FloatType(), True),
+            StructField("SNOMED_FROM_OMOP", StringType(), True),
+            StructField("ADC_UPDT", TimestampType(), True)
+        ])
+        spark.createDataFrame([], schema).write.format("delta").saveAsTable(TARGET_TABLE)
+
+    # ---------------------------------------------------------
+    # 1. DEFINE DRUG UNIVERSE
+    # ---------------------------------------------------------
+    print("  Step 1: Defining Drug Universe...")
+    
+    drug_universe = (
+        spark.table("3_lookup.mill.mill_order_catalog_synonym").alias("S")
+        .join(spark.table("3_lookup.mill.mill_order_catalog").alias("C"), F.col("S.CATALOG_CD") == F.col("C.CATALOG_CD"), "inner")
+        .join(spark.table("4_prod.raw.mill_order_ingredient").alias("I"), "SYNONYM_ID", "left")
+        .filter(F.col("C.CKI").like("MUL.ORD!d%")) 
+        .select(
+            F.col("S.SYNONYM_ID"),
+            F.col("S.MNEMONIC").alias("HNA_ORDER_MNEMONIC"),
+            F.col("C.CKI"),
+            F.col("S.ADC_UPDT"),
+            F.coalesce(F.col("I.HNA_ORDER_MNEMONIC"), F.col("S.MNEMONIC"), F.col("C.PRIMARY_MNEMONIC")).alias("VEC_SEARCH_TERM"),
+            F.when(F.col("C.CKI").like("MUL.ORD%"), F.substring_index(F.col("C.CKI"), "!", -1)).alias("MULTUM_CODE")
+        )
+        .dropDuplicates(["SYNONYM_ID"]) 
+    )
+
+    target_ids = spark.table(TARGET_TABLE).select("SYNONYM_ID")
+    new_records = drug_universe.join(target_ids, "SYNONYM_ID", "left_anti")
+    
+    if new_records.isEmpty():
+        print("  ✓ No new drug records found.")
+        return
+
+    print(f"  Processing {new_records.count()} new drug records...")
+
+    # ---------------------------------------------------------
+    # 2. DETERMINISTIC MAPPING
+    # ---------------------------------------------------------
+    rxnorm = spark.table("3_lookup.rxnorm.rxnconso")
+    
+    shortest_snomed = (
+        rxnorm.filter(F.col("SAB") == "SNOMEDCT_US")
+        .withColumn("len", F.length("CODE"))
+        .withColumn("rn", F.row_number().over(Window.partitionBy("RXCUI").orderBy("len")))
+        .filter(F.col("rn") == 1).select("RXCUI", F.col("CODE").alias("SNOMED_CODE"))
+    )
+
+    base_mapping = (
+        new_records.alias("BASE")
+        .join(rxnorm.filter(F.col("SAB") == "MMSL").alias("RXN"), F.col("BASE.MULTUM_CODE") == F.col("RXN.CODE"), "left")
+        .join(shortest_snomed.alias("SNO"), F.col("RXN.RXCUI") == F.col("SNO.RXCUI"), "left")
+        .select("BASE.SYNONYM_ID", "BASE.HNA_ORDER_MNEMONIC", "BASE.VEC_SEARCH_TERM", "BASE.MULTUM_CODE", 
+                F.col("RXN.RXCUI").alias("RXNORM_CODE"), "SNO.SNOMED_CODE", "BASE.ADC_UPDT")
+    )
+
+    # ---------------------------------------------------------
+    # 3. OPTIMIZED VECTOR MATCHING
+    # ---------------------------------------------------------
+    print("  Step 3: Optimizing Vector Similarity...")
+
+    # Prepare Target Vectors
+    target_vec_df = (
+        spark.table("3_lookup.embeddings.omop_ingredients").alias("TGT")
+        .join(spark.table("3_lookup.omop.concept").alias("C"), 
+              (F.lower(F.trim(F.col("TGT.term"))) == F.lower(F.trim(F.col("C.concept_name")))) &
+              (F.col("C.vocabulary_id").isin(["dm+d", "RxNorm"])) & 
+              (F.col("C.concept_class_id").isin("Ingredient", "Multiple Ingredients")))
+        .select(F.col("TGT.term"), F.col("TGT.embedding_vector"), F.col("C.concept_id"))
+        .toPandas()
+    )
+
+    if target_vec_df.empty:
+        print("  No target vectors found. Skipping similarity step.")
+        return
+
+    tgt_ids = target_vec_df['concept_id'].values
+    tgt_terms = target_vec_df['term'].values
+    tgt_matrix = np.stack(target_vec_df['embedding_vector'].values)
+    tgt_norms = np.linalg.norm(tgt_matrix, axis=1, keepdims=True)
+    tgt_matrix_norm = tgt_matrix / (tgt_norms + 1e-9)
+
+    schema_match = StructType([
+        StructField("RAW_OMOP_ID", IntegerType(), True),
+        StructField("RAW_OMOP_TERM", StringType(), True),
+        StructField("SCORE", FloatType(), True)
+    ])
+
+    @F.pandas_udf(schema_match)
+    def find_best_match_udf(vectors: pd.Series) -> pd.DataFrame:
+        src_matrix = np.vstack(vectors.values)
+        src_norms = np.linalg.norm(src_matrix, axis=1, keepdims=True)
+        src_matrix_norm = src_matrix / (src_norms + 1e-9)
+        scores = np.matmul(src_matrix_norm, tgt_matrix_norm.T)
+        best_idx = np.argmax(scores, axis=1)
+        best_scores = np.max(scores, axis=1)
+        return pd.DataFrame({
+            "RAW_OMOP_ID": tgt_ids[best_idx],
+            "RAW_OMOP_TERM": tgt_terms[best_idx],
+            "SCORE": best_scores
+        })
+
+    source_vecs = spark.table("3_lookup.embeddings.barts_ingredients")
+    
+    df_ready = base_mapping.join(
+        source_vecs, 
+        F.lower(F.trim(base_mapping.VEC_SEARCH_TERM)) == F.lower(F.trim(source_vecs.term)), 
+        "left"
+    )
+    
+    df_matches = (
+        df_ready
+        .withColumn("match", F.when(F.col("embedding_vector").isNotNull(), 
+                                   find_best_match_udf(F.col("embedding_vector")))
+                              .otherwise(None))
+        .select(
+            "SYNONYM_ID", "HNA_ORDER_MNEMONIC", "MULTUM_CODE", "RXNORM_CODE", "SNOMED_CODE", "ADC_UPDT",
+            "match.RAW_OMOP_ID", "match.RAW_OMOP_TERM", "match.SCORE"
+        )
+    )
+
+    # ---------------------------------------------------------
+    # 4. STANDARDIZE & FINALIZE (UPDATED LOGIC)
+    # ---------------------------------------------------------
+    print("  Step 4: Standardizing, Mapping RxNorm & Linking SNOMED...")
+    
+    concept_rel = spark.table("3_lookup.omop.concept_relationship")
+    omop = spark.table("3_lookup.omop.concept")
+
+    # --- Logic A: Populate MAPPED_OMOP_CONCEPT_ID via RxNorm Code ---
+    # Direct lookup: RxNorm Code -> Standard OMOP Concept
+    rxnorm_to_omop = omop.filter(
+        (F.col("vocabulary_id") == "RxNorm") & 
+        (F.col("standard_concept") == "S")
+    ).select(
+        F.col("concept_code").alias("RXNORM_CODE"),
+        F.col("concept_id").alias("DIRECT_STD_ID"),
+        F.col("concept_name").alias("DIRECT_STD_NAME")
+    )
+
+    # --- Logic B: Standardize Vector Results ---
+    # Map Vector Result (RAW) -> Standard Concept (STD)
+    # Supports 'Maps to' AND 'Source - RxNorm eq' (handling the ID 21234887 case)
+    valid_relationships = ["Maps to", "Source - RxNorm eq", "Source - RxNorm"]
+    
+    vector_standardization = (
+        concept_rel.filter(
+            F.col("relationship_id").isin(valid_relationships) & 
+            F.col("invalid_reason").isNull()
+        )
+        .join(omop.alias("T"), (F.col("concept_id_2") == F.col("T.concept_id")) & (F.col("T.standard_concept") == "S"))
+        .select(
+            F.col("concept_id_1").alias("RAW_OMOP_ID"),
+            F.col("concept_id_2").alias("VEC_STD_ID"),
+            F.col("T.concept_name").alias("VEC_STD_NAME")
+        )
+    )
+
+    # --- Logic C: SNOMED Reverse Lookup ---
+    # Find a SNOMED Substance that maps TO the Standard Concept
+    # Rules: Vocabulary=SNOMED, Class=Substance, Domain=Drug
+    # Tie-breaker: Shortest Name
+    
+    snomed_candidates = omop.filter(
+        (F.col("vocabulary_id") == "SNOMED") &
+        (F.col("concept_class_id") == "Substance") &
+        (F.col("domain_id") == "Drug") &
+        (F.col("invalid_reason").isNull())
+    ).alias("SNO_C")
+
+    snomed_to_std_rel = (
+        snomed_candidates
+        .join(concept_rel.alias("R"), F.col("SNO_C.concept_id") == F.col("R.concept_id_1"))
+        .filter(F.col("R.relationship_id").isin(valid_relationships))
+    )
+
+    # Window to find the single best SNOMED code per Standard ID
+    w_shortest = Window.partitionBy("R.concept_id_2").orderBy(F.length("SNO_C.concept_name"), "SNO_C.concept_code")
+
+    best_snomed_map = (
+        snomed_to_std_rel
+        .withColumn("rn", F.row_number().over(w_shortest))
+        .filter("rn = 1")
+        .select(
+            F.col("R.concept_id_2").alias("TARGET_STD_ID"),
+            F.col("SNO_C.concept_code").alias("DERIVED_SNOMED_CODE")
+        )
+    )
+
+    # --- Logic D: JOIN ALL ---
+    final_df = (
+        df_matches.alias("M")
+        # 1. Attach Direct RxNorm Map
+        .join(rxnorm_to_omop, "RXNORM_CODE", "left")
+        # 2. Attach Standardized Vector Map
+        .join(vector_standardization, "RAW_OMOP_ID", "left")
+        # 3. Determine "Effective" Standard ID for SNOMED lookup (Prefer Direct Map, else Vector Map)
+        .withColumn("EFFECTIVE_STD_ID", F.coalesce(F.col("DIRECT_STD_ID"), F.col("VEC_STD_ID")))
+        # 4. Attach Derived SNOMED based on Effective ID
+        .join(best_snomed_map, F.col("EFFECTIVE_STD_ID") == F.col("TARGET_STD_ID"), "left")
+        .select(
+            "SYNONYM_ID", 
+            "HNA_ORDER_MNEMONIC", 
+            "MULTUM_CODE", 
+            "RXNORM_CODE", 
+            "SNOMED_CODE",
+            # Mapped (from RxNorm Code)
+            F.col("DIRECT_STD_ID").alias("MAPPED_OMOP_CONCEPT_ID"), 
+            F.col("DIRECT_STD_NAME").alias("MAPPED_OMOP_CONCEPT_TERM"),
+            # Similarity (Standardized from Vector)
+            F.coalesce(F.col("VEC_STD_ID"), F.col("RAW_OMOP_ID")).alias("SIMILARITY_OMOP_CONCEPT_ID"),
+            F.coalesce(F.col("VEC_STD_NAME"), F.col("RAW_OMOP_TERM")).alias("SIMILARITY_OMOP_CONCEPT_TERM"),
+            F.col("SCORE").alias("SIMILARITY_SCORE"),
+            # Derived Snomed
+            F.col("DERIVED_SNOMED_CODE").alias("SNOMED_FROM_OMOP"),
+            "ADC_UPDT"
+        )
+    )
+
+    # Merge
+    DeltaTable.forName(spark, TARGET_TABLE).alias("t").merge(final_df.alias("s"), "t.SYNONYM_ID = s.SYNONYM_ID") \
+        .whenNotMatchedInsertAll().execute()
+
+    print("✓ Update complete.")
+
+update_med_lookup_table_incr()
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC ALTER TABLE 4_prod.tmp.tempone_nomenclature CLUSTER BY (NOMENCLATURE_ID);
 # MAGIC OPTIMIZE 4_prod.tmp.tempone_nomenclature;
@@ -1847,3 +2279,7 @@ else:
 # MAGIC OPTIMIZE 4_prod.bronze.nomenclature;
 # MAGIC ALTER TABLE 3_lookup.mill.map_nomenclature CLUSTER BY (NOMENCLATURE_ID);
 # MAGIC OPTIMIZE 3_lookup.mill.map_nomenclature;
+# MAGIC
+# MAGIC OPTIMIZE 3_lookup.embeddings.barts_ingredients ZORDER BY (term);
+# MAGIC OPTIMIZE 3_lookup.embeddings.omop_ingredients ZORDER BY (term);
+# MAGIC
