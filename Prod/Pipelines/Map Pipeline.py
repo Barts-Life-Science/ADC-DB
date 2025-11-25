@@ -7236,39 +7236,19 @@ update_table(updates_df,"4_prod.bronze.map_mat_birth",["Pregnancy_ID", "BirthOrd
 
 # Obstetric VTE Risk Assessment results during the pregnancy
 map_mat_vte_comment = "The table contains the Obstetric VTE Risk Assessment record during the perinatal period."
-from pyspark.sql.types import StructType, StructField, LongType, FloatType, StringType
 
 schema_map_mat_vte = StructType([
-    StructField("Pregnancy_ID", LongType(), True, {"comment": "Unique identifier for the pregnancy"}),
-    StructField("PERSON_ID", LongType(), True, {"comment": "Unique identifier for the person"}),
-    StructField("FormID", LongType(), True, {"comment": "Identifier for the form submitted"}),
-    StructField("ENCNTR_ID", LongType(), True, {"comment": "Identifier for the encounter"}),
-    StructField("FormDate", TimestampType(), True, {"comment": "Date of submission of the form"}),
-    StructField("Height_Length", FloatType(), True, {"comment": "Height/Length at Obstetric VTE Risk Assessment"}),
-    StructField("Weight", FloatType(), True, {"comment": "Weight at Obstetric VTE Risk Assessment"}),
-    StructField("BMI", FloatType(), True, {"comment": "BMI at Obstetric VTE Risk Assessment"}),
-    StructField("AssessmentType", StringType(), True, {"comment": "Type of Obstetric VTE Risk Assessment"}),
-    StructField("Pre-eclampsia", StringType(), True, {"comment": "Pre-eclampsia status"}),
-    StructField("Age>35_Parity>3", StringType(), True, {"comment": "Age >35 or Parity >3"}),
-    StructField("MultiplePregnancy", StringType(), True, {"comment": "Multiple pregnancy"}),
-    StructField("Smoker", StringType(), True, {"comment": "Smoking status"}),
-    StructField("PreviousVTE", StringType(), True, {"comment": "Previous VTE history"}),
-    StructField("ObVTEObesity", StringType(), True, {"comment": "Obesity status"}),
-    StructField("GrossVaricoseVeins", StringType(), True, {"comment": "Gross varicose veins"}),
-    StructField("FamilyHistory", StringType(), True, {"comment": "Family history of VTE"}),
-    StructField("KnownThrombophilia", StringType(), True, {"comment": "Known thrombophilia"}),
-    StructField("CurrentSystemicInfection", StringType(), True, {"comment": "Current systemic infection"}),
-    StructField("Dehydration_ReducedImmobility_ART_IVF", StringType(), True, {"comment": "Dehydration/reduced mobility/ART/IVF"}),
-    StructField("SurgProcedure", StringType(), True, {"comment": "Surgical procedure within 6 weeks"}),
-    StructField("OHSS", StringType(), True, {"comment": "Ovarian Hyperstimulation Syndrome"}),
-    StructField("Hyperemesis", StringType(), True, {"comment": "Hyperemesis"}),
-    StructField("Comorbidities", StringType(), True, {"comment": "Medical comorbidities"}),
-    StructField("PersonCompletingForm", StringType(), True, {"comment": "Person completing the form"}),
-    StructField("PatientAtRisk", StringType(), True, {"comment": "Patient at risk of VTE"}),
-    StructField("ObstetricVTERiskTotalv2", StringType(), True, {"comment": "Total VTE risk score v2"}),
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "Unique identifier for the pregnancy."}),
+    StructField("PERSON_ID", LongType(), True, {"comment": "Unique identifier for the person."}),
+    StructField("Event_ID", LongType(), True, {"comment": "Identifier for the Obstetric VTE Risk Assessment."}),
+    StructField("ENCNTR_ID", LongType(), True, {"comment": "Identifier for the encounter."}),
+    StructField("FormDate", TimestampType(), True, {"comment": "Date of submission of the form."}),
+    StructField("Section", StringType(), True, {"comment": "Section description."}),
+    StructField("Element", StringType(), True, {"comment": "Assessment element captured in the Obstetric VTE Risk Assessment."}),
+    StructField("Response", StringType(), True, {"comment": "Response for each element in the Obstetric VTE Risk Assessment."}),
+    StructField("PERFORMED_PRSNL_ID", StringType(), True, {"comment": "The provider associated with the assessment record."}),
     StructField("ADC_UPDT", TimestampType(), True, {"comment": "Date of update of the record"})
 ])
-
 
 def create_mat_vte_mapping_incr():
 
@@ -7315,25 +7295,42 @@ def create_mat_vte_mapping_incr():
         .select(
             col("DOC.PERSON_ID").alias("PERSON_ID"),
             col("DOC.ENCNTR_ID").alias("ENCNTR_ID"),
-            col("DOC.FORM_EVENT_ID").alias("FormID"),
+            col("DOC.SECTION_EVENT_ID").alias("Event_ID"),
             col("Dref.SECTION_DESC_TXT").alias("Section"),
             col("Dref.ELEMENT_LABEL_TXT").alias("Element"),
             col("DOC.RESPONSE_VALUE_TXT").alias("Response"),
             col("DOC.PERFORMED_DT_TM").alias("FormDate"),
+            col("DOC.PERFORMED_PRSNL_ID"),
             col("DOC.ADC_UPDT").alias("ADC_UPDT")
         )
         .filter(
             (col("Section") == "Obstetric VTE Risk Assessment") &
             (col("Element").isin(vte_element))
         )
-        .groupby("PERSON_ID","FormID","ENCNTR_ID")
-        .agg(
-            *[F.first(when(col("Element") == x, col("Response"))).alias(x) for x in vte_element],
-            F.max(col("FormDate")).alias("LastFormDate"),
-            F.max(col("ADC_UPDT")).alias("ADC_UPDT")
-            )
+        .dropDuplicates()
+    )
+
+    # Clean duplicates
+    window_dup = Window.partitionBy("PERSON_ID","Event_ID","ENCNTR_ID","Element")
+    dup_num = (
+        assessment_results
+        .withColumn("dup", F.count("*").over(window_dup))
+        .filter(col("dup") > 1)
+        .count()
+    )
+
+    if dup_num > 0:
+        print("Duplicates found in assessment records. Now cleaning duplicate records...")
+        window = Window.partitionBy("PERSON_ID","Event_ID","ENCNTR_ID","Element").orderBy(F.col("Response").isNull().asc())
+        assessment_final = (
+        assessment_results
+            .withColumn("rn", F.row_number().over(window))
+            .filter(F.col("rn") == 1)
+            .drop("rn") 
         )
-            
+    else:
+        assessment_final = assessment_results  
+
     # Match the possible Pregnancy_ID from pregnancy and birth table
     pregnancy = (
         spark.table("8_dev.bronze.map_mat_pregnancy")
@@ -7412,14 +7409,14 @@ def create_mat_vte_mapping_incr():
 
     # Match the possible Pregnancy_ID for each assessment response records
     processed_df = (
-        assessment_results.alias("a")
+        assessment_final.alias("a")
         .join(
             pregnancy_final.alias("p"),
             (
                 (F.col("a.Person_ID") == F.col("p.Person_ID")) &
                 (F.col("p.calculated_start").isNotNull()) &
                 (F.col("p.calculated_end").isNotNull()) &
-                (F.col("a.LastFormDate").between(F.col("p.calculated_start"), F.col("p.calculated_end")))
+                (F.col("a.FormDate").between(F.col("p.calculated_start"), F.col("p.calculated_end")))
             ),
             "left"
         )
@@ -7429,36 +7426,18 @@ def create_mat_vte_mapping_incr():
     final_df = (
         processed_df
         .select(
-            col("Pregnancy_ID").cast(LongType()).alias("Pregnancy_ID"),
-            col("PERSON_ID").cast(LongType()).alias("PERSON_ID"),
-            col("FormID").cast(LongType()).alias("FormID"),
-            col("ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
-            col("LastFormDate").cast(TimestampType()).alias("FormDate"),
-            col("Height/Length Measured").cast(FloatType()).alias("Height_Length"),
-            col("Weight Measured").cast(FloatType()).alias("Weight"),
-            col("BMI").cast(FloatType()).alias("BMI"),
-            col("Obstetric VTE Risk Assessment Type").cast(StringType()).alias("AssessmentType"),
-            col("Pre-eclampsia").cast(StringType()).alias("Pre-eclampsia"),
-            col("Age>35 / Parity >3").cast(StringType()).alias("Age>35_Parity>3"),
-            col("Multiple Pregnancy (Twins or more)").cast(StringType()).alias("MultiplePregnancy"),
-            col("Smoker").cast(StringType()).alias("Smoker"),
-            col("Previous VTE").cast(StringType()).alias("PreviousVTE"),
-            col("Ob VTE Obesity").cast(StringType()).alias("ObVTEObesity"),
-            col("Gross Varicose Veins").cast(StringType()).alias("GrossVaricoseVeins"),
-            col("Family History of VTE").cast(StringType()).alias("FamilyHistory"),
-            col("VTE Known Thrombophilia").cast(StringType()).alias("KnownThrombophilia"),
-            col("Current Systemic Infection").cast(StringType()).alias("CurrentSystemicInfection"),
-            col("Dehydration/Reduced Immobility/ART/IVF").cast(StringType()).alias("Dehydration_ReducedImmobility_ART_IVF"),
-            col("Surg procedure in this preg or <=6 weeks").cast(StringType()).alias("SurgProcedure"),
-            col("OHSS (Overian Hyperstimulation Syndrome)").cast(StringType()).alias("OHSS"),
-            col("Hyperemesis").cast(StringType()).alias("Hyperemesis"),
-            col("Medical Comorbidities").cast(StringType()).alias("Comorbidities"),
-            col("Person Completing Form (VTE)").cast(StringType()).alias("PersonCompletingForm"),
-            col("Patient at Risk of VTE").cast(StringType()).alias("PatientAtRisk"),
-            col("Obstetric VTE Risk Total v2").cast(StringType()).alias("ObstetricVTERiskTotalv2"),
-            col("ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT") 
+            col("Pregnancy_ID").cast(LongType()),
+            col("PERSON_ID").cast(LongType()),
+            col("Event_ID").cast(LongType()),
+            col("ENCNTR_ID").cast(LongType()),
+            col("FormDate").cast(TimestampType()),
+            col("Section").cast(StringType()),
+            col("Element").cast(StringType()),
+            col("Response").cast(StringType()),
+            col("PERFORMED_PRSNL_ID").cast(StringType()),
+            col("ADC_UPDT").cast(TimestampType()) 
             ))
     return final_df
 
 updates_df = create_mat_vte_mapping_incr()
-update_table(updates_df, "8_dev.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "FormID"], schema_map_mat_vte, map_mat_vte_comment)
+update_table(updates_df, "8_dev.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "Event_ID","Element"], schema_map_mat_vte, map_mat_vte_comment)
