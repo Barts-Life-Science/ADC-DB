@@ -221,7 +221,8 @@ def detect_schema_changes(target_table: str, target_schema: StructType = None, t
     if target_schema:
         current_schema = spark.table(target_table).schema
         current_fields = {f.name: f for f in current_schema.fields}
-        
+        target_fields = {f.name for f in target_schema.fields}
+
         for target_field in target_schema.fields:
             field_name = target_field.name
             
@@ -252,7 +253,7 @@ def detect_schema_changes(target_table: str, target_schema: StructType = None, t
                     'nullable': target_field.nullable
                 })
                 changes['has_changes'] = True
-    
+
     if table_comment:
         # Check current table comment
         try:
@@ -277,6 +278,7 @@ def escape_comment(text: str) -> str:
         return ""
     return text.replace("\\", "\\\\").replace("'", "''")
     
+
 def apply_schema_changes(target_table: str, changes: dict):
     """
     Apply detected schema changes efficiently.
@@ -293,30 +295,49 @@ def apply_schema_changes(target_table: str, changes: dict):
         updates_applied.append(f"Added column {col['name']}")
     
     # Update existing columns
-    for col in changes['columns_to_update']:
-        if col['type_changed'] and col['comment_changed']:
-            # Both type and comment changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` TYPE {col['type']} 
-                COMMENT '{escape_comment(col['comment'])}'
-            """)
-            updates_applied.append(f"Updated {col['name']} type and comment")
-        elif col['type_changed']:
-            # Only type changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` TYPE {col['type']}
-            """)
-            updates_applied.append(f"Updated {col['name']} type")
-        elif col['comment_changed']:
-            # Only comment changed
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                ALTER COLUMN `{col['name']}` COMMENT '{escape_comment(col['comment'])}'
-            """)
-            updates_applied.append(f"Updated {col['name']} comment")
+
+    # Check if any column has a type change
+    type_change_detected = any(col['type_changed'] for col in changes['columns_to_update'])
+
+    if type_change_detected:
+        print(f"Type change detected. Recreating table {target_table}...")
+        df = spark.table(target_table)
+        cols_to_cast = [col['name'] for col in changes['columns_to_update'] if col['type_changed']]
+        pre_counts = df.select([F.count(F.col(c)).alias(c) for c in cols_to_cast]).collect()[0].asDict()
+
+        for col in changes['columns_to_update']:
+            if col['type_changed']:
+                df = df.withColumn(col['name'], df[col['name']].cast(col['type']))
+        
+        # Now check the data loss after changing the data type
+        post_counts = df.select([F.count(F.col(c)).alias(c) for c in cols_to_cast]).collect()[0].asDict()
+        losses = {c: pre_counts[c] - post_counts[c] for c in cols_to_cast if pre_counts[c] - post_counts[c] > 0}
+                
+        if losses:
+            raise ValueError(f"Data loss detected during cast: {losses}")
+        else:
+            print("✔ All type casts completed without introducing NULLs.")
+        
+        # Drop and recreate the table
+        df.write.format("delta") \
+            .mode("overwrite") \
+            .option("overwriteSchema", "true") \
+            .saveAsTable(target_table)
+
+        updates_applied.append(f"Recreated {target_table} due to type change")
+
+    # Handle column comment updates separately
+    comment_change_detected = any(col['comment_changed'] for col in changes['columns_to_update'])
     
+    if comment_change_detected:
+        for col in changes['columns_to_update']:
+            if col['comment_changed']:
+                spark.sql(f"""
+                    ALTER TABLE {target_table}
+                    ALTER COLUMN `{col['name']}` COMMENT '{escape_comment(col['comment'])}'
+                """)
+                updates_applied.append(f"Updated {col['name']} comment")
+
     # Update table comment
     if changes['table_comment_update']:
         spark.sql(f"""
@@ -418,6 +439,25 @@ def update_table(source_df, target_table: str, index_column: str,
         if len(source_df.take(1)) == 0:
             print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
             return
+        else:
+            # Perform merge operation
+            print(f"[INFO] Performing merge on {target_table} using column {index_column}")
+
+            if isinstance(index_column, str):
+                index_keys = [index_column]
+            else:
+                index_keys = index_column
+
+            merge_condition = " AND ".join([f"t.{col} <=> s.{col}" for col in index_keys])
+
+            tgt = DeltaTable.forName(spark, target_table)
+            (
+                tgt.alias("t")
+                .merge(source_df.alias("s"),merge_condition)
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
         
         print(f"[INFO] Performing merge on {target_table} using column {index_column}")
         
@@ -6955,3 +6995,552 @@ def process_coded_events_incremental():
 
 
 process_coded_events_incremental()
+
+# COMMAND ----------
+
+map_mat_pregnancy_comment = "Contains detailed clinical and demographic information about pregnancy episodes for each person, including identifiers, maternal characteristics, pregnancy history, antenatal details, lifestyle factors, delivery information, and related clinical observations." 
+
+schema_map_mat_pregnancy = StructType([
+    StructField("Person_ID", LongType(), False, {"comment": "The unique identifier for the mother."}),
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "The unique identifier allocated to each Pregnancy Episode."}),
+    StructField("MRN", StringType(), True, {"comment": "Unique local identifier to identify the person."}),
+    StructField("NHS_Number", StringType(), True, {"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH."}),
+    StructField("Mother_DOB", TimestampType(), True, {"comment": "Date of Birth for the mother."}),
+    StructField("Gravida_NBR", DoubleType(), True, {"comment": "The total number of times a woman has been pregnant."}),
+    StructField("Parity", DoubleType(), True, {"comment": "The number of pregnancies that have resulted in the birth of one or more viable (living or stillborn) infants."}),
+    StructField("PrevLiveBirth_NBR", DoubleType(), True, {"comment": "Number of previous livebirths."}),
+    StructField("PrevMiscarriages_NBR", DoubleType(), True, {"comment": "Number of previous miscarriages."}),
+    StructField("PrevStillBirth_NBR", DoubleType(), True, {"comment": "Number of previous stillbirths."}),
+    StructField("FirstAntenatalAPPTDate", TimestampType(), True, {"comment": "Date of first antenatal appointment."}),
+    StructField("GestAgePregStart", StringType(), True, {"comment": "Gestational age at start of pregnancy record (weeks)."}),
+    StructField("GestAgePregEnd", StringType(), True, {"comment": "Gestational age at end of pregnancy (weeks)."}),
+    StructField("LastMensPeriodDate", TimestampType(), True, {"comment": "Date on which last menstrual period began."}),
+    StructField("AlcoholUnitsPerWeek", DoubleType(), True, {"comment": "Units of alcohol per week."}),
+    StructField("SmokingBooking_CD", IntegerType(), True, {"comment": "Smoking status at booking code."}),
+    StructField("SmokingBooking_DESC", StringType(), True, {"comment": "Smoking status at booking description."}),
+    StructField("SmokingDelivery_CD", IntegerType(), True, {"comment": "Smoking status at delivery code."}),
+    StructField("SmokingDelivery_DESC", StringType(), True, {"comment": "Smoking status at delivery description."}),
+    StructField("SubstanceUse_CD", StringType(), True, {"comment": "Substance use code."}),
+    StructField("SubstanceUse_DESC", StringType(), True, {"comment": "Description of substance use."}),
+    StructField("ExpectedDeliveryDate", TimestampType(), True, {"comment": "Expected delivery date."}),
+    StructField("Height_CM", FloatType(), True, {"comment": "Height in cm."}),
+    StructField("Weight_KG", FloatType(), True, {"comment": "Weight in kg."}),
+    StructField("BMI", FloatType(), True, {"comment": "BMI."}),
+    StructField("FolicAcidSupp_CD", StringType(), True, {"comment": "Folic acid supplement code during pregnancy."}),
+    StructField("FolicAcidSupp_DESC", StringType(), True, {"comment": "Description of folic acid supplement usage."}),
+    StructField("LaborOnsetMethod_CD", IntegerType(), True, {"comment": "Labor onset method code."}),
+    StructField("LaborOnsetMethod_DESC", StringType(), True, {"comment": "Method for labor onset."}),
+    StructField("Augmentation_CD", IntegerType(), True, {"comment": "Augmentation code if labor was augmented."}),
+    StructField("Augmentation_DESC", StringType(), True, {"comment": "Description of augmentation."}),
+    StructField("AnalgesiaDelivery_CD", StringType(), True, {"comment": "Analgesia code used during delivery."}),
+    StructField("AnalgesiaDelivery_DESC", StringType(), True, {"comment": "Details of analgesia used during delivery."}),
+    StructField("AnalgesiaLabour_CD", StringType(), True, {"comment": "Analgesia code used during labor."}),
+    StructField("AnalgesiaLabour_DESC", StringType(), True, {"comment": "Details of analgesia used during labor."}),
+    StructField("AnaesthesiaLabour_CD", StringType(), True, {"comment": "Anaesthesia code used during labor."}),
+    StructField("AnaesthesiaLabour_DESC", StringType(), True, {"comment": "Details of anaesthesia used during labor."}),
+    StructField("PerinealTrauma_CD", StringType(), True, {"comment": "Perineal trauma code."}),
+    StructField("PerinealTrauma_DESC", StringType(), True, {"comment": "Details of any perineal trauma from delivery."}),
+    StructField("Episiotomy_CD", IntegerType(), True, {"comment": "Episiotomy code."}),
+    StructField("Episiotomy_DESC", StringType(), True, {"comment": "Details of any episiotomy performed."}),
+    StructField("BloodLoss", FloatType(), True, {"comment": "Amount of blood lost."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Timestamp of last update."})
+])
+
+
+def create_mat_pregnancy_mapping_incr():
+    """
+    Creates an incremental pregnancy mapping table that processes only new or modified records.
+    
+    Returns:
+        DataFrame: Processed pregnancy records with standardized format
+    """
+   
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_pregnancy")
+
+    # Get source data and reference tables
+    pregnancy = (
+        spark.table("4_prod.raw.mat_pregnancy")
+        .filter(
+            (col("DELETE_IND") == 0) &
+            (col("ADC_UPDT") > max_adc_updt))
+    )
+
+    msds = (
+        spark.table("4_prod.raw.msds101pregbook")
+        .select("PREGNANCYID","LASTMENSTRUALPERIODDATE","FOLICACIDSUPPLEMENT", "PREVIOUSSTILLBIRTHS", "PREVIOUSLIVEBIRTHS")
+        .withColumn(
+            "FolicAcidSupp_DESC",
+            when(col("FOLICACIDSUPPLEMENT") == "01", "Has been taking prior to becoming pregnant")
+            .when(col("FOLICACIDSUPPLEMENT") == "02", "Started taking once pregnancy confirmed")
+            .when(col("FOLICACIDSUPPLEMENT") == "03", "Not taking folic acid supplement")
+            .when(col("FOLICACIDSUPPLEMENT") == "ZZ", "Not Stated(Person asked but declined to provide a response)")
+        )
+    )
+    # Merge the tables togther
+    processed_pregnancy = (
+        pregnancy.alias("PREG")
+        .join(
+            msds.alias("MSDS"),
+            col("PREG.PREGNANCY_ID") == col("MSDS.PREGNANCYID"),
+            "left")
+    )
+
+    final_df = (
+    processed_pregnancy 
+    .select(
+        col("PREG.PERSON_ID").cast(LongType()).alias("Person_ID"),
+        col("PREG.PREGNANCY_ID").cast(LongType()).alias("Pregnancy_ID"),
+        col("PREG.MRN").cast(StringType()).alias("MRN"),
+        col("PREG.NHS").cast(StringType()).alias("NHS_Number"),       
+        col("PREG.MOTHER_DOB_DT_TM").cast(TimestampType()).alias("Mother_DOB"),
+        col("PREG.GRAVIDA_NBR").cast(DoubleType()).alias("Gravida_NBR"),
+        col("PREG.PARA_NBR").cast(DoubleType()).alias("Parity"),     
+        col("MSDS.PREVIOUSLIVEBIRTHS").cast(DoubleType()).alias("PrevLiveBirth_NBR"),
+        col("PREG.HX_PREG_OUTCOME_SPONT_NBR").cast(DoubleType()).alias("PrevMiscarriages_NBR"),  
+        col("MSDS.PREVIOUSSTILLBIRTHS").cast(DoubleType()).alias("PrevStillBirth_NBR"),      
+        col("PREG.FIRST_ANTENATAL_ASSESSMENT_DT_TM").cast(TimestampType()).alias("FirstAntenatalAPPTDate"),
+        col("PREG.GEST_AGE_PREG_START").cast(StringType()).alias("GestAgePregStart"),
+        col("PREG.GEST_AGE_PREG_END").cast(StringType()).alias("GestAgePregEnd"),  
+        col("MSDS.LASTMENSTRUALPERIODDATE").cast(TimestampType()).alias("LastMensPeriodDate"),      
+        col("PREG.ALCOHOL_USE_NBR").cast(DoubleType()).alias("AlcoholUnitsPerWeek"),
+        col("PREG.PREG_TYPE_SCT_CD").cast(StringType()).alias("PregnancyType_CD"),
+        col("PREG.PREG_TYPE_DESC").cast(StringType()).alias("PregnancyType_DESC"),
+        col("PREG.SMOKE_BOOKING_NM_ID").cast(IntegerType()).alias("SmokingBooking_CD"),        
+        col("PREG.SMOKE_BOOKING_DESC").cast(StringType()).alias("SmokingBooking_DESC"),
+        col("PREG.SMOKING_STATUS_DEL_NM_ID").cast(IntegerType()).alias("SmokingDelivery_CD"),  
+        col("PREG.SMOKING_STATUS_DEL_DESC").cast(StringType()).alias("SmokingDelivery_DESC"),
+        col("PREG.REC_SUB_USE_NM_ID").cast(StringType()).alias("SubstanceUse_CD"),
+        col("PREG.REC_SUB_USE_DESC").cast(StringType()).alias("SubstanceUse_DESC"),
+        col("PREG.FINAL_EDD_DT_TM").cast(TimestampType()).alias("ExpectedDeliveryDate"),
+        col("PREG.HT_BOOKING_CM").cast(FloatType()).alias("Height_CM"),
+        col("PREG.WT_BOOKING_KG").cast(FloatType()).alias("Weight_KG"),
+        col("PREG.BMI_BOOKING_DESC").cast(FloatType()).alias("BMI"),
+        col("MSDS.FOLICACIDSUPPLEMENT").cast(StringType()).alias("FolicAcidSupp_CD"),
+        col("MSDS.FolicAcidSupp_DESC").cast(StringType()),                
+        col("PREG.LAB_ONSET_METHOD_NM_ID").cast(IntegerType()).alias("LaborOnsetMethod_CD"),
+        col("PREG.LAB_ONSET_METHOD_DESC").cast(StringType()).alias("LaborOnsetMethod_DESC"),
+        col("PREG.AUGMENTATION_NM_ID").cast(IntegerType()).alias("Augmentation_CD"),
+        col("PREG.AUGMENTATION_DESC").cast(StringType()).alias("Augmentation_DESC"),
+        col("PREG.ANALGESIA_DEL_NM_ID").cast(StringType()).alias("AnalgesiaDelivery_CD"),
+        col("PREG.ANALGESIA_DEL_DESC").cast(StringType()).alias("AnalgesiaDelivery_DESC"),
+        col("PREG.ANALGESIA_LAB_NM_ID").cast(StringType()).alias("AnalgesiaLabour_CD"),        
+        col("PREG.ANALGESIA_LAB_DESC").cast(StringType()).alias("AnalgesiaLabour_DESC"),
+        col("PREG.ANAESTHESIA_LAB_NM_ID").cast(StringType()).alias("AnaesthesiaLabour_CD"),
+        col("PREG.ANAESTHESIA_LAB_DESC").cast(StringType()).alias("AnaesthesiaLabour_DESC"),
+        col("PREG.PERINEAL_TRAUMA_NM_ID").cast(StringType()).alias("PerinealTrauma_CD"),
+        col("PREG.PERINEAL_TRAUMA_DESC").cast(StringType()).alias("PerinealTrauma_DESC"),
+        col("PREG.EPISIOTOMY_NM_ID").cast(IntegerType()).alias("Episiotomy_CD"),
+        col("PREG.EPISIOTOMY_DESC").cast(StringType()).alias("Episiotomy_DESC"),
+        col("PREG.TOTAL_BLOOD_LOSS").cast(FloatType()).alias("BloodLoss"),
+        col("PREG.ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT")
+    ))
+
+    return final_df
+
+updates_df = create_mat_pregnancy_mapping_incr()
+    
+update_table(updates_df, "4_prod.bronze.map_mat_pregnancy", ["Person_ID","Pregnancy_ID"], schema_map_mat_pregnancy, map_mat_pregnancy_comment)
+
+# COMMAND ----------
+
+map_mat_birth_comment = "The table contains data related to newborns and their associated pregnancies. It includes information such as baby identifiers, birth details, and outcomes of deliveries. Possible use cases include analyzing birth trends, tracking pregnancy outcomes, and understanding demographic factors related to childbirth." 
+
+schema_map_mat_birth = StructType([
+    StructField("MotherPerson_ID", LongType(), True, {"comment": "The unique identifier for the mother."}),
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "The unique identifier allocated to each Pregnancy Episode."}),
+    StructField("BabyPerson_ID", LongType(), True, {"comment": "Internal identifier for the baby."}),
+    StructField("Baby_MRN", StringType(), True, {"comment": "MRN for the baby."}),
+    StructField("Baby_NHS", StringType(), True, {"comment": "NHS Number for the baby."}),
+    StructField("BirthOrder", IntegerType(), True, {"comment": "Order in which this baby was born for this labor."}),
+    StructField("BirthNumber", IntegerType(), True, {"comment": "Total number of babies born this labor."}),
+    StructField("FetusNumber", IntegerType(), True, {"comment": "Total number of fetus during the pregnancy."}),
+    StructField("BirthLocation_CD", IntegerType(), True, {"comment": "Location code for the birth."}),
+    StructField("BirthLocation_DESC", StringType(), True, {"comment": "Location description for the birth."}),
+    StructField("BirthDateTime", StringType(), True, {"comment": "Date and time of the birth."}),
+    StructField("DeliveryMethod_CD", IntegerType(), True, {"comment": "Delivery method code."}),
+    StructField("DeliveryMethod_DESC", StringType(), True, {"comment": "Description of the method of delivery."}),
+    StructField("DeliveryOutcome_CD", IntegerType(), True, {"comment": "Delivery outcome code."}),
+    StructField("DeliveryOutcome_DESC", StringType(), True, {"comment": "Description of the outcome of delivery."}),
+    StructField("NeonatalOutcome_CD", IntegerType(), True, {"comment": "Neonatal outcome code."}),
+    StructField("NeonatalOutcome_DESC", StringType(), True, {"comment": "Description of the outcome of birth."}),
+    StructField("PregOutcome_CD", IntegerType(), True, {"comment": "Pregnancy outcome code."}),
+    StructField("PregOutcome_DESC", StringType(), True, {"comment": "Pregnancy outcome description."}),
+    StructField("PresDel_CD", IntegerType(), True, {"comment": "Presentation at delivery code."}),
+    StructField("PresDel_DESC", StringType(), True, {"comment": "Description of the presentation at delivery, e.g., vertex."}),
+    StructField("GestationWeeks", IntegerType(), True, {"comment": "Gestation in weeks."}),
+    StructField("GestationDays", IntegerType(), True, {"comment": "Gestation in additional days."}),
+    StructField("BirthWeight", StringType(), True, {"comment": "Weight of baby."}),
+    StructField("BirthSex", StringType(), True, {"comment": "Sex of baby."}),
+    StructField("APGAR1Min", IntegerType(), True, {"comment": "APGAR score at 1 minute."}),
+    StructField("APGAR5Min", IntegerType(), True, {"comment": "APGAR score at 5 minutes."}),
+    StructField("FeedingMethod", StringType(), True, {"comment": "Method of feeding."}),
+    StructField("CongenitalAnomalies", StringType(), True, {"comment": "Any congenital anomalies recorded."}),
+    StructField("MotherComplications", StringType(), True, {"comment": "Details of any complications for the mother."}),
+    StructField("FetalComplications", StringType(), True, {"comment": "Details of any complications for the baby."}),
+    StructField("NeonatalComplications", StringType(), True, {"comment": "Details of any neonatal complications."}),
+    StructField("ResMethod", StringType(), True, {"comment": "Resuscitation method if applicable."}),
+    StructField("MaritalStatusMother", StringType(), True, {"comment": "Marital status of the mother at the time of the pregnancy."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Timestamp of last update."})
+])
+
+def create_mat_birth_mapping_incr():
+
+    """
+    Creates an incremental birth mapping table that processes only new or modified records.
+    
+    Returns:
+        DataFrame: Processed birth records with standardized format
+    """
+    
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_birth")
+
+    # Load mat_birth
+    mat_birth = (
+        spark.table("4_prod.raw.mat_birth")
+        .filter((F.col("DELETE_IND") == 0) & (F.col("ADC_UPDT") > max_adc_updt))
+        .withColumn("NHS_NBR", F.regexp_replace(F.col("NHS"), "-", ""))
+        .dropDuplicates()
+    )
+
+    # Detect and clean duplicates in mat_birth
+
+    dup_window = Window.partitionBy("PREGNANCY_ID", "BIRTH_ODR_NBR")
+    dup_num = (
+        mat_birth
+        .withColumn("dup_count", F.count("*").over(dup_window))
+        .filter(col("dup_count") > 1)
+        .count())
+    
+    if dup_num > 0:
+        print(f"Found {dup_num} duplicate records sharing the same PREGNANCY_ID and BIRTH_ODR_NBR. Proceeding to clean up these duplicates...")
+
+        order_window = Window.partitionBy(
+            "PREGNANCY_ID", "BIRTH_ODR_NBR"
+        ).orderBy(
+            F.col("BIRTH_DT_TM").isNotNull().cast("int").desc(),
+            F.col("NB_SEX_DESC").isNotNull().cast("int").desc(),
+            F.col("BABY_PERSON_ID").isNotNull().cast("int").desc(),
+            F.col("NHS").isNotNull().cast("int").desc(),
+            F.col("Record_Updated_Dt").desc(),
+        )
+    
+        mat_birth_final = (
+            mat_birth
+            .withColumn("rn", F.row_number().over(order_window))
+            .filter("rn = 1")
+            .drop("rn")
+            .alias("BIRTH")
+        )
+
+    else:
+        print("No duplicate records found in mat_birth.")
+        mat_birth_final = mat_birth.alias("BIRTH")
+
+    # Load mat_pregnancy
+    mat_pregnancy = (
+        spark.table("4_prod.raw.mat_pregnancy")
+        .filter(F.col("DELETE_IND") == 0)
+        .select("PREGNANCY_ID", "PERSON_ID")
+        .dropDuplicates()
+        .alias("MOTHER")
+    )
+
+    # Load nnu_episodes
+    nnu_epi = (
+        spark.table("4_prod.raw.nnu_episodes")
+        .select("NationalIDBaby", "GestationWeeks", "GestationDays", "CongenitalAnomalies", "FetusNumber", "MaritalStatusMother", "LastUpdate")
+        .dropDuplicates()
+        .filter((F.col("CongenitalAnomalies").isNotNull()) | (F.col("FetusNumber").isNotNull()))
+    )
+
+    # Detect and clean duplicates in nnu_epi
+    dup_window = Window.partitionBy("NationalIDBaby")
+    dup_num = (
+        nnu_epi
+        .withColumn("dup_count", F.count("*").over(dup_window))
+        .filter(F.col("dup_count") > 1)
+        .count()
+    )
+
+    if dup_num > 0:
+        print(f"Found {dup_num} duplicate records sharing the same NationalIDBaby. Now cleaning the duplicates...")
+
+        nnu_window = Window.partitionBy("NationalIDBaby").orderBy(
+            F.col("CongenitalAnomalies").isNotNull().cast("int").desc(),
+            F.col("FetusNumber").isNotNull().cast("int").desc(),
+            F.col("MaritalStatusMother").isNotNull().cast("int").desc(),
+            F.col("GestationWeeks").isNotNull().cast("int").desc(),
+            F.col("GestationDays").isNotNull().cast("int").desc(),
+            F.col("LastUpdate").desc()
+        )
+
+        nnu_epi_final = (
+            nnu_epi
+            .withColumn("rn", F.row_number().over(nnu_window))
+            .filter(F.col("rn") == 1)
+            .drop("rn")
+            .alias("NNU")
+        )
+    else:
+        print("No duplicate records found in nnu_epi.")
+        nnu_epi_final = nnu_epi.alias("NNU")
+    
+    # Merge all the data together
+    final_df = (
+        mat_birth_final
+        .join(mat_pregnancy, col("BIRTH.PREGNANCY_ID") == col("MOTHER.Pregnancy_ID"), "left")
+        .join(nnu_epi_final, col("BIRTH.NHS_NBR") == col("NNU.NationalIDBaby"), "left")
+        .select(
+            col("MOTHER.Person_ID").cast(LongType()).alias("MotherPerson_ID"),
+            col("BIRTH.PREGNANCY_ID").cast(LongType()).alias("Pregnancy_ID"),
+            col("BIRTH.BABY_PERSON_ID").cast(LongType()).alias("BabyPerson_ID"),
+            col("BIRTH.MRN").cast(StringType()).alias("Baby_MRN"),
+            col("BIRTH.NHS_NBR").cast(StringType()).alias("Baby_NHS"),
+            col("BIRTH.BIRTH_ODR_NBR").cast(IntegerType()).alias("BirthOrder"),
+            col("BIRTH.BIRTH_NBR").cast(IntegerType()).alias("BirthNumber"),
+            col("NNU.FetusNumber").cast(IntegerType()),
+            col("BIRTH.BIRTH_LOC_NM_ID").cast(IntegerType()).alias("BirthLocation_CD"),
+            col("BIRTH.BIRTH_LOC_DESC").cast(StringType()).alias("BirthLocation_DESC"),
+            col("BIRTH.BIRTH_DT_TM").cast(StringType()).alias("BirthDateTime"),
+            col("BIRTH.DEL_METHOD_CD").cast(IntegerType()).alias("DeliveryMethod_CD"),
+            col("BIRTH.DEL_METHOD_DESC").cast(StringType()).alias("DeliveryMethod_DESC"),
+            col("BIRTH.DEL_OUTCOME_CD").cast(IntegerType()).alias("DeliveryOutcome_CD"),
+            col("BIRTH.DEL_OUTCOME_DESC").cast(StringType()).alias("DeliveryOutcome_DESC"),
+            col("BIRTH.NEO_OUTCOME_CD").cast(IntegerType()).alias("NeonatalOutcome_CD"),
+            col("BIRTH.NEO_OUTCOME_DESC").cast(StringType()).alias("NeonatalOutcome_DESC"),
+            col("BIRTH.PREG_OUTCOME_CD").cast(IntegerType()).alias("PregOutcome_CD"),
+            col("BIRTH.PREG_OUTCOME_DESC").cast(StringType()).alias("PregOutcome_DESC"),
+            col("BIRTH.PRES_DEL_NM_ID").cast(IntegerType()).alias("PresDel_CD"),
+            col("BIRTH.PRES_DEL_DESC").cast(StringType()).alias("PresDel_DESC"),
+            col("NNU.GestationWeeks").cast(IntegerType()).alias("GestationWeeks"),
+            col("NNU.GestationDays").cast(IntegerType()).alias("GestationDays"),
+            col("BIRTH.BIRTH_WT").cast(StringType()).alias("BirthWeight"),
+            col("BIRTH.NB_SEX_DESC").cast(StringType()).alias("BirthSex"),
+            col("BIRTH.APGAR_1MIN").cast(IntegerType()).alias("APGAR1Min"),
+            col("BIRTH.APGAR_5MIN").cast(IntegerType()).alias("APGAR5Min"),
+            col("BIRTH.FEEDING_METHOD_DESC").cast(StringType()).alias("FeedingMethod"),
+            col("NNU.CongenitalAnomalies").cast(StringType()).alias("CongenitalAnomalies"),
+            col("BIRTH.MOTHER_COMPLICATION_DESC").cast(StringType()).alias("MotherComplications"),
+            col("BIRTH.FETAL_COMPLICATION_DESC").cast(StringType()).alias("FetalComplications"),
+            col("BIRTH.NEONATAL_COMPLICATION_DESC").cast(StringType()).alias("NeonatalComplications"),
+            col("BIRTH.RESUS_METHOD_DESC").cast(StringType()).alias("ResMethod"),
+            col("NNU.MaritalStatusMother").cast(StringType()).alias("MaritalStatusMother"),
+            col("BIRTH.ADC_UPDT").cast(TimestampType()).alias("ADC_UPDT") 
+        )
+    )
+
+    return final_df
+
+updates_df = create_mat_birth_mapping_incr()
+
+update_table(updates_df,"4_prod.bronze.map_mat_birth",["Pregnancy_ID", "BirthOrder"],schema_map_mat_birth,map_mat_birth_comment)
+
+# COMMAND ----------
+
+# Obstetric VTE Risk Assessment results during the pregnancy
+map_mat_vte_comment = "The table contains the Obstetric VTE Risk Assessment record during the perinatal period."
+
+schema_map_mat_vte = StructType([
+    StructField("Pregnancy_ID", LongType(), True, {"comment": "Unique identifier for the pregnancy."}),
+    StructField("PERSON_ID", LongType(), True, {"comment": "Unique identifier for the person."}),
+    StructField("Event_ID", LongType(), True, {"comment": "Identifier for the Obstetric VTE Risk Assessment."}),
+    StructField("ENCNTR_ID", LongType(), True, {"comment": "Identifier for the encounter."}),
+    StructField("FormDate", TimestampType(), True, {"comment": "Date of submission of the form."}),
+    StructField("Section", StringType(), True, {"comment": "Section description."}),
+    StructField("Element", StringType(), True, {"comment": "Assessment element captured in the Obstetric VTE Risk Assessment."}),
+    StructField("Response", StringType(), True, {"comment": "Response for each element in the Obstetric VTE Risk Assessment."}),
+    StructField("PERFORMED_PRSNL_ID", StringType(), True, {"comment": "The provider associated with the assessment record."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Date of update of the record"})
+])
+
+def create_mat_vte_mapping_incr():
+
+    max_adc_updt = get_max_timestamp("4_prod.bronze.map_mat_VTE_Assessment")
+
+    # Get the Obstetric VTE Risk Assessment results    
+    doc_response = (
+        spark.table("4_prod.raw.pi_cde_doc_response")        
+        .filter((col("ACTIVE_IND") == 1) & (col("ADC_UPDT") > max_adc_updt))
+        ).alias("DOC")
+    doc_ref = (
+        spark.table("3_lookup.dwh.pi_lkp_cde_doc_ref")
+        .filter((col("ACTIVE_IND") == 1) & (col("ADC_UPDT") > max_adc_updt))
+        ).alias("Dref")
+
+    vte_element = [
+        "Height/Length Measured",
+        "Weight Measured",
+        "BMI",
+        "Obstetric VTE Risk Assessment Type",
+        "Pre-eclampsia",
+        "Age>35 / Parity >3",
+        "Multiple Pregnancy (Twins or more)",
+        "Smoker",
+        "Previous VTE",
+        "Ob VTE Obesity",
+        "Gross Varicose Veins",
+        "Family History of VTE",
+        "VTE Known Thrombophilia",
+        "Current Systemic Infection",
+        "Dehydration/Reduced Immobility/ART/IVF",
+        "Surg procedure in this preg or <=6 weeks",
+        "OHSS (Overian Hyperstimulation Syndrome)",
+        "Hyperemesis",
+        "Medical Comorbidities",
+        "Person Completing Form (VTE)",
+        "Patient at Risk of VTE",
+        "Obstetric VTE Risk Total v2"        
+    ]
+
+    assessment_results = (
+        doc_response
+        .join(doc_ref,col("DOC.DOC_INPUT_ID") == col("Dref.DOC_INPUT_KEY"), "left")
+        .select(
+            col("DOC.PERSON_ID").alias("PERSON_ID"),
+            col("DOC.ENCNTR_ID").alias("ENCNTR_ID"),
+            col("DOC.SECTION_EVENT_ID").alias("Event_ID"),
+            col("Dref.SECTION_DESC_TXT").alias("Section"),
+            col("Dref.ELEMENT_LABEL_TXT").alias("Element"),
+            col("DOC.RESPONSE_VALUE_TXT").alias("Response"),
+            col("DOC.PERFORMED_DT_TM").alias("FormDate"),
+            col("DOC.PERFORMED_PRSNL_ID"),
+            col("DOC.ADC_UPDT").alias("ADC_UPDT")
+        )
+        .filter(
+            (col("Section") == "Obstetric VTE Risk Assessment") &
+            (col("Element").isin(vte_element))
+        )
+        .dropDuplicates()
+    )
+
+    # Clean duplicates
+    window_dup = Window.partitionBy("PERSON_ID","Event_ID","ENCNTR_ID","Element")
+    dup_num = (
+        assessment_results
+        .withColumn("dup", F.count("*").over(window_dup))
+        .filter(col("dup") > 1)
+        .count()
+    )
+
+    if dup_num > 0:
+        print("Duplicates found in assessment records. Now cleaning duplicate records...")
+        window = Window.partitionBy("PERSON_ID","Event_ID","ENCNTR_ID","Element").orderBy(F.col("Response").isNull().asc())
+        assessment_final = (
+        assessment_results
+            .withColumn("rn", F.row_number().over(window))
+            .filter(F.col("rn") == 1)
+            .drop("rn") 
+        )
+    else:
+        assessment_final = assessment_results  
+
+    # Match the possible Pregnancy_ID from pregnancy and birth table
+    pregnancy = (
+        spark.table("8_dev.bronze.map_mat_pregnancy")
+        .select("Person_ID", "Pregnancy_ID", "LastMensPeriodDate", "GestAgePregEnd","FirstAntenatalAPPTDate", "ROMDate","LabOnsetDate")
+        )
+    birth = (
+        spark.table("8_dev.bronze.map_mat_birth")
+        .select("Pregnancy_ID", "BirthDateTime")
+        )
+    
+    # For each Pregnancy_ID in the birth table, keep only one birth record even if multiple births occurred (the latest BirthDateTime is kept, i.e., the last baby).
+    mat_birth_window = Window.partitionBy("PREGNANCY_ID").orderBy(F.col("BirthDateTime").desc())
+
+    birth_final = (
+        birth
+        .withColumn("rn", F.row_number().over(mat_birth_window))
+        .filter("rn = 1")
+        .drop("rn")
+    )
+    
+    pregnancy_final = (
+        pregnancy
+        .join(birth_final, ["Pregnancy_ID"], "left")
+
+        # Add a new column gestation_length_in_day
+        .withColumn("weeks",
+                    F.abs(F.coalesce(F.regexp_extract("GestAgePregEnd", r"(-?\d+)\s*week", 1).cast("int"), F.lit(0))))
+        .withColumn("days",
+                    F.abs(F.coalesce(F.regexp_extract("GestAgePregEnd", r"(-?\d+)\s*day", 1).cast("int"), F.lit(0))))
+        .withColumn("gestational_length_in_day", F.col("weeks") * 7 + F.col("days"))
+
+        # Determine pregnancy_end_date using possible timestamp or calculation: from top to bottom, the most reliable to least reliable
+        .withColumn(
+            "pregnancy_end_date",
+            # Most reliable: BirthDateTime
+            when(F.col("BirthDateTime").isNotNull(), F.col("BirthDateTime"))
+            # Then, labour onset date
+            .when(F.col("LabOnsetDate").isNotNull(), F.col("LabOnsetDate"))
+            # Then, water broke date
+            .when(F.col("ROMDate").isNotNull(), F.col("ROMDate"))
+            # Finally, if none of the above exists using the last menstrual period date + gestation length if gestation length < 356 days; otherwise NULL
+            .when(
+                (F.col("gestational_length_in_day") > 0) &
+                (F.col("gestational_length_in_day") < 365) &
+                (F.col("LastMensPeriodDate").isNotNull()),
+                F.date_add(F.col("LastMensPeriodDate"), F.col("gestational_length_in_day"))
+            )
+            .otherwise(F.lit(None))
+        )
+        # Identify the calculation period used to link to Pregnancy_ID
+        # Calculated_start: from top to bottom, the most reliable to least reliable
+        .withColumn(
+            "calculated_start",
+            # Most reliable: LMP if available
+            when(F.col("LastMensPeriodDate").isNotNull(), F.col("LastMensPeriodDate"))
+            # Then: first antenatal appointment (The vte assessment is usually carried out at first antenntal appointment.)
+            .when(F.col("FirstAntenatalAPPTDate").isNotNull(), F.col("FirstAntenatalAPPTDate"))
+            # Get an estimated pregnancy start date: pregnancy_end_date - gestational_length_in_day
+            .when(
+                F.col("pregnancy_end_date").isNotNull() & 
+                (F.col("gestational_length_in_day") > 0) &
+                (F.col("gestational_length_in_day") < 365),
+                F.date_sub(F.col("pregnancy_end_date"), F.col("gestational_length_in_day"))
+                )
+            .otherwise(F.lit(None))
+        )
+        # Calculated_end: 6 weeks after pregnancy_end_date
+        .withColumn(
+            "calculated_end",
+            F.when(F.col("pregnancy_end_date").isNotNull(),
+                F.date_add(F.col("pregnancy_end_date"), 6 * 7))
+            .otherwise(F.lit(None))
+        )
+        .filter(F.datediff(F.col("calculated_end"), F.col("calculated_start")) <= 365)
+    )
+
+    # Match the possible Pregnancy_ID for each assessment response records
+    processed_df = (
+        assessment_final.alias("a")
+        .join(
+            pregnancy_final.alias("p"),
+            (
+                (F.col("a.Person_ID") == F.col("p.Person_ID")) &
+                (F.col("p.calculated_start").isNotNull()) &
+                (F.col("p.calculated_end").isNotNull()) &
+                (F.col("a.FormDate").between(F.col("p.calculated_start"), F.col("p.calculated_end")))
+            ),
+            "left"
+        )
+        .select(F.col("Pregnancy_ID"),F.col("a.*"))
+    )
+
+    final_df = (
+        processed_df
+        .select(
+            col("Pregnancy_ID").cast(LongType()),
+            col("PERSON_ID").cast(LongType()),
+            col("Event_ID").cast(LongType()),
+            col("ENCNTR_ID").cast(LongType()),
+            col("FormDate").cast(TimestampType()),
+            col("Section").cast(StringType()),
+            col("Element").cast(StringType()),
+            col("Response").cast(StringType()),
+            col("PERFORMED_PRSNL_ID").cast(StringType()),
+            col("ADC_UPDT").cast(TimestampType()) 
+            ))
+    return final_df
+
+updates_df = create_mat_vte_mapping_incr()
+update_table(updates_df, "8_dev.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "Event_ID","Element"], schema_map_mat_vte, map_mat_vte_comment)
