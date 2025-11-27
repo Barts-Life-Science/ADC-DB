@@ -420,7 +420,7 @@ def apply_column_comments(target_table: str, schema: StructType):
 # ============================================================================
 # Main Update Function
 # ============================================================================
-def update_table(source_df, target_table: str, index_column: str, 
+def update_table(source_df, target_table: str, index_column, 
                  target_schema: StructType = None, table_comment: str = None):
     
     if table_exists(target_table):
@@ -431,42 +431,25 @@ def update_table(source_df, target_table: str, index_column: str,
             if schema_changes['has_changes']:
                 print(f"[INFO] Schema changes detected for {target_table}")
                 apply_schema_changes(target_table, schema_changes)
-
-        # ====================================================
-        # PERFORMANCE FIX IS HERE
-        # ====================================================
+        
         # Check if empty using take(1) to avoid full table scan
         if len(source_df.take(1)) == 0:
             print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
             return
-        else:
-            # Perform merge operation
-            print(f"[INFO] Performing merge on {target_table} using column {index_column}")
-
-            if isinstance(index_column, str):
-                index_keys = [index_column]
-            else:
-                index_keys = index_column
-
-            merge_condition = " AND ".join([f"t.{col} <=> s.{col}" for col in index_keys])
-
-            tgt = DeltaTable.forName(spark, target_table)
-            (
-                tgt.alias("t")
-                .merge(source_df.alias("s"),merge_condition)
-                .whenMatchedUpdateAll()
-                .whenNotMatchedInsertAll()
-                .execute()
-            )
         
+        # Perform merge operation
         print(f"[INFO] Performing merge on {target_table} using column {index_column}")
         
-        # Perform merge
+        if isinstance(index_column, str):
+            index_keys = [index_column]
+        else:
+            index_keys = index_column
+        
+        merge_condition = " AND ".join([f"t.{col} <=> s.{col}" for col in index_keys])
         tgt = DeltaTable.forName(spark, target_table)
         (
             tgt.alias("t")
-            .merge(source_df.alias("s"),
-                   f"t.{index_column} = s.{index_column}")
+            .merge(source_df.alias("s"), merge_condition)
             .whenMatchedUpdateAll()
             .whenNotMatchedInsertAll()
             .execute()
@@ -7435,16 +7418,17 @@ def create_mat_vte_mapping_incr():
         assessment_final = assessment_results  
 
     # Match the possible Pregnancy_ID from pregnancy and birth table
+    # REMOVED: ROMDate and LabOnsetDate as they do not exist in the bronze table schema
     pregnancy = (
-        spark.table("8_dev.bronze.map_mat_pregnancy")
-        .select("Person_ID", "Pregnancy_ID", "LastMensPeriodDate", "GestAgePregEnd","FirstAntenatalAPPTDate", "ROMDate","LabOnsetDate")
+        spark.table("4_prod.bronze.map_mat_pregnancy")
+        .select("Person_ID", "Pregnancy_ID", "LastMensPeriodDate", "GestAgePregEnd","FirstAntenatalAPPTDate")
         )
     birth = (
-        spark.table("8_dev.bronze.map_mat_birth")
+        spark.table("4_prod.bronze.map_mat_birth")
         .select("Pregnancy_ID", "BirthDateTime")
         )
     
-    # For each Pregnancy_ID in the birth table, keep only one birth record even if multiple births occurred (the latest BirthDateTime is kept, i.e., the last baby).
+    # For each Pregnancy_ID in the birth table, keep only one birth record even if multiple births occurred
     mat_birth_window = Window.partitionBy("PREGNANCY_ID").orderBy(F.col("BirthDateTime").desc())
 
     birth_final = (
@@ -7465,16 +7449,13 @@ def create_mat_vte_mapping_incr():
                     F.abs(F.coalesce(F.regexp_extract("GestAgePregEnd", r"(-?\d+)\s*day", 1).cast("int"), F.lit(0))))
         .withColumn("gestational_length_in_day", F.col("weeks") * 7 + F.col("days"))
 
-        # Determine pregnancy_end_date using possible timestamp or calculation: from top to bottom, the most reliable to least reliable
+        # Determine pregnancy_end_date using possible timestamp or calculation
         .withColumn(
             "pregnancy_end_date",
             # Most reliable: BirthDateTime
             when(F.col("BirthDateTime").isNotNull(), F.col("BirthDateTime"))
-            # Then, labour onset date
-            .when(F.col("LabOnsetDate").isNotNull(), F.col("LabOnsetDate"))
-            # Then, water broke date
-            .when(F.col("ROMDate").isNotNull(), F.col("ROMDate"))
-            # Finally, if none of the above exists using the last menstrual period date + gestation length if gestation length < 356 days; otherwise NULL
+            # REMOVED: LabOnsetDate and ROMDate checks as columns are unavailable
+            # Fallback: LMP + gestation length if valid
             .when(
                 (F.col("gestational_length_in_day") > 0) &
                 (F.col("gestational_length_in_day") < 365) &
@@ -7489,9 +7470,9 @@ def create_mat_vte_mapping_incr():
             "calculated_start",
             # Most reliable: LMP if available
             when(F.col("LastMensPeriodDate").isNotNull(), F.col("LastMensPeriodDate"))
-            # Then: first antenatal appointment (The vte assessment is usually carried out at first antenntal appointment.)
+            # Then: first antenatal appointment
             .when(F.col("FirstAntenatalAPPTDate").isNotNull(), F.col("FirstAntenatalAPPTDate"))
-            # Get an estimated pregnancy start date: pregnancy_end_date - gestational_length_in_day
+            # Get an estimated pregnancy start date
             .when(
                 F.col("pregnancy_end_date").isNotNull() & 
                 (F.col("gestational_length_in_day") > 0) &
@@ -7542,5 +7523,6 @@ def create_mat_vte_mapping_incr():
             ))
     return final_df
 
+# Execute update
 updates_df = create_mat_vte_mapping_incr()
-update_table(updates_df, "8_dev.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "Event_ID","Element"], schema_map_mat_vte, map_mat_vte_comment)
+update_table(updates_df, "4_prod.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "Event_ID","Element"], schema_map_mat_vte, map_mat_vte_comment)
