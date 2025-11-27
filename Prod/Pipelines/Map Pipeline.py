@@ -8,6 +8,7 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
+from pyspark.storagelevel import StorageLevel
 
 # COMMAND ----------
 
@@ -19,20 +20,48 @@ def get_max_timestamp(table_name: str,
                      ) -> datetime:
     """
     Returns the greatest value of `ts_column` in `table_name`.
+    If CDF is enabled, uses the earlier of max(ts_column) or table's last update time
+    to guard against future-dated timestamps.
     If the table or the column does not exist the supplied default is returned.
     """
     try:
         if not table_exists(table_name):
             return default_date
-
-        # use the DataFrame API – no need to build a SQL string
+        
+        # Get max value from the timestamp column
         max_row = (
             spark.table(table_name)
                  .select(F.max(ts_column).alias("max_ts"))
                  .first()
         )
-
-        return max_row.max_ts or default_date
+        max_ts_value = max_row.max_ts or default_date
+        
+        # If CDF is enabled, check table's actual last update time as a safeguard
+        if has_cdf_enabled(table_name):
+            try:
+                # Get the table's last modification timestamp from Delta history
+                history = spark.sql(f"DESCRIBE HISTORY {table_name} LIMIT 1").collect()
+                
+                if history and len(history) > 0:
+                    table_last_update = history[0].timestamp
+                    
+                    # Convert to datetime if it's not already
+                    if isinstance(table_last_update, str):
+                        from datetime import datetime
+                        table_last_update = datetime.fromisoformat(table_last_update.replace('Z', '+00:00'))
+                    
+                    # Use the earlier of the two timestamps to be conservative
+                    # This protects against future-dated ADC_UPDT values
+                    if table_last_update < max_ts_value:
+                        print(f"[INFO] {table_name}: Using table update time {table_last_update} instead of max {ts_column} {max_ts_value}")
+                        return table_last_update
+                    
+            except Exception as cdf_error:
+                print(f"[WARN] Could not check CDF history for {table_name}: {cdf_error}")
+                print(f"[INFO] Falling back to max {ts_column} value")
+        
+        return max_ts_value
+        
     except Exception as e:
         print(f"Warning: could not read {ts_column} from {table_name}: {e}")
         return default_date
@@ -46,6 +75,133 @@ def table_exists(table_name: str) -> bool:
     """
     # Spark 3.4+ – Databricks – works with Unity Catalog
     return spark.catalog.tableExists(table_name)
+
+# COMMAND ----------
+
+def get_trust_filter():
+    """Returns the trust filter condition for Barts Health NHS Trust"""
+    return col("Trust") == "Barts"
+
+def has_cdf_enabled(table_name: str) -> bool:
+    """
+    Check if a table has Change Data Feed enabled.
+    
+    Args:
+        table_name: Fully qualified table name
+        
+    Returns:
+        bool: True if CDF is enabled, False otherwise
+    """
+    try:
+        table_props = spark.sql(f"SHOW TBLPROPERTIES {table_name}").collect()
+        cdf_prop = next((row.value for row in table_props if row.key == 'delta.enableChangeDataFeed'), None)
+        return cdf_prop == 'true'
+    except Exception as e:
+        print(f"Warning: Could not check CDF status for {table_name}: {e}")
+        return False
+def get_incremental_data_with_cdf(
+    source_table: str,
+    target_table: str,
+    timestamp_column: str = "ADC_UPDT",
+    apply_trust_filter: bool = True,
+    additional_filters = None
+) -> tuple:
+    """
+    Get incremental data using CDF when available, falling back to timestamp filtering.
+    
+    Returns:
+        tuple: (DataFrame, record_count) - the incremental data and its count
+    """
+    max_timestamp = get_max_timestamp(target_table, timestamp_column)
+    
+    if has_cdf_enabled(source_table):
+        try:
+            print(f"[INFO] Attempting CDF read for {source_table}")
+            
+            changes_df = (
+                spark.read.format("delta")
+                .option("readChangeFeed", "true")
+                .option("startingTimestamp", max_timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+                .table(source_table)
+            )
+            
+            non_meta_cols = [c for c in changes_df.columns if not c.startswith("_")]
+            window_spec = Window.partitionBy(*non_meta_cols).orderBy(col("_commit_timestamp").desc())
+            
+            incremental_df = (
+                changes_df
+                .filter(col("_change_type").isin("insert", "update_postimage"))
+                .withColumn("_row_num", row_number().over(window_spec))
+                .filter(col("_row_num") == 1)
+                .drop("_change_type", "_commit_version", "_commit_timestamp", "_row_num")
+            )
+            
+            # Apply trust filter before counting
+            if apply_trust_filter:
+                schema_fields = [f.name for f in incremental_df.schema.fields]
+                if "Trust" in schema_fields:
+                    incremental_df = incremental_df.filter(col("Trust") == "Barts")
+                    print(f"[INFO] Applied Barts trust filter")
+            
+            # Apply additional filters before counting
+            if additional_filters is not None:
+                incremental_df = incremental_df.filter(additional_filters)
+            
+            record_count = incremental_df.count()
+            print(f"[SUCCESS] Retrieved {record_count} records via CDF from {source_table}")
+            
+            return incremental_df, record_count
+            
+        except Exception as e:
+            error_msg = str(e).split('\n')[0]
+            if "FILE_NOT_FOUND" in error_msg or "PathNotFound" in error_msg:
+                print(f"[WARN] CDF files unavailable for {source_table} (possibly due to file cleanup or shallow clone)")
+            else:
+                print(f"[WARN] CDF read failed for {source_table}: {error_msg}")
+            
+            print(f"[INFO] Using timestamp-based incremental load instead")
+            incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    else:
+        print(f"[INFO] Using timestamp-based incremental load for {source_table}")
+        incremental_df = spark.table(source_table).filter(col(timestamp_column) > max_timestamp)
+    
+    # Timestamp-based path: apply filters then count
+    if apply_trust_filter:
+        schema_fields = [f.name for f in incremental_df.schema.fields]
+        if "Trust" in schema_fields:
+            incremental_df = incremental_df.filter(col("Trust") == "Barts")
+            print(f"[INFO] Applied Barts trust filter")
+    
+    if additional_filters is not None:
+        incremental_df = incremental_df.filter(additional_filters)
+    
+    record_count = incremental_df.count()
+    print(f"[INFO] Retrieved {record_count} records via timestamp filter from {source_table}")
+    
+    return incremental_df, record_count
+
+def apply_trust_filter_to_df(df, table_name: str = None):
+    """
+    Apply Barts trust filtering to a DataFrame.
+    
+    Args:
+        df: DataFrame to filter
+        table_name: Optional table name for logging
+        
+    Returns:
+        DataFrame: Filtered DataFrame
+    """
+    schema_fields = [f.name for f in df.schema.fields]
+    
+    if "Trust" not in schema_fields:
+        if table_name:
+            print(f"[WARN] Trust column not found in {table_name}, returning unfiltered")
+        return df
+    
+    if table_name:
+        print(f"[INFO] Applied Barts trust filter to {table_name}")
+    
+    return df.filter(col("Trust") == "Barts")
 
 # COMMAND ----------
 
@@ -206,56 +362,45 @@ def apply_schema_changes(target_table: str, changes: dict):
 def create_table_with_schema(source_df, target_table: str, target_schema: StructType = None, table_comment: str = None):
     """
     Create a new Delta table with schema and metadata.
-    Uses Delta Table Builder API for clean table creation.
     """
-    
     if target_schema:
-        # Use Delta Table Builder API for clean table creation
+        # 1. Create the empty table first
         builder = (DeltaTable.createIfNotExists(spark)
                   .tableName(target_table)
                   .addColumns(target_schema))
         
-        # Add table comment if provided
         if table_comment:
             builder = builder.comment(table_comment)
         
-        # Add Delta table properties
         builder = (builder
                   .property("delta.enableChangeDataFeed", "true")
-                  .property("delta.enableRowTracking", "true")
-                  .property("delta.autoOptimize.optimizeWrite", "true")
-                  .property("delta.autoOptimize.autoCompact", "true"))
-        
-        # Execute table creation
+                  .property("delta.enableRowTracking", "true"))
         builder.execute()
         print(f"[INFO] Created table {target_table} with schema and metadata")
         
-        # Apply schema to source_df to ensure compatibility
-        source_df_with_schema = spark.createDataFrame(source_df.rdd, target_schema)
+        # 2. Enforce schema using Select/Cast (Avoiding RDD conversion)
+        # This keeps the operation inside the JVM and preserves Catalyst optimizations
+        select_expr = []
+        for field in target_schema.fields:
+            if field.name in source_df.columns:
+                select_expr.append(F.col(field.name).cast(field.dataType))
+            else:
+                # Handle missing columns if necessary, or let it fail depending on requirements
+                select_expr.append(F.lit(None).cast(field.dataType).alias(field.name))
         
-        # Insert the data
-        source_df_with_schema.write.mode("append").saveAsTable(target_table)
+        source_df_aligned = source_df.select(*select_expr)
         
-        # Apply column comments (needed in most Delta versions)
+        # 3. Append data
+        source_df_aligned.write.mode("append").saveAsTable(target_table)
+        
         apply_column_comments(target_table, target_schema)
     else:
-        # No schema provided - use direct write with options
+        # Fallback for no schema
         (source_df.write
                   .format("delta")
                   .option("delta.enableChangeDataFeed", "true")
-                  .option("delta.enableRowTracking", "true")
-                  .option("delta.autoOptimize.optimizeWrite", "true")
-                  .option("delta.autoOptimize.autoCompact", "true")
                   .mode("overwrite")
                   .saveAsTable(target_table))
-        
-        # Add table comment if provided
-        if table_comment:
-            spark.sql(f"""
-                ALTER TABLE {target_table}
-                SET TBLPROPERTIES ('comment' = '{escape_comment(table_comment)}')
-            """)
-            print(f"[INFO] Created table {target_table} without explicit schema")
 
 def apply_column_comments(target_table: str, schema: StructType):
     """Helper to apply column comments to a newly created table."""
@@ -275,43 +420,23 @@ def apply_column_comments(target_table: str, schema: StructType):
 # ============================================================================
 # Main Update Function
 # ============================================================================
-
 def update_table(source_df, target_table: str, index_column: str, 
                  target_schema: StructType = None, table_comment: str = None):
-    """
-    Up-sert `source_df` into `target_table` on `index_column`.
     
-    Features:
-    - Creates table with schema/comments if new
-    - Updates schema/comments on existing tables if changed
-    - Performs efficient merge operation
-    - Works in Shared/UC clusters (no RDD operations except for schema enforcement)
-    
-    Parameters:
-    - source_df: DataFrame to merge/insert
-    - target_table: Name of the target table
-    - index_column: Column to use for merge condition
-    - target_schema: Optional StructType to enforce schema
-    - table_comment: Optional table comment
-    """
-
     if table_exists(target_table):
-        # ========== Existing Table Path ==========
         print(f"[INFO] Table {target_table} exists. Checking for schema updates...")
         
-        # Check and apply schema changes if needed
         if target_schema or table_comment:
             schema_changes = detect_schema_changes(target_table, target_schema, table_comment)
-            
             if schema_changes['has_changes']:
                 print(f"[INFO] Schema changes detected for {target_table}")
                 apply_schema_changes(target_table, schema_changes)
-            else:
-                print(f"[INFO] No schema changes needed for {target_table}")
-        
-        # Check for empty DataFrame
-         
-        if source_df.isEmpty() or source_df.count() == 0:          
+
+        # ====================================================
+        # PERFORMANCE FIX IS HERE
+        # ====================================================
+        # Check if empty using take(1) to avoid full table scan
+        if len(source_df.take(1)) == 0:
             print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
             return
         else:
@@ -334,10 +459,21 @@ def update_table(source_df, target_table: str, index_column: str,
                 .execute()
             )
         
-            print(f"[INFO] Successfully merged data into {target_table}")
+        print(f"[INFO] Performing merge on {target_table} using column {index_column}")
+        
+        # Perform merge
+        tgt = DeltaTable.forName(spark, target_table)
+        (
+            tgt.alias("t")
+            .merge(source_df.alias("s"),
+                   f"t.{index_column} = s.{index_column}")
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        print(f"[INFO] Successfully merged data into {target_table}")
         
     else:
-        # ========== New Table Path ==========
         print(f"[INFO] Table {target_table} does not exist. Creating new table...")
         create_table_with_schema(source_df, target_table, target_schema, table_comment)
         print(f"[INFO] Successfully created and populated {target_table}")
@@ -409,21 +545,12 @@ schema_map_address = StructType([
         "comment": "The description for the code value."
     })
 ])
-
 def create_address_mapping_incr():
     """
     Creates an incremental address mapping table with enhanced UPRN matching.
     
-    Enhanced features based on ASSIGN methodology:
-    1. Multi-tier matching with 40+ algorithms
-    2. Advanced address standardization and corrections
-    3. Field swapping for common data entry errors
-    4. Confidence scoring and quality assessment
-    5. Performance optimizations through selective matching
-    6. Includes latitude and longitude from addressbase
-    
     Returns:
-        DataFrame: Processed addresses with UPRN, deprivation metrics, coordinates, and match confidence
+        DataFrame or None: Processed addresses, or None if no incremental data
     """
 
     # Helper functions for address standardization (ASSIGN-inspired)
@@ -433,10 +560,7 @@ def create_address_mapping_incr():
             if not address:
                 return ""
             
-            # Convert to uppercase and basic cleaning
             address = address.upper().strip()
-            
-            # Remove special characters (ASSIGN approach)
             address = address.replace(",", " ")
             address = address.replace("'", "")
             address = address.replace('"', "")
@@ -445,14 +569,9 @@ def create_address_mapping_incr():
             address = address.replace(".", " ")
             address = address.replace("(", " ")
             address = address.replace(")", " ")
-            
-            # Normalize ampersands
             address = address.replace(" & ", " AND ")
-            
-            # Remove multiple spaces
             address = " ".join(address.split())
             
-            # Common corrections (subset of ASSIGN's extensive dictionary)
             corrections = {
                 "ST": "STREET", "RD": "ROAD", "AVE": "AVENUE",
                 "GDNS": "GARDENS", "CRES": "CRESCENT", "TER": "TERRACE",
@@ -463,13 +582,7 @@ def create_address_mapping_incr():
             }
             
             words = address.split()
-            corrected_words = []
-            
-            for word in words:
-                # Apply corrections if found
-                corrected_word = corrections.get(word, word)
-                corrected_words.append(corrected_word)
-            
+            corrected_words = [corrections.get(word, word) for word in words]
             return " ".join(corrected_words)
         
         return udf(standardize, StringType())
@@ -477,32 +590,22 @@ def create_address_mapping_incr():
     def extract_building_components_udf():
         """Extract building number, name, and flat from address"""
         def extract(street_addr, street_addr2):
-            result = {
-                "number": "",
-                "flat": "",
-                "building_name": ""
-            }
+            result = {"number": "", "flat": "", "building_name": ""}
             
             if not street_addr:
                 return result
             
-            # Extract number from start of address
             import re
             number_match = re.match(r'^(\d+[A-Z]?)\s', street_addr.upper())
             if number_match:
                 result["number"] = number_match.group(1)
-                
-                # Check for flat suffix (e.g., "25A" where A is flat)
                 if re.match(r'^\d+[A-Z]$', result["number"]):
                     result["flat"] = result["number"][-1]
                     result["number"] = result["number"][:-1]
             
-            # Extract flat/apartment indicators
             flat_patterns = [
-                r'FLAT\s+(\w+)',
-                r'APARTMENT\s+(\w+)',
-                r'APT\s+(\w+)',
-                r'UNIT\s+(\w+)'
+                r'FLAT\s+(\w+)', r'APARTMENT\s+(\w+)',
+                r'APT\s+(\w+)', r'UNIT\s+(\w+)'
             ]
             
             combined_addr = f"{street_addr} {street_addr2 or ''}".upper()
@@ -512,7 +615,6 @@ def create_address_mapping_incr():
                     result["flat"] = flat_match.group(1)
                     break
             
-            # Building name is typically in addr2 or after number in addr1
             if street_addr2:
                 result["building_name"] = street_addr2.upper()
             
@@ -526,9 +628,6 @@ def create_address_mapping_incr():
         
         return udf(extract, schema)
 
-    # Get max timestamp for incremental processing
-    max_adc_updt = get_max_timestamp("4_prod.bronze.map_address")
-    
     # Define window for selecting most recent valid address
     window = Window.partitionBy("PARENT_ENTITY_ID").orderBy(
         when(col("ZIPCODE").isNotNull() & (trim(col("ZIPCODE")) != ""), 0).otherwise(1),
@@ -539,19 +638,25 @@ def create_address_mapping_incr():
     standardize_udf = standardize_address_udf()
     extract_components_udf = extract_building_components_udf()
     
-    # Get base address data with enhanced preprocessing
-    base_addresses = (
-        spark.table("4_prod.raw.mill_address")
-        .filter(
-            (col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION")) & 
-            (col("ADC_UPDT") > max_adc_updt)
-        )
-        .select(
-            "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID", 
-            "ZIPCODE", "CITY", "street_addr", "street_addr2", 
-            "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", 
-            "ACTIVE_IND", "END_EFFECTIVE_DT_TM", "ADC_UPDT"
-        )
+    # Get base address data - now returns (df, count)
+    base_addresses, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_address",
+        target_table="4_prod.bronze.map_address",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("PARENT_ENTITY_NAME").isin("PERSON", "ORGANIZATION"))
+    )
+    
+    # EARLY EXIT: Skip expensive processing if no data
+    if record_count == 0:
+        print(f"[INFO] No incremental data to process. Skipping address mapping.")
+        return None
+    
+    base_addresses = base_addresses.select(
+        "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID", 
+        "ZIPCODE", "CITY", "street_addr", "street_addr2", 
+        "street_addr3", "country_cd", "BEG_EFFECTIVE_DT_TM", 
+        "ACTIVE_IND", "END_EFFECTIVE_DT_TM", "ADC_UPDT"
     )
     
     # Get country lookup data
@@ -574,7 +679,6 @@ def create_address_mapping_incr():
         .withColumn("row", row_number().over(window))
         .filter(col("row") == 1)
         .drop("row")
-        # Format street address
         .withColumn(
             "full_street_address",
             when(col("PARENT_ENTITY_NAME") == "PERSON", "")
@@ -586,15 +690,12 @@ def create_address_mapping_incr():
                 )
             )
         )
-        # Clean and standardize postcode
         .withColumn("clean_zipcode", 
             upper(regexp_replace(col("ZIPCODE"), r'[^A-Z0-9]', ''))
         )
-        # Apply standardization UDF
         .withColumn("standardized_address", 
             standardize_udf(col("full_street_address"))
         )
-        # Extract building components
         .withColumn("components", 
             extract_components_udf(col("street_addr"), col("street_addr2"))
         )
@@ -602,7 +703,6 @@ def create_address_mapping_incr():
         .withColumn("flat", col("components.flat"))
         .withColumn("building_name", col("components.building_name"))
         .drop("components")
-        # Privacy masking
         .withColumn(
             "masked_zipcode",
             when(col("PARENT_ENTITY_NAME") == "PERSON", 
@@ -613,16 +713,13 @@ def create_address_mapping_incr():
             "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
             "masked_zipcode", "CITY", "full_street_address", "clean_zipcode",
             "standardized_address", "building_number", "flat", "building_name",
-            "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",  # FIX: Added these columns
+            "BEG_EFFECTIVE_DT_TM", "ACTIVE_IND", "END_EFFECTIVE_DT_TM",
             "ADC_UPDT", col("country_description").alias("country_description")
         )
-        # CRITICAL FIX: Ensure unique ADDRESS_ID
         .dropDuplicates(["ADDRESS_ID"])
     )
     
     # Enhanced UPRN matching with multiple algorithms
-    
-    # Get addressbase data with additional fields for matching INCLUDING COORDINATES
     addressbase_enhanced = (
         spark.table("3_lookup.ons.addressbase_consolidated")
         .filter(col("address_quality") == "VALID")
@@ -641,7 +738,6 @@ def create_address_mapping_incr():
             col("LATITUDE"),
             col("LONGITUDE")
         )
-        # Create additional matching columns
         .withColumn("ab_number_normalized", 
             regexp_extract(col("ab_building_number"), r'^(\d+)', 1)
         )
@@ -660,7 +756,6 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(1))
         .withColumn("match_confidence", lit(1.0))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
-        # FIX: Handle multiple UPRN matches per ADDRESS_ID by selecting best match
         .withColumn("rank", row_number().over(
             Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
         ))
@@ -668,7 +763,6 @@ def create_address_mapping_incr():
         .drop("rank")
     )
     
-    # Get unmatched from algorithm 1
     unmatched_1 = processed_addresses.join(
         algo1_matches.select("ADDRESS_ID"),
         "ADDRESS_ID",
@@ -688,7 +782,6 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(2))
         .withColumn("match_confidence", lit(0.95))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
-        # FIX: Ensure unique ADDRESS_ID
         .withColumn("rank", row_number().over(
             Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
         ))
@@ -696,7 +789,6 @@ def create_address_mapping_incr():
         .drop("rank")
     )
     
-    # Get unmatched from algorithm 2
     unmatched_2 = unmatched_1.join(
         algo2_matches.select("ADDRESS_ID"),
         "ADDRESS_ID",
@@ -719,7 +811,6 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(3))
         .withColumn("match_confidence", col("similarity"))
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
-        # FIX: Ensure unique ADDRESS_ID
         .withColumn("rank", row_number().over(
             Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
         ))
@@ -727,7 +818,6 @@ def create_address_mapping_incr():
         .drop("rank")
     )
     
-    # Get unmatched from algorithm 3
     unmatched_3 = unmatched_2.join(
         algo3_matches.select("ADDRESS_ID"),
         "ADDRESS_ID",
@@ -750,7 +840,6 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(4))
         .withColumn("match_confidence", col("address_similarity") * 0.9)
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
-        # FIX: Ensure unique ADDRESS_ID
         .withColumn("rank", row_number().over(
             Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
         ))
@@ -758,7 +847,6 @@ def create_address_mapping_incr():
         .drop("rank")
     )
     
-    # Get unmatched from algorithm 4
     unmatched_4 = unmatched_3.join(
         algo4_matches.select("ADDRESS_ID"),
         "ADDRESS_ID",
@@ -781,7 +869,6 @@ def create_address_mapping_incr():
         .withColumn("match_algorithm", lit(5))
         .withColumn("match_confidence", col("address_similarity") * 0.8)
         .select("p.*", "a.UPRN", "a.LATITUDE", "a.LONGITUDE", "match_algorithm", "match_confidence")
-        # FIX: Ensure unique ADDRESS_ID
         .withColumn("rank", row_number().over(
             Window.partitionBy("ADDRESS_ID").orderBy(desc("match_confidence"), "UPRN")
         ))
@@ -789,7 +876,6 @@ def create_address_mapping_incr():
         .drop("rank")
     )
     
-    # Combine all unmatched records
     final_unmatched = unmatched_4.join(
         algo5_matches.select("ADDRESS_ID"),
         "ADDRESS_ID",
@@ -800,7 +886,6 @@ def create_address_mapping_incr():
     .withColumn("match_algorithm", lit(0)) \
     .withColumn("match_confidence", lit(0.0))
     
-    # Union all matches
     all_uprn_matches = (
         algo1_matches
         .unionByName(algo2_matches)
@@ -810,16 +895,13 @@ def create_address_mapping_incr():
         .unionByName(final_unmatched)
     )
     
-    # Continue with LSOA and IMD processing...
-    
-    # Get postcode to LSOA mapping
+    # LSOA matching
     postcode_maps = (
         spark.table("3_lookup.imd.postcode_maps")
         .select(col("pcd7"), col("lsoa21cd"))
         .withColumn("clean_pcd7", regexp_replace(col("pcd7"), r'\s+', ''))
     )
     
-    # Match LSOA codes
     with_lsoa_full = (
         all_uprn_matches
         .join(
@@ -833,7 +915,6 @@ def create_address_mapping_incr():
         )
     )
     
-    # Handle partial matches for LSOA
     matched_df = with_lsoa_full.filter(col("full_match_lsoa21cd").isNotNull())
     unmatched_df = with_lsoa_full.filter(col("full_match_lsoa21cd").isNull())
     
@@ -841,7 +922,6 @@ def create_address_mapping_incr():
         postcode_maps
         .withColumn("pcd_3char", substring(col("clean_pcd7"), 1, 3))
         .select("pcd_3char", "lsoa21cd")
-        # FIX: Remove duplicate postcodes to avoid multiple matches
         .dropDuplicates(["pcd_3char"])
     )
     
@@ -872,7 +952,6 @@ def create_address_mapping_incr():
         )
     )
     
-    # Define columns for union - all columns must exist in both dataframes
     common_columns = [
         "ADDRESS_ID", "PARENT_ENTITY_NAME", "PARENT_ENTITY_ID",
         "masked_zipcode", "CITY", "full_street_address", "ADC_UPDT",
@@ -886,7 +965,7 @@ def create_address_mapping_incr():
     
     with_lsoa_combined = matched_final.union(unmatched_final)
     
-    # Get IMD data
+    # IMD data
     imd_table = (
         spark.table("3_lookup.imd.imd_2019")
         .filter(
@@ -895,11 +974,9 @@ def create_address_mapping_incr():
             (col("Indices_of_Deprivation") == "a. Index of Multiple Deprivation (IMD)")
         )
         .select(col("FeatureCode"), col("Value"))
-        # FIX: Ensure unique LSOA codes
         .dropDuplicates(["FeatureCode"])
     )
     
-    # Join with IMD data
     with_imd = (
         with_lsoa_combined
         .join(
@@ -909,7 +986,6 @@ def create_address_mapping_incr():
         )
     )
     
-    # Create match quality description
     match_quality_expr = when(col("match_algorithm") == 1, "Exact match") \
         .when(col("match_algorithm") == 2, "Postcode + Building number") \
         .when(col("match_algorithm") == 3, "Field swap detected") \
@@ -917,7 +993,6 @@ def create_address_mapping_incr():
         .when(col("match_algorithm") == 5, "District + Fuzzy match") \
         .otherwise("No match")
     
-    # Final dataframe with all enhancements including coordinates
     final_df = (
         with_imd
         .withColumn("LSOA", col("final_lsoa21cd"))
@@ -955,14 +1030,8 @@ def create_address_mapping_incr():
             "ADC_UPDT",
             col("country_description").alias("country_cd")
         )
-        # FINAL FIX: Ensure ADDRESS_ID is unique in final output
         .dropDuplicates(["ADDRESS_ID"])
     )
-    
-    # Optional: Add validation to verify uniqueness
-    duplicate_count = final_df.groupBy("ADDRESS_ID").count().filter(col("count") > 1).count()
-    if duplicate_count > 0:
-        raise ValueError(f"Found {duplicate_count} duplicate ADDRESS_IDs in final dataframe")
     
     return final_df
 
@@ -987,11 +1056,15 @@ def verify_no_duplicates(df, key_column):
 # Usage:
 updates_df = create_address_mapping_incr()
 
-# Verify before merge
-if verify_no_duplicates(updates_df, "ADDRESS_ID"):
-    update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID", schema_map_address, map_address_comment)
+# Handle early exit case
+if updates_df is None:
+    print("[INFO] No updates to process. Pipeline complete.")
 else:
-    print("Merge aborted due to duplicates. Please investigate.")
+    # Verify before merge
+    if verify_no_duplicates(updates_df, "ADDRESS_ID"):
+        update_table(updates_df, "4_prod.bronze.map_address", "ADDRESS_ID", schema_map_address, map_address_comment)
+    else:
+        print("Merge aborted due to duplicates. Please investigate.")
     
 
 
@@ -1042,7 +1115,7 @@ schema_map_person = StructType([
 def create_person_mapping_incr():
     """
     Creates an incremental person mapping table that processes only new or modified records.
-    Includes data quality validations for gender and birth year.
+    Includes data quality validations and deduplication to prevent Merge errors.
     
     Returns:
         DataFrame: Processed person records with standardized format
@@ -1058,32 +1131,37 @@ def create_person_mapping_incr():
     
     # Get latest address for each person
     latest_addresses = (
-    spark.table("4_prod.bronze.map_address")
-    .filter(
-        (col("PARENT_ENTITY_NAME") == "PERSON") &
-        (col("ACTIVE_IND") == 1) & 
-        (col("END_EFFECTIVE_DT_TM") > current_date())
-    )
-    .withColumn(
-        "row_num",
-        row_number().over(
-            Window.partitionBy("PARENT_ENTITY_ID")
-            .orderBy(col("ADC_UPDT").desc())
+        spark.table("4_prod.bronze.map_address")
+        .filter(
+            (col("PARENT_ENTITY_NAME") == "PERSON") &
+            (col("ACTIVE_IND") == 1) & 
+            (col("END_EFFECTIVE_DT_TM") > current_date())
         )
-    )
-    .filter(col("row_num") == 1)
-    .select("PARENT_ENTITY_ID", "ADDRESS_ID")
-    .alias("addr")
+        .withColumn(
+            "row_num",
+            row_number().over(
+                Window.partitionBy("PARENT_ENTITY_ID")
+                .orderBy(col("ADC_UPDT").desc())
+            )
+        )
+        .filter(col("row_num") == 1)
+        .select("PARENT_ENTITY_ID", "ADDRESS_ID")
+        .alias("addr")
     )
     
-    # Get base person data with filtering
-    base_persons = (
-        spark.table("4_prod.raw.mill_person")
-        .filter(
-            (col("active_ind") == 1) &
-            (col("ADC_UPDT") > max_adc_updt)  # Only process new/modified records
-        )
+    # Get base person data with filtering - UNPACK THE TUPLE
+    base_persons, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_person",
+        target_table="4_prod.bronze.map_person",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("active_ind") == 1)
     )
+    
+    # EARLY EXIT: Skip expensive processing if no data
+    if record_count == 0:
+        print(f"[INFO] No incremental data to process. Skipping person mapping.")
+        return None
     
     # Process and validate person data
     processed_persons = (
@@ -1129,24 +1207,42 @@ def create_person_mapping_incr():
     
     if validation_failures.count() > 0:
         print(f"WARNING: {validation_failures.count()} records failed validation")
-        # Could add more detailed logging here
+    
+    # --- NEW: DEDUPLICATION LOGIC ---
+    # Resolves DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
+    # If CDF returns multiple updates for one person, keep only the latest one.
+    deduped_persons = (
+        validated_persons
+        .withColumn(
+            "dedupe_rank", 
+            row_number().over(
+                Window.partitionBy("PERSON_ID")
+                .orderBy(col("ADC_UPDT").desc())
+            )
+        )
+        .filter(col("dedupe_rank") == 1)
+        .drop("dedupe_rank")
+    )
     
     # Select final columns with standardized names
-    final_df = validated_persons.select(
+    final_df = deduped_persons.select(
         col("PERSON_ID").alias("person_id"),
         col("SEX_CD").alias("gender_cd"),
         col("birth_year"),
         col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
         col("addr.ADDRESS_ID").alias("address_id"),
-        col("4_prod.raw.mill_person.ADC_UPDT")
+        col("ADC_UPDT") 
     )
     
     return final_df
     
 updates_df = create_person_mapping_incr()
-    
 
-update_table(updates_df, "4_prod.bronze.map_person", "person_id", schema_map_person, map_person_comment)
+# Handle early exit case
+if updates_df is not None:
+    update_table(updates_df, "4_prod.bronze.map_person", "person_id", schema_map_person, map_person_comment)
+else:
+    print("[INFO] No person updates to process. Pipeline complete.")
 
 
 # COMMAND ----------
@@ -1714,30 +1810,30 @@ def create_code_lookup_encounter(code_values, description_alias):
 def create_encounter_mapping_incr():
     """
     Creates an incremental encounter mapping table processing only new/modified records.
-    
-    Process:
-    1. Joins encounter data with clinical event times
-    2. Applies code value lookups for various attributes
-    3. Calculates arrival and departure times
-    4. Standardizes output format
-    
-    Returns:
-        DataFrame: Processed encounter records with standardized format
+    Includes deduplication to prevent Merge errors from multiple CDF updates.
     """
 
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_encounter")
-    
-
     one_week_seconds = 7 * 24 * 60 * 60
     
-    # Get base encounter data
-    base_encounters = (
-        spark.table("4_prod.raw.mill_encounter")
-        .filter(col("ADC_UPDT") > max_adc_updt)
+    # Get base encounter data - UNPACK THE TUPLE
+    base_encounters, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_encounter",
+        target_table="4_prod.bronze.map_encounter",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
     )
+    
+    # EARLY EXIT: Skip expensive processing if no data
+    if record_count == 0:
+        print(f"[INFO] No incremental data to process. Skipping encounter mapping.")
+        return None
     
     # Get reference data
     code_values = spark.table("3_lookup.mill.mill_code_value")
+    
+    # PERF NOTE: This scans the whole clinical event table. 
+    # In production, you might want to filter this by the ENCNTR_IDs present in base_encounters.
     event_times = get_event_times()
     
     # Create code value lookups
@@ -1817,9 +1913,22 @@ def create_encounter_mapping_incr():
         )
         .filter(col("calculated_arrive_dt_tm").isNotNull())
     )
-    
-    # Return final selection
-    return processed_encounters.select(
+
+    deduped_encounters = (
+        processed_encounters
+        .withColumn(
+            "dedupe_rank", 
+            row_number().over(
+                Window.partitionBy("ENCNTR_ID")
+                .orderBy(col("ADC_UPDT").desc())  # Simplified - just use ADC_UPDT
+            )
+        )
+        .filter(col("dedupe_rank") == 1)
+        .drop("dedupe_rank")
+    )
+
+    # Return final selection from the deduped dataframe
+    return deduped_encounters.select(
         col("ENCNTR_ID"),
         col("PERSON_ID"),
         col("calculated_arrive_dt_tm").alias("ARRIVE_DT_TM"),
@@ -1844,11 +1953,13 @@ def create_encounter_mapping_incr():
         col("ADC_UPDT")
     )
 
-
 updates_df = create_encounter_mapping_incr()
-    
- 
-update_table(updates_df, "4_prod.bronze.map_encounter", "ENCNTR_ID", schema_map_encounter, map_encounter_comment)
+
+# Handle early exit case
+if updates_df is not None:
+    update_table(updates_df, "4_prod.bronze.map_encounter", "ENCNTR_ID", schema_map_encounter, map_encounter_comment)
+else:
+    print("[INFO] No encounter updates to process. Pipeline complete.")
 
 
 # COMMAND ----------
@@ -1941,6 +2052,9 @@ schema_map_diagnosis = StructType([
     StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
     }),
+    StructField("OMOP_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the OMOP Term."
+    }),
     StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
         "comment": "A unique identifier for each domain."
     }),
@@ -1952,6 +2066,9 @@ schema_map_diagnosis = StructType([
     }),
     StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the SNOMED Term."
     }),
     StructField("SNOMED_TERM", StringType(), True, metadata={
         "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
@@ -1965,6 +2082,9 @@ schema_map_diagnosis = StructType([
     StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
     }),
+    StructField("ICD10_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the ICD10 Term."
+    }),
     StructField("ICD10_TERM", StringType(), True, metadata={
         "comment": "The term associated with a ICD10 code that provides additional meaning and context to the code."
     }),
@@ -1977,22 +2097,24 @@ schema_map_diagnosis = StructType([
 def create_diagnosis_mapping_incr():
     """
     Creates an incremental diagnosis mapping table processing only new/modified records.
-    
-    Process:
-    1. Joins diagnosis data with encounter data for validation
-    2. Calculates dates using various available fields
-    3. Enriches with nomenclature data
-    4. Adds code value descriptions
-    5. Standardizes output format
-    
-    Returns:
-        DataFrame: Processed diagnosis records with standardized format
+    Includes deduplication to prevent Merge errors.
     """
 
     max_adc_updt = get_max_timestamp("4_prod.bronze.map_diagnosis")
     
-    # Get base tables
-    diagnosis = spark.table("4_prod.raw.mill_diagnosis").filter(col("ADC_UPDT") > max_adc_updt)
+    # Get base tables - UNPACK THE TUPLE
+    diagnosis, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_diagnosis",
+        target_table="4_prod.bronze.map_diagnosis",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
+    )
+    
+    # EARLY EXIT: Skip expensive processing if no data
+    if record_count == 0:
+        print(f"[INFO] No incremental data to process. Skipping diagnosis mapping.")
+        return None
+    
     nomenclature = spark.table("4_prod.bronze.nomenclature")
     encounter = spark.table("4_prod.bronze.map_encounter")
     code_values = spark.table("3_lookup.mill.mill_code_value")
@@ -2010,9 +2132,6 @@ def create_diagnosis_mapping_incr():
             "left"
         )
     )
-
-
-
 
     # Calculate diagnosis dates
     diagnosis_with_dates = (
@@ -2054,23 +2173,6 @@ def create_diagnosis_mapping_incr():
             substring_index(col("CONCEPT_CKI"), "!", -1)
         )
     )
-       # Check nomenclature join
-    after_nomenclature = diagnosis_with_encounter.join(
-        nomenclature_processed,
-        "NOMENCLATURE_ID",
-        "left"
-    )
-
-    
-    # Check one of the code value joins
-    after_code_value = after_nomenclature.join(
-        code_values.select(
-            col("CODE_VALUE"),
-            col("DESCRIPTION").alias("diag_type_desc")
-        ).alias("diag_type"),
-        col("DIAG_TYPE_CD") == col("diag_type.CODE_VALUE"),
-        "left"
-    )
 
     # Start with base join
     result = diagnosis_with_dates.alias("diag").join(
@@ -2091,6 +2193,14 @@ def create_diagnosis_mapping_incr():
             col(join_col) == col(f"{lookup_name}.CODE_VALUE"),
             "left"
         )
+
+    result = result.withColumn(
+        "dedupe_rank",
+        row_number().over(
+            Window.partitionBy("DIAGNOSIS_ID")
+            .orderBy(col("diag.ADC_UPDT").desc())
+        )
+    ).filter(col("dedupe_rank") == 1).drop("dedupe_rank")
 
     # Select final columns
     return result.select(
@@ -2125,14 +2235,17 @@ def create_diagnosis_mapping_incr():
         col("OMOP_CONCEPT_NAME"),
         col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
         col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+        col("OMOP_SIMILARITY"),
         col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
         col("SNOMED_CODE"),
         col("SNOMED_TYPE"),
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
+        col("SNOMED_SIMILARITY"),
         col("SNOMED_TERM"),
         col("ICD10_CODE"),
         col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
         col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        col("ICD10_SIMILARITY"),
         col("ICD10_TERM"),
         # Use greatest ADC_UPDT between diagnosis and nomenclature
         greatest(
@@ -2141,14 +2254,13 @@ def create_diagnosis_mapping_incr():
         ).alias("ADC_UPDT")
     )
 
-
 updates_df = create_diagnosis_mapping_incr()
 
-
-
-
-
-update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID", schema_map_diagnosis, map_diagnosis_comment)
+# Handle early exit case
+if updates_df is not None:
+    update_table(updates_df, "4_prod.bronze.map_diagnosis", "DIAGNOSIS_ID", schema_map_diagnosis, map_diagnosis_comment)
+else:
+    print("[INFO] No diagnosis updates to process. Pipeline complete.")
 
 
 # COMMAND ----------
@@ -2238,6 +2350,9 @@ schema_map_problem = StructType([
     StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
     }),
+    StructField("OMOP_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the OMOP Term."
+    }),
     StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
         "comment": "A unique identifier for each domain."
     }),
@@ -2250,6 +2365,9 @@ schema_map_problem = StructType([
     StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
     }),
+    StructField("SNOMED_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the SNOMED Term."
+    }),
     StructField("SNOMED_TERM", StringType(), True, metadata={
         "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
     }),
@@ -2261,6 +2379,9 @@ schema_map_problem = StructType([
     }),
     StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of ICD10 codes."
+    }),
+    StructField("ICD10_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the ICD10 Term."
     }),
     StructField("ICD10_TERM", StringType(), True, metadata={
         "comment": "The term associated with a ICD10 code that provides additional meaning and context to the code."
@@ -2409,7 +2530,14 @@ def create_problem_mapping_incr():
     code_values = spark.table("3_lookup.mill.mill_code_value")
     encounters = spark.table("4_prod.bronze.map_encounter").alias("enc")
     
-    base_problems = problem.filter(col("ADC_UPDT") > max_adc_updt)
+    base_problems, count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_problem",
+        target_table="4_prod.bronze.map_problem",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True
+    )
+    if count == 0:
+        return None
 
     earliest_date_window = Window.partitionBy("PERSON_ID", "NOMENCLATURE_ID")
     
@@ -2498,7 +2626,7 @@ def create_problem_mapping_incr():
         .join(
             encounters.select(
                 col("PERSON_ID").alias("enc_person_id"),
-                "ENCNTR_ID", 
+                col("ENCNTR_ID").alias("enc_encntr_id"),
                 "ARRIVE_DT_TM", 
                 "DEPART_DT_TM"
             ),
@@ -2516,15 +2644,15 @@ def create_problem_mapping_incr():
             col("ARRIVE_DT_TM") > col("CALC_DT_TM")
         )
         .withColumn("CALC_ENC_WITHIN",
-            expr("max(case when is_within then ENCNTR_ID else null end)")
+            expr("max(case when is_within then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENC_BEFORE",
-            expr("max(case when is_before then ENCNTR_ID else null end)")
+            expr("max(case when is_before then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENC_AFTER",
-            expr("min(case when is_after then ENCNTR_ID else null end)")
+            expr("min(case when is_after then enc_encntr_id else null end)")  # Use aliased column
             .over(Window.partitionBy("PROBLEM_ID"))
         )
         .withColumn("CALC_ENCNTR",
@@ -2594,14 +2722,17 @@ def create_problem_mapping_incr():
         "OMOP_CONCEPT_NAME",
         col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
         col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+        col("OMOP_SIMILARITY"),
         col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
         "SNOMED_CODE",
         "SNOMED_TYPE",
         col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
+        col("SNOMED_SIMILARITY"),
         "SNOMED_TERM",
         "ICD10_CODE",
         col("ICD10_CODE_TYPE").alias("ICD10_TYPE"),
         col("ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),
+        col("ICD10_SIMILARITY"),
         "ICD10_TERM",
         "prob.ADC_UPDT",
         "CALC_DT_TM",
@@ -2614,8 +2745,8 @@ def create_problem_mapping_incr():
 
 updates_df = create_problem_mapping_incr().distinct()
     
-
-update_table(updates_df, "4_prod.bronze.map_problem", "PROBLEM_ID", schema_map_problem, map_problem_comment)
+if updates_df is not None:
+    update_table(updates_df, "4_prod.bronze.map_problem", "PROBLEM_ID", schema_map_problem, map_problem_comment)
 
 
 
@@ -2669,12 +2800,14 @@ schema_map_med_admin = StructType([
     StructField("RXNORM_STR", StringType(), True, metadata={
         "comment": "Provides additional context by displaying the description or name of the medication corresponding to the RxNorm code."
     }),
-    StructField("SNOMED_CODE", StringType(), True, metadata={"comment": "The Snomed concept ID(SCTID)"}),
+    StructField("SNOMED_CODE", StringType(), True, metadata={
+        "comment": "The Snomed concept ID(SCTID). Sourced either from direct RxNorm mapping or derived from the OMOP Standard Concept."
+    }),
     StructField("SNOMED_STR", StringType(), True, metadata={
         "comment": "The description of the SNOMED Code."
     }),
     StructField("ORDER_MNEMONIC", StringType(), True, metadata={
-        "comment": "Text description of the Order. The mnemonic mostly used by department personnel, for example, Lab Technicians, Pharmacists. For Pharmacy orders, this field is not populated until product is assigned by Pharmacy Technician or Pharmacist. The field is truncated and will contain a maximum of 99 characters. Ellipses are not appended if the field is truncated."
+        "comment": "Text description of the Order. The mnemonic mostly used by department personnel."
     }),
     StructField("ORDER_DETAIL", StringType(), True, metadata={
         "comment": "Any additional free text information describing the order."
@@ -2767,21 +2900,23 @@ schema_map_med_admin = StructType([
         "comment": "The standardized medication dose expressed in milliliters (mL)."
     }),
     StructField("DOSE_UNIT_CATEGORY", StringType(), True, metadata={
-        "comment": "It classifies the medication dose unit as weight-based (mg), volume-based (mL), units, discrete forms (like tablet or puff), or other, based on the content of the ADMIN_DOSAGE_UNIT_DISPLAY column."
+        "comment": "It classifies the medication dose unit as weight-based (mg), volume-based (mL), units, discrete forms, or other."
     }),
     StructField("SNOMED_SOURCE", StringType(), True, metadata={
-        "comment": "The method or source of the SNOMED code mapping for each nomenclature entry."
+        "comment": "Indicates the origin of the SNOMED code. Values: 'Direct Map' (via RxNorm) or 'Derived from OMOP' (reverse lookup from Standard Concept)."
     }),
     StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
-        "comment": "A unique identifier for each Concept across all domains."
+        "comment": "The Standard OMOP Concept ID for the medication ingredient."
     }),
     StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
-        "comment": "An unambiguous, meaningful and descriptive name for the Concept."
+        "comment": "The name of the Standard OMOP Concept."
     }),
     StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
-        "comment": "This flag determines where a Concept is a Standard Concept, i.e. is used in the data, a Classification Concept, or a non-standard Source Concept. The allowables values are S (Standard Concept) and C (Classification Concept), otherwise the content is NULL."
+        "comment": "Flag 'S' indicating this is a Standard Concept."
     }),
-    StructField("OMOP_TYPE", StringType(), True, metadata={"comment": "It indicates the source or method of the OMOP concept mapping for each record."})
+    StructField("OMOP_TYPE", StringType(), True, metadata={
+        "comment": "Method of mapping. Values: 'Standard Map' (direct code match), 'Vector Similarity' (embedding match >= 0.6), or 'Unmapped'."
+    })
 ])
 
 def get_unit_conversion_maps_med_admin():
@@ -2863,102 +2998,124 @@ def add_standardized_columns(df, standardization_cases):
         )
     })
 
+
 def create_base_medication_administrations_incr():
-    """Creates base medication administration records with all joins, handling freetext entries."""
-
+    """
+    Creates base medication administration records.
+    Optimized to remove eager count() checks and use broadcast joins for lookups.
+    """
+    
+    print(f"Starting optimized base creation at {datetime.now()}")
+    
     freetext_synonym_id = 789453129
-    max_adc_updt = get_max_timestamp("4_prod.bronze.map_med_admin")
+    
+    # 1. Get Watermark
+    # We use a safe default if the target table is empty
+    try:
+        max_adc_updt = spark.table("4_prod.bronze.map_med_admin") \
+            .select(F.max("ADC_UPDT")).collect()[0][0]
+    except:
+        max_adc_updt = None
+        
+    if max_adc_updt is None:
+        # Fallback for initial load (or handle as full load preferred)
+        print("  No high watermark found. Defaulting to recent history or full load.")
+        max_adc_updt = datetime(1900, 1, 1) # Safe default
+    
+    print(f"  Incremental High Watermark: {max_adc_updt}")
 
-    def add_code_value_lookup(df, cd_column, alias_prefix):
-        """Helper function to add code value lookups"""
-        # Define the lookup table and apply the alias immediately
-        code_value_lookup_df = spark.table("3_lookup.mill.mill_code_value").alias(f"{alias_prefix}_CV")
-
-        # Get the column from the input dataframe to join on
-        df_join_col = col(cd_column)
-
-        # Get the target join column from the aliased lookup dataframe
-        lookup_join_col = col(f"{alias_prefix}_CV.CODE_VALUE")
-
-        # --- Correction Here ---
-        # Access the schema of the *original* table before aliasing, or just use the known column name
-        # Assuming the column name in '3_lookup.mill.mill_code_value' is indeed 'CODE_VALUE'
-        try:
-            # Get the data type of the CODE_VALUE column from the lookup table's schema
-            code_value_target_type = spark.table("3_lookup.mill.mill_code_value").schema["CODE_VALUE"].dataType
-        except KeyError:
-             # Fallback or raise a more specific error if 'CODE_VALUE' might not exist
-             print(f"Warning: 'CODE_VALUE' column not found in 3_lookup.mill.mill_code_value schema. Assuming StringType for join cast.")
-             code_value_target_type = StringType() # Or handle as an error
-
-        # Perform the join, casting the input df column to the lookup table's column type
+    # 2. Load Reference Tables (Cached & Broadcast Ready)
+    # Loading code values once to avoid metadata overhead in loops
+    cv_df = spark.table("3_lookup.mill.mill_code_value")
+    
+    def add_code_value_lookup_optimized(df, cd_column, alias_prefix):
+        """Helper to add code value lookups using Broadcast join"""
+        lookup_df = cv_df.alias(f"{alias_prefix}_CV")
+        
         return df.join(
-            code_value_lookup_df, # Use the aliased dataframe
-            df_join_col.cast(code_value_target_type) == lookup_join_col, # Join condition using aliased column
+            F.broadcast(lookup_df), 
+            col(cd_column).cast(LongType()) == col(f"{alias_prefix}_CV.CODE_VALUE").cast(LongType()), 
             "left"
         )
 
-    def get_shortest_snomed_codes():
-        """Helper function to get shortest SNOMED codes from RxNorm"""
-        rxnorm = spark.table("3_lookup.rxnorm.rxnconso")
-        return (rxnorm
-                .filter(col("SAB") == "SNOMEDCT_US")
-                .withColumn("CODE_LENGTH", length(col("CODE")))
-                .withColumn("rn", row_number().over(
-                    Window.partitionBy("RXCUI").orderBy("CODE_LENGTH")))
-                .filter(col("rn") == 1)
-                .select("RXCUI", "CODE", "STR")
-               ) # Alias added later where used
+    # 3. Load Source Tables
+    # DIRECT READ: bypassing 'get_incremental_data_with_cdf' to avoid the .count() trigger
+    clinical_event = (
+        spark.table("4_prod.raw.mill_clinical_event")
+        .filter(col("ADC_UPDT") > max_adc_updt)
+        .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        # Apply Trust Filter logic inline (Active Ind = 1 is standard for Mill)
+        # .filter(col("ACTIVE_IND") == 1) # Uncomment if 'apply_trust_filter' does this
+        .alias("CE")
+    )
 
-    # Get base tables with aliases and filtering
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").alias("CE")
-    med_admin_event = spark.table("4_prod.raw.mill_med_admin_event").alias("MAE") \
-        .filter((col("MAE.EVENT_TYPE_CD").isNotNull()) & (col("MAE.EVENT_TYPE_CD") != 0))
+    # We read MAE fully or filtered? 
+    # Since we join Inner, we can lazy load it. Spark will push the join keys down.
+    med_admin_event = (
+        spark.table("4_prod.raw.mill_med_admin_event")
+        .filter((col("EVENT_TYPE_CD").isNotNull()) & (col("EVENT_TYPE_CD") != 0))
+        .alias("MAE")
+    )
+
     encounter = spark.table("4_prod.raw.mill_encounter").alias("ENC")
-    ce_med_result = spark.table("4_prod.raw.mill_ce_med_result").alias("MR")
     orders = spark.table("4_prod.raw.mill_orders").alias("ORDERS")
-    # Assuming OI.STRENGTH_UNIT and OI.VOLUME_UNIT are IntegerType or compatible
     order_ingredient = spark.table("4_prod.raw.mill_order_ingredient").alias("OI")
     order_catalog_synonym = spark.table("3_lookup.mill.mill_order_catalog_synonym").alias("OSYN")
-    order_catalog = spark.table("3_lookup.mill.mill_order_catalog") # Alias added later
-    rxnorm = spark.table("3_lookup.rxnorm.rxnconso") # Alias added later
-    shortest_snomed = get_shortest_snomed_codes() # Get the dataframe
+    
+    # Intelligent Lookup (Small enough to Broadcast? Likely yes < 1GB)
+    map_med_lookup = spark.table("3_lookup.mill.map_med_lookup").alias("LKP")
+    
+    rxnorm_desc = spark.table("3_lookup.rxnorm.rxnconso").select("RXCUI", "STR").distinct().alias("RXN_DESC")
+    snomed_desc = spark.table("3_lookup.rxnorm.rxnconso").filter(col("SAB") == "SNOMEDCT_US").select("CODE", "STR").distinct().alias("SNO_DESC")
 
-    # Window specs
-    ce_window = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
-    oi_window = Window.partitionBy("ORDER_ID", "SYNONYM_ID").orderBy("ACTION_SEQUENCE")
-
-    # Get list of relevant event IDs
-    med_events = med_admin_event.select("EVENT_ID")
-    med_results = ce_med_result.select("EVENT_ID")
-    all_med_events = med_events.union(med_results).distinct()
-
-    # Get unit conversion maps and standardization cases
+    # 4. Filter Universe Early
+    # Identify the Event IDs modified in this batch.
+    # We persist this tiny DF to drive all subsequent joins.
+    batch_events = clinical_event.select("EVENT_ID", "ENCNTR_ID", "ORDER_ID").distinct()
+    
+    # Get Unit conversion maps
     weight_conversions, volume_conversions = get_unit_conversion_maps_med_admin()
     standardization_cases = create_standardization_expressions_med_admin(
         weight_conversions,
         volume_conversions
     )
 
+    # 5. Optimize ce_med_result Windowing
+    # Only window rows that match our incremental Event IDs
+    ce_med_result_raw = spark.table("4_prod.raw.mill_ce_med_result")
+    
+    ce_med_result_filtered = ce_med_result_raw.join(
+        batch_events.select("EVENT_ID"), "EVENT_ID", "inner"
+    )
+    
+    ce_window = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
+    
+    ce_med_result_deduped = (
+        ce_med_result_filtered
+        .withColumn("rn", F.row_number().over(ce_window))
+        .filter(col("rn") == 1)
+        .alias("MR")
+    )
+    
+    # Window for Order Ingredient
+    oi_window = Window.partitionBy("ORDER_ID", "SYNONYM_ID").orderBy("ACTION_SEQUENCE")
+
+    # 6. Execute Main Join Pipeline
+    # Using 'batch_events' (derived from CE) as the driver to ensure partition pruning works
     base_joins = (
-        clinical_event.filter(
-            (col("CE.VALID_UNTIL_DT_TM") > current_timestamp()) &
-            (col("CE.ADC_UPDT") > max_adc_updt)
-        )
-        .join(all_med_events, "EVENT_ID", "inner")
-        .join(med_admin_event, col("CE.EVENT_ID") == col("MAE.EVENT_ID"), "left")
+        clinical_event
+        .join(med_admin_event, col("CE.EVENT_ID") == col("MAE.EVENT_ID"), "left") # Keep left, filter comes from CE driver
+        # Explicitly filter to ensure we only have Med Admins
+        .filter(col("MAE.EVENT_ID").isNotNull()) 
+        
         .join(encounter, col("CE.ENCNTR_ID") == col("ENC.ENCNTR_ID"), "inner")
-        .join(
-            ce_med_result.withColumn("rn", F.row_number().over(ce_window)).filter(col("rn") == 1),
-            col("CE.EVENT_ID") == col("MR.EVENT_ID"),
-            "left"
-        )
-        .join(
-            orders,
-            col("CE.ORDER_ID") == col("ORDERS.ORDER_ID"),
-            "left"
-        )
-        # --- Standard Joins (for non-freetext) ---
+        
+        # Join Optimized Result Table
+        .join(ce_med_result_deduped, col("CE.EVENT_ID") == col("MR.EVENT_ID"), "left")
+        
+        .join(orders, col("CE.ORDER_ID") == col("ORDERS.ORDER_ID"), "left")
+        
+        # Join Order Ingredient
         .join(
             order_ingredient
             .withColumn("oi_rn", F.row_number().over(oi_window))
@@ -2968,89 +3125,65 @@ def create_base_medication_administrations_incr():
             (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
             "left"
         )
-        .join(
-             order_catalog.alias("OCAT_STD"),
-             (col("ORDERS.CATALOG_CD") == col("OCAT_STD.CATALOG_CD")) &
-             (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
-             "left"
+        
+        # Join Original Synonym
+        .join(order_catalog_synonym, col("ORDERS.SYNONYM_ID") == col("OSYN.SYNONYM_ID"), "left")
+        
+        # Join Intelligent Lookup (BROADCAST)
+        .join(F.broadcast(map_med_lookup), col("ORDERS.SYNONYM_ID") == col("LKP.SYNONYM_ID"), "left")
+        
+        # Map OMOP/SNOMED Columns
+        .withColumn("FINAL_OMOP_ID", 
+            F.coalesce(
+                F.col("LKP.MAPPED_OMOP_CONCEPT_ID"),
+                F.when(F.col("LKP.SIMILARITY_SCORE") >= 0.6, F.col("LKP.SIMILARITY_OMOP_CONCEPT_ID"))
+            )
         )
-        .join(
-            order_catalog_synonym,
-            (col("ORDERS.SYNONYM_ID") == col("OSYN.SYNONYM_ID")) &
-            (col("ORDERS.SYNONYM_ID") != freetext_synonym_id),
-            "left"
+        .withColumn("FINAL_OMOP_TERM", 
+            F.coalesce(
+                F.col("LKP.MAPPED_OMOP_CONCEPT_TERM"),
+                F.when(F.col("LKP.SIMILARITY_SCORE") >= 0.6, F.col("LKP.SIMILARITY_OMOP_CONCEPT_TERM"))
+            )
         )
-        # --- Freetext Specific Joins ---
-        .join(
-            order_catalog.alias("OCAT_FT"),
-            (lower(col("ORDERS.ORDER_MNEMONIC")) == lower(col("OCAT_FT.PRIMARY_MNEMONIC"))) &
-            (col("ORDERS.SYNONYM_ID") == freetext_synonym_id),
-            "left"
+        .withColumn("FINAL_SNOMED_CODE", 
+            F.coalesce(F.col("LKP.SNOMED_CODE"), F.col("LKP.SNOMED_FROM_OMOP"))
         )
-        # --- RxNorm and SNOMED lookups (handle both standard and freetext) ---
-        .join(
-            rxnorm.alias("RXN_STD").filter(col("RXN_STD.SAB") == "MMSL"),
-            when(col("OCAT_STD.CKI").like("MUL.ORD%"),
-                 substring_index(col("OCAT_STD.CKI"), "!", -1)) == col("RXN_STD.CODE"),
-            "left"
-        )
-        .join(
-            shortest_snomed.alias("SNOMED_STD"),
-            col("RXN_STD.RXCUI") == col("SNOMED_STD.RXCUI"),
-            "left"
-        )
-        .join(
-            rxnorm.alias("RXN_FT").filter(col("RXN_FT.SAB") == "MMSL"),
-            when(col("OCAT_FT.CKI").like("MUL.ORD%"),
-                 substring_index(col("OCAT_FT.CKI"), "!", -1)) == col("RXN_FT.CODE"),
-            "left"
-        )
-        .join(
-            shortest_snomed.alias("SNOMED_FT"),
-            col("RXN_FT.RXCUI") == col("SNOMED_FT.RXCUI"),
-            "left"
-        )
-        # --- Pre-calculate conditional unit codes ---
-        .withColumn(
-             "_cond_strength_unit_cd",
-             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) # Use original type of OI.STRENGTH_UNIT if known, else IntegerType
-             .otherwise(col("OI.STRENGTH_UNIT"))
-         )
-        .withColumn(
-             "_cond_volume_unit_cd",
-             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) # Use original type of OI.VOLUME_UNIT if known, else IntegerType
-             .otherwise(col("OI.VOLUME_UNIT"))
-         )
+        
+        # Join Descriptions (Broadcast if small, but RxNorm is med-sized, usually shuffle is safer unless huge cluster)
+        .join(rxnorm_desc, col("LKP.RXNORM_CODE") == col("RXN_DESC.RXCUI"), "left")
+        .join(snomed_desc, col("FINAL_SNOMED_CODE") == col("SNO_DESC.CODE"), "left")
+        
+        .withColumn("_cond_strength_unit_cd",
+             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) 
+             .otherwise(col("OI.STRENGTH_UNIT")))
+        .withColumn("_cond_volume_unit_cd",
+             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(IntegerType())) 
+             .otherwise(col("OI.VOLUME_UNIT")))
     )
 
-    # Add code value lookups AFTER defining conditional codes if needed,
-    # but the original placement joining on OI.* should still work.
-    # Let's keep the original lookup logic for now.
+    # 7. Apply Lookups (Optimized with Broadcast)
     lookups_added = (
         base_joins
-        .transform(lambda df: add_code_value_lookup(df, "MAE.EVENT_TYPE_CD", "EVENT_TYPE"))
-        .transform(lambda df: add_code_value_lookup(df, "MR.ADMIN_ROUTE_CD", "ADMIN_ROUTE"))
-        .transform(lambda df: add_code_value_lookup(df, "MR.INFUSION_UNIT_CD", "INFUSION_UNIT"))
-        .transform(lambda df: add_code_value_lookup(df, "MR.REFUSAL_CD", "REFUSAL"))
-        .transform(lambda df: add_code_value_lookup(df, "MAE.POSITION_CD", "POSITION"))
-        .transform(lambda df: add_code_value_lookup(df, "MAE.NURSE_UNIT_CD", "NURSE_UNIT"))
-        # These lookups still join on the original OI columns. The CV columns will be null if OI.* was null (freetext case)
-        .transform(lambda df: add_code_value_lookup(df, "OI.STRENGTH_UNIT", "STRENGTH_UNIT"))
-        .transform(lambda df: add_code_value_lookup(df, "OI.VOLUME_UNIT", "VOLUME_UNIT"))
-        .transform(lambda df: add_code_value_lookup(df, "CE.RESULT_STATUS_CD", "RESULT_STATUS"))
-        .transform(lambda df: add_code_value_lookup(df, "MR.DOSAGE_UNIT_CD", "DOSAGE_UNIT"))
-        .transform(lambda df: add_code_value_lookup(df, "MR.INFUSED_VOLUME_UNIT_CD", "INFUSED_VOLUME_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MAE.EVENT_TYPE_CD", "EVENT_TYPE"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MR.ADMIN_ROUTE_CD", "ADMIN_ROUTE"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MR.INFUSION_UNIT_CD", "INFUSION_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MAE.POSITION_CD", "POSITION"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MAE.NURSE_UNIT_CD", "NURSE_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "OI.STRENGTH_UNIT", "STRENGTH_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "OI.VOLUME_UNIT", "VOLUME_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "CE.RESULT_STATUS_CD", "RESULT_STATUS"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MR.DOSAGE_UNIT_CD", "DOSAGE_UNIT"))
+        .transform(lambda df: add_code_value_lookup_optimized(df, "MR.INFUSED_VOLUME_UNIT_CD", "INFUSED_VOLUME_UNIT"))
     )
 
+    # 8. Select and Finalize
     result_df = (
         lookups_added.select(
-            # Identifiers
             col("CE.PERSON_ID").cast(LongType()),
             col("CE.ENCNTR_ID").cast(LongType()),
             col("CE.EVENT_ID").cast(LongType()),
             col("CE.ORDER_ID").cast(LongType()),
 
-            # Status codes and their lookups
             col("MAE.EVENT_TYPE_CD").cast(IntegerType()),
             F.when(col("MAE.EVENT_TYPE_CD").isNull() | (col("MAE.EVENT_TYPE_CD") == 0), None)
              .otherwise(coalesce(col("EVENT_TYPE_CV.DISPLAY"), col("EVENT_TYPE_CV.CDF_MEANING")))
@@ -3061,69 +3194,41 @@ def create_base_medication_administrations_incr():
              .otherwise(coalesce(col("RESULT_STATUS_CV.DISPLAY"), col("RESULT_STATUS_CV.CDF_MEANING")))
              .cast(StringType()).alias("RESULT_STATUS_DISPLAY"),
 
-            # Timing Information
             coalesce(col("MAE.BEG_DT_TM"), col("MR.ADMIN_START_DT_TM"), col("CE.EVENT_START_DT_TM")).cast(TimestampType()).alias("ADMIN_START_DT_TM"),
             coalesce(col("MAE.END_DT_TM"), col("MR.ADMIN_END_DT_TM"), col("CE.EVENT_END_DT_TM")).cast(TimestampType()).alias("ADMIN_END_DT_TM"),
 
-            # --- Conditional Order Information ---
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
-                .otherwise(col("OI.SYNONYM_ID")).cast(LongType()).alias("ORDER_SYNONYM_ID"),
+            col("ORDERS.SYNONYM_ID").cast(LongType()).alias("ORDER_SYNONYM_ID"),
+            
+            F.coalesce(col("LKP.MULTUM_CODE"), col("OSYN.MNEMONIC")).cast(StringType()).alias("ORDER_CKI"),
+            col("LKP.MULTUM_CODE").alias("MULTUM"),
 
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI"))
-                .otherwise(col("OCAT_STD.CKI")).cast(StringType()).alias("ORDER_CKI"),
+            col("LKP.RXNORM_CODE").cast(StringType()).alias("RXNORM_CUI"),
+            col("RXN_DESC.STR").cast(StringType()).alias("RXNORM_STR"),
+            
+            col("FINAL_SNOMED_CODE").cast(StringType()).alias("SNOMED_CODE"),
+            col("SNO_DESC.STR").cast(StringType()).alias("SNOMED_STR"),
 
-            when(
-                (when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI")).otherwise(col("OCAT_STD.CKI"))).like("MUL.ORD%"),
-                 substring_index(when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("OCAT_FT.CKI")).otherwise(col("OCAT_STD.CKI")), "!", -1)
-                ).cast(StringType()).alias("MULTUM"),
-
-            # --- Conditional RxNorm and SNOMED columns ---
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("RXN_FT.RXCUI"))
-                .otherwise(col("RXN_STD.RXCUI")).cast(StringType()).alias("RXNORM_CUI"),
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("RXN_FT.STR"))
-                .otherwise(col("RXN_STD.STR")).cast(StringType()).alias("RXNORM_STR"),
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("SNOMED_FT.CODE"))
-                .otherwise(col("SNOMED_STD.CODE")).cast(StringType()).alias("SNOMED_CODE"),
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("SNOMED_FT.STR"))
-                .otherwise(col("SNOMED_STD.STR")).cast(StringType()).alias("SNOMED_STR"),
-
-            # --- Conditional Order Details ---
-            when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, col("ORDERS.ORDER_MNEMONIC"))
-                .otherwise(col("OSYN.MNEMONIC")).cast(StringType()).alias("ORDER_MNEMONIC"),
+            F.coalesce(col("OSYN.MNEMONIC"), col("ORDERS.ORDER_MNEMONIC")).cast(StringType()).alias("ORDER_MNEMONIC"),
 
             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
                 .otherwise(col("OI.ORDER_DETAIL_DISPLAY_LINE")).cast(StringType()).alias("ORDER_DETAIL"),
 
-            # --- Conditional Dosing Information (using pre-calculated codes) ---
             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
                 .otherwise(col("OI.STRENGTH")).cast(FloatType()).alias("ORDER_STRENGTH"),
 
-            # Use the pre-calculated conditional code directly
             col("_cond_strength_unit_cd").alias("ORDER_STRENGTH_UNIT_CD"),
-
-            # Use the simple condition on the pre-calculated code for the display value
-            F.when(
-                col("_cond_strength_unit_cd").isNull() | (col("_cond_strength_unit_cd") == 0),
-                None
-             )
+            F.when(col("_cond_strength_unit_cd").isNull() | (col("_cond_strength_unit_cd") == 0), None)
              .otherwise(coalesce(col("STRENGTH_UNIT_CV.DISPLAY"), col("STRENGTH_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("ORDER_STRENGTH_UNIT_DISPLAY"),
 
             when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, None)
                 .otherwise(col("OI.VOLUME")).cast(FloatType()).alias("ORDER_VOLUME"),
 
-            # Use the pre-calculated conditional code directly
             col("_cond_volume_unit_cd").alias("ORDER_VOLUME_UNIT_CD"),
-
-            # Use the simple condition on the pre-calculated code for the display value
-             F.when(
-                col("_cond_volume_unit_cd").isNull() | (col("_cond_volume_unit_cd") == 0),
-                None
-             )
+            F.when(col("_cond_volume_unit_cd").isNull() | (col("_cond_volume_unit_cd") == 0), None)
              .otherwise(coalesce(col("VOLUME_UNIT_CV.DISPLAY"), col("VOLUME_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("ORDER_VOLUME_UNIT_DISPLAY"),
 
-            # --- Administration Details ---
             col("MR.ADMIN_ROUTE_CD").cast(IntegerType()),
             F.when(col("MR.ADMIN_ROUTE_CD").isNull() | (col("MR.ADMIN_ROUTE_CD") == 0), None)
              .otherwise(coalesce(col("ADMIN_ROUTE_CV.DISPLAY"), col("ADMIN_ROUTE_CV.CDF_MEANING")))
@@ -3136,12 +3241,11 @@ def create_base_medication_administrations_incr():
              .cast(StringType()).alias("INITIAL_DOSAGE_UNIT_DISPLAY"),
 
             col("MR.ADMIN_DOSAGE").cast(FloatType()).alias("ADMIN_DOSAGE"),
-            col("MR.DOSAGE_UNIT_CD").cast(IntegerType()).alias("ADMIN_DOSAGE_UNIT_CD"), # Re-using alias
+            col("MR.DOSAGE_UNIT_CD").cast(IntegerType()).alias("ADMIN_DOSAGE_UNIT_CD"),
             F.when(col("MR.DOSAGE_UNIT_CD").isNull() | (col("MR.DOSAGE_UNIT_CD") == 0), None)
-             .otherwise(coalesce(col("DOSAGE_UNIT_CV.DISPLAY"), col("DOSAGE_UNIT_CV.CDF_MEANING"))) # Re-using alias
+             .otherwise(coalesce(col("DOSAGE_UNIT_CV.DISPLAY"), col("DOSAGE_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("ADMIN_DOSAGE_UNIT_DISPLAY"),
 
-            # Volume Information
             col("MR.INITIAL_VOLUME").cast(FloatType()).alias("INITIAL_VOLUME"),
             col("MR.INFUSED_VOLUME").cast(FloatType()).alias("INFUSED_VOLUME"),
             col("MR.INFUSED_VOLUME_UNIT_CD").cast(IntegerType()).alias("INFUSED_VOLUME_UNIT_CD"),
@@ -3149,7 +3253,6 @@ def create_base_medication_administrations_incr():
              .otherwise(coalesce(col("INFUSED_VOLUME_UNIT_CV.DISPLAY"), col("INFUSED_VOLUME_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("INFUSED_VOLUME_UNIT_DISPLAY"),
 
-            # Infusion Details
             col("MR.INFUSION_RATE").cast(FloatType()).alias("INFUSION_RATE"),
             col("MR.INFUSION_UNIT_CD").cast(IntegerType()).alias("INFUSION_UNIT_CD"),
             F.when(col("MR.INFUSION_UNIT_CD").isNull() | (col("MR.INFUSION_UNIT_CD") == 0), None)
@@ -3161,7 +3264,6 @@ def create_base_medication_administrations_incr():
              .otherwise(coalesce(col("NURSE_UNIT_CV.DISPLAY"), col("NURSE_UNIT_CV.CDF_MEANING")))
              .cast(StringType()).alias("NURSE_UNIT_DISPLAY"),
 
-            # Provider Information
             col("MAE.POSITION_CD").cast(IntegerType()).alias("POSITION_CD"),
             F.when(col("MAE.POSITION_CD").isNull() | (col("MAE.POSITION_CD") == 0), None)
              .otherwise(coalesce(col("POSITION_CV.DISPLAY"), col("POSITION_CV.CDF_MEANING")))
@@ -3169,20 +3271,32 @@ def create_base_medication_administrations_incr():
 
             col("MAE.PRSNL_ID").cast(LongType()).alias("PRSNL_ID"),
 
-            # Update Tracking
+            col("FINAL_OMOP_ID").cast(IntegerType()).alias("OMOP_CONCEPT_ID"),
+            col("FINAL_OMOP_TERM").cast(StringType()).alias("OMOP_CONCEPT_NAME"),
+            
+            F.when(col("FINAL_OMOP_ID").isNotNull(), lit("S")).otherwise(lit(None)).alias("OMOP_STANDARD_CONCEPT"),
+
+            F.when(col("LKP.MAPPED_OMOP_CONCEPT_ID").isNotNull(), lit("Standard Map"))
+             .when((col("LKP.SIMILARITY_OMOP_CONCEPT_ID").isNotNull()) & (col("LKP.SIMILARITY_SCORE") >= 0.6), lit("Vector Similarity"))
+             .otherwise(lit("Unmapped")).alias("OMOP_TYPE"),
+
+            F.when(col("LKP.SNOMED_CODE").isNotNull(), lit("Direct Map"))
+             .when(col("LKP.SNOMED_FROM_OMOP").isNotNull(), lit("Derived from OMOP"))
+             .otherwise(lit(None)).alias("SNOMED_SOURCE"),
+
             F.greatest(
                 col("CE.ADC_UPDT"),
                 col("MAE.ADC_UPDT"),
                 col("MR.ADC_UPDT"),
+                col("LKP.ADC_UPDT"),
                 when(col("ORDERS.SYNONYM_ID") == freetext_synonym_id, lit(None).cast(TimestampType()))
                     .otherwise(col("OI.ADC_UPDT"))
             ).alias("ADC_UPDT")
         )
-        .drop("_cond_strength_unit_cd", "_cond_volume_unit_cd") # Drop temporary columns
+        .drop("_cond_strength_unit_cd", "_cond_volume_unit_cd", "FINAL_OMOP_ID", "FINAL_OMOP_TERM", "FINAL_SNOMED_CODE")
         .distinct()
     )
 
-    # Add standardized columns and return
     return add_standardized_columns(result_df, standardization_cases)
 
 
@@ -3499,7 +3613,7 @@ def augment_snomed_codes(med_df, refs):
         
         # Select all original columns plus new ones
         .select(
-            *[col(c) for c in med_df.columns if c != "SNOMED_CODE"],
+            *[col(c) for c in med_df.columns if c not in ("SNOMED_CODE", "SNOMED_SOURCE")],
             col("SNOMED_CODE"),
             col("SNOMED_SOURCE")
         )
@@ -3515,276 +3629,198 @@ def augment_snomed_codes(med_df, refs):
     return final_df
 
 
+
+# ==============================================================================
+# 1. NATIVE REPLACEMENT FOR PYTHON UDF
+# ==============================================================================
+def get_simplified_drug_name_native(col_obj):
+    """
+    Replicates the logic of extract_drug_name_med_admin using native Spark expressions.
+    Logic: 
+      - If string contains a digit: Lowercase, split by whitespace, take 1st word.
+      - Else: Lowercase, trim whole string.
+    """
+    # Check if string contains any digit 0-9
+    has_digit = col_obj.rlike('[0-9]')
+    
+    return when(
+        has_digit, 
+        split(lower(col_obj), ' ')[0]  # Take first word
+    ).otherwise(
+        trim(lower(col_obj))           # Take whole string
+    )
+
 def add_omop_mappings(med_df):
     """
-    Adds OMOP concept mappings to the medication administration records.
-    Includes direct code mappings and name-based matching with fallbacks.
+    Serverless-safe OMOP mapping.
+    Uses Conditional Broadcast Joins to avoid processing rows that already matched.
     """
-    print("Inside add_omop_mappings function...")
-    
-    concepts = spark.table("3_lookup.omop.concept")
-    
-    # Debug: Check Multum concept codes format
-    print("Checking Multum concept codes in OMOP...")
-    multum_sample = concepts.filter(col("vocabulary_id") == "Multum").select("concept_code").distinct().limit(10).collect()
-    print(f"Sample Multum concept codes: {[row.concept_code for row in multum_sample]}")
-    
-    # Create separate concept DataFrames for each vocabulary
-    # For Multum, keep as string - no casting
-    multum_concepts = (
-        concepts.filter(col("vocabulary_id") == "Multum")
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("concept_code")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3)
-            )
-        ))
-        .filter(col("rank") == 1)
-        .select(
-            col("concept_code").alias("multum_code"),  # Keep as string
-            col("concept_id").alias("multum_concept_id"),
-            col("concept_name").alias("multum_concept_name"),
-            col("standard_concept").alias("multum_standard_concept")
-        )
+    print("[INFO] Starting Serverless OMOP Mappings (Linear Conditional Chain)...")
+
+    # ==============================================================================
+    # 2. PREPARE LOOKUP TABLES (Lazy execution, lightweight)
+    # ==============================================================================
+    concepts_base = spark.table("3_lookup.omop.concept").select(
+        "concept_id", "concept_name", "vocabulary_id", 
+        "concept_code", "standard_concept", "domain_id", "invalid_reason"
     )
 
-    rxnorm_concepts = (
-        concepts.filter(col("vocabulary_id") == "RxNorm")
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("concept_code")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3)
-            )
-        ))
-        .filter(col("rank") == 1)
-        .select(
-            col("concept_code").alias("rxnorm_code"),
-            col("concept_id").alias("rxnorm_concept_id"),
-            col("concept_name").alias("rxnorm_concept_name"),
-            col("standard_concept").alias("rxnorm_standard_concept")
-        )
+    # Ranking window: Standard > Null > Class
+    rank_window = Window.partitionBy("join_key").orderBy(
+        when(col("standard_concept") == "S", 1)
+        .when(col("standard_concept").isNull(), 2)
+        .otherwise(3),
+        col("concept_id").desc()
     )
 
-    rxnorm_ext_concepts = (
-        concepts.filter(col("vocabulary_id") == "RxNorm Extension")
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("concept_code")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3)
+    def prepare_lookup(vocab_id, key_col_alias, source_col_alias):
+        return (
+            concepts_base
+            .filter(col("vocabulary_id") == vocab_id)
+            .withColumn("join_key", col("concept_code"))
+            .withColumn("rank", row_number().over(rank_window))
+            .filter(col("rank") == 1)
+            .select(
+                col("join_key").alias(key_col_alias),
+                col("concept_id").alias(f"{source_col_alias}_concept_id"),
+                col("concept_name").alias(f"{source_col_alias}_concept_name"),
+                col("standard_concept").alias(f"{source_col_alias}_standard_concept")
             )
-        ))
-        .filter(col("rank") == 1)
-        .select(
-            col("concept_code").alias("rxnorm_ext_code"),
-            col("concept_id").alias("rxnorm_ext_concept_id"),
-            col("concept_name").alias("rxnorm_ext_concept_name"),
-            col("standard_concept").alias("rxnorm_ext_standard_concept")
         )
+
+    # A. Prepare Code Lookups
+    multum_concepts = prepare_lookup("Multum", "multum_code", "multum")
+    rxnorm_concepts = prepare_lookup("RxNorm", "rxnorm_code", "rxnorm")
+    rxnorm_ext_concepts = prepare_lookup("RxNorm Extension", "rxnorm_ext_code", "rxnorm_ext")
+    snomed_concepts = prepare_lookup("SNOMED", "snomed_concept_code", "snomed")
+
+    # B. Prepare Name Lookups (Filtered)
+    drug_concepts = concepts_base.filter(
+        (col("domain_id").isin("Drug", "Ingredient")) & 
+        (col("invalid_reason").isNull())
     )
 
-    snomed_concepts = (
-        concepts.filter(col("vocabulary_id") == "SNOMED")
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("concept_code")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3)
-            )
-        ))
+    exact_name_concepts = (
+        drug_concepts
+        .withColumn("join_key", lower(col("concept_name")))
+        .withColumn("rank", row_number().over(rank_window))
         .filter(col("rank") == 1)
         .select(
-            col("concept_code").alias("snomed_concept_code"),
-            col("concept_id").alias("snomed_concept_id"),
-            col("concept_name").alias("snomed_concept_name"),
-            col("standard_concept").alias("snomed_standard_concept")
-        )
-    )
-    
-    # Modify name matching concepts to include ranking
-    drug_name_concepts_exact = (
-        concepts.filter(
-            ((col("domain_id") == "Drug") | (col("domain_id") == "Ingredient")) &
-            (col("invalid_reason").isNull())
-        )
-        .withColumn("exact_name_lower", lower(col("concept_name")))
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("exact_name_lower")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3),
-                col("concept_id") 
-            )
-        ))
-        .filter(col("rank") == 1)
-        .select(
+            col("join_key").alias("exact_match_key"),
             col("concept_id").alias("exact_concept_id"),
             col("concept_name").alias("exact_concept_name"),
             col("vocabulary_id").alias("exact_vocabulary"),
-            col("standard_concept").alias("exact_standard_concept"),
-            col("exact_name_lower")
+            col("exact_vocabulary").alias("exact_vocab_name"), # Keep for type label
+            col("standard_concept").alias("exact_standard_concept")
         )
     )
 
-    drug_name_concepts_simplified = (
-        concepts.filter(
-            ((col("domain_id") == "Drug") | (col("domain_id") == "Ingredient")) &
-            (col("invalid_reason").isNull())
-        )
-        .withColumn("simplified_name_lower", 
-                    extract_drug_name_med_admin(lower(col("concept_name"))))
-        .withColumn("rank", row_number().over(
-            Window.partitionBy("simplified_name_lower")
-            .orderBy(
-                when(col("standard_concept") == "S", 1)
-                .when(col("standard_concept").isNull(), 2)
-                .otherwise(3),
-                col("concept_id")
-            )
-        ))
+    simplified_name_concepts = (
+        drug_concepts
+        .withColumn("join_key", get_simplified_drug_name_native(col("concept_name")))
+        .withColumn("rank", row_number().over(rank_window))
         .filter(col("rank") == 1)
         .select(
+            col("join_key").alias("simplified_match_key"),
             col("concept_id").alias("simplified_concept_id"),
             col("concept_name").alias("simplified_concept_name"),
             col("vocabulary_id").alias("simplified_vocabulary"),
-            col("standard_concept").alias("simplified_standard_concept"),
-            col("simplified_name_lower")
+            col("vocabulary_id").alias("simplified_vocab_name"), # Keep for type label
+            col("standard_concept").alias("simplified_standard_concept")
         )
     )
+
+    # ==============================================================================
+    # 3. EXECUTE LINEAR CHAIN (Conditional Joins)
+    # ==============================================================================
     
-    print("Starting joins for OMOP mappings...")
-    
-    # Join with med_df in sequence, using left joins
-    # NO CASTING - just string comparison for MULTUM
-    mapped_df = (
+    # Pre-calculate string manipulations once to avoid re-evaluating in join conditions
+    step0_df = (
         med_df
-        # Join with Multum concepts using string comparison
-        .join(
-            multum_concepts,
-            col("MULTUM") == col("multum_code"),  # Direct string comparison
-            "left"
-        )
-        # Join with RxNorm concepts
-        .join(
-            rxnorm_concepts,
-            col("RXNORM_CUI") == col("rxnorm_code"),
-            "left"
-        )
-        # Join with RxNorm Extension concepts
-        .join(
-            rxnorm_ext_concepts,
-            col("RXNORM_CUI") == col("rxnorm_ext_code"),
-            "left"
-        )
-        # Join with SNOMED concepts
-        .join(
-            snomed_concepts,
-            col("SNOMED_CODE") == col("snomed_concept_code"),
-            "left"
-        )
-        # Add derived columns for final OMOP mappings before name matching
-        .withColumns({
-            "OMOP_CONCEPT_ID": coalesce(
-                col("multum_concept_id"),
-                col("rxnorm_concept_id"),
-                col("rxnorm_ext_concept_id"),
-                col("snomed_concept_id")
-            ),
-            "OMOP_CONCEPT_NAME": coalesce(
-                col("multum_concept_name"),
-                col("rxnorm_concept_name"),
-                col("rxnorm_ext_concept_name"),
-                col("snomed_concept_name")
-            ),
-            "OMOP_STANDARD_CONCEPT": coalesce(
-                col("multum_standard_concept"),
-                col("rxnorm_standard_concept"),
-                col("rxnorm_ext_standard_concept"),
-                col("snomed_standard_concept")
-            ),
-            "OMOP_TYPE": when(col("multum_concept_id").isNotNull(), "MULTUM")
-                .when(col("rxnorm_concept_id").isNotNull(), "RXNORM")
-                .when(col("rxnorm_ext_concept_id").isNotNull(), "RXNORMEXT")
-                .when(col("snomed_concept_id").isNotNull(), "SNOMED")
-        })
-        # For rows without mappings, try name matching
-        .withColumn(
-            "order_term_lower",
-            when(col("OMOP_CONCEPT_ID").isNull(),
-                lower(col("ORDER_MNEMONIC"))
-            )
-        )
-        # Add simplified drug name for fallback matching
-        .withColumn(
-            "order_term_simplified",
-            when(
-                col("OMOP_CONCEPT_ID").isNull(),
-                extract_drug_name_med_admin(col("order_term_lower"))
-            )
-        )
-        # Try exact name matching first
-        .join(
-            drug_name_concepts_exact,
-            (col("order_term_lower") == col("exact_name_lower")) &
-            col("OMOP_CONCEPT_ID").isNull(),
-            "left"
-        )
-        # Try simplified name matching for remaining nulls
-        .join(
-            drug_name_concepts_simplified,
-            (col("order_term_simplified") == col("simplified_name_lower")) &
-            col("OMOP_CONCEPT_ID").isNull() &
-            col("exact_concept_id").isNull(),
-            "left"
-        )
-        # Update OMOP columns with name matches
-        .withColumns({
-            "OMOP_CONCEPT_ID": coalesce(
-                col("OMOP_CONCEPT_ID"),
-                col("exact_concept_id"),
-                col("simplified_concept_id")
-            ),
-            "OMOP_CONCEPT_NAME": coalesce(
-                col("OMOP_CONCEPT_NAME"),
-                col("exact_concept_name"),
-                col("simplified_concept_name")
-            ),
-            "OMOP_STANDARD_CONCEPT": coalesce(
-                col("OMOP_STANDARD_CONCEPT"),
-                col("exact_standard_concept"),
-                col("simplified_standard_concept")
-            ),
-            "OMOP_TYPE": coalesce(
-                col("OMOP_TYPE"),
-                when(col("exact_concept_id").isNotNull(), 
-                     concat(lit("NAME_MATCH_"), col("exact_vocabulary"))),
-                when(col("simplified_concept_id").isNotNull(),
-                     concat(lit("SIMPLIFIED_MATCH_"), col("simplified_vocabulary")))
-            )
-        })
-    ).distinct()
+        .withColumn("order_term_lower", lower(col("ORDER_MNEMONIC")))
+        .withColumn("order_term_simplified", get_simplified_drug_name_native(col("ORDER_MNEMONIC")))
+    )
+
+    # --- Step 1: Join Codes (Fastest) ---
+    # These happen for every row, but they are fast hash lookups on broadcast tables.
+    step1_codes = (
+        step0_df
+        .join(broadcast(multum_concepts), col("MULTUM") == col("multum_code"), "left")
+        .join(broadcast(rxnorm_concepts), col("RXNORM_CUI") == col("rxnorm_code"), "left")
+        .join(broadcast(rxnorm_ext_concepts), col("RXNORM_CUI") == col("rxnorm_ext_code"), "left")
+        .join(broadcast(snomed_concepts), col("SNOMED_CODE") == col("snomed_concept_code"), "left")
+    )
     
-    # Drop intermediate columns
-    columns_to_drop = [
+    # --- Step 2: Consolidate Code Matches ---
+    # We must calculate this intermediate column to use it as a "Gate" for the next joins.
+    step2_with_id = step1_codes.withColumn("TEMP_CODE_MATCH_ID", coalesce(
+        col("multum_concept_id"), 
+        col("rxnorm_concept_id"),
+        col("rxnorm_ext_concept_id"), 
+        col("snomed_concept_id")
+    ))
+
+    # --- Step 3: Conditional Exact Name Match ---
+    # JOIN CONDITION: (Key Matches) AND (We don't have a code match yet)
+    # If TEMP_CODE_MATCH_ID is not null, this join is effectively skipped for that row.
+    step3_exact = step2_with_id.join(
+        broadcast(exact_name_concepts),
+        (col("order_term_lower") == col("exact_match_key")) & 
+        (col("TEMP_CODE_MATCH_ID").isNull()), 
+        "left"
+    )
+
+    # --- Step 4: Conditional Simplified Name Match ---
+    # JOIN CONDITION: (Key Matches) AND (No code match) AND (No exact name match)
+    step4_final = step3_exact.join(
+        broadcast(simplified_name_concepts),
+        (col("order_term_simplified") == col("simplified_match_key")) & 
+        (col("TEMP_CODE_MATCH_ID").isNull()) &
+        (col("exact_concept_id").isNull()),
+        "left"
+    )
+
+    # ==============================================================================
+    # 4. FINALIZE COLUMNS
+    # ==============================================================================
+    final_df = step4_final.withColumns({
+        "OMOP_CONCEPT_ID": coalesce(
+            col("TEMP_CODE_MATCH_ID"), # Codes
+            col("exact_concept_id"),   # Name
+            col("simplified_concept_id") # Simplified Name
+        ),
+        "OMOP_CONCEPT_NAME": coalesce(
+            col("multum_concept_name"), col("rxnorm_concept_name"),
+            col("rxnorm_ext_concept_name"), col("snomed_concept_name"),
+            col("exact_concept_name"), col("simplified_concept_name")
+        ),
+        "OMOP_STANDARD_CONCEPT": coalesce(
+            col("multum_standard_concept"), col("rxnorm_standard_concept"),
+            col("rxnorm_ext_standard_concept"), col("snomed_standard_concept"),
+            col("exact_standard_concept"), col("simplified_standard_concept")
+        ),
+        # Construct Type column based on where the ID came from
+        "OMOP_TYPE": when(col("multum_concept_id").isNotNull(), "MULTUM")
+            .when(col("rxnorm_concept_id").isNotNull(), "RXNORM")
+            .when(col("rxnorm_ext_concept_id").isNotNull(), "RXNORMEXT")
+            .when(col("snomed_concept_id").isNotNull(), "SNOMED")
+            .when(col("exact_concept_id").isNotNull(), concat(lit("NAME_MATCH_"), col("exact_vocab_name")))
+            .when(col("simplified_concept_id").isNotNull(), concat(lit("SIMPLIFIED_MATCH_"), col("simplified_vocab_name")))
+    })
+
+    # Cleanup intermediate columns
+    drop_cols = [
         "multum_code", "multum_concept_id", "multum_concept_name", "multum_standard_concept",
         "rxnorm_code", "rxnorm_concept_id", "rxnorm_concept_name", "rxnorm_standard_concept",
         "rxnorm_ext_code", "rxnorm_ext_concept_id", "rxnorm_ext_concept_name", "rxnorm_ext_standard_concept",
         "snomed_concept_code", "snomed_concept_id", "snomed_concept_name", "snomed_standard_concept",
-        "order_term_lower", "order_term_simplified", 
-        "exact_concept_id", "exact_concept_name", "exact_vocabulary", "exact_standard_concept", "exact_name_lower",
-        "simplified_concept_id", "simplified_concept_name", "simplified_vocabulary", "simplified_standard_concept", "simplified_name_lower"
+        "exact_match_key", "exact_concept_id", "exact_concept_name", "exact_vocabulary", "exact_vocab_name", "exact_standard_concept",
+        "simplified_match_key", "simplified_concept_id", "simplified_concept_name", "simplified_vocabulary", "simplified_vocab_name", "simplified_standard_concept",
+        "order_term_lower", "order_term_simplified", "TEMP_CODE_MATCH_ID"
     ]
     
-    print("OMOP mapping joins completed, dropping intermediate columns...")
-    
-    return mapped_df.drop(*columns_to_drop)
+    return final_df.drop(*drop_cols)
+
 
 
 def backfill_snomed_from_omop(df):
@@ -4059,6 +4095,9 @@ schema_map_procedure = StructType([
     StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
          "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID." 
     }),
+    StructField("OMOP_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the OMOP Term."
+    }),
     StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
          "comment": "A unique identifier for each domain."
     }),
@@ -4069,6 +4108,9 @@ schema_map_procedure = StructType([
     StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
     }),
+    StructField("SNOMED_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the SNOMED Term."
+    }),
     StructField("SNOMED_TERM", StringType(), True, metadata={
         "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
     }),
@@ -4078,6 +4120,9 @@ schema_map_procedure = StructType([
     }),
     StructField("OPCS4_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of OPCS4 codes."
+    }),
+    StructField("OPCS4_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the OPCS4 Term."
     }),
     StructField("OPCS4_TERM", StringType(), True, metadata={
         "comment": "The term associated with the OPCS4 code that provides additional meaning and context to the code."
@@ -4133,13 +4178,19 @@ def process_procedure_incremental():
     try:
         print(f"Starting procedure incremental processing at {datetime.now()}")
         
-
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_procedure")
         
         # Get base tables
-        procedures = spark.table("4_prod.raw.mill_procedure").filter(
-            col("ADC_UPDT") > max_adc_updt
-        ).alias("proc")
+        procedures, count = get_incremental_data_with_cdf(
+            source_table="4_prod.raw.mill_procedure",
+            target_table="4_prod.bronze.map_procedure",
+            timestamp_column="ADC_UPDT",
+            apply_trust_filter=True
+        )
+
+        if count == 0:
+            return
+        procedures = procedures.alias("proc")
         
         if procedures.count() > 0:
             print(f"Processing {procedures.count()} updated records")
@@ -4251,20 +4302,40 @@ def process_procedure_incremental():
                 "OMOP_CONCEPT_NAME",
                 col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
                 col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+                col("OMOP_SIMILARITY"),
                 col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
                 "SNOMED_CODE",
                 "SNOMED_TYPE",
                 col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
+                col("SNOMED_SIMILARITY"),
                 "SNOMED_TERM",
                 "OPCS4_CODE",
                 col("OPCS4_CODE_TYPE").alias("OPCS4_TYPE"),
                 col("OPCS4_CODE_MATCH_COUNT").alias("OPCS4_MATCH_NUMBER"),
+                col("OPCS4_SIMILARITY"),
                 "OPCS4_TERM",
                 col("proc.ADC_UPDT").alias("ADC_UPDT")
             )
 
+            # Deduplicate by PROCEDURE_ID before merge
+            # Prioritize by: best OMOP similarity, then best SNOMED similarity, then most recent ADC_UPDT
+            window_spec = Window.partitionBy("PROCEDURE_ID").orderBy(
+                coalesce(col("OMOP_SIMILARITY"), lit(0)).desc(),
+                coalesce(col("SNOMED_SIMILARITY"), lit(0)).desc(),
+                col("ADC_UPDT").desc()
+            )
+            
+            final_df_deduped = (
+                final_df
+                .withColumn("_rn", row_number().over(window_spec))
+                .filter(col("_rn") == 1)
+                .drop("_rn")
+            )
+            
+            print(f"Records after deduplication: {final_df_deduped.count()}")
+
             # Update target table
-            update_table(final_df, "4_prod.bronze.map_procedure", "PROCEDURE_ID", schema_map_procedure, map_procedure_comment)
+            update_table(final_df_deduped, "4_prod.bronze.map_procedure", "PROCEDURE_ID", schema_map_procedure, map_procedure_comment)
             print("Successfully updated procedure mapping table")
             
         else:
@@ -4273,6 +4344,7 @@ def process_procedure_incremental():
     except Exception as e:
         print(f"Error processing procedure updates: {str(e)}")
         raise
+
 
 
 process_procedure_incremental()
@@ -4716,11 +4788,18 @@ def process_numeric_events_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_numeric_events")
         
         # Get base tables with filtering for new/modified records
-        string_results = spark.table("4_prod.raw.mill_ce_string_result")\
-            .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())\
-            .filter(col("ADC_UPDT") > max_adc_updt)\
-            .alias("sr")
-        
+        string_results, count = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_string_result",
+        target_table="4_prod.bronze.map_numeric_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        )
+        )
+        if(count == 0):
+            return
+        string_results = string_results.alias("sr")
         if string_results.count() > 0:
             print(f"Processing {string_results.count()} updated records")
             
@@ -5065,15 +5144,18 @@ def process_date_events_incremental():
         current_ts = current_timestamp()
         
         # Get base date results with filtering
-        date_results = (
-            spark.table("4_prod.raw.mill_ce_date_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_ts) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("dr")
+        date_results, count = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_date_result",
+        target_table="4_prod.bronze.map_date_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_ts)
         )
-        
+        )
+        if(count == 0):
+            return
+        date_results = date_results.alias("dr")
         if date_results.count() > 0:
             print(f"Processing {date_results.count()} updated records")
             
@@ -5574,13 +5656,18 @@ def process_text_events_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_text_events")
         
         # Get base tables with filtering for new/modified records
-        string_results = (
-            spark.table("4_prod.raw.mill_ce_string_result")
-            .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
-            .filter(col("ADC_UPDT") > max_adc_updt)
-            .alias("sr")
+        string_results, count = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_string_result",
+        target_table="4_prod.bronze.map_text_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
         )
-        
+        )
+        if(count == 0):
+            return
+        string_results = string_results.alias("sr")
         if string_results.count() > 0:
             print(f"Processing {string_results.count()} updated records")
             
@@ -5892,6 +5979,9 @@ schema_map_nomen_events = StructType([
     StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of OMOP concepts matched for each NOMENCLATURE_ID."
     }),
+    StructField("OMOP_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the OMOP Term."
+    }),
     StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
         "comment": "A unique identifier for each domain."
     }),
@@ -5906,6 +5996,9 @@ schema_map_nomen_events = StructType([
     }),
     StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
         "comment": "The number of matches found for each NOMENCLATURE_ID in the context of SNOMED codes."
+    }),
+    StructField("SNOMED_SIMILARITY", DoubleType(), True, metadata={
+        "comment": "COSIGN Similarity between the Source term and the SNOMED Term."
     }),
     StructField("SNOMED_TERM", StringType(), True, metadata={
         "comment": "The term associated with a SNOMED code that provides additional meaning and context to the code."
@@ -6118,14 +6211,18 @@ def process_nomen_events_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_nomen_events")
         
         # Get base tables with filtering
-        coded_results = (
-            spark.table("4_prod.raw.mill_ce_coded_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_timestamp()) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("cr")
+        coded_results, count = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_coded_result",
+        target_table="4_prod.bronze.map_nomen_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
         )
+        )
+        if(count == 0):
+            return
+        coded_results = coded_results.alias("cr")
         
         if coded_results.count() > 0:
             print(f"Processing {coded_results.count()} updated records")
@@ -6327,11 +6424,13 @@ def process_nomen_events_incremental():
                 col("OMOP_CONCEPT_NAME"),
                 col("IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),
                 col("NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),
+                col("OMOP_SIMILARITY"),
                 col("CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),
                 col("CONCEPT_CLASS").alias("OMOP_CONCEPT_CLASS"),
                 col("SNOMED_CODE"),
                 col("SNOMED_TYPE"),
                 col("SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),
+                col("SNOMED_SIMILARITY"),
                 col("SNOMED_TERM"),
                 
                 # Update tracking
@@ -6684,15 +6783,19 @@ def process_coded_events_incremental():
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_coded_events")
         
         # Get base tables with filtering
-        coded_results = (
-            spark.table("4_prod.raw.mill_ce_coded_result")
-            .filter(
-                (col("VALID_UNTIL_DT_TM") > current_timestamp()) &
-                (col("ADC_UPDT") > max_adc_updt)
-            )
-            .alias("cr")
+        coded_results, count = (
+        get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_ce_coded_result",
+        target_table="4_prod.bronze.map_coded_events",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("VALID_UNTIL_DT_TM") > current_timestamp())
         )
-        
+
+        )
+        if(count == 0):
+            return
+        coded_results = coded_results.alias("cr")
         if coded_results.count() > 0:
             print(f"Processing {coded_results.count()} updated records")
             

@@ -1,16 +1,15 @@
 # Databricks notebook source
-#Pharos Sample data
+#UTI
 
-project_identifier = 'phar001'
+project_identifier = 'dac047'
 
-rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy','rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_emergency_findings', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_mat_nnu_episodes', 'rde_mat_nnu_exam', 'rde_mat_nnu_nccmds', 'rde_measurements', 'rde_medadmin', 'rde_mill_powertrials', 'rde_msds_booking', 'rde_msds_carecontact', 'rde_msds_delivery', 'rde_msds_diagnosis', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_powerforms', 'rde_radiology', 'rde_raw_pathology', 'rde_blobdataset']
+rde_tables = ['rde_all_diagnosis', 'rde_critactivity', 'rde_emergencyd', 'rde_emergency_findings', 'rde_encounter', 'rde_medadmin', 'rde_pathology', 'rde_patient_demographics', 'rde_powerforms', 'rde_radiology', 'rde_blobdataset']
 
+map_tables = []
 
-map_tables = ['map_diagnosis', 'map_problem', 'map_procedure', 'map_med_admin', 'map_coded_events', 'map_diagnosis', 'map_encounter', 'map_med_admin', 'map_nomen_events', 'map_numeric_events', 'map_person']
+mill_tables = [] 
 
-mill_tables = ['iqemo_chemotherapy_course', 'iqemo_patient', 'iqemo_regimen', 'iqemo_treatment_cycle', 'mat_birth', 'mat_pregnancy', 'mill_allergy', 'mill_encounter', 'mill_episode',  'mill_orders', 'mill_problem', 'mill_procedure', 'pc_diagnoses', 'pc_problems', 'pc_procedures'] 
-
-omop_tables = ['person', 'condition_occurrence', 'death', 'device_exposure', 'drug_exposure', 'measurement', 'observation', 'procedure_occurrence', 'visit_occurrence'] 
+omop_tables = [] 
 
 max_ig_risk = 3
 max_ig_severity = 2
@@ -21,23 +20,86 @@ columns_to_exclude = ['ADC_UPDT']
 
 # Create the cohort view SQL
 
-cohort_sql = f"""
-CREATE OR REPLACE VIEW 6_mgmt.cohorts.phar001 AS
-WITH matched_aliases AS (
-  SELECT DISTINCT 
-    l.nhs_number, 
-    TRY_CAST(pa.PERSON_ID AS BIGINT) as PERSON_ID  -- Returns NULL for non-numeric
-  FROM 6_mgmt.cohort_lookup.biobank_sample l
-  JOIN 4_prod.raw.mill_person_alias pa
-  ON REGEXP_REPLACE(l.nhs_number, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
+cohort_sql = """
+CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac047 AS
+WITH eligible_encounters AS (
+  -- Step 1: Filter encounters by type first (cheap filter)
+  SELECT 
+    ENCNTR_ID,
+    PERSON_ID,
+    encntr_type_desc,
+    ARRIVE_DT_TM,
+    DEPART_DT_TM
+  FROM 4_prod.bronze.map_encounter
+  WHERE encntr_type_desc IN ('Inpatient', 'Emergency Department')
+),
+eligible_patients AS (
+  -- Step 2: Get patients 65+ (cheap calculation, done once per patient)
+  SELECT 
+    PERSON_ID,
+    Date_of_Birth
+  FROM 4_prod.rde.rde_patient_demographics
+  WHERE Date_of_Birth IS NOT NULL
+    AND YEAR(CURRENT_DATE()) - YEAR(Date_of_Birth) >= 65
+),
+relevant_events AS (
+  -- Step 3: Get only clinical events for eligible encounters and patients
+  SELECT 
+    ce.EVENT_ID,
+    ce.PERSON_ID,
+    ce.ENCNTR_ID,
+    ce.EVENT_END_DT_TM,
+    ee.encntr_type_desc,
+    ee.ARRIVE_DT_TM,
+    ee.DEPART_DT_TM,
+    ep.Date_of_Birth
+  FROM 4_prod.raw.mill_clinical_event ce
+  INNER JOIN eligible_encounters ee
+    ON ce.ENCNTR_ID = ee.ENCNTR_ID
+    AND ce.PERSON_ID = ee.PERSON_ID
+  INNER JOIN eligible_patients ep
+    ON ce.PERSON_ID = ep.PERSON_ID
+),
+age_verified AS (
+  -- Step 4: Verify age at actual event time
+  SELECT 
+    re.*,
+    COALESCE(
+      re.EVENT_END_DT_TM,
+      re.ARRIVE_DT_TM
+    ) AS event_date
+  FROM relevant_events re
+),
+age_at_event_filtered AS (
+  SELECT *
+  FROM age_verified
+  WHERE event_date IS NOT NULL
+    AND YEAR(event_date) - YEAR(Date_of_Birth) >= 65
+),
+uti_matched_blobs AS (
+  -- Step 5: NOW scan blob text - only for pre-filtered EVENT_IDs
+  SELECT 
+    bd.EventID,
+    bd.PERSON_ID,
+    aef.ENCNTR_ID
+  FROM 4_prod.rde.rde_blobdataset bd
+  INNER JOIN age_at_event_filtered aef
+    ON bd.EventID = aef.EVENT_ID
+    AND bd.PERSON_ID = aef.PERSON_ID
+  WHERE bd.BlobContents IS NOT NULL
+    AND (
+      LOWER(bd.BlobContents) rlike '(^|[^a-z])urinary tract infection([^a-z]|$)'
+      OR LOWER(bd.BlobContents) rlike '(^|[^a-z])pyelonephritis([^a-z]|$)'
+      OR LOWER(bd.BlobContents) rlike '(^|[^a-z])cystitis([^a-z]|$)'
+    )
 )
 SELECT DISTINCT
-  ma.PERSON_ID as PERSON_ID,
-  CAST(NULL as STRING) as subcohort
-FROM 6_mgmt.cohort_lookup.biobank_sample l
-JOIN matched_aliases ma ON l.nhs_number = ma.nhs_number
-WHERE ma.PERSON_ID IS NOT NULL;
+  CAST(PERSON_ID AS BIGINT) AS PERSON_ID,
+  CAST(NULL AS STRING) AS subcohort
+FROM uti_matched_blobs
+WHERE PERSON_ID IS NOT NULL;
 """
+
 spark.sql(cohort_sql)
 
 

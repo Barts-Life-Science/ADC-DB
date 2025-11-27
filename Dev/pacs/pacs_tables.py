@@ -72,6 +72,10 @@ def stag_patient_alias():
             WHERE 
                 ACTIVE_IND = 1
                 AND PERSON_ALIAS_TYPE_CD = 10 -- MRN
+                AND ALIAS_POOL_CD IN (
+                    -- Include only Barts MRN
+                    683996, 1115132483, 6200990, 6173940
+                )
             GROUP BY PERSON_ID
         ),
         nhs AS (
@@ -377,7 +381,7 @@ def intmd_pacs_examcode():
         ),
         ai_ec AS (
             SELECT vs_input, MAX(ValidatedAIExamCode) AS AIExamCode
-            FROM 4_prod.pacs_ai.predicted_pacs_examcode
+            FROM 4_prod.pacs_dlt.ai_predicted_pacs_examcode
             GROUP BY vs_input
         )
         SELECT
@@ -1221,7 +1225,7 @@ schema = StructType([
         {'comment': "Reference number recorded in Mill_Clinical_Event, often a concatenation of accession and exam code, used for cross-referencing and traceability."}
     ),
     StructField(
-        "MillPersonId", LongType(), True,
+        "PersonId", LongType(), True,
         {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
     ),
     StructField(
@@ -1267,6 +1271,14 @@ schema = StructType([
     StructField(
         "Laterality", StringType(), True,
         {'comment': "Laterality of examined body part."}
+    ),
+    StructField(
+        "Mrn", StringType(), True,
+        {'comment': "Patient MRN identifier."}
+    ),
+    StructField(
+        "NhsNumber", StringType(), True,
+        {'comment': "Patient NHS number."}
     )
 
 ])
@@ -1274,7 +1286,7 @@ schema = StructType([
 # COMMAND ----------
 
 @dlt.table(
-    name="barts_imaging_metadata",
+    name="imaging_metadata",
     comment="Medical imaging metadata available at Barts Health NHS Trust.",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -1294,7 +1306,7 @@ def mill_pacs_data_expanded():
                 MillExamCode AS ExamCode,
                 REPLACE(MillRefNbr, CONCAT(MillAccessionNbr, ExamCode), '')  AS ExamCodeSeq,
                 MillRefNbr,
-                MillPersonId,
+                MillPersonId AS PersonId,
                 CAST(PacsPatientId AS BIGINT) AS PacsPatientId,
                 MillEventDate
             FROM LIVE.intmd_mill_clinical_event_pacs
@@ -1328,6 +1340,14 @@ def mill_pacs_data_expanded():
             LEFT JOIN LIVE.intmd_pacs_examcode AS ec
             ON e.ExaminationCode_t = ec.RawExamCode
             WHERE ExaminationRequestId IS NOT NULL
+        ),
+        ali AS (
+            SELECT
+                MillPersonId,
+                MAX(Mrn) AS Mrn,
+                MAX(NhsNumber) AS NhsNumber
+            FROM LIVE.intmd_pacs_patient_alias
+            GROUP BY MillPersonId
         )
         --,
         --rep AS (
@@ -1347,7 +1367,9 @@ def mill_pacs_data_expanded():
             exa.ExaminationDescription, -- Can use Mill Event Title Text instead
             exa.ExaminationModality,
             exa.ExaminationBodyPart,
-            REPLACE(dc.laterality, ' (qualifier value)', '') AS laterality
+            REPLACE(dc.laterality, ' (qualifier value)', '') AS laterality,
+            ali.Mrn,
+            ali.NhsNumber
         FROM ce
         LEFT JOIN req
         ON
@@ -1361,6 +1383,9 @@ def mill_pacs_data_expanded():
             AND exa.ExamCodeSeq = ce.ExamCodeSeq
         LEFT JOIN LIVE.pacs_examcode_dict AS dc
         ON ce.ExamCode = dc.short_code
+        LEFT JOIN ali
+        ON
+            ce.PersonId = ali.MillPersonId
     """)
 
     return df
@@ -1369,6 +1394,10 @@ def mill_pacs_data_expanded():
 
 
 schema = StructType([
+    StructField(
+        "PersonId", LongType(), True,
+        {'comment': "Identifiers for patients in the Millennium EHR system, enabling linkage to demographic and clinical data."}
+    ), 
     StructField(
         "ReportEventId", LongType(), True,
         {'comment': "Identifiers to link with event records in the Millenium EHR system."}
@@ -1384,6 +1413,22 @@ schema = StructType([
     StructField(
         "ExamCode", StringType(), True,
         {'comment': "Standardized short code representing the type of imaging examination or procedure performed."}
+    ),
+     StructField(
+        "Mrn", StringType(), True,
+        {'comment': "Patient MRN identifier."}
+    ),
+    StructField(
+        "Nhs_Number", StringType(), True,
+        {'comment': "Patient NHS number."}
+    ),
+    StructField(
+        "BlobContents", StringType(), True,
+        {'comment': "Imaging report text."}
+    ),
+    StructField(
+        "AnonymizedText", StringType(), True,
+        {'comment': "Anonymized imaging report text."}
     )
 
 ])
@@ -1391,7 +1436,7 @@ schema = StructType([
 # COMMAND ----------
 
 @dlt.table(
-    name="mill_pacs_data_expanded_report",
+    name="imaging_report",
     comment="mill_clinical_event joined with pacs_requests",
     table_properties={
         "delta.enableChangeDataFeed": "true",
@@ -1402,17 +1447,59 @@ schema = StructType([
 def mill_pacs_data_expanded_report():
     df = spark.sql("""
         SELECT DISTINCT
+            b.PERSON_ID AS PersonId,
             b.EVENTID AS ReportEventId,
             b.ENCNTR_ID AS ReportEncntrId,
             c.MillAccessionNbr AS AccessionNbr,
-            c.MillExamCode AS ExamCode
+            c.MillExamCode AS ExamCode,
+            b.Mrn,
+            b.Nhs_Number,
+            NULL AS BlobContents, -- placeholder: fetch data from rde_blobdataset
+            NULL AS AnonymizedText -- placeholder: fetch data from rde_blobdataset
         FROM 4_prod.rde.rde_blobdataset AS b
         INNER JOIN LIVE.intmd_mill_clinical_event_pacs AS c
-        ON b.EVENTID = c.EVENT_ID
+        ON b.EVENTID = c.EVENT_ID AND b.PERSON_ID = c.MillPersonId
         WHERE
             b.MainEventDesc = 'RADRPT'
             AND c.MillEventClass = 'Document'
     """)
+    return df
+
+# COMMAND ----------
+
+@dlt.table(
+    name="imaging_report_incr",
+    comment="mill_clinical_event joined with pacs_requests",
+    table_properties={
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true"
+    }
+)
+def imaging_report_incr():
+    df = spark.readStream.format("delta") \
+        .option("readChangeFeed", "true") \
+        .table("4_prod.rde.rde_blobdataset") \
+        .alias("b") \
+        .join(
+            spark.table("LIVE.intmd_mill_clinical_event_pacs").alias("c"),
+            (F.col("b.EVENTID") == F.col("c.EVENT_ID")) & (F.col("b.PERSON_ID") == F.col("c.MillPersonId")),
+            "inner"
+        ) \
+        .filter(
+            (F.col("b.MainEventDesc") == "RADRPT") &
+            (F.col("c.MillEventClass") == "Document")
+        ) \
+        .selectExpr(
+            "b.PERSON_ID AS PersonId",
+            "b.EVENTID AS ReportEventId",
+            "b.ENCNTR_ID AS ReportEncntrId",
+            "c.MillAccessionNbr AS AccessionNbr",
+            "c.MillExamCode AS ExamCode",
+            "b.Mrn",
+            "b.Nhs_Number",
+            "b.BlobContents",
+            "b.AnonymizedText"
+        ).distinct()
     return df
 
 # COMMAND ----------
@@ -1430,6 +1517,6 @@ def mill_pacs_data_expanded_quality():
         SELECT
             SUM(CAST(ISNULL(RequestId) AS INT))/COUNT(*) AS RequestIdNullPercentage,
             SUM(CAST(ISNULL(ExaminationIdString) AS INT))/COUNT(*) AS ExaminationIdNullPercentage
-        FROM LIVE.barts_imaging_metadata
+        FROM LIVE.imaging_metadata
     """)
     return df
