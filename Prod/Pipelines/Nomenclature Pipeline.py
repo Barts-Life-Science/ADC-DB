@@ -2268,6 +2268,57 @@ update_med_lookup_table_incr()
 
 # COMMAND ----------
 
+
+# =============================================================================
+# UPDATE CODE VALUE DESCRIPTION EMBEDDINGS
+# =============================================================================
+
+def update_code_value_embeddings():
+    """
+    Extracts unique descriptions from mill_code_value and maintains an embedding index.
+    Reuses the generic sync_and_embed_ingredients logic for consistency.
+    """
+    SOURCE_TABLE = "3_lookup.mill.mill_code_value"
+    TARGET_EMBEDDING_TABLE = "3_lookup.embeddings.code_value_descriptions"
+    
+    print(f"Preparing source data from {SOURCE_TABLE}...")
+    
+    # 1. Load Source Data
+    df_source = spark.table(SOURCE_TABLE)
+    
+    # 2. Extract unique descriptions
+    # We select DESCRIPTION and alias it to 'term' because sync_and_embed_ingredients 
+    # expects a column named 'term'.
+    # Filtering nulls/empty strings before passing to the function.
+    df_terms = df_source.filter(
+        F.col("DESCRIPTION").isNotNull() & 
+        (F.trim(F.col("DESCRIPTION")) != "")
+    ).select(
+        F.col("DESCRIPTION").alias("term")
+    ).distinct()
+    
+    # 3. Process Embeddings
+    # This existing function handles:
+    # - Table creation (if not exists)
+    # - Normalization (Title Case)
+    # - Incremental filtering (Left Anti Join)
+    # - OpenAI Batching
+    # - Delta Merging
+    sync_and_embed_ingredients(df_terms, TARGET_EMBEDDING_TABLE, batch_size=500)
+    
+    # 4. Optimize the new table
+    print(f"Optimizing {TARGET_EMBEDDING_TABLE}...")
+    try:
+        spark.sql(f"OPTIMIZE {TARGET_EMBEDDING_TABLE} ZORDER BY (term)")
+        print("✓ Optimization complete.")
+    except Exception as e:
+        print(f"⚠ Optimization skipped (table might be empty or new): {e}")
+
+# Execute the update
+update_code_value_embeddings()
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC ALTER TABLE 4_prod.tmp.tempone_nomenclature CLUSTER BY (NOMENCLATURE_ID);
 # MAGIC OPTIMIZE 4_prod.tmp.tempone_nomenclature;

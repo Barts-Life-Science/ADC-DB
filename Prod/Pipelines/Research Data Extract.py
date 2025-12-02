@@ -1937,20 +1937,30 @@ schema_rde_blobdataset = StructType([
         StructField("EventID", LongType(), True, metadata={"comment": "EventID to map to radiology and pathology events."}),
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
-
 @dlt.table(name="rde_blobdataset_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def blobdataset_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_blobdataset")
 
     blob_content = dlt.read("current_blob_content").alias("B")
-    clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).alias("CE")
+    
+    # Window to select the clinical event with highest UPDT_CNT per EVENT_ID
+    ce_window = Window.partitionBy("EVENT_ID").orderBy(F.col("UPDT_CNT").desc())
+    
+    clinical_event = (
+        spark.table("4_prod.raw.mill_clinical_event")
+        .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+        .withColumn("_rn", F.row_number().over(ce_window))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+    
     encounter = dlt.read("rde_encounter").alias("E")
     code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
 
     return (
         blob_content.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(clinical_event, col("B.EVENT_ID") == col("CE.EVENT_ID"), "inner")
+        .join(clinical_event.alias("CE"), col("B.EVENT_ID") == col("CE.EVENT_ID"), "inner")
         .join(encounter, col("CE.ENCNTR_ID") == col("E.ENCNTR_ID"), "inner")
         .join(clinical_event.alias("CE2"), col("CE.PARENT_EVENT_ID") == col("CE2.EVENT_ID"), "left")
         .join(code_value_ref.alias("PEvent"), col("CE2.EVENT_CD").cast(IntegerType()) == col("PEvent.CODE_VALUE_CD"), "left")
@@ -1972,7 +1982,6 @@ def blobdataset_incr():
             col("CE.EVENT_TAG").cast(StringType()).alias("ChildTagText"),
             col("B.BLOB_TEXT").cast(StringType()).alias("BlobContents"),
             col("B.ANON_TEXT").cast(StringType()).alias("AnonymizedText"),
-            
             col("Evntcd.CODE_DISP_TXT").cast(StringType()).alias("EventDesc"),
             col("CE.RESULT_VAL").cast(StringType()).alias("EventResultText"),
             col("CE.RESULT_VAL").cast(DoubleType()).alias("EventResultNBR"),
