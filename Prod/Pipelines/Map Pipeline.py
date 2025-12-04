@@ -1086,6 +1086,12 @@ schema_map_person = StructType([
         metadata={"comment": "The sex/gender that the patient is considered to have for administration and record keeping purposes. This is typically asserted by the patient when they present to administrative users. This may not match the biological sex as determined by anatomy or genetics, or the individual's preferred identification (gender identity)."}
     ),
     StructField(
+        name="gender_desc",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "Text description associated with the gender code value."}
+    ),
+    StructField(
         name="birth_year",
         dataType=IntegerType(),
         nullable=True,
@@ -1096,6 +1102,12 @@ schema_map_person = StructType([
         dataType=DoubleType(),
         nullable=True,
         metadata={"comment": "Identifies a religious, national, racial, or cultural group of the person."}
+    ),
+    StructField(
+        name="ethnicity_desc",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "Text description associated with the ethnicity code value."}
     ),
     StructField(
         name="address_id",
@@ -1168,12 +1180,12 @@ def create_person_mapping_incr():
         base_persons
         # Join with code lookups for gender and ethnicity
         .join(
-            code_lookup.select("CODE_VALUE", "CDF_MEANING").alias("gender"),
+            code_lookup.select(col("CODE_VALUE"), col("CDF_MEANING").alias("SEX_DESC")).alias("gender"),
             col("SEX_CD") == col("gender.CODE_VALUE"),
             "left"
         )
         .join(
-            code_lookup.select("CODE_VALUE", "CDF_MEANING").alias("ethnicity"),
+            code_lookup.select(col("CODE_VALUE"), col("DISPLAY").alias("ETHNIC_DESC")).alias("ethnicity"),
             col("ETHNIC_GRP_CD") == col("ethnicity.CODE_VALUE"),
             "left"
         )
@@ -1228,12 +1240,13 @@ def create_person_mapping_incr():
     final_df = deduped_persons.select(
         col("PERSON_ID").alias("person_id"),
         col("SEX_CD").alias("gender_cd"),
+        col("SEX_DESC").alias("gender_desc"),
         col("birth_year"),
         col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
+        col("ETHNIC_DESC").alias("ethnicity_desc"),
         col("addr.ADDRESS_ID").alias("address_id"),
-        col("ADC_UPDT") 
+        col("ADC_UPDT")
     )
-    
     return final_df
     
 updates_df = create_person_mapping_incr()
