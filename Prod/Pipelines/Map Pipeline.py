@@ -7526,3 +7526,1407 @@ def create_mat_vte_mapping_incr():
 # Execute update
 updates_df = create_mat_vte_mapping_incr()
 update_table(updates_df, "4_prod.bronze.map_mat_VTE_Assessment", ["Pregnancy_ID","PERSON_ID", "ENCNTR_ID", "Event_ID","Element"], schema_map_mat_vte, map_mat_vte_comment)
+
+# COMMAND ----------
+
+
+# ------------------------------------------------------------------------  
+# Table comment and schema  
+# ------------------------------------------------------------------------  
+map_family_history_comment = """
+  The table contains family history information for patients, including details about
+  relatives' medical conditions, relationship types, and clinical characteristics.
+  It combines data from FHX_ACTIVITY (family history conditions), PERSON_PERSON_RELTN
+  (relationship details), and NOMENCLATURE (coded terminology). The table supports
+  both coded conditions (linked to OMOP, SNOMED, ICD10) and free-text entries from
+  LONG_TEXT. Key use cases include genetic risk assessment, hereditary disease tracking,
+  and familial health pattern analysis.
+
+  Source tables:
+  - 4_prod.raw.mill_fhx_activity (primary)
+  - 4_prod.raw.mill_person_person_reltn (relationships)
+  - 4_prod.bronze.nomenclature (coded conditions with OMOP/SNOMED/ICD10 mappings)
+  - 4_prod.raw.mill_fhx_long_text_r / mill_long_text (free-text conditions)
+  - 4_prod.raw.mill_person_alias (MRN/NHS identifiers)
+  - 3_lookup.mill.mill_code_value (code decodes)
+  """
+
+schema_map_family_history = StructType([
+      # ----------------------------------------------------------------
+      # Identifiers
+      # ----------------------------------------------------------------
+      StructField("FHX_ACTIVITY_ID", LongType(), True, metadata={
+          "comment": "Primary unique identifier for the family history activity record from FHX_ACTIVITY."
+      }),
+      StructField("PERSON_ID", LongType(), True, metadata={
+          "comment": "Unique identifier for the patient whose family history is being recorded."
+      }),
+      StructField("MRN", StringType(), True, metadata={
+          "comment": "Local Medical Record Number for the patient."
+      }),
+      StructField("NHS_Number", StringType(), True, metadata={
+          "comment": "NHS Number for the patient."
+      }),
+
+      # ----------------------------------------------------------------
+      # Relationship Information
+      # ----------------------------------------------------------------
+      StructField("RELATED_PERSON_ID", LongType(), True, metadata={
+          "comment": "Identifier for the related family member. May be 0 for virtual/unnamed relatives."
+      }),
+      StructField("RELATION_CD", DoubleType(), True, metadata={
+          "comment": "Code identifying the type of family relationship (Code Set 40). E.g., Mother, Father, Sibling."
+      }),
+      StructField("RELATION_DESC", StringType(), True, metadata={
+          "comment": "Display description of the relationship type (e.g., 'Mother', 'Father', 'Grandparent')."
+      }),
+      StructField("RELATION_TYPE_CD", DoubleType(), True, metadata={
+          "comment": "Code for the category of relationship (Code Set 351). E.g., Family History, Emergency Contact."
+      }),
+      StructField("RELATION_TYPE_DESC", StringType(), True, metadata={
+          "comment": "Description of the relationship category."
+      }),
+      StructField("GENETIC_IND", IntegerType(), True, metadata={
+          "comment": "Indicates if the relationship is genetic/blood-related. 1=Genetic, 0=Non-genetic (e.g., step-parent, adoptive)."
+      }),
+      StructField("PERSON_PERSON_RELTN_ID", LongType(), True, metadata={
+          "comment": "Unique identifier for the person-to-person relationship record from PERSON_PERSON_RELTN."
+      }),
+
+      # ----------------------------------------------------------------
+      # Condition Information (Coded and Free Text)
+      # ----------------------------------------------------------------
+      StructField("NOMENCLATURE_ID", LongType(), True, metadata={
+          "comment": "Identifier linking to NOMENCLATURE for coded conditions. 0 indicates free-text entry."
+      }),
+      StructField("CONDITION_DESC_CODED", StringType(), True, metadata={
+          "comment": "Coded condition description from NOMENCLATURE.SOURCE_STRING. NULL if free-text entry."
+      }),
+      StructField("CONDITION_DESC_FREETEXT", StringType(), True, metadata={
+          "comment": "Free-text description of the condition from LONG_TEXT. NULL if coded entry."
+      }),
+      StructField("CONDITION_DESC", StringType(), True, metadata={
+          "comment": "Combined condition description. Uses coded description if available, otherwise free-text."
+      }),
+      StructField("CONDITION_SOURCE", StringType(), True, metadata={
+          "comment": "Indicates source of condition description: 'CODED' (from nomenclature), 'FREE_TEXT' (from long_text), or 'UNKNOWN'."
+      }),
+
+      # ----------------------------------------------------------------
+      # Vocabulary / Terminology Details
+      # ----------------------------------------------------------------
+      StructField("SOURCE_IDENTIFIER", StringType(), True, metadata={
+          "comment": "The code/key from the source vocabulary (e.g., SNOMED code, ICD code) as stored in NOMENCLATURE."
+      }),
+      StructField("SOURCE_VOCABULARY_CD", DoubleType(), True, metadata={
+          "comment": "Code indicating the source vocabulary (Code Set 400). E.g., SNOMED CT, ICD-9, ICD-10."
+      }),
+      StructField("SOURCE_VOCABULARY_DESC", StringType(), True, metadata={
+          "comment": "Description of the source vocabulary (e.g., 'SNOMED CT', 'ICD-10-CM')."
+      }),
+      StructField("VOCAB_AXIS_CD", DoubleType(), True, metadata={
+          "comment": "Vocabulary axis code (Code Set 15849), primarily used for SNOMED CT axes."
+      }),
+      StructField("VOCAB_AXIS_DESC", StringType(), True, metadata={
+          "comment": "Description of the vocabulary axis."
+      }),
+      StructField("CONCEPT_CKI", StringType(), True, metadata={
+          "comment": "Cerner Knowledge Index (CKI) concept identifier. Extracted portion after '!' delimiter."
+      }),
+
+      # ----------------------------------------------------------------
+      # OMOP Mappings (from bronze.nomenclature)
+      # ----------------------------------------------------------------
+      StructField("OMOP_CONCEPT_ID", IntegerType(), True, metadata={
+          "comment": "OMOP CDM Concept ID mapped from the source nomenclature."
+      }),
+      StructField("OMOP_CONCEPT_NAME", StringType(), True, metadata={
+          "comment": "OMOP Concept Name/description."
+      }),
+      StructField("OMOP_STANDARD_CONCEPT", StringType(), True, metadata={
+          "comment": "OMOP standard concept flag: 'S'=Standard Concept, 'C'=Classification Concept, NULL=Non-standard."
+      }),
+      StructField("OMOP_MATCH_NUMBER", LongType(), True, metadata={
+          "comment": "Number of OMOP concepts matched for this NOMENCLATURE_ID. >1 indicates multiple possible mappings."
+      }),
+      StructField("OMOP_SIMILARITY", DoubleType(), True, metadata={
+          "comment": "Cosine similarity score (0-1) between source term and matched OMOP term. Higher = better match."
+      }),
+      StructField("OMOP_CONCEPT_DOMAIN", StringType(), True, metadata={
+          "comment": "OMOP domain of the concept (e.g., 'Condition', 'Observation', 'Procedure')."
+      }),
+
+      # ----------------------------------------------------------------
+      # SNOMED Mappings
+      # ----------------------------------------------------------------
+      StructField("SNOMED_CODE", LongType(), True, metadata={
+          "comment": "SNOMED CT concept code."
+      }),
+      StructField("SNOMED_TYPE", StringType(), True, metadata={
+          "comment": "Method/source of the SNOMED mapping (e.g., 'DIRECT', 'CKI', 'SIMILARITY')."
+      }),
+      StructField("SNOMED_MATCH_NUMBER", LongType(), True, metadata={
+          "comment": "Number of SNOMED matches for this NOMENCLATURE_ID. >1 indicates multiple possible mappings."
+      }),
+      StructField("SNOMED_SIMILARITY", DoubleType(), True, metadata={
+          "comment": "Cosine similarity score (0-1) between source term and matched SNOMED term."
+      }),
+      StructField("SNOMED_TERM", StringType(), True, metadata={
+          "comment": "SNOMED CT preferred term description."
+      }),
+
+      # ----------------------------------------------------------------
+      # ICD-10 Mappings
+      # ----------------------------------------------------------------
+      StructField("ICD10_CODE", StringType(), True, metadata={
+          "comment": "ICD-10 diagnosis code."
+      }),
+      StructField("ICD10_TYPE", StringType(), True, metadata={
+          "comment": "Method/source of ICD-10 mapping (e.g., 'DIRECT', 'SNOMED_MAP', 'SIMILARITY')."
+      }),
+      StructField("ICD10_MATCH_NUMBER", LongType(), True, metadata={
+          "comment": "Number of ICD-10 matches for this NOMENCLATURE_ID. >1 indicates multiple possible mappings."
+      }),
+      StructField("ICD10_SIMILARITY", DoubleType(), True, metadata={
+          "comment": "Cosine similarity score (0-1) between source term and matched ICD-10 term."
+      }),
+      StructField("ICD10_TERM", StringType(), True, metadata={
+          "comment": "ICD-10 code description/term."
+      }),
+
+      # ----------------------------------------------------------------
+      # Clinical Details
+      # ----------------------------------------------------------------
+      StructField("FHX_TYPE", StringType(), True, metadata={
+          "comment": "Type of family history entry: 'PERSON' (patient overview), 'RELTN' (family member), 'CONDITION' (specific condition)."
+      }),
+      StructField("FHX_VALUE_FLAG", IntegerType(), True, metadata={
+          "comment": "Indicates condition status for the family member: 0=Negative, 1=Positive, 2=Unknown, 3=Unable to Obtain, 4=Patient Adopted."
+      }),
+      StructField("ONSET_AGE", DoubleType(), True, metadata={
+          "comment": "Age at which the condition started in the family member. Critical for hereditary risk assessment."
+      }),
+      StructField("ONSET_AGE_UNIT", StringType(), True, metadata={
+          "comment": "Unit of measurement for onset age (e.g., 'Years', 'Months', 'Days')."
+      }),
+      StructField("SEVERITY", StringType(), True, metadata={
+          "comment": "Severity of the condition (Code Set 12022). E.g., 'Mild', 'Moderate', 'Severe'."
+      }),
+      StructField("COURSE", StringType(), True, metadata={
+          "comment": "Course/progression of the condition (Code Set 12039). E.g., 'Improving', 'Stable', 'Worsening'."
+      }),
+      StructField("LIFE_CYCLE_STATUS", StringType(), True, metadata={
+          "comment": "Current status of the family history record (Code Set 12030). E.g., 'Active', 'Inactive', 'Resolved', 'Cancelled'."
+      }),
+
+      # ----------------------------------------------------------------
+      # Temporal Fields
+      # ----------------------------------------------------------------
+      StructField("BEG_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+          "comment": "Date/time when this family history record becomes effective."
+      }),
+      StructField("END_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+          "comment": "Date/time after which this record is no longer valid/active."
+      }),
+      StructField("ADC_UPDT", TimestampType(), True, metadata={
+          "comment": "Latest update timestamp across joined tables (FHX_ACTIVITY, PERSON_PERSON_RELTN, NOMENCLATURE). Used for incremental processing."
+      })
+  ])
+
+  
+  
+# ------------------------------------------------------------------------  
+# Helper: Code value lookup  
+# ------------------------------------------------------------------------  
+def create_family_history_code_lookup(code_values, alias_suffix: str):  
+    """  
+    Creates a code value lookup specific to family history mapping.  
+  
+    Returns a DF with:  
+        CODE_VALUE,  
+        {alias_suffix}_display,  
+        {alias_suffix}_desc  
+    """  
+    return (  
+        code_values  
+        .select(  
+            col("CODE_VALUE"),  
+            col("DISPLAY").alias(f"{alias_suffix}_display"),  
+            col("DESCRIPTION").alias(f"{alias_suffix}_desc")  
+        )  
+        .alias(alias_suffix)  
+    )  
+  
+  
+# ------------------------------------------------------------------------  
+# Main incremental mapping function  
+# ------------------------------------------------------------------------  
+def create_family_history_mapping_incr():  
+    """  
+    Creates an incremental family history mapping table that processes  
+    only new or modified records, with enhanced nomenclature mappings  
+    (OMOP/SNOMED/ICD10) and optimized MRN/NHS resolution.  
+    """  
+    print(f"[INFO] Starting family history mapping at {datetime.now()}")  
+  
+    # Incremental read from mill_fhx_activity (using ADC_UPDT, as in other maps)  
+    fhx_activity, record_count = get_incremental_data_with_cdf(  
+        source_table="4_prod.raw.mill_fhx_activity",  
+        target_table="4_prod.bronze.map_family_history",  
+        timestamp_column="ADC_UPDT",  
+        apply_trust_filter=True,  
+        additional_filters=(col("ACTIVE_IND") == 1)  
+    )  
+  
+    if record_count == 0:  
+        print("[INFO] No incremental data to process. Skipping family history mapping.")  
+        return None  
+  
+    fhx = fhx_activity.alias("fhx")  
+    print(f"[INFO] Family history incremental records: {record_count}")  
+  
+    # --------------------------------------------------------------------  
+    # Reference tables  
+    # --------------------------------------------------------------------  
+    code_values = spark.table("3_lookup.mill.mill_code_value")  
+  
+    # Person-person relationship  
+    person_reltn = (  
+        spark.table("4_prod.raw.mill_person_person_reltn")  
+        .filter(col("ACTIVE_IND") == 1)  
+        .alias("ppr")  
+    )  
+  
+    # Enhanced nomenclature from bronze  
+    nomenclature = (  
+        spark.table("4_prod.bronze.nomenclature")  
+        .withColumn(  
+            "CONCEPT_CKI_PROCESSED",  
+            substring_index(col("CONCEPT_CKI"), "!", -1)  
+        )  
+        .alias("nom")  
+    )  
+  
+    # Free text  
+    fhx_long_text_r = spark.table("4_prod.raw.mill_fhx_long_text_r").alias("fltr")  
+    long_text = spark.table("4_prod.raw.mill_long_text").alias("lt")  
+  
+    # --------------------------------------------------------------------  
+    # Optimized MRN / NHS lookup: only for PERSON_IDs in this batch  
+    # --------------------------------------------------------------------  
+    batch_persons = fhx.select("PERSON_ID").distinct().alias("pids")  
+  
+    person_alias = (  
+        spark.table("4_prod.raw.mill_person_alias")  
+        .filter(col("ACTIVE_IND") == 1)  
+        .alias("pa")  
+    )  
+  
+    # MRN (type 10, specific alias pools)  
+    mrn_base = (  
+        person_alias  
+        .join(batch_persons, "PERSON_ID", "inner")  
+        .filter(  
+            (col("PERSON_ALIAS_TYPE_CD") == 10) &  
+            col("ALIAS_POOL_CD").isin(683996, 1115132483, 6200990, 6173940)  
+        )  
+    )  
+    mrn_window = Window.partitionBy("PERSON_ID").orderBy(col("BEG_EFFECTIVE_DT_TM").desc())  
+    mrn_lookup = (  
+        mrn_base  
+        .withColumn("rn", row_number().over(mrn_window))  
+        .filter(col("rn") == 1)  
+        .select(  
+            col("PERSON_ID"),  
+            col("ALIAS").alias("MRN")  
+        )  
+        .alias("mrn")  
+    )  
+  
+    # NHS Number (type 18)  
+    nhs_base = (  
+        person_alias  
+        .join(batch_persons, "PERSON_ID", "inner")  
+        .filter(col("PERSON_ALIAS_TYPE_CD") == 18)  
+    )  
+    nhs_window = Window.partitionBy("PERSON_ID").orderBy(col("BEG_EFFECTIVE_DT_TM").desc())  
+    nhs_lookup = (  
+        nhs_base  
+        .withColumn("rn", row_number().over(nhs_window))  
+        .filter(col("rn") == 1)  
+        .select(  
+            col("PERSON_ID"),  
+            col("ALIAS").alias("NHS_Number")  
+        )  
+        .alias("nhs")  
+    )  
+  
+    # --------------------------------------------------------------------  
+    # Code value lookups  
+    # --------------------------------------------------------------------  
+    relation_lookup      = create_family_history_code_lookup(code_values, "rel")  
+    relation_type_lookup = create_family_history_code_lookup(code_values, "reltype")  
+    vocab_lookup         = create_family_history_code_lookup(code_values, "vocab")  
+    vocab_axis_lookup    = create_family_history_code_lookup(code_values, "axis")  
+    onset_unit_lookup    = create_family_history_code_lookup(code_values, "onset_unit")  
+    severity_lookup      = create_family_history_code_lookup(code_values, "severity")  
+    course_lookup        = create_family_history_code_lookup(code_values, "course")  
+    lifecycle_lookup     = create_family_history_code_lookup(code_values, "lifecycle")  
+  
+    # --------------------------------------------------------------------  
+    # Build main joined DataFrame  
+    # --------------------------------------------------------------------  
+    processed = (  
+        fhx  
+        # Relationship  
+        .join(  
+            person_reltn,  
+            (col("fhx.PERSON_ID") == col("ppr.PERSON_ID")) &  
+            (col("fhx.RELATED_PERSON_ID") == col("ppr.RELATED_PERSON_ID")),  
+            "left"  
+        )  
+        # Nomenclature (only when NOMENCLATURE_ID != 0)  
+        .join(  
+            nomenclature,  
+            (col("fhx.NOMENCLATURE_ID") == col("nom.NOMENCLATURE_ID")) &  
+            (col("fhx.NOMENCLATURE_ID") != 0),  
+            "left"  
+        )  
+        # Free text  
+        .join(fhx_long_text_r, col("fhx.FHX_ACTIVITY_ID") == col("fltr.FHX_ACTIVITY_ID"), "left")  
+        .join(long_text, col("fltr.LONG_TEXT_ID") == col("lt.LONG_TEXT_ID"), "left")  
+        # MRN / NHS  
+        .join(mrn_lookup, col("fhx.PERSON_ID") == col("mrn.PERSON_ID"), "left")  
+        .join(nhs_lookup, col("fhx.PERSON_ID") == col("nhs.PERSON_ID"), "left")  
+        # Lookups  
+        .join(relation_lookup,      col("ppr.PERSON_RELTN_CD")      == col("rel.CODE_VALUE"),        "left")  
+        .join(relation_type_lookup, col("ppr.PERSON_RELTN_TYPE_CD") == col("reltype.CODE_VALUE"),    "left")  
+        .join(vocab_lookup,         col("nom.SOURCE_VOCABULARY_CD") == col("vocab.CODE_VALUE"),      "left")  
+        .join(vocab_axis_lookup,    col("nom.VOCAB_AXIS_CD")        == col("axis.CODE_VALUE"),       "left")  
+        .join(onset_unit_lookup,    col("fhx.ONSET_AGE_UNIT_CD")    == col("onset_unit.CODE_VALUE"), "left")  
+        .join(severity_lookup,      col("fhx.SEVERITY_CD")          == col("severity.CODE_VALUE"),   "left")  
+        .join(course_lookup,        col("fhx.COURSE_CD")            == col("course.CODE_VALUE"),     "left")  
+        .join(lifecycle_lookup,     col("fhx.LIFE_CYCLE_STATUS_CD") == col("lifecycle.CODE_VALUE"),  "left")  
+    )  
+  
+    # --------------------------------------------------------------------  
+    # Final column selection & transformation  
+    # --------------------------------------------------------------------  
+    result_df = processed.select(  
+        # IDs / patient  
+        col("fhx.FHX_ACTIVITY_ID").cast(LongType()).alias("FHX_ACTIVITY_ID"),  
+        col("fhx.PERSON_ID").cast(LongType()).alias("PERSON_ID"),  
+        col("mrn.MRN").cast(StringType()).alias("MRN"),  
+        col("nhs.NHS_Number").cast(StringType()).alias("NHS_Number"),  
+  
+        # Relationship  
+        col("fhx.RELATED_PERSON_ID").cast(LongType()).alias("RELATED_PERSON_ID"),  
+        col("ppr.PERSON_RELTN_CD").cast(DoubleType()).alias("RELATION_CD"),  
+        col("rel_display").alias("RELATION_DESC"),  
+        col("ppr.PERSON_RELTN_TYPE_CD").cast(DoubleType()).alias("RELATION_TYPE_CD"),  
+        col("reltype_display").alias("RELATION_TYPE_DESC"),  
+        col("ppr.GENETIC_RELATIONSHIP_IND").cast(IntegerType()).alias("GENETIC_IND"),  
+        col("ppr.PERSON_PERSON_RELTN_ID").cast(LongType()).alias("PERSON_PERSON_RELTN_ID"),  
+  
+        # Condition details (coded / free text)  
+        col("fhx.NOMENCLATURE_ID").cast(LongType()).alias("NOMENCLATURE_ID"),  
+        col("nom.SOURCE_STRING").alias("CONDITION_DESC_CODED"),  
+        col("lt.LONG_TEXT").alias("CONDITION_DESC_FREETEXT"),  
+        coalesce(col("nom.SOURCE_STRING"), col("lt.LONG_TEXT")).alias("CONDITION_DESC"),  
+        when(col("fhx.NOMENCLATURE_ID").isNotNull() & (col("fhx.NOMENCLATURE_ID") != 0), lit("CODED"))  
+        .when(col("lt.LONG_TEXT").isNotNull(), lit("FREE_TEXT"))  
+        .otherwise(lit("UNKNOWN")).alias("CONDITION_SOURCE"),  
+  
+        # Vocabulary / CKI  
+        col("nom.SOURCE_IDENTIFIER").cast(StringType()).alias("SOURCE_IDENTIFIER"),  
+        col("nom.SOURCE_VOCABULARY_CD"),  
+        col("vocab_display").alias("SOURCE_VOCABULARY_DESC"),  
+        col("nom.VOCAB_AXIS_CD"),  
+        col("axis_display").alias("VOCAB_AXIS_DESC"),  
+        col("nom.CONCEPT_CKI_PROCESSED").alias("CONCEPT_CKI"),  
+  
+        # OMOP from nomenclature  
+        col("nom.OMOP_CONCEPT_ID").cast(IntegerType()).alias("OMOP_CONCEPT_ID"),  
+        col("nom.OMOP_CONCEPT_NAME").cast(StringType()).alias("OMOP_CONCEPT_NAME"),  
+        col("nom.IS_STANDARD_OMOP_CONCEPT").alias("OMOP_STANDARD_CONCEPT"),  
+        col("nom.NUMBER_OF_OMOP_MATCHES").alias("OMOP_MATCH_NUMBER"),  
+        col("nom.OMOP_SIMILARITY"),  
+        col("nom.CONCEPT_DOMAIN").alias("OMOP_CONCEPT_DOMAIN"),  
+  
+        # SNOMED  
+        col("nom.SNOMED_CODE").cast(LongType()).alias("SNOMED_CODE"),  
+        col("nom.SNOMED_TYPE").cast(StringType()).alias("SNOMED_TYPE"),  
+        col("nom.SNOMED_MATCH_COUNT").alias("SNOMED_MATCH_NUMBER"),  
+        col("nom.SNOMED_SIMILARITY"),  
+        col("nom.SNOMED_TERM").cast(StringType()).alias("SNOMED_TERM"),  
+  
+        # ICD10  
+        col("nom.ICD10_CODE").cast(StringType()).alias("ICD10_CODE"),  
+        col("nom.ICD10_CODE_TYPE").alias("ICD10_TYPE"),  
+        col("nom.ICD10_CODE_MATCH_COUNT").alias("ICD10_MATCH_NUMBER"),  
+        col("nom.ICD10_SIMILARITY"),  
+        col("nom.ICD10_TERM").cast(StringType()).alias("ICD10_TERM"),  
+  
+        # Clinical details  
+        col("fhx.TYPE_MEAN").alias("FHX_TYPE"),  
+        col("fhx.FHX_VALUE_FLAG").cast(IntegerType()).alias("FHX_VALUE_FLAG"),  
+        col("fhx.ONSET_AGE").cast(DoubleType()).alias("ONSET_AGE"),  
+        col("onset_unit_display").alias("ONSET_AGE_UNIT"),  
+        col("severity_display").alias("SEVERITY"),  
+        col("course_display").alias("COURSE"),  
+        col("lifecycle_display").alias("LIFE_CYCLE_STATUS"),  
+  
+        # Dates  
+        col("fhx.BEG_EFFECTIVE_DT_TM").cast(TimestampType()).alias("BEG_EFFECTIVE_DT_TM"),  
+        col("fhx.END_EFFECTIVE_DT_TM").cast(TimestampType()).alias("END_EFFECTIVE_DT_TM"),  
+  
+        # Composite ADC_UPDT  
+        greatest(  
+            col("fhx.ADC_UPDT"),  
+            col("ppr.ADC_UPDT"),  
+            col("nom.ADC_UPDT")  
+        ).alias("ADC_UPDT")  
+    )  
+  
+    # --------------------------------------------------------------------  
+    # Deduplicate on FHX_ACTIVITY_ID (same pattern as other maps)  
+    # --------------------------------------------------------------------  
+    window_spec = Window.partitionBy("FHX_ACTIVITY_ID").orderBy(  
+        col("ADC_UPDT").desc(),  
+        coalesce(col("OMOP_SIMILARITY"), lit(0.0)).desc()  
+    )  
+  
+    final_df = (  
+        result_df  
+        .withColumn("_rn", row_number().over(window_spec))  
+        .filter(col("_rn") == 1)  
+        .drop("_rn")  
+    )  
+  
+    print(f"[INFO] Family history mapping complete. Output records: {final_df.count()}")  
+    return final_df  
+  
+  
+# ------------------------------------------------------------------------  
+# Orchestrator  
+# ------------------------------------------------------------------------  
+def process_family_history_incremental():  
+    """  
+    End-to-end processing of incremental family history updates into:  
+    4_prod.bronze.map_family_history  
+    """  
+    try:  
+        print(f"[INFO] Starting family history incremental pipeline at {datetime.now()}")  
+        updates_df = create_family_history_mapping_incr()  
+  
+        if updates_df is None:  
+            print("[INFO] No family history updates to process. Pipeline complete.")  
+            return  
+  
+        # Defensive check before merge  
+        if verify_no_duplicates(updates_df, "FHX_ACTIVITY_ID"):  
+            update_table(  
+                updates_df,  
+                "4_prod.bronze.map_family_history",  
+                "FHX_ACTIVITY_ID",  
+                schema_map_family_history,  
+                map_family_history_comment  
+            )  
+            print("[INFO] Successfully updated map_family_history")  
+        else:  
+            print("[WARN] Merge aborted due to duplicates on FHX_ACTIVITY_ID. Please investigate.")  
+  
+    except Exception as e:  
+        print(f"[ERROR] Error processing family history updates: {e}")  
+        import traceback  
+        traceback.print_exc()  
+        raise  
+  
+  
+# Run the pipeline  
+process_family_history_incremental()  
+
+# COMMAND ----------
+
+# ============================================================================
+# MAP_PATIENT_JOURNEY - Patient Location History and Journey Tracking
+# ============================================================================
+
+map_patient_journey_comment = """
+The table tracks patient movements through healthcare facilities, providing a comprehensive
+view of each patient's journey from admission to discharge. It combines location history
+from ENCNTR_LOC_HIST with encounter-level context from ENCOUNTER to show:
+- Where the patient came from (admission source, referral, transport mode)
+- How they were admitted (emergency, elective, routine; inpatient, outpatient, ED)
+- Their movement through departments/units during their stay
+- Where they went upon discharge (home, transfer, deceased, nursing home)
+
+Each row represents a location 'stop' in the patient's journey, with sequencing and
+timing to enable flow analysis, length-of-stay calculations, and pathway analytics.
+
+Source tables:
+- 4_prod.raw.mill_encntr_loc_hist (primary - location movements)
+- 4_prod.raw.mill_encounter (encounter context, admission/discharge)
+- 4_prod.raw.mill_person_alias (MRN/NHS identifiers)
+- 3_lookup.mill.mill_code_value (code decodes)
+
+Common use cases:
+- Patient flow analysis and bottleneck identification
+- Length of stay analysis by department/unit
+- Admission source and discharge destination reporting
+- Readmission pathway analysis
+- Capacity planning and bed management analytics
+"""
+
+schema_map_patient_journey = StructType([
+    # ========================================================================
+    # IDENTIFIERS
+    # ========================================================================
+    StructField("ENCNTR_LOC_HIST_ID", LongType(), True, metadata={
+        "comment": "Primary unique identifier for this location history record. Each row represents one 'stop' in the patient's journey."
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "Unique identifier for the encounter/visit. Links all location movements for a single hospital stay."
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "Unique identifier for the patient from the PERSON table."
+    }),
+    StructField("MRN", StringType(), True, metadata={
+        "comment": "Local Medical Record Number for the patient."
+    }),
+    StructField("NHS_NUMBER", StringType(), True, metadata={
+        "comment": "NHS Number for the patient (UK national identifier)."
+    }),
+
+    # ========================================================================
+    # ENCOUNTER CONTEXT
+    # ========================================================================
+    StructField("ENCNTR_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "Code for encounter type (Code Set 71). Categorizes the encounter into logical groups."
+    }),
+    StructField("ENCNTR_TYPE_DESC", StringType(), True, metadata={
+        "comment": "Description of encounter type. Examples: 'Inpatient', 'Outpatient', 'Emergency', 'Day Case'."
+    }),
+    StructField("ENCNTR_TYPE_CLASS_CD", DoubleType(), True, metadata={
+        "comment": "Code for encounter type class (Code Set 69). Higher-level categorization than encounter type."
+    }),
+    StructField("ENCNTR_TYPE_CLASS_DESC", StringType(), True, metadata={
+        "comment": "Description of encounter class. Standard values: 'Inpatient', 'Outpatient', 'Emergency', 'Recurring Outpatient'."
+    }),
+    StructField("ENCNTR_STATUS_CD", DoubleType(), True, metadata={
+        "comment": "Code for current encounter status (Code Set 261)."
+    }),
+    StructField("ENCNTR_STATUS_DESC", StringType(), True, metadata={
+        "comment": "Description of encounter status. Examples: 'Active', 'Discharged', 'Preadmit', 'Cancelled'."
+    }),
+
+    # ========================================================================
+    # ADMISSION DETAILS
+    # ========================================================================
+    StructField("ADMIT_SRC_CD", DoubleType(), True, metadata={
+        "comment": "Code identifying where the patient came from before admission (Code Set 2)."
+    }),
+    StructField("ADMIT_SRC_DESC", StringType(), True, metadata={
+        "comment": "Description of admission source. Examples: 'GP Referral', 'Transfer from Another Hospital', 'A&E'."
+    }),
+    StructField("ENCOUNTER_ADMIT_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "Code for admission type at encounter level (Code Set 3)."
+    }),
+    StructField("ENCOUNTER_ADMIT_TYPE_DESC", StringType(), True, metadata={
+        "comment": "Description of admission circumstances. Examples: 'Emergency', 'Elective', 'Routine', 'Urgent'."
+    }),
+    StructField("ADMIT_MODE_CD", DoubleType(), True, metadata={
+        "comment": "Code identifying how the patient arrived (Code Set 68)."
+    }),
+    StructField("ADMIT_MODE_DESC", StringType(), True, metadata={
+        "comment": "Description of arrival method. Examples: 'Ambulance', 'Helicopter', 'Private Transport', 'Walk-in'."
+    }),
+    StructField("REFERRAL_SOURCE_CD", DoubleType(), True, metadata={
+        "comment": "Code identifying the source of referral (Code Set 30385)."
+    }),
+    StructField("REFERRAL_SOURCE_DESC", StringType(), True, metadata={
+        "comment": "Description of referral source. Examples: 'GP', 'Consultant', 'Self', 'A&E', 'NHS 111'."
+    }),
+    StructField("READMIT_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating if this is a readmission (Code Set 47)."
+    }),
+    StructField("READMIT_DESC", StringType(), True, metadata={
+        "comment": "Description of readmission status."
+    }),
+    StructField("REASON_FOR_VISIT", StringType(), True, metadata={
+        "comment": "Free-text description of why the patient presented (presenting complaint)."
+    }),
+
+    # ========================================================================
+    # LOCATION HIERARCHY
+    # ========================================================================
+    StructField("LOC_FACILITY_CD", DoubleType(), True, metadata={
+        "comment": "Code for the facility/hospital (Code Set 220). Top level of location hierarchy."
+    }),
+    StructField("FACILITY_DESC", StringType(), True, metadata={
+        "comment": "Name of the facility/hospital where the patient is located."
+    }),
+    StructField("LOC_BUILDING_CD", DoubleType(), True, metadata={
+        "comment": "Code for the building within the facility (Code Set 220)."
+    }),
+    StructField("BUILDING_DESC", StringType(), True, metadata={
+        "comment": "Name of the building within the facility."
+    }),
+    StructField("LOC_NURSE_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "Code for the nursing unit/ward (Code Set 220). Key location for patient flow analysis."
+    }),
+    StructField("NURSE_UNIT_DESC", StringType(), True, metadata={
+        "comment": "Name of the nursing unit/ward. Examples: 'ICU', 'Ward 5A', 'Medical Assessment Unit'."
+    }),
+    StructField("LOC_ROOM_CD", DoubleType(), True, metadata={
+        "comment": "Code for the room within the nursing unit (Code Set 220)."
+    }),
+    StructField("ROOM_DESC", StringType(), True, metadata={
+        "comment": "Room number or name within the nursing unit."
+    }),
+    StructField("LOC_BED_CD", DoubleType(), True, metadata={
+        "comment": "Code for the specific bed (Code Set 220). Lowest level of location hierarchy."
+    }),
+    StructField("BED_DESC", StringType(), True, metadata={
+        "comment": "Bed identifier within the room."
+    }),
+
+    # ========================================================================
+    # LOCATION-LEVEL ENCOUNTER DETAILS
+    # ========================================================================
+    StructField("LOC_ENCNTR_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "Encounter type at the time of this location record (Code Set 71)."
+    }),
+    StructField("LOC_ENCNTR_TYPE_DESC", StringType(), True, metadata={
+        "comment": "Description of encounter type at this location."
+    }),
+    StructField("LOC_ENCNTR_TYPE_CLASS_CD", DoubleType(), True, metadata={
+        "comment": "Encounter class at the time of this location record (Code Set 69)."
+    }),
+    StructField("LOC_ENCNTR_TYPE_CLASS_DESC", StringType(), True, metadata={
+        "comment": "Description of encounter class at this location."
+    }),
+    StructField("MED_SERVICE_CD", DoubleType(), True, metadata={
+        "comment": "Code for the medical service/specialty providing care (Code Set 34)."
+    }),
+    StructField("MED_SERVICE_DESC", StringType(), True, metadata={
+        "comment": "Description of medical service. Examples: 'General Medicine', 'General Surgery', 'Cardiology'."
+    }),
+    StructField("LOC_ADMIT_TYPE_CD", DoubleType(), True, metadata={
+        "comment": "Admission type at this specific location (Code Set 3)."
+    }),
+    StructField("LOC_ADMIT_TYPE_DESC", StringType(), True, metadata={
+        "comment": "Description of admission type at this location."
+    }),
+
+    # ========================================================================
+    # TRANSFER DETAILS
+    # ========================================================================
+    StructField("TRANSFER_REASON_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating why the patient was transferred to this location (Code Set 285)."
+    }),
+    StructField("TRANSFER_REASON_DESC", StringType(), True, metadata={
+        "comment": "Description of transfer reason. Examples: 'Clinical Need', 'Bed Management', 'Step Down'."
+    }),
+
+    # ========================================================================
+    # ACCOMMODATION
+    # ========================================================================
+    StructField("ACCOMMODATION_CD", DoubleType(), True, metadata={
+        "comment": "Code for the type of accommodation provided (Code Set 10)."
+    }),
+    StructField("ACCOMMODATION_DESC", StringType(), True, metadata={
+        "comment": "Description of accommodation type. Examples: 'Private Room', 'Semi-Private', 'Ward'."
+    }),
+    StructField("ACCOMMODATION_REASON_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating why this accommodation was given (Code Set 14767)."
+    }),
+    StructField("ACCOMMODATION_REASON_DESC", StringType(), True, metadata={
+        "comment": "Description of accommodation reason."
+    }),
+
+    # ========================================================================
+    # ALTERNATE LEVEL OF CARE
+    # ========================================================================
+    StructField("ALT_LVL_CARE_CD", DoubleType(), True, metadata={
+        "comment": "Code for alternate level of care (Code Set 22589)."
+    }),
+    StructField("ALT_LVL_CARE_DESC", StringType(), True, metadata={
+        "comment": "Description of alternate level of care."
+    }),
+    StructField("ALC_REASON_CD", DoubleType(), True, metadata={
+        "comment": "Code for reason alternate level of care was assigned (Code Set 28443)."
+    }),
+    StructField("ALC_REASON_DESC", StringType(), True, metadata={
+        "comment": "Description of ALC reason."
+    }),
+
+    # ========================================================================
+    # SERVICE & SPECIALTY
+    # ========================================================================
+    StructField("SERVICE_CATEGORY_CD", DoubleType(), True, metadata={
+        "comment": "Code for the category of service (Code Set 3394)."
+    }),
+    StructField("SERVICE_CATEGORY_DESC", StringType(), True, metadata={
+        "comment": "Description of service category."
+    }),
+    StructField("PROGRAM_SERVICE_CD", DoubleType(), True, metadata={
+        "comment": "Code for the program service associated with this location (Code Set 27900)."
+    }),
+    StructField("PROGRAM_SERVICE_DESC", StringType(), True, metadata={
+        "comment": "Description of program service."
+    }),
+    StructField("SPECIALTY_UNIT_CD", DoubleType(), True, metadata={
+        "comment": "Code for the specialty unit (Code Set 27901)."
+    }),
+    StructField("SPECIALTY_UNIT_DESC", StringType(), True, metadata={
+        "comment": "Description of specialty unit."
+    }),
+
+    # ========================================================================
+    # ISOLATION
+    # ========================================================================
+    StructField("ISOLATION_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating isolation or restricted access requirements (Code Set 70)."
+    }),
+    StructField("ISOLATION_DESC", StringType(), True, metadata={
+        "comment": "Description of isolation status. Examples: 'Contact Precautions', 'Droplet Isolation'."
+    }),
+
+    # ========================================================================
+    # TIMING - LOCATION MOVEMENT
+    # ========================================================================
+    StructField("LOC_ARRIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the patient arrived at this location."
+    }),
+    StructField("LOC_DEPART_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the patient departed from this location. NULL if patient is still at this location."
+    }),
+    StructField("LOC_BEG_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time this location record became effective."
+    }),
+    StructField("LOC_END_EFFECTIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time this location record was no longer effective."
+    }),
+    StructField("LOC_TRANSACTION_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the transaction that triggered this history record occurred."
+    }),
+    StructField("LOC_ACTIVITY_DT_TM", TimestampType(), True, metadata={
+        "comment": "System date/time when the history row was inserted."
+    }),
+    StructField("LOC_LENGTH_OF_STAY_HOURS", DoubleType(), True, metadata={
+        "comment": "Calculated length of stay at this specific location in hours."
+    }),
+
+    # ========================================================================
+    # TIMING - ENCOUNTER LEVEL
+    # ========================================================================
+    StructField("PRE_REG_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time pre-registration or pre-admission was performed."
+    }),
+    StructField("REG_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time registration or admission was performed."
+    }),
+    StructField("ENCNTR_ARRIVE_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the patient arrived at the facility for this encounter."
+    }),
+    StructField("INPATIENT_ADMIT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time of inpatient admission."
+    }),
+    StructField("DISCH_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the patient was discharged from the facility."
+    }),
+    StructField("ENCNTR_DEPART_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time the patient physically left the facility."
+    }),
+    StructField("EST_LENGTH_OF_STAY", IntegerType(), True, metadata={
+        "comment": "Estimated length of stay in days, as recorded at admission."
+    }),
+    StructField("ENCNTR_LENGTH_OF_STAY_DAYS", DoubleType(), True, metadata={
+        "comment": "Calculated total encounter length of stay in days."
+    }),
+
+    # ========================================================================
+    # DISCHARGE DETAILS
+    # ========================================================================
+    StructField("DISCH_DISPOSITION_CD", DoubleType(), True, metadata={
+        "comment": "Code for discharge disposition (Code Set 19)."
+    }),
+    StructField("DISCH_DISPOSITION_DESC", StringType(), True, metadata={
+        "comment": "Description of discharge disposition. Examples: 'Discharged Home', 'Deceased', 'Transferred'."
+    }),
+    StructField("DISCH_TO_LOCTN_CD", DoubleType(), True, metadata={
+        "comment": "Code for discharge destination location (Code Set 20)."
+    }),
+    StructField("DISCH_TO_LOCTN_DESC", StringType(), True, metadata={
+        "comment": "Description of discharge destination. Examples: 'Home', 'Nursing Home', 'Rehabilitation Facility'."
+    }),
+
+    # ========================================================================
+    # TRIAGE & CLINICAL FLAGS
+    # ========================================================================
+    StructField("TRIAGE_CD", DoubleType(), True, metadata={
+        "comment": "Code for triage category/acuity (Code Set 14753)."
+    }),
+    StructField("TRIAGE_DESC", StringType(), True, metadata={
+        "comment": "Description of triage category."
+    }),
+    StructField("TRIAGE_DT_TM", TimestampType(), True, metadata={
+        "comment": "Date/time triage was performed."
+    }),
+    StructField("TRAUMA_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating type of trauma if applicable (Code Set 14752)."
+    }),
+    StructField("TRAUMA_DESC", StringType(), True, metadata={
+        "comment": "Description of trauma type."
+    }),
+    StructField("AMBULATORY_COND_CD", DoubleType(), True, metadata={
+        "comment": "Code for patient's ambulatory condition on arrival (Code Set 5)."
+    }),
+    StructField("AMBULATORY_COND_DESC", StringType(), True, metadata={
+        "comment": "Description of ambulatory condition. Examples: 'Ambulatory', 'Wheelchair', 'Stretcher'."
+    }),
+    StructField("FINANCIAL_CLASS_CD", DoubleType(), True, metadata={
+        "comment": "Code for financial classification (Code Set 354)."
+    }),
+    StructField("FINANCIAL_CLASS_DESC", StringType(), True, metadata={
+        "comment": "Description of financial class. Examples: 'NHS', 'Private', 'Overseas Visitor'."
+    }),
+    StructField("VIP_CD", DoubleType(), True, metadata={
+        "comment": "Code indicating VIP status (Code Set 67)."
+    }),
+    StructField("VIP_DESC", StringType(), True, metadata={
+        "comment": "Description of VIP status if applicable."
+    }),
+    StructField("CONFID_LEVEL_CD", DoubleType(), True, metadata={
+        "comment": "Code for confidentiality level (Code Set 87)."
+    }),
+    StructField("CONFID_LEVEL_DESC", StringType(), True, metadata={
+        "comment": "Description of confidentiality level."
+    }),
+
+    # ========================================================================
+    # SEQUENCE / ORDERING
+    # ========================================================================
+    StructField("LOCATION_SEQUENCE", IntegerType(), True, metadata={
+        "comment": "Sequential number of this location within the encounter journey. 1 = first location."
+    }),
+    StructField("PREV_NURSE_UNIT", StringType(), True, metadata={
+        "comment": "Name of the previous nursing unit the patient was in. NULL for first location."
+    }),
+    StructField("NEXT_NURSE_UNIT", StringType(), True, metadata={
+        "comment": "Name of the next nursing unit the patient moved to. NULL for last location."
+    }),
+    StructField("IS_FIRST_LOCATION", IntegerType(), True, metadata={
+        "comment": "Flag indicating if this is the first location in the patient's journey. 1=Yes, 0=No."
+    }),
+    StructField("IS_LAST_LOCATION", IntegerType(), True, metadata={
+        "comment": "Flag indicating if this is the last/current location in the patient's journey. 1=Yes, 0=No."
+    }),
+    StructField("TOTAL_LOCATIONS_VISITED", IntegerType(), True, metadata={
+        "comment": "Total number of locations visited during this encounter."
+    }),
+
+    # ========================================================================
+    # ORGANIZATION
+    # ========================================================================
+    StructField("ORGANIZATION_ID", LongType(), True, metadata={
+        "comment": "Identifier for the organization associated with this location record."
+    }),
+
+    # ========================================================================
+    # AUDIT / UPDATE TRACKING
+    # ========================================================================
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Latest update timestamp across joined tables. Used for incremental processing."
+    })
+])
+
+
+def create_patient_journey_code_lookup(code_values, alias_suffix: str):
+    """
+    Creates a code value lookup for patient journey mapping.
+    
+    Args:
+        code_values: DataFrame containing code values
+        alias_suffix: Suffix for column aliases
+        
+    Returns:
+        DataFrame: Lookup table with CODE_VALUE and DISPLAY columns
+    """
+    return (
+        code_values
+        .select(
+            col("CODE_VALUE"),
+            col("DISPLAY").alias(f"{alias_suffix}_display")
+        )
+        .alias(alias_suffix)
+    )
+
+
+def create_patient_journey_mapping_incr():
+    """
+    Creates an incremental patient journey mapping table that processes only 
+    new or modified records from ENCNTR_LOC_HIST.
+    
+    Tracks patient movements through healthcare facilities with full context
+    from admission through discharge, including location sequencing and 
+    journey analytics.
+    
+    Returns:
+        DataFrame: Processed patient journey records with standardized format,
+                   or None if no incremental data to process
+    """
+    print(f"[INFO] Starting patient journey mapping at {datetime.now()}")
+    
+    # Get incremental data from encntr_loc_hist
+    elh_base, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_encntr_loc_hist",
+        target_table="4_prod.bronze.map_patient_journey",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("ACTIVE_IND") == 1)
+    )
+    
+    if record_count == 0:
+        print("[INFO] No incremental data to process. Skipping patient journey mapping.")
+        return None
+    
+    print(f"[INFO] Processing {record_count} patient journey location records")
+    
+    elh = elh_base.alias("elh")
+    
+    # --------------------------------------------------------------------
+    # Reference tables
+    # --------------------------------------------------------------------
+    code_values = spark.table("3_lookup.mill.mill_code_value")
+    
+    # Encounter table
+    encounter = (
+        spark.table("4_prod.raw.mill_encounter")
+        .filter(col("ACTIVE_IND") == 1)
+        .alias("enc")
+    )
+    
+    # Person alias for MRN and NHS - optimize by filtering to batch persons
+    batch_encntrs = elh.select("ENCNTR_ID").distinct()
+    batch_persons = (
+        encounter
+        .join(batch_encntrs, "ENCNTR_ID", "inner")
+        .select("PERSON_ID")
+        .distinct()
+    )
+    
+    person_alias = (
+        spark.table("4_prod.raw.mill_person_alias")
+        .filter(
+            (col("ACTIVE_IND") == 1) &
+            (col("END_EFFECTIVE_DT_TM") > current_timestamp())
+        )
+    )
+    
+    # MRN lookup
+    mrn_window = Window.partitionBy("PERSON_ID").orderBy(col("BEG_EFFECTIVE_DT_TM").desc())
+    mrn_lookup = (
+        person_alias
+        .join(batch_persons, "PERSON_ID", "inner")
+        .filter(
+            (col("PERSON_ALIAS_TYPE_CD") == 10) &
+            col("ALIAS_POOL_CD").isin(683996, 1115132483, 6200990, 6173940)
+        )
+        .withColumn("rn", row_number().over(mrn_window))
+        .filter(col("rn") == 1)
+        .select(
+            col("PERSON_ID"),
+            col("ALIAS").alias("MRN")
+        )
+        .alias("pa_mrn")
+    )
+    
+    # NHS Number lookup
+    nhs_window = Window.partitionBy("PERSON_ID").orderBy(col("BEG_EFFECTIVE_DT_TM").desc())
+    nhs_lookup = (
+        person_alias
+        .join(batch_persons, "PERSON_ID", "inner")
+        .filter(col("PERSON_ALIAS_TYPE_CD") == 18)
+        .withColumn("rn", row_number().over(nhs_window))
+        .filter(col("rn") == 1)
+        .select(
+            col("PERSON_ID"),
+            col("ALIAS").alias("NHS_NUMBER")
+        )
+        .alias("pa_nhs")
+    )
+    
+    # --------------------------------------------------------------------
+    # Create all code value lookups
+    # --------------------------------------------------------------------
+    # Encounter lookups
+    cv_enc_type = create_patient_journey_code_lookup(code_values, "cv_enc_type")
+    cv_enc_class = create_patient_journey_code_lookup(code_values, "cv_enc_class")
+    cv_enc_status = create_patient_journey_code_lookup(code_values, "cv_enc_status")
+    
+    # Admission lookups
+    cv_admit_src = create_patient_journey_code_lookup(code_values, "cv_admit_src")
+    cv_admit_type_enc = create_patient_journey_code_lookup(code_values, "cv_admit_type_enc")
+    cv_admit_mode = create_patient_journey_code_lookup(code_values, "cv_admit_mode")
+    cv_referral_src = create_patient_journey_code_lookup(code_values, "cv_referral_src")
+    cv_readmit = create_patient_journey_code_lookup(code_values, "cv_readmit")
+    
+    # Location hierarchy lookups
+    cv_facility = create_patient_journey_code_lookup(code_values, "cv_facility")
+    cv_building = create_patient_journey_code_lookup(code_values, "cv_building")
+    cv_nurse_unit = create_patient_journey_code_lookup(code_values, "cv_nurse_unit")
+    cv_room = create_patient_journey_code_lookup(code_values, "cv_room")
+    cv_bed = create_patient_journey_code_lookup(code_values, "cv_bed")
+    
+    # Location-level encounter lookups
+    cv_loc_enc_type = create_patient_journey_code_lookup(code_values, "cv_loc_enc_type")
+    cv_loc_enc_class = create_patient_journey_code_lookup(code_values, "cv_loc_enc_class")
+    cv_med_service = create_patient_journey_code_lookup(code_values, "cv_med_service")
+    cv_loc_admit_type = create_patient_journey_code_lookup(code_values, "cv_loc_admit_type")
+    cv_transfer_reason = create_patient_journey_code_lookup(code_values, "cv_transfer_reason")
+    
+    # Accommodation lookups
+    cv_accommodation = create_patient_journey_code_lookup(code_values, "cv_accommodation")
+    cv_accom_reason = create_patient_journey_code_lookup(code_values, "cv_accom_reason")
+    
+    # Alternate level of care lookups
+    cv_alt_lvl_care = create_patient_journey_code_lookup(code_values, "cv_alt_lvl_care")
+    cv_alc_reason = create_patient_journey_code_lookup(code_values, "cv_alc_reason")
+    
+    # Service/Specialty lookups
+    cv_service_cat = create_patient_journey_code_lookup(code_values, "cv_service_cat")
+    cv_program_svc = create_patient_journey_code_lookup(code_values, "cv_program_svc")
+    cv_specialty = create_patient_journey_code_lookup(code_values, "cv_specialty")
+    cv_isolation = create_patient_journey_code_lookup(code_values, "cv_isolation")
+    
+    # Discharge lookups
+    cv_disch_disp = create_patient_journey_code_lookup(code_values, "cv_disch_disp")
+    cv_disch_to = create_patient_journey_code_lookup(code_values, "cv_disch_to")
+    
+    # Clinical flags lookups
+    cv_triage = create_patient_journey_code_lookup(code_values, "cv_triage")
+    cv_trauma = create_patient_journey_code_lookup(code_values, "cv_trauma")
+    cv_ambulatory = create_patient_journey_code_lookup(code_values, "cv_ambulatory")
+    cv_fin_class = create_patient_journey_code_lookup(code_values, "cv_fin_class")
+    cv_vip = create_patient_journey_code_lookup(code_values, "cv_vip")
+    cv_confid = create_patient_journey_code_lookup(code_values, "cv_confid")
+    
+    # --------------------------------------------------------------------
+    # Build main joined DataFrame
+    # --------------------------------------------------------------------
+    processed = (
+        elh
+        # Join to ENCOUNTER
+        .join(encounter, col("elh.ENCNTR_ID") == col("enc.ENCNTR_ID"), "inner")
+        
+        # Patient identifiers
+        .join(mrn_lookup, col("enc.PERSON_ID") == col("pa_mrn.PERSON_ID"), "left")
+        .join(nhs_lookup, col("enc.PERSON_ID") == col("pa_nhs.PERSON_ID"), "left")
+        
+        # Encounter type & class
+        .join(cv_enc_type, col("enc.ENCNTR_TYPE_CD") == col("cv_enc_type.CODE_VALUE"), "left")
+        .join(cv_enc_class, col("enc.ENCNTR_TYPE_CLASS_CD") == col("cv_enc_class.CODE_VALUE"), "left")
+        .join(cv_enc_status, col("enc.ENCNTR_STATUS_CD") == col("cv_enc_status.CODE_VALUE"), "left")
+        
+        # Admission source/type/mode
+        .join(cv_admit_src, col("enc.ADMIT_SRC_CD") == col("cv_admit_src.CODE_VALUE"), "left")
+        .join(cv_admit_type_enc, col("enc.ADMIT_TYPE_CD") == col("cv_admit_type_enc.CODE_VALUE"), "left")
+        .join(cv_admit_mode, col("enc.ADMIT_MODE_CD") == col("cv_admit_mode.CODE_VALUE"), "left")
+        .join(cv_referral_src, col("enc.REFERRAL_SOURCE_CD") == col("cv_referral_src.CODE_VALUE"), "left")
+        .join(cv_readmit, col("enc.READMIT_CD") == col("cv_readmit.CODE_VALUE"), "left")
+        
+        # Location hierarchy
+        .join(cv_facility, col("elh.LOC_FACILITY_CD") == col("cv_facility.CODE_VALUE"), "left")
+        .join(cv_building, col("elh.LOC_BUILDING_CD") == col("cv_building.CODE_VALUE"), "left")
+        .join(cv_nurse_unit, col("elh.LOC_NURSE_UNIT_CD") == col("cv_nurse_unit.CODE_VALUE"), "left")
+        .join(cv_room, col("elh.LOC_ROOM_CD") == col("cv_room.CODE_VALUE"), "left")
+        .join(cv_bed, col("elh.LOC_BED_CD") == col("cv_bed.CODE_VALUE"), "left")
+        
+        # Location-level encounter details
+        .join(cv_loc_enc_type, col("elh.ENCNTR_TYPE_CD") == col("cv_loc_enc_type.CODE_VALUE"), "left")
+        .join(cv_loc_enc_class, col("elh.ENCNTR_TYPE_CLASS_CD") == col("cv_loc_enc_class.CODE_VALUE"), "left")
+        .join(cv_med_service, col("elh.MED_SERVICE_CD") == col("cv_med_service.CODE_VALUE"), "left")
+        .join(cv_loc_admit_type, col("elh.ADMIT_TYPE_CD") == col("cv_loc_admit_type.CODE_VALUE"), "left")
+        .join(cv_transfer_reason, col("elh.TRANSFER_REASON_CD") == col("cv_transfer_reason.CODE_VALUE"), "left")
+        
+        # Accommodation
+        .join(cv_accommodation, col("elh.ACCOMMODATION_CD") == col("cv_accommodation.CODE_VALUE"), "left")
+        .join(cv_accom_reason, col("elh.ACCOMMODATION_REASON_CD") == col("cv_accom_reason.CODE_VALUE"), "left")
+        
+        # Alternate level of care
+        .join(cv_alt_lvl_care, col("elh.ALT_LVL_CARE_CD") == col("cv_alt_lvl_care.CODE_VALUE"), "left")
+        .join(cv_alc_reason, col("elh.ALC_REASON_CD") == col("cv_alc_reason.CODE_VALUE"), "left")
+        
+        # Service/Specialty
+        .join(cv_service_cat, col("elh.SERVICE_CATEGORY_CD") == col("cv_service_cat.CODE_VALUE"), "left")
+        .join(cv_program_svc, col("elh.PROGRAM_SERVICE_CD") == col("cv_program_svc.CODE_VALUE"), "left")
+        .join(cv_specialty, col("elh.SPECIALTY_UNIT_CD") == col("cv_specialty.CODE_VALUE"), "left")
+        .join(cv_isolation, col("elh.ISOLATION_CD") == col("cv_isolation.CODE_VALUE"), "left")
+        
+        # Discharge
+        .join(cv_disch_disp, col("enc.DISCH_DISPOSITION_CD") == col("cv_disch_disp.CODE_VALUE"), "left")
+        .join(cv_disch_to, col("enc.DISCH_TO_LOCTN_CD") == col("cv_disch_to.CODE_VALUE"), "left")
+        
+        # Clinical flags
+        .join(cv_triage, col("enc.TRIAGE_CD") == col("cv_triage.CODE_VALUE"), "left")
+        .join(cv_trauma, col("enc.TRAUMA_CD") == col("cv_trauma.CODE_VALUE"), "left")
+        .join(cv_ambulatory, col("enc.AMBULATORY_COND_CD") == col("cv_ambulatory.CODE_VALUE"), "left")
+        .join(cv_fin_class, col("enc.FINANCIAL_CLASS_CD") == col("cv_fin_class.CODE_VALUE"), "left")
+        .join(cv_vip, col("enc.VIP_CD") == col("cv_vip.CODE_VALUE"), "left")
+        .join(cv_confid, col("enc.CONFID_LEVEL_CD") == col("cv_confid.CODE_VALUE"), "left")
+    )
+    
+    # --------------------------------------------------------------------
+    # Add calculated columns and window functions
+    # --------------------------------------------------------------------
+    # Window for sequencing within encounter
+    journey_window = Window.partitionBy("elh.ENCNTR_ID").orderBy(
+        coalesce(col("elh.ARRIVE_DT_TM"), col("elh.BEG_EFFECTIVE_DT_TM"))
+    )
+    journey_window_desc = Window.partitionBy("elh.ENCNTR_ID").orderBy(
+        coalesce(col("elh.ARRIVE_DT_TM"), col("elh.BEG_EFFECTIVE_DT_TM")).desc()
+    )
+    count_window = Window.partitionBy("elh.ENCNTR_ID")
+    
+    result_df = processed.select(
+        # ========================================================================
+        # IDENTIFIERS
+        # ========================================================================
+        col("elh.ENCNTR_LOC_HIST_ID").cast(LongType()).alias("ENCNTR_LOC_HIST_ID"),
+        col("elh.ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
+        col("enc.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+        col("pa_mrn.MRN").cast(StringType()).alias("MRN"),
+        col("pa_nhs.NHS_NUMBER").cast(StringType()).alias("NHS_NUMBER"),
+        
+        # ========================================================================
+        # ENCOUNTER CONTEXT
+        # ========================================================================
+        col("enc.ENCNTR_TYPE_CD").cast(DoubleType()).alias("ENCNTR_TYPE_CD"),
+        col("cv_enc_type_display").alias("ENCNTR_TYPE_DESC"),
+        col("enc.ENCNTR_TYPE_CLASS_CD").cast(DoubleType()).alias("ENCNTR_TYPE_CLASS_CD"),
+        col("cv_enc_class_display").alias("ENCNTR_TYPE_CLASS_DESC"),
+        col("enc.ENCNTR_STATUS_CD").cast(DoubleType()).alias("ENCNTR_STATUS_CD"),
+        col("cv_enc_status_display").alias("ENCNTR_STATUS_DESC"),
+        
+        # ========================================================================
+        # ADMISSION DETAILS
+        # ========================================================================
+        col("enc.ADMIT_SRC_CD").cast(DoubleType()).alias("ADMIT_SRC_CD"),
+        col("cv_admit_src_display").alias("ADMIT_SRC_DESC"),
+        col("enc.ADMIT_TYPE_CD").cast(DoubleType()).alias("ENCOUNTER_ADMIT_TYPE_CD"),
+        col("cv_admit_type_enc_display").alias("ENCOUNTER_ADMIT_TYPE_DESC"),
+        col("enc.ADMIT_MODE_CD").cast(DoubleType()).alias("ADMIT_MODE_CD"),
+        col("cv_admit_mode_display").alias("ADMIT_MODE_DESC"),
+        col("enc.REFERRAL_SOURCE_CD").cast(DoubleType()).alias("REFERRAL_SOURCE_CD"),
+        col("cv_referral_src_display").alias("REFERRAL_SOURCE_DESC"),
+        col("enc.READMIT_CD").cast(DoubleType()).alias("READMIT_CD"),
+        col("cv_readmit_display").alias("READMIT_DESC"),
+        col("enc.REASON_FOR_VISIT").cast(StringType()).alias("REASON_FOR_VISIT"),
+        
+        # ========================================================================
+        # LOCATION HIERARCHY
+        # ========================================================================
+        col("elh.LOC_FACILITY_CD").cast(DoubleType()).alias("LOC_FACILITY_CD"),
+        col("cv_facility_display").alias("FACILITY_DESC"),
+        col("elh.LOC_BUILDING_CD").cast(DoubleType()).alias("LOC_BUILDING_CD"),
+        col("cv_building_display").alias("BUILDING_DESC"),
+        col("elh.LOC_NURSE_UNIT_CD").cast(DoubleType()).alias("LOC_NURSE_UNIT_CD"),
+        col("cv_nurse_unit_display").alias("NURSE_UNIT_DESC"),
+        col("elh.LOC_ROOM_CD").cast(DoubleType()).alias("LOC_ROOM_CD"),
+        col("cv_room_display").alias("ROOM_DESC"),
+        col("elh.LOC_BED_CD").cast(DoubleType()).alias("LOC_BED_CD"),
+        col("cv_bed_display").alias("BED_DESC"),
+        
+        # ========================================================================
+        # LOCATION-LEVEL ENCOUNTER DETAILS
+        # ========================================================================
+        col("elh.ENCNTR_TYPE_CD").cast(DoubleType()).alias("LOC_ENCNTR_TYPE_CD"),
+        col("cv_loc_enc_type_display").alias("LOC_ENCNTR_TYPE_DESC"),
+        col("elh.ENCNTR_TYPE_CLASS_CD").cast(DoubleType()).alias("LOC_ENCNTR_TYPE_CLASS_CD"),
+        col("cv_loc_enc_class_display").alias("LOC_ENCNTR_TYPE_CLASS_DESC"),
+        col("elh.MED_SERVICE_CD").cast(DoubleType()).alias("MED_SERVICE_CD"),
+        col("cv_med_service_display").alias("MED_SERVICE_DESC"),
+        col("elh.ADMIT_TYPE_CD").cast(DoubleType()).alias("LOC_ADMIT_TYPE_CD"),
+        col("cv_loc_admit_type_display").alias("LOC_ADMIT_TYPE_DESC"),
+        
+        # ========================================================================
+        # TRANSFER DETAILS
+        # ========================================================================
+        col("elh.TRANSFER_REASON_CD").cast(DoubleType()).alias("TRANSFER_REASON_CD"),
+        col("cv_transfer_reason_display").alias("TRANSFER_REASON_DESC"),
+        
+        # ========================================================================
+        # ACCOMMODATION
+        # ========================================================================
+        col("elh.ACCOMMODATION_CD").cast(DoubleType()).alias("ACCOMMODATION_CD"),
+        col("cv_accommodation_display").alias("ACCOMMODATION_DESC"),
+        col("elh.ACCOMMODATION_REASON_CD").cast(DoubleType()).alias("ACCOMMODATION_REASON_CD"),
+        col("cv_accom_reason_display").alias("ACCOMMODATION_REASON_DESC"),
+        
+        # ========================================================================
+        # ALTERNATE LEVEL OF CARE
+        # ========================================================================
+        col("elh.ALT_LVL_CARE_CD").cast(DoubleType()).alias("ALT_LVL_CARE_CD"),
+        col("cv_alt_lvl_care_display").alias("ALT_LVL_CARE_DESC"),
+        col("elh.ALC_REASON_CD").cast(DoubleType()).alias("ALC_REASON_CD"),
+        col("cv_alc_reason_display").alias("ALC_REASON_DESC"),
+        
+        # ========================================================================
+        # SERVICE & SPECIALTY
+        # ========================================================================
+        col("elh.SERVICE_CATEGORY_CD").cast(DoubleType()).alias("SERVICE_CATEGORY_CD"),
+        col("cv_service_cat_display").alias("SERVICE_CATEGORY_DESC"),
+        col("elh.PROGRAM_SERVICE_CD").cast(DoubleType()).alias("PROGRAM_SERVICE_CD"),
+        col("cv_program_svc_display").alias("PROGRAM_SERVICE_DESC"),
+        col("elh.SPECIALTY_UNIT_CD").cast(DoubleType()).alias("SPECIALTY_UNIT_CD"),
+        col("cv_specialty_display").alias("SPECIALTY_UNIT_DESC"),
+        
+        # ========================================================================
+        # ISOLATION
+        # ========================================================================
+        col("elh.ISOLATION_CD").cast(DoubleType()).alias("ISOLATION_CD"),
+        col("cv_isolation_display").alias("ISOLATION_DESC"),
+        
+        # ========================================================================
+        # TIMING - LOCATION MOVEMENT
+        # ========================================================================
+        col("elh.ARRIVE_DT_TM").cast(TimestampType()).alias("LOC_ARRIVE_DT_TM"),
+        col("elh.DEPART_DT_TM").cast(TimestampType()).alias("LOC_DEPART_DT_TM"),
+        col("elh.BEG_EFFECTIVE_DT_TM").cast(TimestampType()).alias("LOC_BEG_EFFECTIVE_DT_TM"),
+        col("elh.END_EFFECTIVE_DT_TM").cast(TimestampType()).alias("LOC_END_EFFECTIVE_DT_TM"),
+        col("elh.TRANSACTION_DT_TM").cast(TimestampType()).alias("LOC_TRANSACTION_DT_TM"),
+        col("elh.ACTIVITY_DT_TM").cast(TimestampType()).alias("LOC_ACTIVITY_DT_TM"),
+        
+        # Calculate location LOS in hours
+        F.round(
+            (unix_timestamp(coalesce(col("elh.DEPART_DT_TM"), col("elh.END_EFFECTIVE_DT_TM"))) -
+             unix_timestamp(coalesce(col("elh.ARRIVE_DT_TM"), col("elh.BEG_EFFECTIVE_DT_TM")))) / 3600.0,
+            2
+        ).cast(DoubleType()).alias("LOC_LENGTH_OF_STAY_HOURS"),
+        
+        # ========================================================================
+        # TIMING - ENCOUNTER LEVEL
+        # ========================================================================
+        col("enc.PRE_REG_DT_TM").cast(TimestampType()).alias("PRE_REG_DT_TM"),
+        col("enc.REG_DT_TM").cast(TimestampType()).alias("REG_DT_TM"),
+        col("enc.ARRIVE_DT_TM").cast(TimestampType()).alias("ENCNTR_ARRIVE_DT_TM"),
+        col("enc.INPATIENT_ADMIT_DT_TM").cast(TimestampType()).alias("INPATIENT_ADMIT_DT_TM"),
+        col("enc.DISCH_DT_TM").cast(TimestampType()).alias("DISCH_DT_TM"),
+        col("enc.DEPART_DT_TM").cast(TimestampType()).alias("ENCNTR_DEPART_DT_TM"),
+        col("enc.EST_LENGTH_OF_STAY").cast(IntegerType()).alias("EST_LENGTH_OF_STAY"),
+        
+        # Calculate encounter LOS in days
+        F.round(
+            (unix_timestamp(coalesce(col("enc.DISCH_DT_TM"), col("enc.DEPART_DT_TM"))) -
+             unix_timestamp(coalesce(col("enc.ARRIVE_DT_TM"), col("enc.REG_DT_TM")))) / 86400.0,
+            2
+        ).cast(DoubleType()).alias("ENCNTR_LENGTH_OF_STAY_DAYS"),
+        
+        # ========================================================================
+        # DISCHARGE DETAILS
+        # ========================================================================
+        col("enc.DISCH_DISPOSITION_CD").cast(DoubleType()).alias("DISCH_DISPOSITION_CD"),
+        col("cv_disch_disp_display").alias("DISCH_DISPOSITION_DESC"),
+        col("enc.DISCH_TO_LOCTN_CD").cast(DoubleType()).alias("DISCH_TO_LOCTN_CD"),
+        col("cv_disch_to_display").alias("DISCH_TO_LOCTN_DESC"),
+        
+        # ========================================================================
+        # TRIAGE & CLINICAL FLAGS
+        # ========================================================================
+        col("enc.TRIAGE_CD").cast(DoubleType()).alias("TRIAGE_CD"),
+        col("cv_triage_display").alias("TRIAGE_DESC"),
+        col("enc.TRIAGE_DT_TM").cast(TimestampType()).alias("TRIAGE_DT_TM"),
+        col("enc.TRAUMA_CD").cast(DoubleType()).alias("TRAUMA_CD"),
+        col("cv_trauma_display").alias("TRAUMA_DESC"),
+        col("enc.AMBULATORY_COND_CD").cast(DoubleType()).alias("AMBULATORY_COND_CD"),
+        col("cv_ambulatory_display").alias("AMBULATORY_COND_DESC"),
+        col("enc.FINANCIAL_CLASS_CD").cast(DoubleType()).alias("FINANCIAL_CLASS_CD"),
+        col("cv_fin_class_display").alias("FINANCIAL_CLASS_DESC"),
+        col("enc.VIP_CD").cast(DoubleType()).alias("VIP_CD"),
+        col("cv_vip_display").alias("VIP_DESC"),
+        col("enc.CONFID_LEVEL_CD").cast(DoubleType()).alias("CONFID_LEVEL_CD"),
+        col("cv_confid_display").alias("CONFID_LEVEL_DESC"),
+        
+        # ========================================================================
+        # SEQUENCE / ORDERING (Window functions)
+        # ========================================================================
+        row_number().over(journey_window).cast(IntegerType()).alias("LOCATION_SEQUENCE"),
+        
+        lag(col("cv_nurse_unit_display")).over(journey_window).alias("PREV_NURSE_UNIT"),
+        lead(col("cv_nurse_unit_display")).over(journey_window).alias("NEXT_NURSE_UNIT"),
+        
+        when(row_number().over(journey_window) == 1, lit(1))
+            .otherwise(lit(0)).cast(IntegerType()).alias("IS_FIRST_LOCATION"),
+        
+        when(row_number().over(journey_window_desc) == 1, lit(1))
+            .otherwise(lit(0)).cast(IntegerType()).alias("IS_LAST_LOCATION"),
+        
+        F.count("*").over(count_window).cast(IntegerType()).alias("TOTAL_LOCATIONS_VISITED"),
+        
+        # ========================================================================
+        # ORGANIZATION
+        # ========================================================================
+        col("elh.ORGANIZATION_ID").cast(LongType()).alias("ORGANIZATION_ID"),
+        
+        # ========================================================================
+        # AUDIT / UPDATE TRACKING
+        # ========================================================================
+        greatest(
+            col("elh.UPDT_DT_TM"),
+            col("enc.UPDT_DT_TM")
+        ).alias("ADC_UPDT")
+    )
+    
+    # --------------------------------------------------------------------
+    # Deduplicate on ENCNTR_LOC_HIST_ID
+    # --------------------------------------------------------------------
+    dedup_window = Window.partitionBy("ENCNTR_LOC_HIST_ID").orderBy(col("ADC_UPDT").desc())
+    
+    final_df = (
+        result_df
+        .withColumn("_rn", row_number().over(dedup_window))
+        .filter(col("_rn") == 1)
+        .drop("_rn")
+    )
+    
+    print(f"[INFO] Patient journey mapping complete. Output records: {final_df.count()}")
+    return final_df
+
+
+def process_patient_journey_incremental():
+    """
+    End-to-end processing of incremental patient journey updates into:
+    4_prod.bronze.map_patient_journey
+    """
+    try:
+        print(f"[INFO] Starting patient journey incremental pipeline at {datetime.now()}")
+        updates_df = create_patient_journey_mapping_incr()
+        
+        if updates_df is None:
+            print("[INFO] No patient journey updates to process. Pipeline complete.")
+            return
+        
+        # Verify no duplicates before merge
+        if verify_no_duplicates(updates_df, "ENCNTR_LOC_HIST_ID"):
+            update_table(
+                updates_df,
+                "4_prod.bronze.map_patient_journey",
+                "ENCNTR_LOC_HIST_ID",
+                schema_map_patient_journey,
+                map_patient_journey_comment
+            )
+            print("[INFO] Successfully updated map_patient_journey")
+        else:
+            print("[WARN] Merge aborted due to duplicates on ENCNTR_LOC_HIST_ID. Please investigate.")
+            
+    except Exception as e:
+        print(f"[ERROR] Error processing patient journey updates: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+# Execute the pipeline
+process_patient_journey_incremental()
