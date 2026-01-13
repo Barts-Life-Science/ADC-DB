@@ -203,6 +203,89 @@ def apply_trust_filter_to_df(df, table_name: str = None):
     
     return df.filter(col("Trust") == "Barts")
 
+
+def extract_udi_components_udf():
+    """
+    UDF to extract GS1 and HIBCC UDI components from serial/catalog number fields.
+    
+    GS1 format: 01[14-digit GTIN]17[YYMMDD expiry]11[YYMMDD prod]10[batch]21[serial]
+    HIBCC format: +[labeler][product] or +$$[production id]
+    """
+    from datetime import datetime
+    import re
+    
+    def extract(serial_number, catalogue_number):
+        result = {
+            "gs1_di": None, 
+            "gs1_prod_date": None, 
+            "gs1_exp_date": None,
+            "gs1_batch": None, 
+            "gs1_serial": None,
+            "hibcc_di": None, 
+            "hibcc_pi": None
+        }
+        
+        # Process both fields
+        for value in [serial_number, catalogue_number]:
+            if not value or not isinstance(value, str):
+                continue
+            
+            remaining = value.strip()
+            
+            # GS1 sequential parsing
+            while remaining:
+                if remaining.startswith('01') and len(remaining) >= 16:
+                    result['gs1_di'] = remaining[2:16]
+                    remaining = remaining[16:]
+                elif remaining.startswith('17') and len(remaining) >= 8:
+                    try:
+                        result['gs1_exp_date'] = datetime.strptime(remaining[2:8], '%y%m%d')
+                    except ValueError:
+                        pass
+                    remaining = remaining[8:]
+                elif remaining.startswith('11') and len(remaining) >= 8:
+                    try:
+                        result['gs1_prod_date'] = datetime.strptime(remaining[2:8], '%y%m%d')
+                    except ValueError:
+                        pass
+                    remaining = remaining[8:]
+                elif remaining.startswith('10'):
+                    result['gs1_batch'] = remaining[2:].strip()
+                    break
+                elif remaining.startswith('21'):
+                    result['gs1_serial'] = remaining[2:].strip()
+                    break
+                else:
+                    break
+            
+            # HIBCC parsing
+            if value.startswith('+$$'):
+                result['hibcc_pi'] = value[3:]
+            elif value.startswith('+'):
+                result['hibcc_di'] = value[1:]
+        
+        return (
+            result['gs1_di'],
+            result['gs1_prod_date'],
+            result['gs1_exp_date'],
+            result['gs1_batch'],
+            result['gs1_serial'],
+            result['hibcc_di'],
+            result['hibcc_pi']
+        )
+    
+    schema = StructType([
+        StructField("gs1_di", StringType()),
+        StructField("gs1_prod_date", TimestampType()),
+        StructField("gs1_exp_date", TimestampType()),
+        StructField("gs1_batch", StringType()),
+        StructField("gs1_serial", StringType()),
+        StructField("hibcc_di", StringType()),
+        StructField("hibcc_pi", StringType())
+    ])
+    
+    return udf(extract, schema)
+
 # COMMAND ----------
 
 
@@ -1075,6 +1158,24 @@ schema_map_person = StructType([
         metadata={"comment": "The year of birth."}
     ),
     StructField(
+        name="birth_month",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "The month of birth (1-12)."}
+    ),
+    StructField(
+        name="birth_day",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "The day of birth (1-31)."}
+    ),
+    StructField(
+        name="birth_datetime",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "The full birth date and time."}
+    ),
+    StructField(
         name="ethnicity_cd",
         dataType=DoubleType(),
         nullable=True,
@@ -1099,6 +1200,7 @@ def create_person_mapping_incr():
     """
     Creates an incremental person mapping table that processes only new or modified records.
     Includes data quality validations and deduplication to prevent Merge errors.
+    
     
     Returns:
         DataFrame: Processed person records with standardized format
@@ -1132,7 +1234,7 @@ def create_person_mapping_incr():
         .alias("addr")
     )
     
-    # Get base person data with filtering - UNPACK THE TUPLE
+    # Get base person data with filtering
     base_persons, record_count = get_incremental_data_with_cdf(
         source_table="4_prod.raw.mill_person",
         target_table="4_prod.bronze.map_person",
@@ -1166,10 +1268,25 @@ def create_person_mapping_incr():
             col("PERSON_ID") == col("addr.PARENT_ENTITY_ID"),
             "left"
         )
-        # Calculate birth year
+        # Calculate birth year, month, day
         .withColumn(
             "birth_year", 
             year(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_month",
+            month(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_day",
+            dayofmonth(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_datetime",
+            col("BIRTH_DT_TM")
         )
     )
     
@@ -1191,33 +1308,34 @@ def create_person_mapping_incr():
     if validation_failures.count() > 0:
         print(f"WARNING: {validation_failures.count()} records failed validation")
     
-    # --- NEW: DEDUPLICATION LOGIC ---
-    # Resolves DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
-    # If CDF returns multiple updates for one person, keep only the latest one.
+    # Deduplication: keep only the latest record per person
     deduped_persons = (
         validated_persons
         .withColumn(
-            "dedupe_rank", 
+            "row_rank",
             row_number().over(
                 Window.partitionBy("PERSON_ID")
                 .orderBy(col("ADC_UPDT").desc())
             )
         )
-        .filter(col("dedupe_rank") == 1)
-        .drop("dedupe_rank")
+        .filter(col("row_rank") == 1)
+        .drop("row_rank")
     )
     
-    # Select final columns with standardized names
-    final_df = deduped_persons.select(
-        col("PERSON_ID").alias("person_id"),
-        col("SEX_CD").alias("gender_cd"),
-        col("birth_year"),
-        col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
-        col("addr.ADDRESS_ID").alias("address_id"),
-        col("ADC_UPDT") 
+    return (
+        deduped_persons
+        .select(
+            col("PERSON_ID").alias("person_id"),
+            col("SEX_CD").alias("gender_cd"),
+            col("birth_year"),
+            col("birth_month"),   
+            col("birth_day"),       
+            col("birth_datetime"),   
+            col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
+            col("addr.ADDRESS_ID").alias("address_id"),
+            col("ADC_UPDT")
+        )
     )
-    
-    return final_df
     
 updates_df = create_person_mapping_incr()
 
@@ -8930,3 +9048,315 @@ def process_patient_journey_incremental():
 
 # Execute the pipeline
 process_patient_journey_incremental()
+
+# COMMAND ----------
+
+map_implant_details_comment = "Surgical implant details extracted from SurgiNet clinical events. Contains manufacturer, description, serial numbers, and UDI identifiers."
+
+schema_map_implant_details = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "Primary key - the implant description event ID"
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "Encounter identifier"
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "Patient identifier"
+    }),
+    StructField("PRIMARY_PROCEDURE", StringType(), True, metadata={
+        "comment": "Primary surgical procedure description"
+    }),
+    StructField("PROCEDURE_CAT", LongType(), True, metadata={
+        "comment": "Procedure catalog code"
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel who performed/recorded the implant"
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Clinically significant update datetime (implant date)"
+    }),
+    StructField("CATALOGUE_NUMBER", StringType(), True, metadata={
+        "comment": "Manufacturer catalogue/part number"
+    }),
+    StructField("COMPATIBILITY", StringType(), True, metadata={
+        "comment": "Compatibility confirmation"
+    }),
+    StructField("CONFIRM_MANUFACTURER", StringType(), True, metadata={
+        "comment": "Manufacturer confirmation"
+    }),
+    StructField("CONFIRM_STERILITY", StringType(), True, metadata={
+        "comment": "Sterility confirmation"
+    }),
+    StructField("EXPIRY_DATE", TimestampType(), True, metadata={
+        "comment": "Device expiration date"
+    }),
+    StructField("IMPLANT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Free text description of the implant device"
+    }),
+    StructField("MANUFACTURER", StringType(), True, metadata={
+        "comment": "Implant manufacturer name"
+    }),
+    StructField("QUANTITY", StringType(), True, metadata={
+        "comment": "Number of devices implanted"
+    }),
+    StructField("SCRUB_NURSE_CONFIRMS", StringType(), True, metadata={
+        "comment": "Scrub nurse confirmation"
+    }),
+    StructField("SCRUB_NURSE_READ", StringType(), True, metadata={
+        "comment": "Scrub nurse read confirmation"
+    }),
+    StructField("SERIAL_NUMBER", StringType(), True, metadata={
+        "comment": "Device serial number"
+    }),
+    StructField("SIDE_OF_PROCEDURE", StringType(), True, metadata={
+        "comment": "Laterality (left/right/bilateral)"
+    }),
+    StructField("SIZE", StringType(), True, metadata={
+        "comment": "Device size"
+    }),
+    StructField("STERILISATION_DATE", TimestampType(), True, metadata={
+        "comment": "Device sterilization date"
+    }),
+    StructField("SURGEON_CONFIRM", StringType(), True, metadata={
+        "comment": "Surgeon confirmation"
+    }),
+    StructField("GS1_IDENTIFIER", StringType(), True, metadata={
+        "comment": "GS1 UDI Device Identifier (UDI-DI)"
+    }),
+    StructField("GS1_PRODUCTION_DATE", TimestampType(), True, metadata={
+        "comment": "GS1 production date from barcode"
+    }),
+    StructField("GS1_EXPIRY_DATE", TimestampType(), True, metadata={
+        "comment": "GS1 expiry date from barcode"
+    }),
+    StructField("GS1_BATCH_NUMBER", StringType(), True, metadata={
+        "comment": "GS1 batch/lot number from barcode"
+    }),
+    StructField("GS1_SERIAL_NUMBER", StringType(), True, metadata={
+        "comment": "GS1 serial number from barcode (UDI-PI)"
+    }),
+    StructField("HIBCC_DEVICE_ID", StringType(), True, metadata={
+        "comment": "HIBCC UDI Device Identifier"
+    }),
+    StructField("HIBCC_PROD_ID", StringType(), True, metadata={
+        "comment": "HIBCC Production Identifier"
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update"
+    })
+])
+
+
+
+def create_implant_details_incr():
+    """
+    Creates an incremental implant details table from SurgiNet clinical events.
+    
+    Uses window functions to group related implant events (different EVENT_CDs)
+    into single implant records, keyed by the implant description event.
+    
+    Returns:
+        DataFrame or None: Processed implant details, or None if no incremental data
+    """
+    
+    # Column mapping from EVENT_TITLE_TEXT to clean column names
+    column_mapping = {
+        'SN - IM - Quantity': 'QUANTITY',
+        'SN - IM - Confirm Side of Procedure': 'SIDE_OF_PROCEDURE',
+        'SN - IM - Confirm Compatibility': 'COMPATIBILITY',
+        'SN - IM - Expiry Date': 'EXPIRY_DATE',
+        'SN - IM - Scrub Nurse Read': 'SCRUB_NURSE_READ',
+        'SN - IM - Surgeon Confirm Implant': 'SURGEON_CONFIRM',
+        'SN - IM - Manufacturer': 'MANUFACTURER',
+        'SN - IM - Confirm Manufacturer': 'CONFIRM_MANUFACTURER',
+        'SN - IM - Implant Description': 'IMPLANT_DESCRIPTION',
+        'SN - IM - Scrub Nurse Confirms': 'SCRUB_NURSE_CONFIRMS',
+        'SN - IM - Sterilisation Date': 'STERILISATION_DATE',
+        'SN - IM - Confirm Sterility': 'CONFIRM_STERILITY',
+        'SN - IM - Catalogue Number': 'CATALOGUE_NUMBER',
+        'SN - IM - Serial Number': 'SERIAL_NUMBER',
+        'SN - IM - Size': 'SIZE'
+    }
+    
+    # Build CASE statement for column renaming
+    case_statements = [f"WHEN EVENT_TITLE_TEXT = '{old}' THEN '{new}'" 
+                      for old, new in column_mapping.items()]
+    case_when = f"CASE {' '.join(case_statements)} ELSE EVENT_TITLE_TEXT END"
+    
+    # Get incremental base implant events (EVENT_CD = 71837900 is the implant description)
+    # This determines which encounters have new/updated implants
+    base_events, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_clinical_event",
+        target_table="4_prod.bronze.map_implant_details",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("EVENT_CD") == 71837900)
+    )
+    
+    if record_count == 0:
+        print("[INFO] No incremental implant data to process. Skipping.")
+        return None
+    
+    # Get the encounter IDs that need processing
+    incremental_encntr_ids = base_events.select("ENCNTR_ID").distinct()
+    
+    # Main query with window functions to group implant events
+    events_df = spark.sql(f"""
+        WITH base_events AS (
+            SELECT EVENT_ID, ENCNTR_ID, PERSON_ID
+            FROM 4_prod.raw.mill_clinical_event
+            WHERE VALID_UNTIL_DT_TM > NOW()
+            AND EVENT_CD = 71837900
+        ),
+        procedure_events AS (
+            SELECT 
+                p.ENCNTR_ID,
+                prev.EVENT_TAG as PRIMARY_PROCEDURE,
+                prev.CATALOG_CD as PROCEDURE_CAT,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.ENCNTR_ID 
+                    ORDER BY p.PARENT_EVENT_ID DESC, p.EVENT_ID DESC
+                ) as rn
+            FROM 4_prod.raw.mill_clinical_event p
+            JOIN 4_prod.raw.mill_clinical_event prev 
+                ON p.ENCNTR_ID = prev.ENCNTR_ID
+                AND prev.EVENT_CD = 3016930
+                AND prev.PARENT_EVENT_ID = p.PARENT_EVENT_ID
+                AND prev.EVENT_ID < p.EVENT_ID
+            WHERE p.VALID_UNTIL_DT_TM > NOW()
+            AND p.EVENT_CD = 3016928
+            AND p.EVENT_TAG = 'Yes'
+        ),
+        primary_procedure AS (
+            SELECT ENCNTR_ID, PRIMARY_PROCEDURE, PROCEDURE_CAT
+            FROM procedure_events
+            WHERE rn = 1
+        ),
+        numbered_events AS (
+            SELECT 
+                mce.EVENT_ID,
+                mce.ENCNTR_ID,
+                be.PERSON_ID,
+                pp.PRIMARY_PROCEDURE,
+                pp.PROCEDURE_CAT,
+                mce.PERFORMED_PRSNL_ID,
+                mce.CLINSIG_UPDT_DT_TM,
+                mce.ADC_UPDT,
+                {case_when} as EVENT_TITLE_TEXT,
+                mce.EVENT_TAG,
+                mce.EVENT_CD,
+                -- Group events by counting implant descriptions
+                SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID 
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_group,
+                -- Get the implant event ID for this group
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.EVENT_ID END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_event_id,
+                -- Get metadata from the implant description event
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.PERFORMED_PRSNL_ID END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_performed_prsnl_id,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.CLINSIG_UPDT_DT_TM END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_clinsig_updt_dt_tm,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.ADC_UPDT END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_adc_updt
+            FROM 4_prod.raw.mill_clinical_event mce
+            INNER JOIN base_events be ON mce.ENCNTR_ID = be.ENCNTR_ID
+            LEFT JOIN primary_procedure pp ON mce.ENCNTR_ID = pp.ENCNTR_ID
+            WHERE mce.VALID_UNTIL_DT_TM > NOW()
+            AND mce.EVENT_TITLE_TEXT LIKE 'SN - IM %'
+        )
+        SELECT * FROM numbered_events
+    """)
+    
+    # Filter to only incremental encounters
+    events_df = events_df.join(
+        broadcast(incremental_encntr_ids),
+        "ENCNTR_ID",
+        "inner"
+    )
+    
+    # Pivot to create one row per implant
+    pivoted = events_df.groupBy(
+        'implant_event_id', 
+        'ENCNTR_ID', 
+        'PERSON_ID', 
+        'PRIMARY_PROCEDURE', 
+        'PROCEDURE_CAT',
+        'implant_performed_prsnl_id',
+        'implant_clinsig_updt_dt_tm',
+        'implant_adc_updt'
+    ).pivot(
+        'EVENT_TITLE_TEXT'
+    ).agg(first('EVENT_TAG'))
+    
+    # Helper to extract date from format "1:YYYYMMDD00000000:0.000000:0:0"
+    def extract_date(col_name):
+        return when(col(col_name).isNotNull(), 
+                   to_timestamp(regexp_extract(col(col_name), r'1:(\d{8})', 1), 'yyyyMMdd'))
+    
+    # Clean date and quantity columns
+    result = (pivoted
+        .withColumn('EXPIRY_DATE', extract_date('EXPIRY_DATE'))
+        .withColumn('STERILISATION_DATE', extract_date('STERILISATION_DATE'))
+        .withColumn('QUANTITY', regexp_replace(col('QUANTITY'), r'[^0-9]', ''))
+        .withColumnRenamed('implant_event_id', 'EVENT_ID')
+        .withColumnRenamed('implant_performed_prsnl_id', 'PERFORMED_PRSNL_ID')
+        .withColumnRenamed('implant_clinsig_updt_dt_tm', 'CLINSIG_UPDT_DT_TM')
+        .withColumnRenamed('implant_adc_updt', 'ADC_UPDT'))
+    
+    # Extract UDI components
+    extract_udi = extract_udi_components_udf()
+    
+    result = (result
+        .withColumn("udi", extract_udi(col("SERIAL_NUMBER"), col("CATALOGUE_NUMBER")))
+        .withColumn("GS1_IDENTIFIER", col("udi.gs1_di"))
+        .withColumn("GS1_PRODUCTION_DATE", col("udi.gs1_prod_date"))
+        .withColumn("GS1_EXPIRY_DATE", col("udi.gs1_exp_date"))
+        .withColumn("GS1_BATCH_NUMBER", col("udi.gs1_batch"))
+        .withColumn("GS1_SERIAL_NUMBER", col("udi.gs1_serial"))
+        .withColumn("HIBCC_DEVICE_ID", col("udi.hibcc_di"))
+        .withColumn("HIBCC_PROD_ID", col("udi.hibcc_pi"))
+        .drop("udi"))
+    
+    return result
+
+
+    
+
+# COMMAND ----------
+
+# Implant Details
+implant_details_df = create_implant_details_incr()
+if implant_details_df is not None:
+    update_table(
+        source_df=implant_details_df,
+        target_table="4_prod.bronze.map_implant_details",
+        index_column="EVENT_ID",
+        target_schema=schema_map_implant_details,
+        table_comment=map_implant_details_comment
+    )
