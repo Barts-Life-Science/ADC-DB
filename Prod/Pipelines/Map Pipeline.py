@@ -9,6 +9,8 @@ from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
 from pyspark.storagelevel import StorageLevel
+from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.ml.feature import Normalizer
 
 # COMMAND ----------
 
@@ -5236,11 +5238,13 @@ def process_date_events_incremental():
     """
     Main function to process incremental date events updates.
     Handles the end-to-end process of updating the date events mapping table.
+    
+    FIXED: Added deduplication by EVENT_ID before merge to prevent 
+    DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE error.
     """
     try:
         print(f"Starting date events incremental processing at {datetime.now()}")
         
-
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_date_events")
         current_ts = current_timestamp()
         
@@ -5428,6 +5432,20 @@ def process_date_events_incremental():
                 )
             )
             
+            # ============================================================
+            # FIX: Deduplicate by EVENT_ID before merge
+            # This prevents DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
+            # when CDF returns multiple updates for the same EVENT_ID
+            # ============================================================
+            dedup_window = Window.partitionBy("EVENT_ID").orderBy(col("ADC_UPDT").desc())
+            result_df = (
+                result_df
+                .withColumn("_dedup_rank", row_number().over(dedup_window))
+                .filter(col("_dedup_rank") == 1)
+                .drop("_dedup_rank")
+            )
+            print(f"After deduplication: {result_df.count()} unique EVENT_IDs")
+            # ============================================================
 
             update_table(result_df, "4_prod.bronze.map_date_events", "EVENT_ID", schema_map_date_events, map_date_events_comment)
             print("Successfully updated date events mapping table")
@@ -9051,6 +9069,274 @@ process_patient_journey_incremental()
 
 # COMMAND ----------
 
+# Procedure categories → expected device keywords (for strict filtering)
+PROCEDURE_DEVICE_RULES = {
+    # Eye procedures
+    "cataract": ["lens", "iol", "intraocular", "implant", "phaco"],
+    "phacoemulsification": ["lens", "iol", "intraocular", "implant"],
+    
+    # Joint replacements
+    "knee replacement": ["tibial", "femoral", "patella", "knee", "polyethylene", "bearing", "component"],
+    "hip replacement": ["femoral", "acetabular", "hip", "head", "stem", "liner", "cup"],
+    "shoulder replacement": ["humeral", "glenoid", "shoulder"],
+    "arthroplasty": ["prosthesis", "component", "implant", "head", "stem"],
+    
+    # Fracture fixation
+    "fracture": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod", "k-wire"],
+    "orif": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod"],
+    "internal fixation": ["screw", "plate", "pin", "nail", "wire", "fixation"],
+    
+    # Soft tissue
+    "hernia": ["mesh", "plug", "patch", "prolene", "vicryl"],
+    "repair": ["mesh", "suture", "anchor", "patch"],
+    
+    # Urology
+    "stent": ["stent", "catheter", "ureteral", "pigtail"],
+    "ureteroscopy": ["stent", "catheter", "ureteral"],
+    "cystoscopy": ["stent", "catheter"],
+    
+    # Cardiac
+    "pacemaker": ["pacemaker", "lead", "generator", "icd", "crt", "electrode"],
+    "cardiac": ["stent", "valve", "pacemaker", "lead"],
+    
+    # Gynecology
+    "iud": ["mirena", "iud", "intrauterine", "coil", "levonorgestrel"],
+    "contraceptive": ["mirena", "iud", "implant", "coil"],
+    
+    # Spine
+    "spinal": ["screw", "rod", "cage", "plate", "fusion"],
+    "discectomy": ["cage", "spacer", "implant"],
+    
+    # Vascular
+    "vascular": ["stent", "graft", "catheter"],
+    "angioplasty": ["stent", "balloon"],
+}
+
+
+def get_procedure_category(procedure_text):
+    """
+    Map procedure text to device category.
+    Returns the first matching category or 'other'.
+    """
+    if not procedure_text:
+        return None
+    proc_lower = procedure_text.lower()
+    for category in PROCEDURE_DEVICE_RULES.keys():
+        if category in proc_lower:
+            return category
+    return "other"
+
+
+def device_matches_procedure(device_name, procedure_category):
+    """
+    Check if device concept is valid for procedure category (strict filter).
+    Returns True if device keywords match procedure expectations, or if no rule exists.
+    """
+    if procedure_category is None or procedure_category == "other":
+        return True  # Allow if no specific rule
+    keywords = PROCEDURE_DEVICE_RULES.get(procedure_category, [])
+    if not keywords:
+        return True
+    device_lower = device_name.lower() if device_name else ""
+    return any(kw in device_lower for kw in keywords)
+
+
+def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
+    """
+    Creates a lookup DataFrame that maps implant descriptions to SNOMED device concepts
+    using pre-computed embeddings AND procedure validation.
+    
+    CHUNKED VERSION: Processes implants in batches to avoid timeout on large cross-joins.
+    SERVERLESS COMPATIBLE: No Spark ML or cache/unpersist operations.
+    
+    Args:
+        chunk_size: Number of (implant, procedure) pairs to process per batch.
+                   Default 5000 creates ~67M rows per chunk (5000 x 13333).
+    
+    Returns:
+        DataFrame with columns:
+        - IMPLANT_DESCRIPTION_NORMALIZED (join key)
+        - PRIMARY_PROCEDURE (join key)
+        - SNOMED_DEVICE_CONCEPT_ID
+        - SNOMED_DEVICE_CONCEPT_NAME
+        - SIMILARITY_SCORE
+        - PROCEDURE_CATEGORY
+    """
+    SIMILARITY_THRESHOLD = 0.7
+    
+    # Check if embedding tables exist
+    if not spark.catalog.tableExists("3_lookup.embeddings.implant_descriptions"):
+        print("[WARN] Implant embeddings not found. Run sync_and_embed_implant_descriptions() first.")
+        return None
+    
+    if not spark.catalog.tableExists("3_lookup.embeddings.device_concepts"):
+        print("[WARN] Device concept embeddings not found. Run sync_and_embed_device_concepts() first.")
+        return None
+    
+    print("[INFO] Loading embeddings and computing device mappings with procedure validation (CHUNKED)...")
+    
+    # Load unique implant description + procedure combinations
+    implant_procedures = (spark.table("4_prod.bronze.map_implant_details")
+        .filter(col("IMPLANT_DESCRIPTION").isNotNull())
+        .filter(trim(col("IMPLANT_DESCRIPTION")) != "")
+        .select(
+            initcap(lower(trim(col("IMPLANT_DESCRIPTION")))).alias("implant_term_normalized"),
+            col("PRIMARY_PROCEDURE")
+        )
+        .distinct())
+    
+    total_combinations = implant_procedures.count()
+    print(f"[INFO] Unique (implant, procedure) combinations: {total_combinations}")
+    
+    # Load implant embeddings
+    implant_embeddings = (spark.table("3_lookup.embeddings.implant_descriptions")
+        .filter(col("embedding_vector").isNotNull())
+        .select(
+            initcap(lower(trim(col("term")))).alias("embed_term"),
+            col("embedding_vector").cast(ArrayType(FloatType())).alias("implant_embedding")
+        ))
+    
+    # Join to get embeddings for our implant descriptions
+    implants_with_emb = (implant_procedures
+        .join(implant_embeddings,
+              col("implant_term_normalized") == col("embed_term"),
+              "inner")
+        .drop("embed_term"))
+    
+    implants_with_emb_count = implants_with_emb.count()
+    print(f"[INFO] Implants with embeddings: {implants_with_emb_count}")
+    
+    # Load device concepts with embeddings
+    device_concepts = (spark.table("4_prod.omop.concept")
+        .filter(col("domain_id") == "Device")
+        .filter(col("standard_concept") == "S")
+        .filter(col("vocabulary_id") == "SNOMED")
+        .filter(col("concept_class_id") == "Physical Object")
+        .filter(col("invalid_reason").isNull())
+        .select(
+            col("concept_id").alias("device_concept_id"),
+            col("concept_name")
+        ))
+    
+    device_embeddings = (spark.table("3_lookup.embeddings.device_concepts")
+        .filter(col("embedding_vector").isNotNull())
+        .select(
+            initcap(lower(trim(col("term")))).alias("device_term_normalized"),
+            col("embedding_vector").cast(ArrayType(FloatType())).alias("device_embedding")
+        ))
+    
+    # Join device embeddings with concept IDs
+    device_with_ids = (device_embeddings
+        .join(device_concepts,
+              col("device_term_normalized") == initcap(lower(trim(col("concept_name")))),
+              "inner")
+        .select("device_concept_id", "concept_name", "device_embedding"))
+    
+    device_count = device_with_ids.count()
+    print(f"[INFO] Device concepts with embeddings: {device_count}")
+    
+    # Add row numbers for chunking
+    implants_numbered = implants_with_emb.withColumn(
+        "row_num", 
+        row_number().over(Window.orderBy("implant_term_normalized", "PRIMARY_PROCEDURE"))
+    )
+    
+    # Calculate number of chunks
+    num_chunks = (implants_with_emb_count + chunk_size - 1) // chunk_size
+    print(f"[INFO] Processing in {num_chunks} chunks of up to {chunk_size} implants each...")
+    print(f"[INFO] Estimated rows per chunk: ~{chunk_size * device_count:,}")
+    
+    # UDF for cosine similarity (pure numpy, no Spark ML)
+    @udf(DoubleType())
+    def cosine_similarity_udf(v1, v2):
+        if v1 is None or v2 is None:
+            return None
+        a = np.array(v1)
+        b = np.array(v2)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
+    
+    # UDF for procedure category
+    @udf(StringType())
+    def get_procedure_category_udf(procedure):
+        return get_procedure_category(procedure)
+    
+    # UDF for procedure validation
+    @udf(BooleanType())
+    def validate_procedure_device_udf(device_name, procedure_category):
+        return device_matches_procedure(device_name, procedure_category)
+    
+    # Process chunks and write intermediate results to temp table
+    temp_table = "8_dev.default.temp_implant_device_mapping"
+    
+    for chunk_idx in range(num_chunks):
+        chunk_start = chunk_idx * chunk_size + 1
+        chunk_end = (chunk_idx + 1) * chunk_size
+        
+        print(f"[INFO] Processing chunk {chunk_idx + 1}/{num_chunks} (rows {chunk_start}-{chunk_end})...")
+        
+        # Get this chunk of implants
+        chunk_implants = implants_numbered.filter(
+            (col("row_num") >= chunk_start) & (col("row_num") <= chunk_end)
+        ).drop("row_num")
+        
+        # Cross join with device embeddings
+        cross_joined = chunk_implants.crossJoin(broadcast(device_with_ids))
+        
+        # Compute similarity and apply procedure filter
+        with_similarity = (cross_joined
+            .withColumn("similarity", cosine_similarity_udf(col("implant_embedding"), col("device_embedding")))
+            .withColumn("procedure_category", get_procedure_category_udf(col("PRIMARY_PROCEDURE")))
+            .withColumn("procedure_valid", validate_procedure_device_udf(col("concept_name"), col("procedure_category")))
+            .filter(col("similarity") >= SIMILARITY_THRESHOLD)
+            .filter(col("procedure_valid") == True))
+        
+        # Get best match per (implant_description, procedure) combination
+        w = Window.partitionBy("implant_term_normalized", "PRIMARY_PROCEDURE").orderBy(col("similarity").desc())
+        
+        chunk_best = (with_similarity
+            .withColumn("rank", row_number().over(w))
+            .filter(col("rank") == 1)
+            .select(
+                col("implant_term_normalized").alias("IMPLANT_DESCRIPTION_NORMALIZED"),
+                col("PRIMARY_PROCEDURE"),
+                col("device_concept_id").alias("SNOMED_DEVICE_CONCEPT_ID"),
+                col("concept_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
+                col("similarity").alias("SIMILARITY_SCORE"),
+                col("procedure_category").alias("PROCEDURE_CATEGORY")
+            ))
+        
+        # Write chunk results to temp table (append mode)
+        if chunk_idx == 0:
+            chunk_best.write.mode("overwrite").saveAsTable(temp_table)
+        else:
+            chunk_best.write.mode("append").saveAsTable(temp_table)
+        
+        chunk_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {temp_table}").collect()[0].cnt
+        print(f"[INFO] Chunk {chunk_idx + 1} complete. Total rows in temp table: {chunk_count}")
+    
+    # Read combined results and do final deduplication
+    print("[INFO] Reading combined results and deduplicating...")
+    combined = spark.table(temp_table)
+    
+    # Final deduplication (in case a combo appeared in multiple chunks due to edge cases)
+    w_final = Window.partitionBy("IMPLANT_DESCRIPTION_NORMALIZED", "PRIMARY_PROCEDURE").orderBy(col("SIMILARITY_SCORE").desc())
+    
+    best_matches = (combined
+        .withColumn("rank", row_number().over(w_final))
+        .filter(col("rank") == 1)
+        .drop("rank"))
+    
+    match_count = best_matches.count()
+    print(f"[INFO] Total mappings with procedure validation: {match_count}")
+    
+    return best_matches
+
+# COMMAND ----------
+
 map_implant_details_comment = "Surgical implant details extracted from SurgiNet clinical events. Contains manufacturer, description, serial numbers, and UDI identifiers."
 
 schema_map_implant_details = StructType([
@@ -9152,11 +9438,19 @@ def create_implant_details_incr():
     """
     Creates an incremental implant details table from SurgiNet clinical events.
     
+    EXTENDED: Now includes SNOMED device concept mapping using embeddings + procedure validation.
+    
     Uses window functions to group related implant events (different EVENT_CDs)
     into single implant records, keyed by the implant description event.
     
     Returns:
-        DataFrame or None: Processed implant details, or None if no incremental data
+        DataFrame or None: Processed implant details with SNOMED mapping, or None if no incremental data
+    
+    New columns added:
+        - SNOMED_DEVICE_CONCEPT_ID: Best matching SNOMED device concept (validated against procedure)
+        - SNOMED_DEVICE_CONCEPT_NAME: Concept name
+        - SIMILARITY_SCORE: Cosine similarity score (0-1)
+        - PROCEDURE_CATEGORY: Detected procedure category used for validation
     """
     
     # Column mapping from EVENT_TITLE_TEXT to clean column names
@@ -9184,7 +9478,6 @@ def create_implant_details_incr():
     case_when = f"CASE {' '.join(case_statements)} ELSE EVENT_TITLE_TEXT END"
     
     # Get incremental base implant events (EVENT_CD = 71837900 is the implant description)
-    # This determines which encounters have new/updated implants
     base_events, record_count = get_incremental_data_with_cdf(
         source_table="4_prod.raw.mill_clinical_event",
         target_table="4_prod.bronze.map_implant_details",
@@ -9245,12 +9538,10 @@ def create_implant_details_incr():
                 {case_when} as EVENT_TITLE_TEXT,
                 mce.EVENT_TAG,
                 mce.EVENT_CD,
-                -- Group events by counting implant descriptions
                 SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
                     OVER (PARTITION BY mce.ENCNTR_ID 
                           ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
                                   mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_group,
-                -- Get the implant event ID for this group
                 FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.EVENT_ID END) 
                     OVER (PARTITION BY mce.ENCNTR_ID, 
                           SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
@@ -9259,7 +9550,6 @@ def create_implant_details_incr():
                                             mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
                           ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
                                   mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_event_id,
-                -- Get metadata from the implant description event
                 FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.PERFORMED_PRSNL_ID END) 
                     OVER (PARTITION BY mce.ENCNTR_ID, 
                           SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
@@ -9342,6 +9632,43 @@ def create_implant_details_incr():
         .withColumn("HIBCC_DEVICE_ID", col("udi.hibcc_di"))
         .withColumn("HIBCC_PROD_ID", col("udi.hibcc_pi"))
         .drop("udi"))
+    
+    # =========================================================================
+    # NEW: Add SNOMED device mapping using embeddings + procedure validation
+    # =========================================================================
+    device_mapping = get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000)
+    
+    if device_mapping is not None:
+        # Normalize implant description for join
+        result = result.withColumn(
+            "IMPLANT_DESCRIPTION_NORMALIZED",
+            initcap(lower(trim(col("IMPLANT_DESCRIPTION"))))
+        )
+        
+        # Left join with device mapping on BOTH implant description AND procedure
+        result = (result
+            .join(
+                broadcast(device_mapping),
+                (result.IMPLANT_DESCRIPTION_NORMALIZED == device_mapping.IMPLANT_DESCRIPTION_NORMALIZED) &
+                (result.PRIMARY_PROCEDURE.eqNullSafe(device_mapping.PRIMARY_PROCEDURE)),
+                "left"
+            )
+            .drop(device_mapping.IMPLANT_DESCRIPTION_NORMALIZED)
+            .drop(device_mapping.PRIMARY_PROCEDURE)
+            .drop("IMPLANT_DESCRIPTION_NORMALIZED"))
+        
+        mapped_count = result.filter(col('SNOMED_DEVICE_CONCEPT_ID').isNotNull()).count()
+        total_count = result.count()
+        print(f"[INFO] Added SNOMED device mapping with procedure validation.")
+        print(f"[INFO] Records with mapping: {mapped_count}/{total_count} ({100.0*mapped_count/total_count:.1f}%)")
+    else:
+        # Add empty columns if mapping not available
+        print("[WARN] Device mapping not available. Adding NULL columns.")
+        result = (result
+            .withColumn("SNOMED_DEVICE_CONCEPT_ID", lit(None).cast(IntegerType()))
+            .withColumn("SNOMED_DEVICE_CONCEPT_NAME", lit(None).cast(StringType()))
+            .withColumn("SIMILARITY_SCORE", lit(None).cast(DoubleType()))
+            .withColumn("PROCEDURE_CATEGORY", lit(None).cast(StringType())))
     
     return result
 
