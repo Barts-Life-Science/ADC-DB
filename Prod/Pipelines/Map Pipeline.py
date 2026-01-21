@@ -9636,7 +9636,7 @@ def create_implant_details_incr():
     # =========================================================================
     # NEW: Add SNOMED device mapping using embeddings + procedure validation
     # =========================================================================
-    device_mapping = get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000)
+    device_mapping = get_device_mapping_lookup_with_procedure_chunked(chunk_size=100)
     
     if device_mapping is not None:
         # Normalize implant description for join

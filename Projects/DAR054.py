@@ -60,17 +60,8 @@ rde_tables = [
     'rde_critopcs',
     # Radiology
     'rde_radiology',
-    # Free Text (NLP)
+    # Free Text 
     'rde_blobdataset',
-    # Cancer Registry
-    'rde_scr_diagnosis', 
-    'rde_scr_careplan', 
-    'rde_scr_deftreatment', 
-    'rde_scr_investigations', 
-    'rde_scr_pathology', 
-    'rde_scr_referrals',
-    'rde_scr_demographics',
-    'rde_scr_trackingcomments',
     # Additional clinical data
     'rde_allergydetails',
     'rde_family_history',
@@ -101,10 +92,10 @@ columns_to_exclude = ['ADC_UPDT']
 cohort_sql = f"""
 CREATE OR REPLACE VIEW 6_mgmt.cohorts.{project_identifier} AS
 SELECT DISTINCT Person_ID AS PERSON_ID
-FROM 4_prod.rde.rde_all_diagnosis
-WHERE Catalogue = 'ICD10WHO'
-AND Diagnosis_code RLIKE '^C(8[1-6]|88|9[0-6])'
+FROM 4_prod.bronze.map_diagnosis
+WHERE ICD10_CODE RLIKE '^C(8[1-6]|88|9[0-6])'
 """
+
 spark.sql(cohort_sql)
 print(f"Created cohort view: 6_mgmt.cohorts.{project_identifier}")
 
@@ -341,12 +332,6 @@ display(spark.sql(f"SHOW VIEWS IN 5_projects.{project_identifier}"))
 
 # COMMAND ----------
 
-# Verify IG filtering on demographics (check excluded columns)
-print("3. Demographics columns (after IG filtering):")
-display(spark.sql(f"DESCRIBE 5_projects.{project_identifier}.rde_patient_demographics"))
-
-# COMMAND ----------
-
 # Verify subcohort view
 print("4. Subcohort distribution:")
 display(spark.sql(f"""
@@ -358,24 +343,3 @@ display(spark.sql(f"""
     GROUP BY SUBCOHORT
     ORDER BY SUBCOHORT
 """))
-
-# COMMAND ----------
-
-# Sample data availability
-print("5. Sample data counts:")
-data_counts = spark.sql(f"""
-    SELECT 
-        'Demographics' as data_type, COUNT(*) as record_count 
-    FROM 5_projects.{project_identifier}.rde_patient_demographics
-    UNION ALL
-    SELECT 'Diagnoses', COUNT(*) FROM 5_projects.{project_identifier}.rde_all_diagnosis
-    UNION ALL
-    SELECT 'Encounters', COUNT(*) FROM 5_projects.{project_identifier}.rde_encounter
-    UNION ALL
-    SELECT 'Pathology', COUNT(*) FROM 5_projects.{project_identifier}.rde_pathology
-    UNION ALL
-    SELECT 'Allergies', COUNT(*) FROM 5_projects.{project_identifier}.rde_allergydetails
-    UNION ALL
-    SELECT 'Clinical Trials', COUNT(*) FROM 5_projects.{project_identifier}.rde_mill_powertrials
-""")
-display(data_counts)
