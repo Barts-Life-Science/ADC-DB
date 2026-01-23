@@ -1,31 +1,24 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # DAR054 - Preventing serious complications in patients with haematological malignancies
+# MAGIC DAR054 - Preventing serious complications in patients with haematological malignancies
+# MAGIC Partner: Pulse AI (Commercial)
 # MAGIC
-# MAGIC **Partner:** Pulse AI (Commercial)
+# MAGIC Purpose: ML model development for predicting complications (neutropenic sepsis, TLS, CRS, etc.)
 # MAGIC
-# MAGIC **Purpose:** ML model development for predicting complications (neutropenic sepsis, TLS, CRS, etc.)
+# MAGIC Cohort: Patients with specified haematological malignancy ICD-10 codes:
 # MAGIC
-# MAGIC **Cohort:** Patients with ICD-10 codes C81-C96 (haematological malignancies)
-# MAGIC - C81: Hodgkin lymphoma
-# MAGIC - C82: Follicular lymphoma
-# MAGIC - C83: Non-follicular lymphoma
-# MAGIC - C84: Mature T/NK-cell lymphomas
-# MAGIC - C85: Other non-Hodgkin lymphoma
-# MAGIC - C86: Other T/NK-cell lymphomas
-# MAGIC - C88: Malignant immunoproliferative diseases
-# MAGIC - C90: Multiple myeloma and plasmacytomas
-# MAGIC - C91: Lymphoid leukaemia
-# MAGIC - C92: Myeloid leukaemia
-# MAGIC - C93: Monocytic leukaemia
-# MAGIC - C94: Other leukaemias
-# MAGIC - C95: Leukaemia unspecified
-# MAGIC - C96: Other malignant neoplasms of lymphoid/haematopoietic tissue
+# MAGIC Category	ICD-10 Range	Description
+# MAGIC Lymphoma	C81-C85	Hodgkin and Non-Hodgkin lymphomas
+# MAGIC AML	C92.0-C92.9	Acute Myeloid Leukaemia
+# MAGIC Multiple Myeloma	C90	Plasma cell disorders
+# MAGIC MDS	D46	Myelodysplastic Syndromes
+# MAGIC CLL/Lymphoid	C91	CLL and related lymphoid leukaemias
+# MAGIC CML	C92.1-C92.2	Chronic Myeloid Leukaemia
+# MAGIC SUBCOHORT: Available via subcohort view with:
 # MAGIC
-# MAGIC **SUBCOHORT:** ICD-10 category (C81, C82, etc.) for disease subtyping - available via `subcohort` view
-# MAGIC
-# MAGIC ---
-# MAGIC **Note:** This notebook should be moved to `/Workspace/Shared/ADC-DB/Projects/DAR054` for production use.
+# MAGIC CATEGORY: Disease category (Lymphoma, AML, Multiple Myeloma, MDS, CLL/Lymphoid Leukaemia, CML)
+# MAGIC TIER: Risk tier (Tier 1 = High early complication risk, Tier 2 = Lower risk)
+# MAGIC SUBTYPE: Specific ICD-10 code (e.g., C83.3)
 
 # COMMAND ----------
 
@@ -70,6 +63,9 @@ rde_tables = [
     'rde_powerforms'
 ]
 
+# Bronze/map tables to include (from 4_prod.bronze)
+map_tables = ['map_patient_journey']
+
 # IG thresholds - STRICT (confirmed for external commercial access)
 # max_ig_risk = 3 excludes: MRN, NHS_Number, Postcode, DOB, DOD, raw BlobContents
 # max_ig_severity = 2 excludes: unanonymized free text
@@ -88,12 +84,46 @@ columns_to_exclude = ['ADC_UPDT']
 
 # COMMAND ----------
 
+cohort_codes = [
+    # Lymphoma (C81-C85) - Tier 1
+    'C835', 'C844', 'C833', 'C831', 'C851', 'C859', 'C817',
+    # Lymphoma (C81-C85) - Tier 2
+    'C823', 'C830', 'C822', 'C821', 'C820', 'C840', 
+    'C810', 'C811', 'C812', 'C813', 'C814',
+    # AML (C92) - Tier 1
+    'C924', 'C926', 'C925', 'C920',
+    # AML (C92) - Tier 2
+    'C928', 'C929', 'C923', 'C927',
+    # Multiple Myeloma (C90) - Tier 1
+    'C902', 'C900', 'C909',
+    # Multiple Myeloma (C90) - Tier 2
+    'C901', 'C903',
+    # MDS (D46) - Tier 1
+    'D462', 'D469',
+    # MDS (D46) - Tier 2
+    'D460', 'D461', 'D464',
+    # CLL/Lymphoid (C91) - Tier 1
+    'C912', 'C913', 'C910',
+    # CLL/Lymphoid (C91) - Tier 2
+    'C911', 'C914', 'C915', 'C917', 'C919',
+    # CML (C92.1-C92.2) - Tier 1
+    'C922',
+    # CML (C92.1-C92.2) - Tier 2
+    'C921'
+]
+
+# Create SQL-friendly list
+cohort_codes_sql = ", ".join([f"'{code}'" for code in cohort_codes])
+
 # Create cohort view in 6_mgmt.cohorts (distinct patients only)
 cohort_sql = f"""
 CREATE OR REPLACE VIEW 6_mgmt.cohorts.{project_identifier} AS
 SELECT DISTINCT Person_ID AS PERSON_ID
 FROM 4_prod.bronze.map_diagnosis
-WHERE ICD10_CODE RLIKE '^C(8[1-6]|88|9[0-6])'
+WHERE (
+    SUBSTRING(REPLACE(ICD10_CODE, '.', '') , 1, 5) IN ({cohort_codes_sql})
+    OR SUBSTRING(REPLACE(ICD10_CODE, '.', '') , 1, 4) IN ({cohort_codes_sql})
+)
 """
 
 spark.sql(cohort_sql)
@@ -186,6 +216,55 @@ def get_person_id_column(table_name):
     else:
         return None
 
+
+def find_person_id_column(full_table_path):
+    """
+    Find the person ID column in a table given its full path.
+    Searches for common variations of the person identifier column name.
+    """
+    columns = spark.table(full_table_path).columns
+    potential_columns = [
+        'PERSON_ID', 'person_id', 'Person_ID', 'personid', 
+        'PERSONID', 'PersonID', 'participant_id'
+    ]
+    
+    for col in potential_columns:
+        if col in columns:
+            return col
+            
+    # Fallback: fuzzy match for any column containing 'person' and 'id'
+    for col in columns:
+        col_lower = col.lower()
+        if 'person' in col_lower and 'id' in col_lower:
+            return col
+            
+    return None
+
+
+def process_and_create_views(tables, source_catalog, source_schema, project_id):
+    """
+    Generic function to create cohort-filtered views for a list of tables
+    from a specific source location. Selects all columns (*).
+    """
+    for table in tables:
+        full_table_path = f"{source_catalog}.{source_schema}.{table}"
+        person_id_col = find_person_id_column(full_table_path)
+        
+        if person_id_col:
+            view_sql = f"""
+            CREATE OR REPLACE VIEW 5_projects.{project_id}.{table}
+            AS
+            SELECT m.*
+            FROM {full_table_path} m
+            INNER JOIN 6_mgmt.cohorts.{project_id} c
+            ON m.{person_id_col} = c.PERSON_ID
+            """
+            spark.sql(view_sql)
+            created_views.append(table)
+            print(f"Created view: 5_projects.{project_id}.{table}")
+        else:
+            print(f"Warning: No person ID column found in {full_table_path}. Skipping view creation for {table}.")
+
 # COMMAND ----------
 
 # Create filtered views for each RDE table
@@ -235,6 +314,11 @@ for table in rde_tables:
 
 # COMMAND ----------
 
+# Process map tables from bronze schema
+process_and_create_views(map_tables, '4_prod', 'bronze', project_identifier)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Create Subcohort Lookup View
 # MAGIC
@@ -243,33 +327,120 @@ for table in rde_tables:
 
 # COMMAND ----------
 
-# Create subcohort lookup view
 subcohort_sql = f"""
 CREATE OR REPLACE VIEW 5_projects.{project_identifier}.subcohort AS
+WITH coded_diagnoses AS (
+    SELECT
+        PERSON_ID,
+        REPLACE(ICD10_CODE, '.', '') AS Diagnosis_code,
+        SUBSTRING(Diagnosis_code, 1, 5) AS code_5char,
+        SUBSTRING(Diagnosis_code, 1, 4) AS code_4char,
+        DIAG_DT_TM AS DIAGNOSIS_DATE
+    FROM 4_prod.bronze.map_diagnosis
+    WHERE Person_ID IN (SELECT PERSON_ID FROM 6_mgmt.cohorts.{project_identifier})
+),
+categorized AS (
+    SELECT
+        PERSON_ID,
+        Diagnosis_code,
+        DIAGNOSIS_DATE,
+        -- Determine SUBTYPE (the specific code)
+        CASE
+            WHEN code_5char IN ('C835','C844','C833','C831','C851','C859','C817',
+                                'C823','C830','C822','C821','C820','C840',
+                                'C810','C811','C812','C813','C814') THEN code_5char
+            WHEN code_5char IN ('C924','C926','C925','C920','C928','C929','C923','C927','C922','C921') THEN code_5char
+            WHEN code_5char IN ('C902','C900','C909','C901','C903') THEN code_5char
+            WHEN code_5char IN ('D462','D469','D460','D461','D464') THEN code_5char
+            WHEN code_5char IN ('C912','C913','C910','C911','C914','C915','C917','C919') THEN code_5char
+            WHEN code_4char IN ('C835','C844','C833','C831','C851','C859','C817',
+                                'C823','C830','C822','C821','C820','C840',
+                                'C810','C811','C812','C813','C814') THEN code_4char
+            WHEN code_4char IN ('C924','C926','C925','C920','C928','C929','C923','C927','C922','C921') THEN code_4char
+            WHEN code_4char IN ('C902','C900','C909','C901','C903') THEN code_4char
+            WHEN code_4char IN ('D462','D469','D460','D461','D464') THEN code_4char
+            WHEN code_4char IN ('C912','C913','C910','C911','C914','C915','C917','C919') THEN code_4char
+            ELSE NULL
+        END AS SUBTYPE,
+        -- Determine CATEGORY
+        CASE
+            WHEN code_5char LIKE 'C81%' OR code_5char LIKE 'C82%' OR code_5char LIKE 'C83%' 
+                 OR code_5char LIKE 'C84%' OR code_5char LIKE 'C85%'
+                 OR code_4char LIKE 'C81%' OR code_4char LIKE 'C82%' OR code_4char LIKE 'C83%' 
+                 OR code_4char LIKE 'C84%' OR code_4char LIKE 'C85%' THEN 'Lymphoma'
+            WHEN (code_5char IN ('C924','C926','C925','C920','C928','C929','C923','C927')
+                  OR code_4char IN ('C924','C926','C925','C920','C928','C929','C923','C927')) THEN 'AML'
+            WHEN (code_5char IN ('C921','C922') OR code_4char IN ('C921','C922')) THEN 'CML'
+            WHEN code_5char LIKE 'C90%' OR code_4char LIKE 'C90%' THEN 'Multiple Myeloma'
+            WHEN code_5char LIKE 'D46%' OR code_4char LIKE 'D46%' THEN 'MDS'
+            WHEN code_5char LIKE 'C91%' OR code_4char LIKE 'C91%' THEN 'CLL/Lymphoid Leukaemia'
+            ELSE NULL
+        END AS CATEGORY,
+        -- Determine TIER
+        CASE
+            -- Lymphoma Tier 1
+            WHEN code_5char IN ('C835','C844','C833','C831','C851','C859','C817')
+                 OR code_4char IN ('C835','C844','C833','C831','C851','C859','C817') THEN 'Tier 1'
+            -- Lymphoma Tier 2
+            WHEN code_5char IN ('C823','C830','C822','C821','C820','C840','C810','C811','C812','C813','C814')
+                 OR code_4char IN ('C823','C830','C822','C821','C820','C840','C810','C811','C812','C813','C814') THEN 'Tier 2'
+            -- AML Tier 1
+            WHEN code_5char IN ('C924','C926','C925','C920')
+                 OR code_4char IN ('C924','C926','C925','C920') THEN 'Tier 1'
+            -- AML Tier 2
+            WHEN code_5char IN ('C928','C929','C923','C927')
+                 OR code_4char IN ('C928','C929','C923','C927') THEN 'Tier 2'
+            -- Multiple Myeloma Tier 1
+            WHEN code_5char IN ('C902','C900','C909')
+                 OR code_4char IN ('C902','C900','C909') THEN 'Tier 1'
+            -- Multiple Myeloma Tier 2
+            WHEN code_5char IN ('C901','C903')
+                 OR code_4char IN ('C901','C903') THEN 'Tier 2'
+            -- MDS Tier 1
+            WHEN code_5char IN ('D462','D469')
+                 OR code_4char IN ('D462','D469') THEN 'Tier 1'
+            -- MDS Tier 2
+            WHEN code_5char IN ('D460','D461','D464')
+                 OR code_4char IN ('D460','D461','D464') THEN 'Tier 2'
+            -- CLL/Lymphoid Tier 1
+            WHEN code_5char IN ('C912','C913','C910')
+                 OR code_4char IN ('C912','C913','C910') THEN 'Tier 1'
+            -- CLL/Lymphoid Tier 2
+            WHEN code_5char IN ('C911','C914','C915','C917','C919')
+                 OR code_4char IN ('C911','C914','C915','C917','C919') THEN 'Tier 2'
+            -- CML Tier 1
+            WHEN code_5char = 'C922' OR code_4char = 'C922' THEN 'Tier 1'
+            -- CML Tier 2
+            WHEN code_5char = 'C921' OR code_4char = 'C921' THEN 'Tier 2'
+            ELSE NULL
+        END AS TIER
+    FROM coded_diagnoses
+)
 SELECT
-    Person_ID AS PERSON_ID,
-    SUBSTRING(Diagnosis_code, 1, 3) AS SUBCOHORT,
+    PERSON_ID,
+    CATEGORY,
+    TIER,
+    SUBTYPE,
     Diagnosis_code AS DIAGNOSIS_CODE,
-    Code_text AS DIAGNOSIS_DESCRIPTION,
-    MIN(Diagnosis_date) AS FIRST_DIAGNOSIS_DATE
-FROM 4_prod.rde.rde_all_diagnosis
-WHERE Catalogue = 'ICD10WHO'
-AND Diagnosis_code RLIKE '^C(8[1-6]|88|9[0-6])'
-AND Person_ID IN (SELECT PERSON_ID FROM 6_mgmt.cohorts.{project_identifier})
-GROUP BY Person_ID, SUBSTRING(Diagnosis_code, 1, 3), Diagnosis_code, Code_text
-ORDER BY Person_ID, FIRST_DIAGNOSIS_DATE
+    MIN(DIAGNOSIS_DATE) AS FIRST_DIAGNOSIS_DATE
+FROM categorized
+WHERE SUBTYPE IS NOT NULL
+GROUP BY PERSON_ID, CATEGORY, TIER, SUBTYPE, Diagnosis_code
+ORDER BY PERSON_ID, CATEGORY, TIER, FIRST_DIAGNOSIS_DATE
 """
 spark.sql(subcohort_sql)
 print(f"Created subcohort view: 5_projects.{project_identifier}.subcohort")
 
-# Display subcohort breakdown
+# Display subcohort breakdown by category and tier
 subcohort_breakdown = spark.sql(f"""
     SELECT 
-        SUBCOHORT as icd10_category,
+        CATEGORY,
+        TIER,
+        SUBTYPE,
         COUNT(DISTINCT PERSON_ID) as patient_count
     FROM 5_projects.{project_identifier}.subcohort
-    GROUP BY SUBCOHORT
-    ORDER BY SUBCOHORT
+    GROUP BY CATEGORY, TIER, SUBTYPE
+    ORDER BY CATEGORY, TIER, SUBTYPE
 """)
 display(subcohort_breakdown)
 
@@ -336,10 +507,10 @@ display(spark.sql(f"SHOW VIEWS IN 5_projects.{project_identifier}"))
 print("4. Subcohort distribution:")
 display(spark.sql(f"""
     SELECT 
-        SUBCOHORT,
+        SUBTYPE,
         COUNT(DISTINCT PERSON_ID) as patients,
         COUNT(*) as diagnosis_records
     FROM 5_projects.{project_identifier}.subcohort
-    GROUP BY SUBCOHORT
-    ORDER BY SUBCOHORT
+    GROUP BY SUBTYPE
+    ORDER BY SUBTYPE
 """))
