@@ -9113,27 +9113,25 @@ PROCEDURE_DEVICE_RULES = {
 }
 
 
+
 def get_procedure_category(procedure_text):
-    """
-    Map procedure text to device category.
-    Returns the first matching category or 'other'.
-    """
+    """Map procedure text to device category."""
     if not procedure_text:
-        return None
+        return "other"
     proc_lower = procedure_text.lower()
     for category in PROCEDURE_DEVICE_RULES.keys():
         if category in proc_lower:
             return category
     return "other"
 
+# Register as UDF
+get_procedure_category_udf = F.udf(get_procedure_category, StringType())
+
 
 def device_matches_procedure(device_name, procedure_category):
-    """
-    Check if device concept is valid for procedure category (strict filter).
-    Returns True if device keywords match procedure expectations, or if no rule exists.
-    """
+    """Check if device concept is valid for procedure category."""
     if procedure_category is None or procedure_category == "other":
-        return True  # Allow if no specific rule
+        return True
     keywords = PROCEDURE_DEVICE_RULES.get(procedure_category, [])
     if not keywords:
         return True
@@ -9141,28 +9139,90 @@ def device_matches_procedure(device_name, procedure_category):
     return any(kw in device_lower for kw in keywords)
 
 
-def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
+def add_cosine_similarity_column(df, v1_col_name, v2_col_name, output_col_name="similarity"):
     """
-    Creates a lookup DataFrame that maps implant descriptions to SNOMED device concepts
-    using pre-computed embeddings AND procedure validation.
+    Add a cosine similarity column using native Spark functions.
     
-    CHUNKED VERSION: Processes implants in batches to avoid timeout on large cross-joins.
-    SERVERLESS COMPATIBLE: No Spark ML or cache/unpersist operations.
+    Much faster than a Python UDF because:
+    - No Python↔JVM serialization per row
+    - Catalyst can optimize the computation
+    - Runs natively in the JVM
+    """
+    v1 = col(v1_col_name)
+    v2 = col(v2_col_name)
+    
+    # Dot product: sum of element-wise products
+    dot_product = F.aggregate(
+        F.zip_with(v1, v2, lambda x, y: x * y),
+        F.lit(0.0).cast("double"),
+        lambda acc, x: acc + x
+    )
+    
+    # L2 norms
+    norm1 = F.sqrt(F.aggregate(v1, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
+    norm2 = F.sqrt(F.aggregate(v2, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
+    
+    # Cosine similarity with zero-division protection
+    similarity = F.when(
+        (norm1 == 0) | (norm2 == 0), 
+        F.lit(0.0)
+    ).otherwise(
+        dot_product / (norm1 * norm2)
+    )
+    
+    return df.withColumn(output_col_name, similarity)
+
+def build_device_category_lookup(device_concepts_df):
+    """
+    Build a mapping of procedure_category → list of valid device_concept_ids.
+    
+    This enables pre-filtering devices BEFORE the cross join, dramatically reducing
+    the number of similarity computations needed.
+    """
+    # Collect all device concepts to driver (small enough - typically <20k devices)
+    devices = device_concepts_df.select("device_concept_id", "concept_name").collect()
+    
+    category_to_devices = {}
+    
+    for category, keywords in PROCEDURE_DEVICE_RULES.items():
+        matching_ids = []
+        for row in devices:
+            device_name = (row.concept_name or "").lower()
+            if any(kw in device_name for kw in keywords):
+                matching_ids.append(row.device_concept_id)
+        category_to_devices[category] = matching_ids
+    
+    # "other" category matches all devices
+    category_to_devices["other"] = [row.device_concept_id for row in devices]
+    
+    return category_to_devices
+
+
+BROADCAST_THRESHOLD = 1000
+
+
+
+def get_device_mapping_incremental(chunk_size=500):
+    """
+    INCREMENTAL version: Only computes mappings for NEW implant+procedure combinations.
+    
+    OPTIMIZATIONS (v4):
+    - Native Spark cosine similarity (no Python UDF)
+    - Pre-filters devices by procedure category BEFORE cross join
+    - Uses temp Delta tables instead of .cache() (serverless compatible)
+    - Writes each chunk directly (avoids OOM from unioning many DataFrames)
+    - Conditional broadcast (only for small device sets < 1000)
     
     Args:
-        chunk_size: Number of (implant, procedure) pairs to process per batch.
-                   Default 5000 creates ~67M rows per chunk (5000 x 13333).
+        chunk_size: Number of new combinations to process per batch (default 500)
     
     Returns:
-        DataFrame with columns:
-        - IMPLANT_DESCRIPTION_NORMALIZED (join key)
-        - PRIMARY_PROCEDURE (join key)
-        - SNOMED_DEVICE_CONCEPT_ID
-        - SNOMED_DEVICE_CONCEPT_NAME
-        - SIMILARITY_SCORE
-        - PROCEDURE_CATEGORY
+        DataFrame with all mappings for use in joins
     """
     SIMILARITY_THRESHOLD = 0.7
+    MAPPING_TABLE = "3_lookup.embeddings.implant_device_mapping"
+    TEMP_IMPLANTS_TABLE = "4_prod.tmp._temp_new_implants_with_embeddings"
+    TEMP_DEVICES_TABLE = "4_prod.tmp._temp_device_embeddings"
     
     # Check if embedding tables exist
     if not spark.catalog.tableExists("3_lookup.embeddings.implant_descriptions"):
@@ -9173,10 +9233,18 @@ def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
         print("[WARN] Device concept embeddings not found. Run sync_and_embed_device_concepts() first.")
         return None
     
-    print("[INFO] Loading embeddings and computing device mappings with procedure validation (CHUNKED)...")
+    # Ensure mapping table exists
+    if not spark.catalog.tableExists(MAPPING_TABLE):
+        print(f"[WARN] Mapping table {MAPPING_TABLE} does not exist. Run migrate_temp_mapping_table() first.")
+        return None
     
-    # Load unique implant description + procedure combinations
-    implant_procedures = (spark.table("4_prod.bronze.map_implant_details")
+    # =========================================================================
+    # Step 1: Identify NEW implant+procedure combinations that need mapping
+    # =========================================================================
+    print("[INFO] Identifying new implant+procedure combinations...")
+    
+    # All unique combinations currently in map_implant_details
+    all_combinations = (spark.table("4_prod.bronze.map_implant_details")
         .filter(col("IMPLANT_DESCRIPTION").isNotNull())
         .filter(trim(col("IMPLANT_DESCRIPTION")) != "")
         .select(
@@ -9185,8 +9253,33 @@ def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
         )
         .distinct())
     
-    total_combinations = implant_procedures.count()
-    print(f"[INFO] Unique (implant, procedure) combinations: {total_combinations}")
+    # Existing mappings
+    existing_mappings = (spark.table(MAPPING_TABLE)
+        .select(
+            col("IMPLANT_DESCRIPTION_NORMALIZED").alias("existing_implant"),
+            col("PRIMARY_PROCEDURE").alias("existing_procedure")
+        ))
+    
+    # Find NEW combinations (left anti join)
+    new_combinations = (all_combinations
+        .join(
+            existing_mappings,
+            (all_combinations.implant_term_normalized == existing_mappings.existing_implant) &
+            (all_combinations.PRIMARY_PROCEDURE.eqNullSafe(existing_mappings.existing_procedure)),
+            "left_anti"
+        ))
+    
+    new_count = new_combinations.count()
+    print(f"[INFO] New combinations to process: {new_count}")
+    
+    if new_count == 0:
+        print("[INFO] No new mappings needed. Returning existing mappings.")
+        return spark.table(MAPPING_TABLE)
+    
+    # =========================================================================
+    # Step 2: Load embeddings and write to temp Delta tables (serverless cache)
+    # =========================================================================
+    print("[INFO] Loading embeddings to temp tables...")
     
     # Load implant embeddings
     implant_embeddings = (spark.table("3_lookup.embeddings.implant_descriptions")
@@ -9196,15 +9289,31 @@ def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
             col("embedding_vector").cast(ArrayType(FloatType())).alias("implant_embedding")
         ))
     
-    # Join to get embeddings for our implant descriptions
-    implants_with_emb = (implant_procedures
+    # Add procedure category to new combinations BEFORE join
+    new_with_category = new_combinations.withColumn(
+        "procedure_category",
+        get_procedure_category_udf(col("PRIMARY_PROCEDURE"))
+    )
+    
+    # Join new combinations with their embeddings and write to temp table
+    new_with_embeddings = (new_with_category
         .join(implant_embeddings,
               col("implant_term_normalized") == col("embed_term"),
               "inner")
         .drop("embed_term"))
     
-    implants_with_emb_count = implants_with_emb.count()
-    print(f"[INFO] Implants with embeddings: {implants_with_emb_count}")
+    # Write to temp Delta table (this replaces .cache() for serverless)
+    new_with_embeddings.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_IMPLANTS_TABLE)
+    print(f"[INFO] Wrote new implants to temp table: {TEMP_IMPLANTS_TABLE}")
+    
+    # Read back from temp table
+    new_with_embeddings = spark.table(TEMP_IMPLANTS_TABLE)
+    new_with_emb_count = new_with_embeddings.count()
+    print(f"[INFO] New combinations with embeddings: {new_with_emb_count}")
+    
+    if new_with_emb_count == 0:
+        print("[INFO] No new combinations have embeddings. Returning existing mappings.")
+        return spark.table(MAPPING_TABLE)
     
     # Load device concepts with embeddings
     device_concepts = (spark.table("4_prod.omop.concept")
@@ -9225,115 +9334,178 @@ def get_device_mapping_lookup_with_procedure_chunked(chunk_size=5000):
             col("embedding_vector").cast(ArrayType(FloatType())).alias("device_embedding")
         ))
     
-    # Join device embeddings with concept IDs
     device_with_ids = (device_embeddings
         .join(device_concepts,
               col("device_term_normalized") == initcap(lower(trim(col("concept_name")))),
               "inner")
         .select("device_concept_id", "concept_name", "device_embedding"))
     
+    # Write devices to temp table
+    device_with_ids.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_DEVICES_TABLE)
+    print(f"[INFO] Wrote devices to temp table: {TEMP_DEVICES_TABLE}")
+    
+    device_with_ids = spark.table(TEMP_DEVICES_TABLE)
     device_count = device_with_ids.count()
     print(f"[INFO] Device concepts with embeddings: {device_count}")
     
-    # Add row numbers for chunking
-    implants_numbered = implants_with_emb.withColumn(
-        "row_num", 
-        row_number().over(Window.orderBy("implant_term_normalized", "PRIMARY_PROCEDURE"))
+    # =========================================================================
+    # Step 3: Build procedure category → device ID lookup for pre-filtering
+    # =========================================================================
+    print("[INFO] Building device category lookup for pre-filtering...")
+    category_to_devices = build_device_category_lookup(device_with_ids)
+    
+    # Log category sizes
+    for cat, dev_ids in sorted(category_to_devices.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
+        print(f"  {cat}: {len(dev_ids)} devices")
+    
+    # =========================================================================
+    # Step 4: Process by procedure category - WRITE EACH CHUNK DIRECTLY
+    # =========================================================================
+    print("[INFO] Processing by procedure category...")
+    
+    # Get unique categories in our data, process "other" LAST (it's the largest)
+    categories = [row.procedure_category for row in new_with_embeddings.select("procedure_category").distinct().collect()]
+    # Move "other" to the end
+    if "other" in categories:
+        categories.remove("other")
+        categories.append("other")
+    print(f"[INFO] Procedure categories to process: {categories}")
+    
+    total_appended = 0
+    
+    for category in categories:
+        # Get implants for this category
+        category_implants = new_with_embeddings.filter(col("procedure_category") == category)
+        category_count = category_implants.count()
+        
+        if category_count == 0:
+            continue
+        
+        # Get device IDs valid for this category
+        valid_device_ids = category_to_devices.get(category, category_to_devices["other"])
+        
+        if not valid_device_ids:
+            print(f"[INFO] Skipping category '{category}' - no matching devices")
+            continue
+        
+        # Filter devices to only those valid for this category
+        category_devices = device_with_ids.filter(col("device_concept_id").isin(valid_device_ids))
+        filtered_device_count = len(valid_device_ids)
+        
+        print(f"[INFO] Processing '{category}': {category_count} implants × {filtered_device_count} devices")
+        
+        # Decide whether to use broadcast based on device count
+        use_broadcast = filtered_device_count <= BROADCAST_THRESHOLD
+        if not use_broadcast:
+            print(f"  [INFO] Using shuffle join (devices > {BROADCAST_THRESHOLD})")
+        
+        # Process in chunks - WRITE EACH CHUNK DIRECTLY
+        num_chunks = (category_count + chunk_size - 1) // chunk_size
+        category_appended = 0
+        
+        if num_chunks > 1:
+            # Add row numbers for chunking
+            category_numbered = category_implants.withColumn(
+                "row_num",
+                row_number().over(Window.orderBy("implant_term_normalized", "PRIMARY_PROCEDURE"))
+            )
+            
+            for chunk_idx in range(num_chunks):
+                start_row = chunk_idx * chunk_size + 1
+                end_row = (chunk_idx + 1) * chunk_size
+                
+                print(f"  [INFO] Chunk {chunk_idx + 1}/{num_chunks}...")
+                
+                chunk = category_numbered.filter(
+                    (col("row_num") >= start_row) & (col("row_num") <= end_row)
+                ).drop("row_num")
+                
+                chunk_result = process_chunk(chunk, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
+                
+                # WRITE EACH CHUNK DIRECTLY - avoids accumulating DataFrames in memory
+                if chunk_result is not None:
+                    chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
+                    category_appended += 1  # Don't count rows, just track that we wrote
+        else:
+            # Process entire category at once
+            chunk_result = process_chunk(category_implants, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
+            if chunk_result is not None:
+                chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
+                category_appended += 1
+        
+        if category_appended > 0:
+            print(f"  [INFO] Wrote {category_appended} chunk(s) for '{category}'")
+            total_appended += category_appended
+    
+    # =========================================================================
+    # Step 5: Cleanup temp tables and return
+    # =========================================================================
+    print("[INFO] Cleaning up temp tables...")
+    spark.sql(f"DROP TABLE IF EXISTS {TEMP_IMPLANTS_TABLE}")
+    spark.sql(f"DROP TABLE IF EXISTS {TEMP_DEVICES_TABLE}")
+    
+    print(f"[INFO] Processing complete. Wrote {total_appended} chunk(s) total.")
+    
+    # Get final count from table
+    full_mappings = spark.table(MAPPING_TABLE)
+    final_count = full_mappings.count()
+    print(f"[INFO] Total mappings in table: {final_count}")
+    
+    return full_mappings
+
+
+
+
+def process_chunk(implants_df, devices_df, similarity_threshold, use_broadcast=True):
+    """
+    Process a chunk of implants against filtered devices.
+    Uses native Spark functions for cosine similarity.
+    
+    Args:
+        use_broadcast: If True, broadcast devices_df. Set False for large device sets.
+    """
+    # Cross join - conditionally broadcast based on size
+    if use_broadcast:
+        crossed = implants_df.crossJoin(broadcast(devices_df))
+    else:
+        crossed = implants_df.crossJoin(devices_df)
+    
+    # Compute cosine similarity using native Spark functions
+    with_similarity = add_cosine_similarity_column(
+        crossed, 
+        "implant_embedding", 
+        "device_embedding",
+        "similarity"
     )
     
-    # Calculate number of chunks
-    num_chunks = (implants_with_emb_count + chunk_size - 1) // chunk_size
-    print(f"[INFO] Processing in {num_chunks} chunks of up to {chunk_size} implants each...")
-    print(f"[INFO] Estimated rows per chunk: ~{chunk_size * device_count:,}")
+    # Filter by threshold
+    above_threshold = with_similarity.filter(col("similarity") >= similarity_threshold)
     
-    # UDF for cosine similarity (pure numpy, no Spark ML)
-    @udf(DoubleType())
-    def cosine_similarity_udf(v1, v2):
-        if v1 is None or v2 is None:
-            return None
-        a = np.array(v1)
-        b = np.array(v2)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
+    # Get best match per implant+procedure
+    w = Window.partitionBy("implant_term_normalized", "PRIMARY_PROCEDURE").orderBy(col("similarity").desc())
     
-    # UDF for procedure category
-    @udf(StringType())
-    def get_procedure_category_udf(procedure):
-        return get_procedure_category(procedure)
-    
-    # UDF for procedure validation
-    @udf(BooleanType())
-    def validate_procedure_device_udf(device_name, procedure_category):
-        return device_matches_procedure(device_name, procedure_category)
-    
-    # Process chunks and write intermediate results to temp table
-    temp_table = "8_dev.default.temp_implant_device_mapping"
-    
-    for chunk_idx in range(num_chunks):
-        chunk_start = chunk_idx * chunk_size + 1
-        chunk_end = (chunk_idx + 1) * chunk_size
-        
-        print(f"[INFO] Processing chunk {chunk_idx + 1}/{num_chunks} (rows {chunk_start}-{chunk_end})...")
-        
-        # Get this chunk of implants
-        chunk_implants = implants_numbered.filter(
-            (col("row_num") >= chunk_start) & (col("row_num") <= chunk_end)
-        ).drop("row_num")
-        
-        # Cross join with device embeddings
-        cross_joined = chunk_implants.crossJoin(broadcast(device_with_ids))
-        
-        # Compute similarity and apply procedure filter
-        with_similarity = (cross_joined
-            .withColumn("similarity", cosine_similarity_udf(col("implant_embedding"), col("device_embedding")))
-            .withColumn("procedure_category", get_procedure_category_udf(col("PRIMARY_PROCEDURE")))
-            .withColumn("procedure_valid", validate_procedure_device_udf(col("concept_name"), col("procedure_category")))
-            .filter(col("similarity") >= SIMILARITY_THRESHOLD)
-            .filter(col("procedure_valid") == True))
-        
-        # Get best match per (implant_description, procedure) combination
-        w = Window.partitionBy("implant_term_normalized", "PRIMARY_PROCEDURE").orderBy(col("similarity").desc())
-        
-        chunk_best = (with_similarity
-            .withColumn("rank", row_number().over(w))
-            .filter(col("rank") == 1)
-            .select(
-                col("implant_term_normalized").alias("IMPLANT_DESCRIPTION_NORMALIZED"),
-                col("PRIMARY_PROCEDURE"),
-                col("device_concept_id").alias("SNOMED_DEVICE_CONCEPT_ID"),
-                col("concept_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
-                col("similarity").alias("SIMILARITY_SCORE"),
-                col("procedure_category").alias("PROCEDURE_CATEGORY")
-            ))
-        
-        # Write chunk results to temp table (append mode)
-        if chunk_idx == 0:
-            chunk_best.write.mode("overwrite").saveAsTable(temp_table)
-        else:
-            chunk_best.write.mode("append").saveAsTable(temp_table)
-        
-        chunk_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {temp_table}").collect()[0].cnt
-        print(f"[INFO] Chunk {chunk_idx + 1} complete. Total rows in temp table: {chunk_count}")
-    
-    # Read combined results and do final deduplication
-    print("[INFO] Reading combined results and deduplicating...")
-    combined = spark.table(temp_table)
-    
-    # Final deduplication (in case a combo appeared in multiple chunks due to edge cases)
-    w_final = Window.partitionBy("IMPLANT_DESCRIPTION_NORMALIZED", "PRIMARY_PROCEDURE").orderBy(col("SIMILARITY_SCORE").desc())
-    
-    best_matches = (combined
-        .withColumn("rank", row_number().over(w_final))
+    best_matches = (above_threshold
+        .withColumn("rank", row_number().over(w))
         .filter(col("rank") == 1)
-        .drop("rank"))
-    
-    match_count = best_matches.count()
-    print(f"[INFO] Total mappings with procedure validation: {match_count}")
+        .select(
+            col("implant_term_normalized").alias("IMPLANT_DESCRIPTION_NORMALIZED"),
+            col("PRIMARY_PROCEDURE"),
+            col("device_concept_id").cast(IntegerType()).alias("SNOMED_DEVICE_CONCEPT_ID"),
+            col("concept_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
+            col("similarity").cast(DoubleType()).alias("SIMILARITY_SCORE"),
+            col("procedure_category").alias("PROCEDURE_CATEGORY")
+        ))
     
     return best_matches
+
+# COMMAND ----------
+
+
+device_mapping = get_device_mapping_incremental(chunk_size=1000)
+
+if device_mapping is not None:
+    display(device_mapping.limit(10))
+    print(f"Total mappings: {device_mapping.count()}")
 
 # COMMAND ----------
 
@@ -9636,7 +9808,7 @@ def create_implant_details_incr():
     # =========================================================================
     # NEW: Add SNOMED device mapping using embeddings + procedure validation
     # =========================================================================
-    device_mapping = get_device_mapping_lookup_with_procedure_chunked(chunk_size=100)
+    device_mapping = get_device_mapping_incremental(chunk_size=2000)
     
     if device_mapping is not None:
         # Normalize implant description for join
