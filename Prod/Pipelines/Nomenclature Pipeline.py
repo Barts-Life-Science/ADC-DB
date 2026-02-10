@@ -2319,6 +2319,94 @@ update_code_value_embeddings()
 
 # COMMAND ----------
 
+def sync_and_embed_device_concepts(batch_size=250):
+    """
+    Embed SNOMED Physical Object device concepts.
+    
+    Source: 4_prod.omop.concept (filtered to SNOMED Physical Objects)
+    Target: 3_lookup.embeddings.device_concepts
+    """
+    TARGET_TABLE = "3_lookup.embeddings.device_concepts"
+    
+    print("=" * 60)
+    print("EMBEDDING OMOP DEVICE CONCEPTS")
+    print("=" * 60)
+    
+    source_df = (spark.table("4_prod.omop.concept")
+        .filter(col("domain_id") == "Device")
+        .filter(col("standard_concept") == "S")
+        .filter(col("vocabulary_id") == "SNOMED")
+        .filter(col("concept_class_id") == "Physical Object")
+        .filter(col("invalid_reason").isNull())
+        .select(
+            col("concept_id"),
+            col("concept_name").alias("term")
+        )
+        .distinct())
+    
+    count = source_df.count()
+    print(f"Found {count} SNOMED device concepts to embed")
+    
+    sync_and_embed_ingredients(source_df, TARGET_TABLE, batch_size=batch_size)
+    
+    print(f"Optimizing {TARGET_TABLE}...")
+    try:
+        spark.sql(f"OPTIMIZE {TARGET_TABLE} ZORDER BY (term)")
+        print("✓ Optimization complete")
+    except Exception as e:
+        print(f"⚠ Optimization skipped: {e}")
+    
+    final_count = spark.table(TARGET_TABLE).count()
+    with_embeddings = spark.table(TARGET_TABLE).filter(col("embedding_vector").isNotNull()).count()
+    print(f"\nFinal: {with_embeddings}/{final_count} with embeddings")
+    print("=" * 60)
+
+sync_and_embed_device_concepts()
+
+# COMMAND ----------
+
+def sync_and_embed_implant_descriptions(batch_size=250):
+    """
+    Embed unique implant descriptions from bronze.map_implant_details.
+    
+    Source: 4_prod.bronze.map_implant_details.IMPLANT_DESCRIPTION
+    Target: 3_lookup.embeddings.implant_descriptions
+    """
+    TARGET_TABLE = "3_lookup.embeddings.implant_descriptions"
+    
+    print("=" * 60)
+    print("EMBEDDING IMPLANT DESCRIPTIONS")
+    print("=" * 60)
+    
+    source_df = (spark.table("4_prod.bronze.map_implant_details")
+        .filter(col("IMPLANT_DESCRIPTION").isNotNull())
+        .filter(trim(col("IMPLANT_DESCRIPTION")) != "")
+        .select(
+            col("IMPLANT_DESCRIPTION").alias("term")
+        )
+        .distinct())
+    
+    count = source_df.count()
+    print(f"Found {count} unique implant descriptions to embed")
+    
+    sync_and_embed_ingredients(source_df, TARGET_TABLE, batch_size=batch_size)
+    
+    print(f"Optimizing {TARGET_TABLE}...")
+    try:
+        spark.sql(f"OPTIMIZE {TARGET_TABLE} ZORDER BY (term)")
+        print("✓ Optimization complete")
+    except Exception as e:
+        print(f"⚠ Optimization skipped: {e}")
+    
+    final_count = spark.table(TARGET_TABLE).count()
+    with_embeddings = spark.table(TARGET_TABLE).filter(col("embedding_vector").isNotNull()).count()
+    print(f"\nFinal: {with_embeddings}/{final_count} with embeddings")
+    print("=" * 60)
+    
+sync_and_embed_implant_descriptions()
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC ALTER TABLE 4_prod.tmp.tempone_nomenclature CLUSTER BY (NOMENCLATURE_ID);
 # MAGIC OPTIMIZE 4_prod.tmp.tempone_nomenclature;
@@ -2333,4 +2421,5 @@ update_code_value_embeddings()
 # MAGIC
 # MAGIC OPTIMIZE 3_lookup.embeddings.barts_ingredients ZORDER BY (term);
 # MAGIC OPTIMIZE 3_lookup.embeddings.omop_ingredients ZORDER BY (term);
-# MAGIC
+# MAGIC OPTIMIZE 3_lookup.embeddings.device_concepts ZORDER BY (term);
+# MAGIC OPTIMIZE 3_lookup.embeddings.implant_descriptions ZORDER BY (term);

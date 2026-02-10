@@ -9,6 +9,8 @@ from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
 from pyspark.storagelevel import StorageLevel
+from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.ml.feature import Normalizer
 
 # COMMAND ----------
 
@@ -202,6 +204,89 @@ def apply_trust_filter_to_df(df, table_name: str = None):
         print(f"[INFO] Applied Barts trust filter to {table_name}")
     
     return df.filter(col("Trust") == "Barts")
+
+
+def extract_udi_components_udf():
+    """
+    UDF to extract GS1 and HIBCC UDI components from serial/catalog number fields.
+    
+    GS1 format: 01[14-digit GTIN]17[YYMMDD expiry]11[YYMMDD prod]10[batch]21[serial]
+    HIBCC format: +[labeler][product] or +$$[production id]
+    """
+    from datetime import datetime
+    import re
+    
+    def extract(serial_number, catalogue_number):
+        result = {
+            "gs1_di": None, 
+            "gs1_prod_date": None, 
+            "gs1_exp_date": None,
+            "gs1_batch": None, 
+            "gs1_serial": None,
+            "hibcc_di": None, 
+            "hibcc_pi": None
+        }
+        
+        # Process both fields
+        for value in [serial_number, catalogue_number]:
+            if not value or not isinstance(value, str):
+                continue
+            
+            remaining = value.strip()
+            
+            # GS1 sequential parsing
+            while remaining:
+                if remaining.startswith('01') and len(remaining) >= 16:
+                    result['gs1_di'] = remaining[2:16]
+                    remaining = remaining[16:]
+                elif remaining.startswith('17') and len(remaining) >= 8:
+                    try:
+                        result['gs1_exp_date'] = datetime.strptime(remaining[2:8], '%y%m%d')
+                    except ValueError:
+                        pass
+                    remaining = remaining[8:]
+                elif remaining.startswith('11') and len(remaining) >= 8:
+                    try:
+                        result['gs1_prod_date'] = datetime.strptime(remaining[2:8], '%y%m%d')
+                    except ValueError:
+                        pass
+                    remaining = remaining[8:]
+                elif remaining.startswith('10'):
+                    result['gs1_batch'] = remaining[2:].strip()
+                    break
+                elif remaining.startswith('21'):
+                    result['gs1_serial'] = remaining[2:].strip()
+                    break
+                else:
+                    break
+            
+            # HIBCC parsing
+            if value.startswith('+$$'):
+                result['hibcc_pi'] = value[3:]
+            elif value.startswith('+'):
+                result['hibcc_di'] = value[1:]
+        
+        return (
+            result['gs1_di'],
+            result['gs1_prod_date'],
+            result['gs1_exp_date'],
+            result['gs1_batch'],
+            result['gs1_serial'],
+            result['hibcc_di'],
+            result['hibcc_pi']
+        )
+    
+    schema = StructType([
+        StructField("gs1_di", StringType()),
+        StructField("gs1_prod_date", TimestampType()),
+        StructField("gs1_exp_date", TimestampType()),
+        StructField("gs1_batch", StringType()),
+        StructField("gs1_serial", StringType()),
+        StructField("hibcc_di", StringType()),
+        StructField("hibcc_pi", StringType())
+    ])
+    
+    return udf(extract, schema)
 
 # COMMAND ----------
 
@@ -1075,6 +1160,24 @@ schema_map_person = StructType([
         metadata={"comment": "The year of birth."}
     ),
     StructField(
+        name="birth_month",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "The month of birth (1-12)."}
+    ),
+    StructField(
+        name="birth_day",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "The day of birth (1-31)."}
+    ),
+    StructField(
+        name="birth_datetime",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "The full birth date and time."}
+    ),
+    StructField(
         name="ethnicity_cd",
         dataType=DoubleType(),
         nullable=True,
@@ -1099,6 +1202,7 @@ def create_person_mapping_incr():
     """
     Creates an incremental person mapping table that processes only new or modified records.
     Includes data quality validations and deduplication to prevent Merge errors.
+    
     
     Returns:
         DataFrame: Processed person records with standardized format
@@ -1132,7 +1236,7 @@ def create_person_mapping_incr():
         .alias("addr")
     )
     
-    # Get base person data with filtering - UNPACK THE TUPLE
+    # Get base person data with filtering
     base_persons, record_count = get_incremental_data_with_cdf(
         source_table="4_prod.raw.mill_person",
         target_table="4_prod.bronze.map_person",
@@ -1166,10 +1270,25 @@ def create_person_mapping_incr():
             col("PERSON_ID") == col("addr.PARENT_ENTITY_ID"),
             "left"
         )
-        # Calculate birth year
+        # Calculate birth year, month, day
         .withColumn(
             "birth_year", 
             year(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_month",
+            month(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_day",
+            dayofmonth(col("BIRTH_DT_TM")).cast(IntegerType())
+        )
+
+        .withColumn(
+            "birth_datetime",
+            col("BIRTH_DT_TM")
         )
     )
     
@@ -1191,33 +1310,34 @@ def create_person_mapping_incr():
     if validation_failures.count() > 0:
         print(f"WARNING: {validation_failures.count()} records failed validation")
     
-    # --- NEW: DEDUPLICATION LOGIC ---
-    # Resolves DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
-    # If CDF returns multiple updates for one person, keep only the latest one.
+    # Deduplication: keep only the latest record per person
     deduped_persons = (
         validated_persons
         .withColumn(
-            "dedupe_rank", 
+            "row_rank",
             row_number().over(
                 Window.partitionBy("PERSON_ID")
                 .orderBy(col("ADC_UPDT").desc())
             )
         )
-        .filter(col("dedupe_rank") == 1)
-        .drop("dedupe_rank")
+        .filter(col("row_rank") == 1)
+        .drop("row_rank")
     )
     
-    # Select final columns with standardized names
-    final_df = deduped_persons.select(
-        col("PERSON_ID").alias("person_id"),
-        col("SEX_CD").alias("gender_cd"),
-        col("birth_year"),
-        col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
-        col("addr.ADDRESS_ID").alias("address_id"),
-        col("ADC_UPDT") 
+    return (
+        deduped_persons
+        .select(
+            col("PERSON_ID").alias("person_id"),
+            col("SEX_CD").alias("gender_cd"),
+            col("birth_year"),
+            col("birth_month"),   
+            col("birth_day"),       
+            col("birth_datetime"),   
+            col("ETHNIC_GRP_CD").alias("ethnicity_cd"),
+            col("addr.ADDRESS_ID").alias("address_id"),
+            col("ADC_UPDT")
+        )
     )
-    
-    return final_df
     
 updates_df = create_person_mapping_incr()
 
@@ -5118,11 +5238,13 @@ def process_date_events_incremental():
     """
     Main function to process incremental date events updates.
     Handles the end-to-end process of updating the date events mapping table.
+    
+    FIXED: Added deduplication by EVENT_ID before merge to prevent 
+    DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE error.
     """
     try:
         print(f"Starting date events incremental processing at {datetime.now()}")
         
-
         max_adc_updt = get_max_timestamp("4_prod.bronze.map_date_events")
         current_ts = current_timestamp()
         
@@ -5310,6 +5432,20 @@ def process_date_events_incremental():
                 )
             )
             
+            # ============================================================
+            # FIX: Deduplicate by EVENT_ID before merge
+            # This prevents DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
+            # when CDF returns multiple updates for the same EVENT_ID
+            # ============================================================
+            dedup_window = Window.partitionBy("EVENT_ID").orderBy(col("ADC_UPDT").desc())
+            result_df = (
+                result_df
+                .withColumn("_dedup_rank", row_number().over(dedup_window))
+                .filter(col("_dedup_rank") == 1)
+                .drop("_dedup_rank")
+            )
+            print(f"After deduplication: {result_df.count()} unique EVENT_IDs")
+            # ============================================================
 
             update_table(result_df, "4_prod.bronze.map_date_events", "EVENT_ID", schema_map_date_events, map_date_events_comment)
             print("Successfully updated date events mapping table")
@@ -8930,3 +9066,796 @@ def process_patient_journey_incremental():
 
 # Execute the pipeline
 process_patient_journey_incremental()
+
+# COMMAND ----------
+
+# Procedure categories → expected device keywords (for strict filtering)
+PROCEDURE_DEVICE_RULES = {
+    # Eye procedures
+    "cataract": ["lens", "iol", "intraocular", "implant", "phaco"],
+    "phacoemulsification": ["lens", "iol", "intraocular", "implant"],
+    
+    # Joint replacements
+    "knee replacement": ["tibial", "femoral", "patella", "knee", "polyethylene", "bearing", "component"],
+    "hip replacement": ["femoral", "acetabular", "hip", "head", "stem", "liner", "cup"],
+    "shoulder replacement": ["humeral", "glenoid", "shoulder"],
+    "arthroplasty": ["prosthesis", "component", "implant", "head", "stem"],
+    
+    # Fracture fixation
+    "fracture": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod", "k-wire"],
+    "orif": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod"],
+    "internal fixation": ["screw", "plate", "pin", "nail", "wire", "fixation"],
+    
+    # Soft tissue
+    "hernia": ["mesh", "plug", "patch", "prolene", "vicryl"],
+    "repair": ["mesh", "suture", "anchor", "patch"],
+    
+    # Urology
+    "stent": ["stent", "catheter", "ureteral", "pigtail"],
+    "ureteroscopy": ["stent", "catheter", "ureteral"],
+    "cystoscopy": ["stent", "catheter"],
+    
+    # Cardiac
+    "pacemaker": ["pacemaker", "lead", "generator", "icd", "crt", "electrode"],
+    "cardiac": ["stent", "valve", "pacemaker", "lead"],
+    
+    # Gynecology
+    "iud": ["mirena", "iud", "intrauterine", "coil", "levonorgestrel"],
+    "contraceptive": ["mirena", "iud", "implant", "coil"],
+    
+    # Spine
+    "spinal": ["screw", "rod", "cage", "plate", "fusion"],
+    "discectomy": ["cage", "spacer", "implant"],
+    
+    # Vascular
+    "vascular": ["stent", "graft", "catheter"],
+    "angioplasty": ["stent", "balloon"],
+}
+
+
+
+def get_procedure_category(procedure_text):
+    """Map procedure text to device category."""
+    if not procedure_text:
+        return "other"
+    proc_lower = procedure_text.lower()
+    for category in PROCEDURE_DEVICE_RULES.keys():
+        if category in proc_lower:
+            return category
+    return "other"
+
+# Register as UDF
+get_procedure_category_udf = F.udf(get_procedure_category, StringType())
+
+
+def device_matches_procedure(device_name, procedure_category):
+    """Check if device concept is valid for procedure category."""
+    if procedure_category is None or procedure_category == "other":
+        return True
+    keywords = PROCEDURE_DEVICE_RULES.get(procedure_category, [])
+    if not keywords:
+        return True
+    device_lower = device_name.lower() if device_name else ""
+    return any(kw in device_lower for kw in keywords)
+
+
+def add_cosine_similarity_column(df, v1_col_name, v2_col_name, output_col_name="similarity"):
+    """
+    Add a cosine similarity column using native Spark functions.
+    
+    Much faster than a Python UDF because:
+    - No Python↔JVM serialization per row
+    - Catalyst can optimize the computation
+    - Runs natively in the JVM
+    """
+    v1 = col(v1_col_name)
+    v2 = col(v2_col_name)
+    
+    # Dot product: sum of element-wise products
+    dot_product = F.aggregate(
+        F.zip_with(v1, v2, lambda x, y: x * y),
+        F.lit(0.0).cast("double"),
+        lambda acc, x: acc + x
+    )
+    
+    # L2 norms
+    norm1 = F.sqrt(F.aggregate(v1, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
+    norm2 = F.sqrt(F.aggregate(v2, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
+    
+    # Cosine similarity with zero-division protection
+    similarity = F.when(
+        (norm1 == 0) | (norm2 == 0), 
+        F.lit(0.0)
+    ).otherwise(
+        dot_product / (norm1 * norm2)
+    )
+    
+    return df.withColumn(output_col_name, similarity)
+
+def build_device_category_lookup(device_concepts_df):
+    """
+    Build a mapping of procedure_category → list of valid device_concept_ids.
+    
+    This enables pre-filtering devices BEFORE the cross join, dramatically reducing
+    the number of similarity computations needed.
+    """
+    # Collect all device concepts to driver (small enough - typically <20k devices)
+    devices = device_concepts_df.select("device_concept_id", "concept_name").collect()
+    
+    category_to_devices = {}
+    
+    for category, keywords in PROCEDURE_DEVICE_RULES.items():
+        matching_ids = []
+        for row in devices:
+            device_name = (row.concept_name or "").lower()
+            if any(kw in device_name for kw in keywords):
+                matching_ids.append(row.device_concept_id)
+        category_to_devices[category] = matching_ids
+    
+    # "other" category matches all devices
+    category_to_devices["other"] = [row.device_concept_id for row in devices]
+    
+    return category_to_devices
+
+
+BROADCAST_THRESHOLD = 1000
+
+
+
+def get_device_mapping_incremental(chunk_size=500):
+    """
+    INCREMENTAL version: Only computes mappings for NEW implant+procedure combinations.
+    
+    OPTIMIZATIONS (v4):
+    - Native Spark cosine similarity (no Python UDF)
+    - Pre-filters devices by procedure category BEFORE cross join
+    - Uses temp Delta tables instead of .cache() (serverless compatible)
+    - Writes each chunk directly (avoids OOM from unioning many DataFrames)
+    - Conditional broadcast (only for small device sets < 1000)
+    
+    Args:
+        chunk_size: Number of new combinations to process per batch (default 500)
+    
+    Returns:
+        DataFrame with all mappings for use in joins
+    """
+    SIMILARITY_THRESHOLD = 0.7
+    MAPPING_TABLE = "3_lookup.embeddings.implant_device_mapping"
+    TEMP_IMPLANTS_TABLE = "4_prod.tmp._temp_new_implants_with_embeddings"
+    TEMP_DEVICES_TABLE = "4_prod.tmp._temp_device_embeddings"
+    
+    # Check if embedding tables exist
+    if not spark.catalog.tableExists("3_lookup.embeddings.implant_descriptions"):
+        print("[WARN] Implant embeddings not found. Run sync_and_embed_implant_descriptions() first.")
+        return None
+    
+    if not spark.catalog.tableExists("3_lookup.embeddings.device_concepts"):
+        print("[WARN] Device concept embeddings not found. Run sync_and_embed_device_concepts() first.")
+        return None
+    
+    # Ensure mapping table exists
+    if not spark.catalog.tableExists(MAPPING_TABLE):
+        print(f"[WARN] Mapping table {MAPPING_TABLE} does not exist. Run migrate_temp_mapping_table() first.")
+        return None
+    
+    # =========================================================================
+    # Step 1: Identify NEW implant+procedure combinations that need mapping
+    # =========================================================================
+    print("[INFO] Identifying new implant+procedure combinations...")
+    
+    # All unique combinations currently in map_implant_details
+    all_combinations = (spark.table("4_prod.bronze.map_implant_details")
+        .filter(col("IMPLANT_DESCRIPTION").isNotNull())
+        .filter(trim(col("IMPLANT_DESCRIPTION")) != "")
+        .select(
+            initcap(lower(trim(col("IMPLANT_DESCRIPTION")))).alias("implant_term_normalized"),
+            col("PRIMARY_PROCEDURE")
+        )
+        .distinct())
+    
+    # Existing mappings
+    existing_mappings = (spark.table(MAPPING_TABLE)
+        .select(
+            col("IMPLANT_DESCRIPTION_NORMALIZED").alias("existing_implant"),
+            col("PRIMARY_PROCEDURE").alias("existing_procedure")
+        ))
+    
+    # Find NEW combinations (left anti join)
+    new_combinations = (all_combinations
+        .join(
+            existing_mappings,
+            (all_combinations.implant_term_normalized == existing_mappings.existing_implant) &
+            (all_combinations.PRIMARY_PROCEDURE.eqNullSafe(existing_mappings.existing_procedure)),
+            "left_anti"
+        ))
+    
+    new_count = new_combinations.count()
+    print(f"[INFO] New combinations to process: {new_count}")
+    
+    if new_count == 0:
+        print("[INFO] No new mappings needed. Returning existing mappings.")
+        return spark.table(MAPPING_TABLE)
+    
+    # =========================================================================
+    # Step 2: Load embeddings and write to temp Delta tables (serverless cache)
+    # =========================================================================
+    print("[INFO] Loading embeddings to temp tables...")
+    
+    # Load implant embeddings
+    implant_embeddings = (spark.table("3_lookup.embeddings.implant_descriptions")
+        .filter(col("embedding_vector").isNotNull())
+        .select(
+            initcap(lower(trim(col("term")))).alias("embed_term"),
+            col("embedding_vector").cast(ArrayType(FloatType())).alias("implant_embedding")
+        ))
+    
+    # Add procedure category to new combinations BEFORE join
+    new_with_category = new_combinations.withColumn(
+        "procedure_category",
+        get_procedure_category_udf(col("PRIMARY_PROCEDURE"))
+    )
+    
+    # Join new combinations with their embeddings and write to temp table
+    new_with_embeddings = (new_with_category
+        .join(implant_embeddings,
+              col("implant_term_normalized") == col("embed_term"),
+              "inner")
+        .drop("embed_term"))
+    
+    # Write to temp Delta table (this replaces .cache() for serverless)
+    new_with_embeddings.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_IMPLANTS_TABLE)
+    print(f"[INFO] Wrote new implants to temp table: {TEMP_IMPLANTS_TABLE}")
+    
+    # Read back from temp table
+    new_with_embeddings = spark.table(TEMP_IMPLANTS_TABLE)
+    new_with_emb_count = new_with_embeddings.count()
+    print(f"[INFO] New combinations with embeddings: {new_with_emb_count}")
+    
+    if new_with_emb_count == 0:
+        print("[INFO] No new combinations have embeddings. Returning existing mappings.")
+        return spark.table(MAPPING_TABLE)
+    
+    # Load device concepts with embeddings
+    device_concepts = (spark.table("4_prod.omop.concept")
+        .filter(col("domain_id") == "Device")
+        .filter(col("standard_concept") == "S")
+        .filter(col("vocabulary_id") == "SNOMED")
+        .filter(col("concept_class_id") == "Physical Object")
+        .filter(col("invalid_reason").isNull())
+        .select(
+            col("concept_id").alias("device_concept_id"),
+            col("concept_name")
+        ))
+    
+    device_embeddings = (spark.table("3_lookup.embeddings.device_concepts")
+        .filter(col("embedding_vector").isNotNull())
+        .select(
+            initcap(lower(trim(col("term")))).alias("device_term_normalized"),
+            col("embedding_vector").cast(ArrayType(FloatType())).alias("device_embedding")
+        ))
+    
+    device_with_ids = (device_embeddings
+        .join(device_concepts,
+              col("device_term_normalized") == initcap(lower(trim(col("concept_name")))),
+              "inner")
+        .select("device_concept_id", "concept_name", "device_embedding"))
+    
+    # Write devices to temp table
+    device_with_ids.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_DEVICES_TABLE)
+    print(f"[INFO] Wrote devices to temp table: {TEMP_DEVICES_TABLE}")
+    
+    device_with_ids = spark.table(TEMP_DEVICES_TABLE)
+    device_count = device_with_ids.count()
+    print(f"[INFO] Device concepts with embeddings: {device_count}")
+    
+    # =========================================================================
+    # Step 3: Build procedure category → device ID lookup for pre-filtering
+    # =========================================================================
+    print("[INFO] Building device category lookup for pre-filtering...")
+    category_to_devices = build_device_category_lookup(device_with_ids)
+    
+    # Log category sizes
+    for cat, dev_ids in sorted(category_to_devices.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
+        print(f"  {cat}: {len(dev_ids)} devices")
+    
+    # =========================================================================
+    # Step 4: Process by procedure category - WRITE EACH CHUNK DIRECTLY
+    # =========================================================================
+    print("[INFO] Processing by procedure category...")
+    
+    # Get unique categories in our data, process "other" LAST (it's the largest)
+    categories = [row.procedure_category for row in new_with_embeddings.select("procedure_category").distinct().collect()]
+    # Move "other" to the end
+    if "other" in categories:
+        categories.remove("other")
+        categories.append("other")
+    print(f"[INFO] Procedure categories to process: {categories}")
+    
+    total_appended = 0
+    
+    for category in categories:
+        # Get implants for this category
+        category_implants = new_with_embeddings.filter(col("procedure_category") == category)
+        category_count = category_implants.count()
+        
+        if category_count == 0:
+            continue
+        
+        # Get device IDs valid for this category
+        valid_device_ids = category_to_devices.get(category, category_to_devices["other"])
+        
+        if not valid_device_ids:
+            print(f"[INFO] Skipping category '{category}' - no matching devices")
+            continue
+        
+        # Filter devices to only those valid for this category
+        category_devices = device_with_ids.filter(col("device_concept_id").isin(valid_device_ids))
+        filtered_device_count = len(valid_device_ids)
+        
+        print(f"[INFO] Processing '{category}': {category_count} implants × {filtered_device_count} devices")
+        
+        # Decide whether to use broadcast based on device count
+        use_broadcast = filtered_device_count <= BROADCAST_THRESHOLD
+        if not use_broadcast:
+            print(f"  [INFO] Using shuffle join (devices > {BROADCAST_THRESHOLD})")
+        
+        # Process in chunks - WRITE EACH CHUNK DIRECTLY
+        num_chunks = (category_count + chunk_size - 1) // chunk_size
+        category_appended = 0
+        
+        if num_chunks > 1:
+            # Add row numbers for chunking
+            category_numbered = category_implants.withColumn(
+                "row_num",
+                row_number().over(Window.orderBy("implant_term_normalized", "PRIMARY_PROCEDURE"))
+            )
+            
+            for chunk_idx in range(num_chunks):
+                start_row = chunk_idx * chunk_size + 1
+                end_row = (chunk_idx + 1) * chunk_size
+                
+                print(f"  [INFO] Chunk {chunk_idx + 1}/{num_chunks}...")
+                
+                chunk = category_numbered.filter(
+                    (col("row_num") >= start_row) & (col("row_num") <= end_row)
+                ).drop("row_num")
+                
+                chunk_result = process_chunk(chunk, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
+                
+                # WRITE EACH CHUNK DIRECTLY - avoids accumulating DataFrames in memory
+                if chunk_result is not None:
+                    chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
+                    category_appended += 1  # Don't count rows, just track that we wrote
+        else:
+            # Process entire category at once
+            chunk_result = process_chunk(category_implants, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
+            if chunk_result is not None:
+                chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
+                category_appended += 1
+        
+        if category_appended > 0:
+            print(f"  [INFO] Wrote {category_appended} chunk(s) for '{category}'")
+            total_appended += category_appended
+    
+    # =========================================================================
+    # Step 5: Cleanup temp tables and return
+    # =========================================================================
+    print("[INFO] Cleaning up temp tables...")
+    spark.sql(f"DROP TABLE IF EXISTS {TEMP_IMPLANTS_TABLE}")
+    spark.sql(f"DROP TABLE IF EXISTS {TEMP_DEVICES_TABLE}")
+    
+    print(f"[INFO] Processing complete. Wrote {total_appended} chunk(s) total.")
+    
+    # Get final count from table
+    full_mappings = spark.table(MAPPING_TABLE)
+    final_count = full_mappings.count()
+    print(f"[INFO] Total mappings in table: {final_count}")
+    
+    return full_mappings
+
+
+
+
+def process_chunk(implants_df, devices_df, similarity_threshold, use_broadcast=True):
+    """
+    Process a chunk of implants against filtered devices.
+    Uses native Spark functions for cosine similarity.
+    
+    Args:
+        use_broadcast: If True, broadcast devices_df. Set False for large device sets.
+    """
+    # Cross join - conditionally broadcast based on size
+    if use_broadcast:
+        crossed = implants_df.crossJoin(broadcast(devices_df))
+    else:
+        crossed = implants_df.crossJoin(devices_df)
+    
+    # Compute cosine similarity using native Spark functions
+    with_similarity = add_cosine_similarity_column(
+        crossed, 
+        "implant_embedding", 
+        "device_embedding",
+        "similarity"
+    )
+    
+    # Filter by threshold
+    above_threshold = with_similarity.filter(col("similarity") >= similarity_threshold)
+    
+    # Get best match per implant+procedure
+    w = Window.partitionBy("implant_term_normalized", "PRIMARY_PROCEDURE").orderBy(col("similarity").desc())
+    
+    best_matches = (above_threshold
+        .withColumn("rank", row_number().over(w))
+        .filter(col("rank") == 1)
+        .select(
+            col("implant_term_normalized").alias("IMPLANT_DESCRIPTION_NORMALIZED"),
+            col("PRIMARY_PROCEDURE"),
+            col("device_concept_id").cast(IntegerType()).alias("SNOMED_DEVICE_CONCEPT_ID"),
+            col("concept_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
+            col("similarity").cast(DoubleType()).alias("SIMILARITY_SCORE"),
+            col("procedure_category").alias("PROCEDURE_CATEGORY")
+        ))
+    
+    return best_matches
+
+# COMMAND ----------
+
+
+device_mapping = get_device_mapping_incremental(chunk_size=1000)
+
+if device_mapping is not None:
+    display(device_mapping.limit(10))
+    print(f"Total mappings: {device_mapping.count()}")
+
+# COMMAND ----------
+
+map_implant_details_comment = "Surgical implant details extracted from SurgiNet clinical events. Contains manufacturer, description, serial numbers, and UDI identifiers."
+
+schema_map_implant_details = StructType([
+    StructField("EVENT_ID", LongType(), True, metadata={
+        "comment": "Primary key - the implant description event ID"
+    }),
+    StructField("ENCNTR_ID", LongType(), True, metadata={
+        "comment": "Encounter identifier"
+    }),
+    StructField("PERSON_ID", LongType(), True, metadata={
+        "comment": "Patient identifier"
+    }),
+    StructField("PRIMARY_PROCEDURE", StringType(), True, metadata={
+        "comment": "Primary surgical procedure description"
+    }),
+    StructField("PROCEDURE_CAT", LongType(), True, metadata={
+        "comment": "Procedure catalog code"
+    }),
+    StructField("PERFORMED_PRSNL_ID", LongType(), True, metadata={
+        "comment": "Personnel who performed/recorded the implant"
+    }),
+    StructField("CLINSIG_UPDT_DT_TM", TimestampType(), True, metadata={
+        "comment": "Clinically significant update datetime (implant date)"
+    }),
+    StructField("CATALOGUE_NUMBER", StringType(), True, metadata={
+        "comment": "Manufacturer catalogue/part number"
+    }),
+    StructField("COMPATIBILITY", StringType(), True, metadata={
+        "comment": "Compatibility confirmation"
+    }),
+    StructField("CONFIRM_MANUFACTURER", StringType(), True, metadata={
+        "comment": "Manufacturer confirmation"
+    }),
+    StructField("CONFIRM_STERILITY", StringType(), True, metadata={
+        "comment": "Sterility confirmation"
+    }),
+    StructField("EXPIRY_DATE", TimestampType(), True, metadata={
+        "comment": "Device expiration date"
+    }),
+    StructField("IMPLANT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Free text description of the implant device"
+    }),
+    StructField("MANUFACTURER", StringType(), True, metadata={
+        "comment": "Implant manufacturer name"
+    }),
+    StructField("QUANTITY", StringType(), True, metadata={
+        "comment": "Number of devices implanted"
+    }),
+    StructField("SCRUB_NURSE_CONFIRMS", StringType(), True, metadata={
+        "comment": "Scrub nurse confirmation"
+    }),
+    StructField("SCRUB_NURSE_READ", StringType(), True, metadata={
+        "comment": "Scrub nurse read confirmation"
+    }),
+    StructField("SERIAL_NUMBER", StringType(), True, metadata={
+        "comment": "Device serial number"
+    }),
+    StructField("SIDE_OF_PROCEDURE", StringType(), True, metadata={
+        "comment": "Laterality (left/right/bilateral)"
+    }),
+    StructField("SIZE", StringType(), True, metadata={
+        "comment": "Device size"
+    }),
+    StructField("STERILISATION_DATE", TimestampType(), True, metadata={
+        "comment": "Device sterilization date"
+    }),
+    StructField("SURGEON_CONFIRM", StringType(), True, metadata={
+        "comment": "Surgeon confirmation"
+    }),
+    StructField("GS1_IDENTIFIER", StringType(), True, metadata={
+        "comment": "GS1 UDI Device Identifier (UDI-DI)"
+    }),
+    StructField("GS1_PRODUCTION_DATE", TimestampType(), True, metadata={
+        "comment": "GS1 production date from barcode"
+    }),
+    StructField("GS1_EXPIRY_DATE", TimestampType(), True, metadata={
+        "comment": "GS1 expiry date from barcode"
+    }),
+    StructField("GS1_BATCH_NUMBER", StringType(), True, metadata={
+        "comment": "GS1 batch/lot number from barcode"
+    }),
+    StructField("GS1_SERIAL_NUMBER", StringType(), True, metadata={
+        "comment": "GS1 serial number from barcode (UDI-PI)"
+    }),
+    StructField("HIBCC_DEVICE_ID", StringType(), True, metadata={
+        "comment": "HIBCC UDI Device Identifier"
+    }),
+    StructField("HIBCC_PROD_ID", StringType(), True, metadata={
+        "comment": "HIBCC Production Identifier"
+    }),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update"
+    })
+])
+
+
+
+def create_implant_details_incr():
+    """
+    Creates an incremental implant details table from SurgiNet clinical events.
+    
+    EXTENDED: Now includes SNOMED device concept mapping using embeddings + procedure validation.
+    
+    Uses window functions to group related implant events (different EVENT_CDs)
+    into single implant records, keyed by the implant description event.
+    
+    Returns:
+        DataFrame or None: Processed implant details with SNOMED mapping, or None if no incremental data
+    
+    New columns added:
+        - SNOMED_DEVICE_CONCEPT_ID: Best matching SNOMED device concept (validated against procedure)
+        - SNOMED_DEVICE_CONCEPT_NAME: Concept name
+        - SIMILARITY_SCORE: Cosine similarity score (0-1)
+        - PROCEDURE_CATEGORY: Detected procedure category used for validation
+    """
+    
+    # Column mapping from EVENT_TITLE_TEXT to clean column names
+    column_mapping = {
+        'SN - IM - Quantity': 'QUANTITY',
+        'SN - IM - Confirm Side of Procedure': 'SIDE_OF_PROCEDURE',
+        'SN - IM - Confirm Compatibility': 'COMPATIBILITY',
+        'SN - IM - Expiry Date': 'EXPIRY_DATE',
+        'SN - IM - Scrub Nurse Read': 'SCRUB_NURSE_READ',
+        'SN - IM - Surgeon Confirm Implant': 'SURGEON_CONFIRM',
+        'SN - IM - Manufacturer': 'MANUFACTURER',
+        'SN - IM - Confirm Manufacturer': 'CONFIRM_MANUFACTURER',
+        'SN - IM - Implant Description': 'IMPLANT_DESCRIPTION',
+        'SN - IM - Scrub Nurse Confirms': 'SCRUB_NURSE_CONFIRMS',
+        'SN - IM - Sterilisation Date': 'STERILISATION_DATE',
+        'SN - IM - Confirm Sterility': 'CONFIRM_STERILITY',
+        'SN - IM - Catalogue Number': 'CATALOGUE_NUMBER',
+        'SN - IM - Serial Number': 'SERIAL_NUMBER',
+        'SN - IM - Size': 'SIZE'
+    }
+    
+    # Build CASE statement for column renaming
+    case_statements = [f"WHEN EVENT_TITLE_TEXT = '{old}' THEN '{new}'" 
+                      for old, new in column_mapping.items()]
+    case_when = f"CASE {' '.join(case_statements)} ELSE EVENT_TITLE_TEXT END"
+    
+    # Get incremental base implant events (EVENT_CD = 71837900 is the implant description)
+    base_events, record_count = get_incremental_data_with_cdf(
+        source_table="4_prod.raw.mill_clinical_event",
+        target_table="4_prod.bronze.map_implant_details",
+        timestamp_column="ADC_UPDT",
+        apply_trust_filter=True,
+        additional_filters=(col("EVENT_CD") == 71837900)
+    )
+    
+    if record_count == 0:
+        print("[INFO] No incremental implant data to process. Skipping.")
+        return None
+    
+    # Get the encounter IDs that need processing
+    incremental_encntr_ids = base_events.select("ENCNTR_ID").distinct()
+    
+    # Main query with window functions to group implant events
+    events_df = spark.sql(f"""
+        WITH base_events AS (
+            SELECT EVENT_ID, ENCNTR_ID, PERSON_ID
+            FROM 4_prod.raw.mill_clinical_event
+            WHERE VALID_UNTIL_DT_TM > NOW()
+            AND EVENT_CD = 71837900
+        ),
+        procedure_events AS (
+            SELECT 
+                p.ENCNTR_ID,
+                prev.EVENT_TAG as PRIMARY_PROCEDURE,
+                prev.CATALOG_CD as PROCEDURE_CAT,
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.ENCNTR_ID 
+                    ORDER BY p.PARENT_EVENT_ID DESC, p.EVENT_ID DESC
+                ) as rn
+            FROM 4_prod.raw.mill_clinical_event p
+            JOIN 4_prod.raw.mill_clinical_event prev 
+                ON p.ENCNTR_ID = prev.ENCNTR_ID
+                AND prev.EVENT_CD = 3016930
+                AND prev.PARENT_EVENT_ID = p.PARENT_EVENT_ID
+                AND prev.EVENT_ID < p.EVENT_ID
+            WHERE p.VALID_UNTIL_DT_TM > NOW()
+            AND p.EVENT_CD = 3016928
+            AND p.EVENT_TAG = 'Yes'
+        ),
+        primary_procedure AS (
+            SELECT ENCNTR_ID, PRIMARY_PROCEDURE, PROCEDURE_CAT
+            FROM procedure_events
+            WHERE rn = 1
+        ),
+        numbered_events AS (
+            SELECT 
+                mce.EVENT_ID,
+                mce.ENCNTR_ID,
+                be.PERSON_ID,
+                pp.PRIMARY_PROCEDURE,
+                pp.PROCEDURE_CAT,
+                mce.PERFORMED_PRSNL_ID,
+                mce.CLINSIG_UPDT_DT_TM,
+                mce.ADC_UPDT,
+                {case_when} as EVENT_TITLE_TEXT,
+                mce.EVENT_TAG,
+                mce.EVENT_CD,
+                SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID 
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_group,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.EVENT_ID END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_event_id,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.PERFORMED_PRSNL_ID END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_performed_prsnl_id,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.CLINSIG_UPDT_DT_TM END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_clinsig_updt_dt_tm,
+                FIRST_VALUE(CASE WHEN mce.EVENT_CD = 71837900 THEN mce.ADC_UPDT END) 
+                    OVER (PARTITION BY mce.ENCNTR_ID, 
+                          SUM(CASE WHEN mce.EVENT_CD = 71837900 THEN 1 ELSE 0 END) 
+                              OVER (PARTITION BY mce.ENCNTR_ID 
+                                    ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                            mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM)
+                          ORDER BY mce.PARENT_EVENT_ID, mce.EVENT_ID, 
+                                  mce.CLINICAL_EVENT_ID, mce.CLINSIG_UPDT_DT_TM) as implant_adc_updt
+            FROM 4_prod.raw.mill_clinical_event mce
+            INNER JOIN base_events be ON mce.ENCNTR_ID = be.ENCNTR_ID
+            LEFT JOIN primary_procedure pp ON mce.ENCNTR_ID = pp.ENCNTR_ID
+            WHERE mce.VALID_UNTIL_DT_TM > NOW()
+            AND mce.EVENT_TITLE_TEXT LIKE 'SN - IM %'
+        )
+        SELECT * FROM numbered_events
+    """)
+    
+    # Filter to only incremental encounters
+    events_df = events_df.join(
+        broadcast(incremental_encntr_ids),
+        "ENCNTR_ID",
+        "inner"
+    )
+    
+    # Pivot to create one row per implant
+    pivoted = events_df.groupBy(
+        'implant_event_id', 
+        'ENCNTR_ID', 
+        'PERSON_ID', 
+        'PRIMARY_PROCEDURE', 
+        'PROCEDURE_CAT',
+        'implant_performed_prsnl_id',
+        'implant_clinsig_updt_dt_tm',
+        'implant_adc_updt'
+    ).pivot(
+        'EVENT_TITLE_TEXT'
+    ).agg(first('EVENT_TAG'))
+    
+    # Helper to extract date from format "1:YYYYMMDD00000000:0.000000:0:0"
+    def extract_date(col_name):
+        return when(col(col_name).isNotNull(), 
+                   to_timestamp(regexp_extract(col(col_name), r'1:(\d{8})', 1), 'yyyyMMdd'))
+    
+    # Clean date and quantity columns
+    result = (pivoted
+        .withColumn('EXPIRY_DATE', extract_date('EXPIRY_DATE'))
+        .withColumn('STERILISATION_DATE', extract_date('STERILISATION_DATE'))
+        .withColumn('QUANTITY', regexp_replace(col('QUANTITY'), r'[^0-9]', ''))
+        .withColumnRenamed('implant_event_id', 'EVENT_ID')
+        .withColumnRenamed('implant_performed_prsnl_id', 'PERFORMED_PRSNL_ID')
+        .withColumnRenamed('implant_clinsig_updt_dt_tm', 'CLINSIG_UPDT_DT_TM')
+        .withColumnRenamed('implant_adc_updt', 'ADC_UPDT'))
+    
+    # Extract UDI components
+    extract_udi = extract_udi_components_udf()
+    
+    result = (result
+        .withColumn("udi", extract_udi(col("SERIAL_NUMBER"), col("CATALOGUE_NUMBER")))
+        .withColumn("GS1_IDENTIFIER", col("udi.gs1_di"))
+        .withColumn("GS1_PRODUCTION_DATE", col("udi.gs1_prod_date"))
+        .withColumn("GS1_EXPIRY_DATE", col("udi.gs1_exp_date"))
+        .withColumn("GS1_BATCH_NUMBER", col("udi.gs1_batch"))
+        .withColumn("GS1_SERIAL_NUMBER", col("udi.gs1_serial"))
+        .withColumn("HIBCC_DEVICE_ID", col("udi.hibcc_di"))
+        .withColumn("HIBCC_PROD_ID", col("udi.hibcc_pi"))
+        .drop("udi"))
+    
+    # =========================================================================
+    # NEW: Add SNOMED device mapping using embeddings + procedure validation
+    # =========================================================================
+    device_mapping = get_device_mapping_incremental(chunk_size=2000)
+    
+    if device_mapping is not None:
+        # Normalize implant description for join
+        result = result.withColumn(
+            "IMPLANT_DESCRIPTION_NORMALIZED",
+            initcap(lower(trim(col("IMPLANT_DESCRIPTION"))))
+        )
+        
+        # Left join with device mapping on BOTH implant description AND procedure
+        result = (result
+            .join(
+                broadcast(device_mapping),
+                (result.IMPLANT_DESCRIPTION_NORMALIZED == device_mapping.IMPLANT_DESCRIPTION_NORMALIZED) &
+                (result.PRIMARY_PROCEDURE.eqNullSafe(device_mapping.PRIMARY_PROCEDURE)),
+                "left"
+            )
+            .drop(device_mapping.IMPLANT_DESCRIPTION_NORMALIZED)
+            .drop(device_mapping.PRIMARY_PROCEDURE)
+            .drop("IMPLANT_DESCRIPTION_NORMALIZED"))
+        
+        mapped_count = result.filter(col('SNOMED_DEVICE_CONCEPT_ID').isNotNull()).count()
+        total_count = result.count()
+        print(f"[INFO] Added SNOMED device mapping with procedure validation.")
+        print(f"[INFO] Records with mapping: {mapped_count}/{total_count} ({100.0*mapped_count/total_count:.1f}%)")
+    else:
+        # Add empty columns if mapping not available
+        print("[WARN] Device mapping not available. Adding NULL columns.")
+        result = (result
+            .withColumn("SNOMED_DEVICE_CONCEPT_ID", lit(None).cast(IntegerType()))
+            .withColumn("SNOMED_DEVICE_CONCEPT_NAME", lit(None).cast(StringType()))
+            .withColumn("SIMILARITY_SCORE", lit(None).cast(DoubleType()))
+            .withColumn("PROCEDURE_CATEGORY", lit(None).cast(StringType())))
+    
+    return result
+
+
+    
+
+# COMMAND ----------
+
+# Implant Details
+implant_details_df = create_implant_details_incr()
+if implant_details_df is not None:
+    update_table(
+        source_df=implant_details_df,
+        target_table="4_prod.bronze.map_implant_details",
+        index_column="EVENT_ID",
+        target_schema=schema_map_implant_details,
+        table_comment=map_implant_details_comment
+    )
