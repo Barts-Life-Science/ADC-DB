@@ -3146,6 +3146,7 @@ def create_base_medication_administrations_incr():
     clinical_event = (
         spark.table("4_prod.raw.mill_clinical_event")
         .filter(col("ADC_UPDT") > max_adc_updt)
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
         # Apply Trust Filter logic inline (Active Ind = 1 is standard for Mill)
         # .filter(col("ACTIVE_IND") == 1) # Uncomment if 'apply_trust_filter' does this
@@ -4498,6 +4499,7 @@ def get_last_clinical_events_for_death():
     """
     return (
         spark.table("4_prod.raw.mill_clinical_event")
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .groupBy("PERSON_ID")
         .agg(F.max("CLINSIG_UPDT_DT_TM").alias("LAST_CE_DT_TM"))
     )
@@ -4909,6 +4911,7 @@ def process_numeric_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -4924,6 +4927,7 @@ def process_numeric_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5268,6 +5272,7 @@ def process_date_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5283,6 +5288,7 @@ def process_date_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5793,6 +5799,7 @@ def process_text_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5808,6 +5815,7 @@ def process_text_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6350,6 +6358,7 @@ def process_nomen_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6365,6 +6374,7 @@ def process_nomen_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6921,6 +6931,7 @@ def process_coded_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6936,6 +6947,7 @@ def process_coded_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -9267,6 +9279,7 @@ def create_implant_details_incr():
             FROM 4_prod.raw.mill_clinical_event
             WHERE VALID_UNTIL_DT_TM > NOW()
             AND EVENT_CD = 71837900
+            AND RESULT_STATUS_CD NOT IN (29, 30, 31)
         ),
         procedure_events AS (
             SELECT 

@@ -1252,7 +1252,7 @@ def pathology_incr():
     blob_content = dlt.read("current_blob_content").alias("d")
     encounter = dlt.read("rde_encounter").alias("ENC")
 
-    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
+    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(~col("RESULT_STATUS_CD").isin(29, 30, 31)).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
 
     joined_data = (
         clinical_event_final
@@ -1723,7 +1723,7 @@ def radiology_incr():
     encounter = dlt.read("rde_encounter").alias("ENC")
     nhsi_exam_mapping = spark.table("4_prod.raw.tbl_nhsi_exam_mapping").alias("M")
 
-    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
+    clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(~col("RESULT_STATUS_CD").isin(29, 30, 31)).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
 
     joined_data = (
         clinical_event_final
@@ -1996,6 +1996,7 @@ def blobdataset_incr():
         .filter(col("ADC_UPDT") > max_adc_updt)
         .filter(col("BlobContents").isNotNull())
         .filter(col("NHS_Number").isNotNull())
+        .filter(~col("CE.RESULT_STATUS_CD").isin(29, 30, 31))
     )
 
 @dlt.view(name="blobdataset_update")
@@ -4484,6 +4485,7 @@ def measurements_incr():
 
     return (
         clinical_event.filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .join(encounter, col("cce.ENCNTR_ID") == col("ENC.ENCNTR_ID"), "inner")
         .join(code_value_ref.alias("ref"), col("cce.event_cd") == col("ref.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("urf"), col("cce.result_units_cd") == col("urf.CODE_VALUE_CD"), "left")
@@ -4845,6 +4847,7 @@ def medadmin_incr():
 
     return (
         clinical_event.filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .join(med_admin_event, col("CE.EVENT_ID") == col("MAE.EVENT_ID"), "inner")
         .join(encounter, col("CE.ENCNTR_ID") == col("ENC.ENCNTR_ID"), "inner")
         .join(ce_med_result.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1), 
