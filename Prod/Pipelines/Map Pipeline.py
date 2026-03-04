@@ -1138,6 +1138,273 @@ else:
 
 # COMMAND ----------
 
+# ============================================================================
+# map_address_epc
+# ============================================================================
+
+map_address_epc_comment = (
+    "EPC (Energy Performance Certificate) housing characteristics joined to address records via UPRN. "
+    "Contains energy efficiency ratings, building fabric, heating systems, property characteristics, "
+    "and derived health-research flags (fuel poverty risk, cold hazard proxy, spatial heating poverty, off-gas-grid). "
+    "One row per ADDRESS_ID."
+)
+
+schema_map_address_epc = StructType([
+    StructField("ADDRESS_ID", LongType(), False, metadata={
+        "comment": "Primary key. Foreign key to map_address."
+    }),
+    StructField("UPRN", LongType(), True, metadata={
+        "comment": "Unique Property Reference Number used to join to EPC data."
+    }),
+    StructField("EPC_LMK_KEY", StringType(), True, metadata={
+        "comment": "EPC certificate unique identifier (LMK_KEY from the EPC register)."
+    }),
+
+    # --- Energy efficiency ---
+    StructField("CURRENT_ENERGY_RATING", StringType(), True, metadata={
+        "comment": "EPC band A-G. Core fuel poverty indicator; bands D-G flag risk under LILEE definition."
+    }),
+    StructField("POTENTIAL_ENERGY_RATING", StringType(), True, metadata={
+        "comment": "Achievable EPC band after recommended improvements."
+    }),
+    StructField("CURRENT_ENERGY_EFFICIENCY", IntegerType(), True, metadata={
+        "comment": "SAP score (1-100+). Continuous energy efficiency measure underpinning the EPC band."
+    }),
+    StructField("POTENTIAL_ENERGY_EFFICIENCY", IntegerType(), True, metadata={
+        "comment": "Achievable SAP score after improvements."
+    }),
+
+    # --- Building fabric ---
+    StructField("WALLS_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Wall construction and insulation description. Solid uninsulated walls indicate cold/damp risk."
+    }),
+    StructField("WALLS_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Wall energy efficiency rating (Very Good to Very Poor)."
+    }),
+    StructField("ROOF_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Roof type and insulation depth."
+    }),
+    StructField("ROOF_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Roof energy efficiency rating."
+    }),
+    StructField("FLOOR_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Floor construction and insulation."
+    }),
+    StructField("FLOOR_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Floor energy efficiency rating."
+    }),
+    StructField("WINDOWS_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Glazing description. Single glazing indicates cold surfaces and condensation risk."
+    }),
+    StructField("WINDOWS_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Window energy efficiency rating."
+    }),
+    StructField("GLAZED_TYPE", StringType(), True, metadata={
+        "comment": "Glazing type (single/double/triple). Also serves as noise insulation proxy."
+    }),
+
+    # --- Heating ---
+    StructField("MAINHEAT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Main heating system description. Identifies combustion-based heating producing indoor NOx."
+    }),
+    StructField("MAINHEAT_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Main heating energy efficiency rating."
+    }),
+    StructField("MAIN_FUEL", StringType(), True, metadata={
+        "comment": "Fuel type (mains gas, electricity, oil, etc). Critical for indoor air quality and fuel poverty."
+    }),
+    StructField("MAINHEATCONT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Heating controls description (programmer, thermostat, TRVs)."
+    }),
+    StructField("SECONDHEAT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Secondary heating. Open fires and solid fuel stoves identifiable here."
+    }),
+    StructField("MAINS_GAS_FLAG", BooleanType(), True, metadata={
+        "comment": "Whether mains gas is available. Off-gas-grid homes face higher fuel costs."
+    }),
+    StructField("HOTWATER_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Hot water system description."
+    }),
+
+    # --- Property characteristics ---
+    StructField("PROPERTY_TYPE", StringType(), True, metadata={
+        "comment": "House/Flat/Bungalow/Maisonette/Park home."
+    }),
+    StructField("BUILT_FORM", StringType(), True, metadata={
+        "comment": "Detached/Semi/Terrace etc. Affects heat loss via surface-area-to-volume ratio."
+    }),
+    StructField("TOTAL_FLOOR_AREA", DoubleType(), True, metadata={
+        "comment": "Total floor area in m². Overcrowding proxy when linked to household size."
+    }),
+    StructField("NUMBER_HABITABLE_ROOMS", IntegerType(), True, metadata={
+        "comment": "Count of habitable rooms. Overcrowding denominator."
+    }),
+    StructField("NUMBER_HEATED_ROOMS", IntegerType(), True, metadata={
+        "comment": "Count of heated rooms. Fewer than habitable rooms indicates spatial heating poverty."
+    }),
+    StructField("CONSTRUCTION_AGE_BAND", StringType(), True, metadata={
+        "comment": "Building age band. Strongest single predictor of fabric quality. Pre-1919 homes avg SAP ~45."
+    }),
+    StructField("MECHANICAL_VENTILATION", StringType(), True, metadata={
+        "comment": "Ventilation type (natural/mechanical). Only ventilation field in EPC data."
+    }),
+    StructField("NUMBER_OPEN_FIREPLACES", IntegerType(), True, metadata={
+        "comment": "Open fireplace count. Draughtiness and ventilation proxy."
+    }),
+
+    # --- Energy costs ---
+    StructField("HEATING_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual heating cost (GBP)."
+    }),
+    StructField("HOT_WATER_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual hot water cost (GBP)."
+    }),
+    StructField("LIGHTING_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual lighting cost (GBP)."
+    }),
+    StructField("ENERGY_CONSUMPTION_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled energy consumption (kWh/m2/year)."
+    }),
+    StructField("CO2_EMISSIONS_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled CO2 emissions (tonnes/year)."
+    }),
+
+    # --- Assessment metadata ---
+    StructField("EPC_INSPECTION_DATE", DateType(), True, metadata={
+        "comment": "Date the EPC assessment was carried out."
+    }),
+    StructField("EPC_LODGEMENT_DATE", DateType(), True, metadata={
+        "comment": "Date the EPC was lodged on the register."
+    }),
+    StructField("TENURE", StringType(), True, metadata={
+        "comment": "Tenure at time of EPC: Owner-occupied / Rented (private) / Rented (social)."
+    }),
+    StructField("TRANSACTION_TYPE", StringType(), True, metadata={
+        "comment": "EPC trigger: marketed sale, rental, new dwelling, ECO assessment, etc."
+    }),
+
+    # --- Derived health flags ---
+    StructField("fuel_poverty_risk", BooleanType(), True, metadata={
+        "comment": "True if EPC band D-G. Flags fuel poverty risk under LILEE definition."
+    }),
+    StructField("hhsrs_cold_hazard_proxy", BooleanType(), True, metadata={
+        "comment": "True if EPC band F or G. Approximates HHSRS Category 1 excessive cold hazard."
+    }),
+    StructField("spatial_heating_poverty", BooleanType(), True, metadata={
+        "comment": "True if heated rooms < habitable rooms, indicating partial home heating."
+    }),
+    StructField("off_gas_grid", BooleanType(), True, metadata={
+        "comment": "True if no mains gas connection. Off-grid homes face higher fuel costs."
+    }),
+
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+])
+
+
+def create_address_epc_mapping():
+    """
+    Joins EPC certificate data to map_address via UPRN.
+    Returns one row per ADDRESS_ID with EPC housing characteristics.
+    """
+
+    # Get active person addresses with a UPRN
+    addresses = (
+        spark.table("4_prod.bronze.map_address")
+        .filter(col("UPRN").isNotNull())
+        .select("ADDRESS_ID", "UPRN")
+    )
+
+    # EPC certificates — cast UPRN to bigint to match map_address
+    epc = (
+        spark.table("3_lookup.geo.epc_certificates")
+        .withColumn("UPRN", col("UPRN").cast("long"))
+        .filter(col("UPRN").isNotNull())
+    )
+
+    # Join on UPRN
+    joined = (
+        addresses.alias("a")
+        .join(epc.alias("e"), col("a.UPRN") == col("e.UPRN"), "inner")
+        .select(
+            col("a.ADDRESS_ID"),
+            col("a.UPRN"),
+            col("e.LMK_KEY").alias("EPC_LMK_KEY"),
+
+            # Energy efficiency
+            col("e.CURRENT_ENERGY_RATING"),
+            col("e.POTENTIAL_ENERGY_RATING"),
+            col("e.CURRENT_ENERGY_EFFICIENCY"),
+            col("e.POTENTIAL_ENERGY_EFFICIENCY"),
+
+            # Building fabric
+            col("e.WALLS_DESCRIPTION"),
+            col("e.WALLS_ENERGY_EFF"),
+            col("e.ROOF_DESCRIPTION"),
+            col("e.ROOF_ENERGY_EFF"),
+            col("e.FLOOR_DESCRIPTION"),
+            col("e.FLOOR_ENERGY_EFF"),
+            col("e.WINDOWS_DESCRIPTION"),
+            col("e.WINDOWS_ENERGY_EFF"),
+            col("e.GLAZED_TYPE"),
+
+            # Heating
+            col("e.MAINHEAT_DESCRIPTION"),
+            col("e.MAINHEAT_ENERGY_EFF"),
+            col("e.MAIN_FUEL"),
+            col("e.MAINHEATCONT_DESCRIPTION"),
+            col("e.SECONDHEAT_DESCRIPTION"),
+            col("e.MAINS_GAS_FLAG"),
+            col("e.HOTWATER_DESCRIPTION"),
+
+            # Property characteristics
+            col("e.PROPERTY_TYPE"),
+            col("e.BUILT_FORM"),
+            col("e.TOTAL_FLOOR_AREA"),
+            col("e.NUMBER_HABITABLE_ROOMS"),
+            col("e.NUMBER_HEATED_ROOMS"),
+            col("e.CONSTRUCTION_AGE_BAND"),
+            col("e.MECHANICAL_VENTILATION"),
+            col("e.NUMBER_OPEN_FIREPLACES"),
+
+            # Energy costs
+            col("e.HEATING_COST_CURRENT"),
+            col("e.HOT_WATER_COST_CURRENT"),
+            col("e.LIGHTING_COST_CURRENT"),
+            col("e.ENERGY_CONSUMPTION_CURRENT"),
+            col("e.CO2_EMISSIONS_CURRENT"),
+
+            # Assessment metadata
+            col("e.INSPECTION_DATE").alias("EPC_INSPECTION_DATE"),
+            col("e.LODGEMENT_DATE").alias("EPC_LODGEMENT_DATE"),
+            col("e.TENURE"),
+            col("e.TRANSACTION_TYPE"),
+
+            # Derived flags
+            col("e.fuel_poverty_risk"),
+            col("e.hhsrs_cold_hazard_proxy"),
+            col("e.spatial_heating_poverty"),
+            col("e.off_gas_grid"),
+
+            current_timestamp().alias("ADC_UPDT"),
+        )
+    )
+
+    print(f"[INFO] Address-EPC join: {joined.count():,} rows matched")
+    return joined
+
+# COMMAND ----------
+
+updates_df = create_address_epc_mapping()
+
+if verify_no_duplicates(updates_df, "ADDRESS_ID"):
+    update_table(updates_df, "4_prod.bronze.map_address_epc", "ADDRESS_ID", schema_map_address_epc, map_address_epc_comment)
+else:
+    print("Merge aborted due to duplicates. Please investigate.")
+
+# COMMAND ----------
+
 map_person_comment = "The table contains demographic information about individuals, including identifiers such as person ID, gender, birth year, and ethnicity, address ID linking to the address table." 
 
 schema_map_person = StructType([
