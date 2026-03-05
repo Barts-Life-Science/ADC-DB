@@ -1138,6 +1138,273 @@ else:
 
 # COMMAND ----------
 
+# ============================================================================
+# map_address_epc
+# ============================================================================
+
+map_address_epc_comment = (
+    "EPC (Energy Performance Certificate) housing characteristics joined to address records via UPRN. "
+    "Contains energy efficiency ratings, building fabric, heating systems, property characteristics, "
+    "and derived health-research flags (fuel poverty risk, cold hazard proxy, spatial heating poverty, off-gas-grid). "
+    "One row per ADDRESS_ID."
+)
+
+schema_map_address_epc = StructType([
+    StructField("ADDRESS_ID", LongType(), False, metadata={
+        "comment": "Primary key. Foreign key to map_address."
+    }),
+    StructField("UPRN", LongType(), True, metadata={
+        "comment": "Unique Property Reference Number used to join to EPC data."
+    }),
+    StructField("EPC_LMK_KEY", StringType(), True, metadata={
+        "comment": "EPC certificate unique identifier (LMK_KEY from the EPC register)."
+    }),
+
+    # --- Energy efficiency ---
+    StructField("CURRENT_ENERGY_RATING", StringType(), True, metadata={
+        "comment": "EPC band A-G. Core fuel poverty indicator; bands D-G flag risk under LILEE definition."
+    }),
+    StructField("POTENTIAL_ENERGY_RATING", StringType(), True, metadata={
+        "comment": "Achievable EPC band after recommended improvements."
+    }),
+    StructField("CURRENT_ENERGY_EFFICIENCY", IntegerType(), True, metadata={
+        "comment": "SAP score (1-100+). Continuous energy efficiency measure underpinning the EPC band."
+    }),
+    StructField("POTENTIAL_ENERGY_EFFICIENCY", IntegerType(), True, metadata={
+        "comment": "Achievable SAP score after improvements."
+    }),
+
+    # --- Building fabric ---
+    StructField("WALLS_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Wall construction and insulation description. Solid uninsulated walls indicate cold/damp risk."
+    }),
+    StructField("WALLS_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Wall energy efficiency rating (Very Good to Very Poor)."
+    }),
+    StructField("ROOF_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Roof type and insulation depth."
+    }),
+    StructField("ROOF_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Roof energy efficiency rating."
+    }),
+    StructField("FLOOR_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Floor construction and insulation."
+    }),
+    StructField("FLOOR_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Floor energy efficiency rating."
+    }),
+    StructField("WINDOWS_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Glazing description. Single glazing indicates cold surfaces and condensation risk."
+    }),
+    StructField("WINDOWS_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Window energy efficiency rating."
+    }),
+    StructField("GLAZED_TYPE", StringType(), True, metadata={
+        "comment": "Glazing type (single/double/triple). Also serves as noise insulation proxy."
+    }),
+
+    # --- Heating ---
+    StructField("MAINHEAT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Main heating system description. Identifies combustion-based heating producing indoor NOx."
+    }),
+    StructField("MAINHEAT_ENERGY_EFF", StringType(), True, metadata={
+        "comment": "Main heating energy efficiency rating."
+    }),
+    StructField("MAIN_FUEL", StringType(), True, metadata={
+        "comment": "Fuel type (mains gas, electricity, oil, etc). Critical for indoor air quality and fuel poverty."
+    }),
+    StructField("MAINHEATCONT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Heating controls description (programmer, thermostat, TRVs)."
+    }),
+    StructField("SECONDHEAT_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Secondary heating. Open fires and solid fuel stoves identifiable here."
+    }),
+    StructField("MAINS_GAS_FLAG", BooleanType(), True, metadata={
+        "comment": "Whether mains gas is available. Off-gas-grid homes face higher fuel costs."
+    }),
+    StructField("HOTWATER_DESCRIPTION", StringType(), True, metadata={
+        "comment": "Hot water system description."
+    }),
+
+    # --- Property characteristics ---
+    StructField("PROPERTY_TYPE", StringType(), True, metadata={
+        "comment": "House/Flat/Bungalow/Maisonette/Park home."
+    }),
+    StructField("BUILT_FORM", StringType(), True, metadata={
+        "comment": "Detached/Semi/Terrace etc. Affects heat loss via surface-area-to-volume ratio."
+    }),
+    StructField("TOTAL_FLOOR_AREA", DoubleType(), True, metadata={
+        "comment": "Total floor area in m². Overcrowding proxy when linked to household size."
+    }),
+    StructField("NUMBER_HABITABLE_ROOMS", IntegerType(), True, metadata={
+        "comment": "Count of habitable rooms. Overcrowding denominator."
+    }),
+    StructField("NUMBER_HEATED_ROOMS", IntegerType(), True, metadata={
+        "comment": "Count of heated rooms. Fewer than habitable rooms indicates spatial heating poverty."
+    }),
+    StructField("CONSTRUCTION_AGE_BAND", StringType(), True, metadata={
+        "comment": "Building age band. Strongest single predictor of fabric quality. Pre-1919 homes avg SAP ~45."
+    }),
+    StructField("MECHANICAL_VENTILATION", StringType(), True, metadata={
+        "comment": "Ventilation type (natural/mechanical). Only ventilation field in EPC data."
+    }),
+    StructField("NUMBER_OPEN_FIREPLACES", IntegerType(), True, metadata={
+        "comment": "Open fireplace count. Draughtiness and ventilation proxy."
+    }),
+
+    # --- Energy costs ---
+    StructField("HEATING_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual heating cost (GBP)."
+    }),
+    StructField("HOT_WATER_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual hot water cost (GBP)."
+    }),
+    StructField("LIGHTING_COST_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled annual lighting cost (GBP)."
+    }),
+    StructField("ENERGY_CONSUMPTION_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled energy consumption (kWh/m2/year)."
+    }),
+    StructField("CO2_EMISSIONS_CURRENT", DoubleType(), True, metadata={
+        "comment": "Modelled CO2 emissions (tonnes/year)."
+    }),
+
+    # --- Assessment metadata ---
+    StructField("EPC_INSPECTION_DATE", DateType(), True, metadata={
+        "comment": "Date the EPC assessment was carried out."
+    }),
+    StructField("EPC_LODGEMENT_DATE", DateType(), True, metadata={
+        "comment": "Date the EPC was lodged on the register."
+    }),
+    StructField("TENURE", StringType(), True, metadata={
+        "comment": "Tenure at time of EPC: Owner-occupied / Rented (private) / Rented (social)."
+    }),
+    StructField("TRANSACTION_TYPE", StringType(), True, metadata={
+        "comment": "EPC trigger: marketed sale, rental, new dwelling, ECO assessment, etc."
+    }),
+
+    # --- Derived health flags ---
+    StructField("fuel_poverty_risk", BooleanType(), True, metadata={
+        "comment": "True if EPC band D-G. Flags fuel poverty risk under LILEE definition."
+    }),
+    StructField("hhsrs_cold_hazard_proxy", BooleanType(), True, metadata={
+        "comment": "True if EPC band F or G. Approximates HHSRS Category 1 excessive cold hazard."
+    }),
+    StructField("spatial_heating_poverty", BooleanType(), True, metadata={
+        "comment": "True if heated rooms < habitable rooms, indicating partial home heating."
+    }),
+    StructField("off_gas_grid", BooleanType(), True, metadata={
+        "comment": "True if no mains gas connection. Off-grid homes face higher fuel costs."
+    }),
+
+    StructField("ADC_UPDT", TimestampType(), True, metadata={
+        "comment": "Timestamp of last update."
+    }),
+])
+
+
+def create_address_epc_mapping():
+    """
+    Joins EPC certificate data to map_address via UPRN.
+    Returns one row per ADDRESS_ID with EPC housing characteristics.
+    """
+
+    # Get active person addresses with a UPRN
+    addresses = (
+        spark.table("4_prod.bronze.map_address")
+        .filter(col("UPRN").isNotNull())
+        .select("ADDRESS_ID", "UPRN")
+    )
+
+    # EPC certificates — cast UPRN to bigint to match map_address
+    epc = (
+        spark.table("3_lookup.geo.epc_certificates")
+        .withColumn("UPRN", col("UPRN").cast("long"))
+        .filter(col("UPRN").isNotNull())
+    )
+
+    # Join on UPRN
+    joined = (
+        addresses.alias("a")
+        .join(epc.alias("e"), col("a.UPRN") == col("e.UPRN"), "inner")
+        .select(
+            col("a.ADDRESS_ID"),
+            col("a.UPRN"),
+            col("e.LMK_KEY").alias("EPC_LMK_KEY"),
+
+            # Energy efficiency
+            col("e.CURRENT_ENERGY_RATING"),
+            col("e.POTENTIAL_ENERGY_RATING"),
+            col("e.CURRENT_ENERGY_EFFICIENCY"),
+            col("e.POTENTIAL_ENERGY_EFFICIENCY"),
+
+            # Building fabric
+            col("e.WALLS_DESCRIPTION"),
+            col("e.WALLS_ENERGY_EFF"),
+            col("e.ROOF_DESCRIPTION"),
+            col("e.ROOF_ENERGY_EFF"),
+            col("e.FLOOR_DESCRIPTION"),
+            col("e.FLOOR_ENERGY_EFF"),
+            col("e.WINDOWS_DESCRIPTION"),
+            col("e.WINDOWS_ENERGY_EFF"),
+            col("e.GLAZED_TYPE"),
+
+            # Heating
+            col("e.MAINHEAT_DESCRIPTION"),
+            col("e.MAINHEAT_ENERGY_EFF"),
+            col("e.MAIN_FUEL"),
+            col("e.MAINHEATCONT_DESCRIPTION"),
+            col("e.SECONDHEAT_DESCRIPTION"),
+            col("e.MAINS_GAS_FLAG"),
+            col("e.HOTWATER_DESCRIPTION"),
+
+            # Property characteristics
+            col("e.PROPERTY_TYPE"),
+            col("e.BUILT_FORM"),
+            col("e.TOTAL_FLOOR_AREA"),
+            col("e.NUMBER_HABITABLE_ROOMS"),
+            col("e.NUMBER_HEATED_ROOMS"),
+            col("e.CONSTRUCTION_AGE_BAND"),
+            col("e.MECHANICAL_VENTILATION"),
+            col("e.NUMBER_OPEN_FIREPLACES"),
+
+            # Energy costs
+            col("e.HEATING_COST_CURRENT"),
+            col("e.HOT_WATER_COST_CURRENT"),
+            col("e.LIGHTING_COST_CURRENT"),
+            col("e.ENERGY_CONSUMPTION_CURRENT"),
+            col("e.CO2_EMISSIONS_CURRENT"),
+
+            # Assessment metadata
+            col("e.INSPECTION_DATE").alias("EPC_INSPECTION_DATE"),
+            col("e.LODGEMENT_DATE").alias("EPC_LODGEMENT_DATE"),
+            col("e.TENURE"),
+            col("e.TRANSACTION_TYPE"),
+
+            # Derived flags
+            col("e.fuel_poverty_risk"),
+            col("e.hhsrs_cold_hazard_proxy"),
+            col("e.spatial_heating_poverty"),
+            col("e.off_gas_grid"),
+
+            current_timestamp().alias("ADC_UPDT"),
+        )
+    )
+
+    print(f"[INFO] Address-EPC join: {joined.count():,} rows matched")
+    return joined
+
+# COMMAND ----------
+
+updates_df = create_address_epc_mapping()
+
+if verify_no_duplicates(updates_df, "ADDRESS_ID"):
+    update_table(updates_df, "4_prod.bronze.map_address_epc", "ADDRESS_ID", schema_map_address_epc, map_address_epc_comment)
+else:
+    print("Merge aborted due to duplicates. Please investigate.")
+
+# COMMAND ----------
+
 map_person_comment = "The table contains demographic information about individuals, including identifiers such as person ID, gender, birth year, and ethnicity, address ID linking to the address table." 
 
 schema_map_person = StructType([
@@ -3146,6 +3413,7 @@ def create_base_medication_administrations_incr():
     clinical_event = (
         spark.table("4_prod.raw.mill_clinical_event")
         .filter(col("ADC_UPDT") > max_adc_updt)
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
         # Apply Trust Filter logic inline (Active Ind = 1 is standard for Mill)
         # .filter(col("ACTIVE_IND") == 1) # Uncomment if 'apply_trust_filter' does this
@@ -4498,6 +4766,7 @@ def get_last_clinical_events_for_death():
     """
     return (
         spark.table("4_prod.raw.mill_clinical_event")
+        .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
         .groupBy("PERSON_ID")
         .agg(F.max("CLINSIG_UPDT_DT_TM").alias("LAST_CE_DT_TM"))
     )
@@ -4909,6 +5178,7 @@ def process_numeric_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -4924,6 +5194,7 @@ def process_numeric_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5268,6 +5539,7 @@ def process_date_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5283,6 +5555,7 @@ def process_date_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5793,6 +6066,7 @@ def process_text_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -5808,6 +6082,7 @@ def process_text_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6350,6 +6625,7 @@ def process_nomen_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6365,6 +6641,7 @@ def process_nomen_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6921,6 +7198,7 @@ def process_coded_events_incremental():
             clinical_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -6936,6 +7214,7 @@ def process_coded_events_incremental():
             parent_events = (
                 spark.table("4_prod.raw.mill_clinical_event")
                 .filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
+                .filter(~col("RESULT_STATUS_CD").isin(29, 30, 31))
                 .withColumn(
                     "row_rank",
                     row_number().over(
@@ -9069,443 +9348,26 @@ process_patient_journey_incremental()
 
 # COMMAND ----------
 
-# Procedure categories → expected device keywords (for strict filtering)
-PROCEDURE_DEVICE_RULES = {
-    # Eye procedures
-    "cataract": ["lens", "iol", "intraocular", "implant", "phaco"],
-    "phacoemulsification": ["lens", "iol", "intraocular", "implant"],
-    
-    # Joint replacements
-    "knee replacement": ["tibial", "femoral", "patella", "knee", "polyethylene", "bearing", "component"],
-    "hip replacement": ["femoral", "acetabular", "hip", "head", "stem", "liner", "cup"],
-    "shoulder replacement": ["humeral", "glenoid", "shoulder"],
-    "arthroplasty": ["prosthesis", "component", "implant", "head", "stem"],
-    
-    # Fracture fixation
-    "fracture": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod", "k-wire"],
-    "orif": ["screw", "plate", "pin", "nail", "wire", "fixation", "rod"],
-    "internal fixation": ["screw", "plate", "pin", "nail", "wire", "fixation"],
-    
-    # Soft tissue
-    "hernia": ["mesh", "plug", "patch", "prolene", "vicryl"],
-    "repair": ["mesh", "suture", "anchor", "patch"],
-    
-    # Urology
-    "stent": ["stent", "catheter", "ureteral", "pigtail"],
-    "ureteroscopy": ["stent", "catheter", "ureteral"],
-    "cystoscopy": ["stent", "catheter"],
-    
-    # Cardiac
-    "pacemaker": ["pacemaker", "lead", "generator", "icd", "crt", "electrode"],
-    "cardiac": ["stent", "valve", "pacemaker", "lead"],
-    
-    # Gynecology
-    "iud": ["mirena", "iud", "intrauterine", "coil", "levonorgestrel"],
-    "contraceptive": ["mirena", "iud", "implant", "coil"],
-    
-    # Spine
-    "spinal": ["screw", "rod", "cage", "plate", "fusion"],
-    "discectomy": ["cage", "spacer", "implant"],
-    
-    # Vascular
-    "vascular": ["stent", "graft", "catheter"],
-    "angioplasty": ["stent", "balloon"],
-}
-
-
-
-def get_procedure_category(procedure_text):
-    """Map procedure text to device category."""
-    if not procedure_text:
-        return "other"
-    proc_lower = procedure_text.lower()
-    for category in PROCEDURE_DEVICE_RULES.keys():
-        if category in proc_lower:
-            return category
-    return "other"
-
-# Register as UDF
-get_procedure_category_udf = F.udf(get_procedure_category, StringType())
-
-
-def device_matches_procedure(device_name, procedure_category):
-    """Check if device concept is valid for procedure category."""
-    if procedure_category is None or procedure_category == "other":
-        return True
-    keywords = PROCEDURE_DEVICE_RULES.get(procedure_category, [])
-    if not keywords:
-        return True
-    device_lower = device_name.lower() if device_name else ""
-    return any(kw in device_lower for kw in keywords)
-
-
-def add_cosine_similarity_column(df, v1_col_name, v2_col_name, output_col_name="similarity"):
+def get_device_mapping_lookup() -> DataFrame:
     """
-    Add a cosine similarity column using native Spark functions.
+    Get device mapping lookup for Map Pipeline.
     
-    Much faster than a Python UDF because:
-    - No Python↔JVM serialization per row
-    - Catalyst can optimize the computation
-    - Runs natively in the JVM
+    Returns DataFrame with:
+        - normalized_desc: lowercase trimmed IMPLANT_DESCRIPTION
+        - device_concept_id: SNOMED concept ID
+        - device_concept_name: SNOMED concept name
+        - device_category: category (PACEMAKER, ICD, etc.)
+        - mapping_confidence: confidence score
     """
-    v1 = col(v1_col_name)
-    v2 = col(v2_col_name)
-    
-    # Dot product: sum of element-wise products
-    dot_product = F.aggregate(
-        F.zip_with(v1, v2, lambda x, y: x * y),
-        F.lit(0.0).cast("double"),
-        lambda acc, x: acc + x
-    )
-    
-    # L2 norms
-    norm1 = F.sqrt(F.aggregate(v1, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
-    norm2 = F.sqrt(F.aggregate(v2, F.lit(0.0).cast("double"), lambda acc, x: acc + x * x))
-    
-    # Cosine similarity with zero-division protection
-    similarity = F.when(
-        (norm1 == 0) | (norm2 == 0), 
-        F.lit(0.0)
-    ).otherwise(
-        dot_product / (norm1 * norm2)
-    )
-    
-    return df.withColumn(output_col_name, similarity)
-
-def build_device_category_lookup(device_concepts_df):
-    """
-    Build a mapping of procedure_category → list of valid device_concept_ids.
-    
-    This enables pre-filtering devices BEFORE the cross join, dramatically reducing
-    the number of similarity computations needed.
-    """
-    # Collect all device concepts to driver (small enough - typically <20k devices)
-    devices = device_concepts_df.select("device_concept_id", "concept_name").collect()
-    
-    category_to_devices = {}
-    
-    for category, keywords in PROCEDURE_DEVICE_RULES.items():
-        matching_ids = []
-        for row in devices:
-            device_name = (row.concept_name or "").lower()
-            if any(kw in device_name for kw in keywords):
-                matching_ids.append(row.device_concept_id)
-        category_to_devices[category] = matching_ids
-    
-    # "other" category matches all devices
-    category_to_devices["other"] = [row.device_concept_id for row in devices]
-    
-    return category_to_devices
-
-
-BROADCAST_THRESHOLD = 1000
-
-
-
-def get_device_mapping_incremental(chunk_size=500):
-    """
-    INCREMENTAL version: Only computes mappings for NEW implant+procedure combinations.
-    
-    OPTIMIZATIONS (v4):
-    - Native Spark cosine similarity (no Python UDF)
-    - Pre-filters devices by procedure category BEFORE cross join
-    - Uses temp Delta tables instead of .cache() (serverless compatible)
-    - Writes each chunk directly (avoids OOM from unioning many DataFrames)
-    - Conditional broadcast (only for small device sets < 1000)
-    
-    Args:
-        chunk_size: Number of new combinations to process per batch (default 500)
-    
-    Returns:
-        DataFrame with all mappings for use in joins
-    """
-    SIMILARITY_THRESHOLD = 0.7
-    MAPPING_TABLE = "3_lookup.embeddings.implant_device_mapping"
-    TEMP_IMPLANTS_TABLE = "4_prod.tmp._temp_new_implants_with_embeddings"
-    TEMP_DEVICES_TABLE = "4_prod.tmp._temp_device_embeddings"
-    
-    # Check if embedding tables exist
-    if not spark.catalog.tableExists("3_lookup.embeddings.implant_descriptions"):
-        print("[WARN] Implant embeddings not found. Run sync_and_embed_implant_descriptions() first.")
-        return None
-    
-    if not spark.catalog.tableExists("3_lookup.embeddings.device_concepts"):
-        print("[WARN] Device concept embeddings not found. Run sync_and_embed_device_concepts() first.")
-        return None
-    
-    # Ensure mapping table exists
-    if not spark.catalog.tableExists(MAPPING_TABLE):
-        print(f"[WARN] Mapping table {MAPPING_TABLE} does not exist. Run migrate_temp_mapping_table() first.")
-        return None
-    
-    # =========================================================================
-    # Step 1: Identify NEW implant+procedure combinations that need mapping
-    # =========================================================================
-    print("[INFO] Identifying new implant+procedure combinations...")
-    
-    # All unique combinations currently in map_implant_details
-    all_combinations = (spark.table("4_prod.bronze.map_implant_details")
-        .filter(col("IMPLANT_DESCRIPTION").isNotNull())
-        .filter(trim(col("IMPLANT_DESCRIPTION")) != "")
-        .select(
-            initcap(lower(trim(col("IMPLANT_DESCRIPTION")))).alias("implant_term_normalized"),
-            col("PRIMARY_PROCEDURE")
-        )
-        .distinct())
-    
-    # Existing mappings
-    existing_mappings = (spark.table(MAPPING_TABLE)
-        .select(
-            col("IMPLANT_DESCRIPTION_NORMALIZED").alias("existing_implant"),
-            col("PRIMARY_PROCEDURE").alias("existing_procedure")
-        ))
-    
-    # Find NEW combinations (left anti join)
-    new_combinations = (all_combinations
-        .join(
-            existing_mappings,
-            (all_combinations.implant_term_normalized == existing_mappings.existing_implant) &
-            (all_combinations.PRIMARY_PROCEDURE.eqNullSafe(existing_mappings.existing_procedure)),
-            "left_anti"
-        ))
-    
-    new_count = new_combinations.count()
-    print(f"[INFO] New combinations to process: {new_count}")
-    
-    if new_count == 0:
-        print("[INFO] No new mappings needed. Returning existing mappings.")
-        return spark.table(MAPPING_TABLE)
-    
-    # =========================================================================
-    # Step 2: Load embeddings and write to temp Delta tables (serverless cache)
-    # =========================================================================
-    print("[INFO] Loading embeddings to temp tables...")
-    
-    # Load implant embeddings
-    implant_embeddings = (spark.table("3_lookup.embeddings.implant_descriptions")
-        .filter(col("embedding_vector").isNotNull())
-        .select(
-            initcap(lower(trim(col("term")))).alias("embed_term"),
-            col("embedding_vector").cast(ArrayType(FloatType())).alias("implant_embedding")
-        ))
-    
-    # Add procedure category to new combinations BEFORE join
-    new_with_category = new_combinations.withColumn(
-        "procedure_category",
-        get_procedure_category_udf(col("PRIMARY_PROCEDURE"))
-    )
-    
-    # Join new combinations with their embeddings and write to temp table
-    new_with_embeddings = (new_with_category
-        .join(implant_embeddings,
-              col("implant_term_normalized") == col("embed_term"),
-              "inner")
-        .drop("embed_term"))
-    
-    # Write to temp Delta table (this replaces .cache() for serverless)
-    new_with_embeddings.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_IMPLANTS_TABLE)
-    print(f"[INFO] Wrote new implants to temp table: {TEMP_IMPLANTS_TABLE}")
-    
-    # Read back from temp table
-    new_with_embeddings = spark.table(TEMP_IMPLANTS_TABLE)
-    new_with_emb_count = new_with_embeddings.count()
-    print(f"[INFO] New combinations with embeddings: {new_with_emb_count}")
-    
-    if new_with_emb_count == 0:
-        print("[INFO] No new combinations have embeddings. Returning existing mappings.")
-        return spark.table(MAPPING_TABLE)
-    
-    # Load device concepts with embeddings
-    device_concepts = (spark.table("4_prod.omop.concept")
-        .filter(col("domain_id") == "Device")
-        .filter(col("standard_concept") == "S")
-        .filter(col("vocabulary_id") == "SNOMED")
-        .filter(col("concept_class_id") == "Physical Object")
-        .filter(col("invalid_reason").isNull())
-        .select(
-            col("concept_id").alias("device_concept_id"),
-            col("concept_name")
-        ))
-    
-    device_embeddings = (spark.table("3_lookup.embeddings.device_concepts")
-        .filter(col("embedding_vector").isNotNull())
-        .select(
-            initcap(lower(trim(col("term")))).alias("device_term_normalized"),
-            col("embedding_vector").cast(ArrayType(FloatType())).alias("device_embedding")
-        ))
-    
-    device_with_ids = (device_embeddings
-        .join(device_concepts,
-              col("device_term_normalized") == initcap(lower(trim(col("concept_name")))),
-              "inner")
-        .select("device_concept_id", "concept_name", "device_embedding"))
-    
-    # Write devices to temp table
-    device_with_ids.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TEMP_DEVICES_TABLE)
-    print(f"[INFO] Wrote devices to temp table: {TEMP_DEVICES_TABLE}")
-    
-    device_with_ids = spark.table(TEMP_DEVICES_TABLE)
-    device_count = device_with_ids.count()
-    print(f"[INFO] Device concepts with embeddings: {device_count}")
-    
-    # =========================================================================
-    # Step 3: Build procedure category → device ID lookup for pre-filtering
-    # =========================================================================
-    print("[INFO] Building device category lookup for pre-filtering...")
-    category_to_devices = build_device_category_lookup(device_with_ids)
-    
-    # Log category sizes
-    for cat, dev_ids in sorted(category_to_devices.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
-        print(f"  {cat}: {len(dev_ids)} devices")
-    
-    # =========================================================================
-    # Step 4: Process by procedure category - WRITE EACH CHUNK DIRECTLY
-    # =========================================================================
-    print("[INFO] Processing by procedure category...")
-    
-    # Get unique categories in our data, process "other" LAST (it's the largest)
-    categories = [row.procedure_category for row in new_with_embeddings.select("procedure_category").distinct().collect()]
-    # Move "other" to the end
-    if "other" in categories:
-        categories.remove("other")
-        categories.append("other")
-    print(f"[INFO] Procedure categories to process: {categories}")
-    
-    total_appended = 0
-    
-    for category in categories:
-        # Get implants for this category
-        category_implants = new_with_embeddings.filter(col("procedure_category") == category)
-        category_count = category_implants.count()
-        
-        if category_count == 0:
-            continue
-        
-        # Get device IDs valid for this category
-        valid_device_ids = category_to_devices.get(category, category_to_devices["other"])
-        
-        if not valid_device_ids:
-            print(f"[INFO] Skipping category '{category}' - no matching devices")
-            continue
-        
-        # Filter devices to only those valid for this category
-        category_devices = device_with_ids.filter(col("device_concept_id").isin(valid_device_ids))
-        filtered_device_count = len(valid_device_ids)
-        
-        print(f"[INFO] Processing '{category}': {category_count} implants × {filtered_device_count} devices")
-        
-        # Decide whether to use broadcast based on device count
-        use_broadcast = filtered_device_count <= BROADCAST_THRESHOLD
-        if not use_broadcast:
-            print(f"  [INFO] Using shuffle join (devices > {BROADCAST_THRESHOLD})")
-        
-        # Process in chunks - WRITE EACH CHUNK DIRECTLY
-        num_chunks = (category_count + chunk_size - 1) // chunk_size
-        category_appended = 0
-        
-        if num_chunks > 1:
-            # Add row numbers for chunking
-            category_numbered = category_implants.withColumn(
-                "row_num",
-                row_number().over(Window.orderBy("implant_term_normalized", "PRIMARY_PROCEDURE"))
-            )
-            
-            for chunk_idx in range(num_chunks):
-                start_row = chunk_idx * chunk_size + 1
-                end_row = (chunk_idx + 1) * chunk_size
-                
-                print(f"  [INFO] Chunk {chunk_idx + 1}/{num_chunks}...")
-                
-                chunk = category_numbered.filter(
-                    (col("row_num") >= start_row) & (col("row_num") <= end_row)
-                ).drop("row_num")
-                
-                chunk_result = process_chunk(chunk, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
-                
-                # WRITE EACH CHUNK DIRECTLY - avoids accumulating DataFrames in memory
-                if chunk_result is not None:
-                    chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
-                    category_appended += 1  # Don't count rows, just track that we wrote
-        else:
-            # Process entire category at once
-            chunk_result = process_chunk(category_implants, category_devices, SIMILARITY_THRESHOLD, use_broadcast)
-            if chunk_result is not None:
-                chunk_result.write.mode("append").saveAsTable(MAPPING_TABLE)
-                category_appended += 1
-        
-        if category_appended > 0:
-            print(f"  [INFO] Wrote {category_appended} chunk(s) for '{category}'")
-            total_appended += category_appended
-    
-    # =========================================================================
-    # Step 5: Cleanup temp tables and return
-    # =========================================================================
-    print("[INFO] Cleaning up temp tables...")
-    spark.sql(f"DROP TABLE IF EXISTS {TEMP_IMPLANTS_TABLE}")
-    spark.sql(f"DROP TABLE IF EXISTS {TEMP_DEVICES_TABLE}")
-    
-    print(f"[INFO] Processing complete. Wrote {total_appended} chunk(s) total.")
-    
-    # Get final count from table
-    full_mappings = spark.table(MAPPING_TABLE)
-    final_count = full_mappings.count()
-    print(f"[INFO] Total mappings in table: {final_count}")
-    
-    return full_mappings
-
-
-
-
-def process_chunk(implants_df, devices_df, similarity_threshold, use_broadcast=True):
-    """
-    Process a chunk of implants against filtered devices.
-    Uses native Spark functions for cosine similarity.
-    
-    Args:
-        use_broadcast: If True, broadcast devices_df. Set False for large device sets.
-    """
-    # Cross join - conditionally broadcast based on size
-    if use_broadcast:
-        crossed = implants_df.crossJoin(broadcast(devices_df))
-    else:
-        crossed = implants_df.crossJoin(devices_df)
-    
-    # Compute cosine similarity using native Spark functions
-    with_similarity = add_cosine_similarity_column(
-        crossed, 
-        "implant_embedding", 
-        "device_embedding",
-        "similarity"
-    )
-    
-    # Filter by threshold
-    above_threshold = with_similarity.filter(col("similarity") >= similarity_threshold)
-    
-    # Get best match per implant+procedure
-    w = Window.partitionBy("implant_term_normalized", "PRIMARY_PROCEDURE").orderBy(col("similarity").desc())
-    
-    best_matches = (above_threshold
-        .withColumn("rank", row_number().over(w))
-        .filter(col("rank") == 1)
-        .select(
-            col("implant_term_normalized").alias("IMPLANT_DESCRIPTION_NORMALIZED"),
-            col("PRIMARY_PROCEDURE"),
-            col("device_concept_id").cast(IntegerType()).alias("SNOMED_DEVICE_CONCEPT_ID"),
-            col("concept_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
-            col("similarity").cast(DoubleType()).alias("SIMILARITY_SCORE"),
-            col("procedure_category").alias("PROCEDURE_CATEGORY")
-        ))
-    
-    return best_matches
-
-# COMMAND ----------
-
-
-device_mapping = get_device_mapping_incremental(chunk_size=1000)
-
-if device_mapping is not None:
-    display(device_mapping.limit(10))
-    print(f"Total mappings: {device_mapping.count()}")
+    return spark.table("4_prod.bronze.map_device_mapping") \
+        .withColumn("normalized_desc", F.lower(F.trim(F.col("IMPLANT_DESCRIPTION")))) \
+        .groupBy("normalized_desc") \
+        .agg(
+            F.first("snomed_concept_id").alias("SNOMED_DEVICE_CONCEPT_ID"),
+            F.first("snomed_name").alias("SNOMED_DEVICE_CONCEPT_NAME"),
+            F.first("device_type").alias("DEVICE_TYPE"),
+            F.first("mapping_confidence").alias("MAPPING_CONFIDENCE")
+        ).filter(F.col("SNOMED_DEVICE_CONCEPT_ID").isNotNull())
 
 # COMMAND ----------
 
@@ -9601,6 +9463,18 @@ schema_map_implant_details = StructType([
     }),
     StructField("ADC_UPDT", TimestampType(), True, metadata={
         "comment": "Timestamp of last update"
+    }),
+    StructField("SNOMED_DEVICE_CONCEPT_ID",IntegerType(),True,metadata={
+        "comment":"SNOMED CT concept ID for the device"
+    }),
+    StructField("SNOMED_DEVICE_CONCEPT_NAME",StringType(),True,metadata={
+        "comment":"SNOMED CT concept name for the device"
+    }),
+    StructField("DEVICE_TYPE",StringType(),True,metadata={
+        "comment":"Device type category from SNOMED hierarchy"
+    }),
+    StructField("MAPPING_CONFIDENCE",DoubleType(),True,metadata={
+    "comment":"Confidence score of the device mapping (0-1)"
     })
 ])
 
@@ -9672,6 +9546,7 @@ def create_implant_details_incr():
             FROM 4_prod.raw.mill_clinical_event
             WHERE VALID_UNTIL_DT_TM > NOW()
             AND EVENT_CD = 71837900
+            AND RESULT_STATUS_CD NOT IN (29, 30, 31)
         ),
         procedure_events AS (
             SELECT 
@@ -9805,42 +9680,43 @@ def create_implant_details_incr():
         .withColumn("HIBCC_PROD_ID", col("udi.hibcc_pi"))
         .drop("udi"))
     
-    # =========================================================================
-    # NEW: Add SNOMED device mapping using embeddings + procedure validation
-    # =========================================================================
-    device_mapping = get_device_mapping_incremental(chunk_size=2000)
+
+    device_mapping = get_device_mapping_lookup()
     
     if device_mapping is not None:
-        # Normalize implant description for join
         result = result.withColumn(
-            "IMPLANT_DESCRIPTION_NORMALIZED",
-            initcap(lower(trim(col("IMPLANT_DESCRIPTION"))))
+            "normalized_desc",
+            lower(trim(col("IMPLANT_DESCRIPTION")))
         )
         
-        # Left join with device mapping on BOTH implant description AND procedure
+        # Simple lookup join on implant only (procedure validation done in Nomenclature Pipeline)
         result = (result
             .join(
                 broadcast(device_mapping),
-                (result.IMPLANT_DESCRIPTION_NORMALIZED == device_mapping.IMPLANT_DESCRIPTION_NORMALIZED) &
-                (result.PRIMARY_PROCEDURE.eqNullSafe(device_mapping.PRIMARY_PROCEDURE)),
+                result.normalized_desc==device_mapping.normalized_desc,
                 "left"
             )
-            .drop(device_mapping.IMPLANT_DESCRIPTION_NORMALIZED)
-            .drop(device_mapping.PRIMARY_PROCEDURE)
-            .drop("IMPLANT_DESCRIPTION_NORMALIZED"))
+            .drop(device_mapping.normalized_desc)
+            .drop("normalized_desc"))
         
         mapped_count = result.filter(col('SNOMED_DEVICE_CONCEPT_ID').isNotNull()).count()
         total_count = result.count()
-        print(f"[INFO] Added SNOMED device mapping with procedure validation.")
-        print(f"[INFO] Records with mapping: {mapped_count}/{total_count} ({100.0*mapped_count/total_count:.1f}%)")
+        print(f"[INFO] Device mapping lookup complete.")
+        print(f"[INFO] Records with validated mapping: {mapped_count}/{total_count} ({100.0*mapped_count/total_count:.1f}%)")
     else:
-        # Add empty columns if mapping not available
         print("[WARN] Device mapping not available. Adding NULL columns.")
         result = (result
             .withColumn("SNOMED_DEVICE_CONCEPT_ID", lit(None).cast(IntegerType()))
             .withColumn("SNOMED_DEVICE_CONCEPT_NAME", lit(None).cast(StringType()))
             .withColumn("SIMILARITY_SCORE", lit(None).cast(DoubleType()))
-            .withColumn("PROCEDURE_CATEGORY", lit(None).cast(StringType())))
+            .withColumn("PROCEDURE_CATEGORY", lit(None).cast(StringType()))
+            .withColumn("VALIDATED", lit(None).cast(BooleanType())))
+
+    before_filter = result.count() 
+    result = result.filter(col("EVENT_ID").isNotNull()) 
+    after_filter = result.count()  
+    if before_filter != after_filter:
+        print(f"[INFO] Filtered out {before_filter - after_filter} records with NULL EVENT_ID")  
     
     return result
 
