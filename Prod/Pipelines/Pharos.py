@@ -2638,159 +2638,153 @@ pharos_treatment_comment = "This table captures comprehensive treatment for brea
 
 schema_pharos_treatment = StructType([
     StructField(
-        "person_id",
-        LongType(),
-        nullable=True,
+        "person_id", 
+        LongType(), 
+        nullable=True, 
         metadata={"comment": "Assigned unique ID for each participant (TBC)"}
     ),
     StructField(
-        "clinical_record_id",
-        LongType(),
-        nullable=True,
+        "clinical_record_id", 
+        LongType(), 
+        nullable=True, 
         metadata={"comment": "Unique clincial record PharosID"}
     ),
     StructField(
-        "treatment_type",
-        StringType(),
-        nullable=True,
+        "treatment_type", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Type of treatment given"}
     ),
     StructField(
-        "treatment_regimen",
-        StringType(),
-        nullable=True,
+        "treatment_regimen", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Name of drug or treatment given"}
     ),
     StructField(
-        "treatment_name",
-        StringType(),
-        nullable=True,
+        "treatment_name", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Name of drug or treatment given"}
     ),
     StructField(
-        "treatment_name_other",
-        StringType(),
-        nullable=True,
+        "treatment_name_other", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Name of drug given if other selected in treatment_name"}
     ),
     StructField(
-        "treatment_intent",
-        StringType(),
-        nullable=True,
+        "treatment_intent", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Treatment intent (e.g. Neoadjuvant, Adjuvant, Advanced)"}
     ),
     StructField(
-        "treatment_start_date",
-        TimestampType(),
-        nullable=True,
+        "treatment_start_date", 
+        TimestampType(), 
+        nullable=True, 
         metadata={"comment": "Start date of treatment"}
     ),
     StructField(
-        "days_diagnosis_treatmentstart",
-        IntegerType(),
-        nullable=True,
+        "days_diagnosis_treatmentstart", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "Difference in days between primary diagnosis and start of treatment"}
     ),
     StructField(
-        "therapy_ongoing",
-        BooleanType(),
-        nullable=True,
+        "therapy_ongoing", 
+        BooleanType(), 
+        nullable=True, 
         metadata={"comment": "Is the therapy ongoing?"}
     ),
     StructField(
-        "months_therapy_length",
-        IntegerType(),
-        nullable=True,
+        "months_therapy_length", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "Planned duration of therapy in days"}
     ),
     StructField(
-        "treatment_end_date",
-        TimestampType(),
-        nullable=True,
+        "treatment_end_date", 
+        TimestampType(), 
+        nullable=True, 
         metadata={"comment": "End date of treatment"}
     ),
     StructField(
-        "days_diagnosis_treatmentend",
-        IntegerType(),
-        nullable=True,
+        "days_diagnosis_treatmentend", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "Difference in days between primary diagnosis and end of treatment"}
     ),
     StructField(
-        "treatment_end_reason",
-        StringType(),
-        nullable=True,
+        "treatment_end_reason", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Reason why the treatment was stopped (e.g. Toxicity, Progression, Protocol end, Patient choice, Death, Other, Unknown)"}
     ),
     StructField(
-        "treatment_side_effects",
-        StringType(),
-        nullable=True,
+        "treatment_side_effects", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Any side effects from administered treatment, if multiple then  separated by semicolon (;)"}
     ),
     StructField(
-        "date_treatment_last_given",
-        TimestampType(),
-        nullable=True,
+        "date_treatment_last_given", 
+        TimestampType(), 
+        nullable=True, 
         metadata={"comment": "Date of last record of treatment administration where end date is missing"}
     ),
     StructField(
-        "days_treatmentlastgiven",
-        IntegerType(),
-        nullable=True,
+        "days_treatmentlastgiven", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "Difference in days between primary diagnosis and date of last given treatment"}
     ),
     StructField(
-        "treatment_duration",
-        IntegerType(),
-        nullable=True,
+        "treatment_duration", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "Time in days between start and end date of treatment"}
     ),
     StructField(
-        "treatment_cycles",
-        IntegerType(),
-        nullable=True,
+        "treatment_cycles", 
+        IntegerType(), 
+        nullable=True, 
         metadata={"comment": "For systemic therapy given in cycles; total number of cycles given"}
     ),
     StructField(
-        "clinical_trial",
-        StringType(),
-        nullable=True,
+        "clinical_trial", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Whether patient was enrolled in an interventional trial"}
     ),
     StructField(
-        "radiotherapy_site",
-        StringType(),
-        nullable=True,
+        "radiotherapy_site", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Anatomical site(s) where radiotherapy was given"}
     ),
     StructField(
-        "radiotherapy_dose",
-        StringType(),
-        nullable=True,
+        "radiotherapy_dose", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Dose of radiotherapy administered"}
     ),
     StructField(
-        "radiotherapy_fraction",
-        StringType(),
-        nullable=True,
+        "radiotherapy_fraction", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Number of radiotherapy fractions delivered"}
     ),
     StructField(
-        "radiotherapy_boost",
-        StringType(),
-        nullable=True,
+        "radiotherapy_boost", 
+        StringType(), 
+        nullable=True, 
         metadata={"comment": "Indicates if a boost dose of radiotherapy was given"}
     ),
     StructField(
-        "ADC_UPDT",
-        TimestampType(),
-        nullable=True,
-        metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
-    ),
-    StructField(
-        "date_checked_treatment",
-        TimestampType(),
-        nullable=True,
+        "date_checked_treatment", 
+        TimestampType(), 
+        nullable=True, 
         metadata={"comment": "Last update timestamp."}
     )
 ])
@@ -2798,9 +2792,9 @@ schema_pharos_treatment = StructType([
 
 def create_pharos_treatment_incr():
 
-    max_adc_updt = get_max_timestamp(get_target_table("pharos_treatment"), "ADC_UPDT")
+    max_adc_updt = get_max_timestamp("8_dev.silver.pharos_treatment", "date_checked_treatment")
 
-    # Load Tables
+        # Load Tables
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
     procedure = spark.table("4_prod.bronze.map_procedure")
     drug = spark.table("4_prod.bronze.map_med_admin")
@@ -2813,12 +2807,8 @@ def create_pharos_treatment_incr():
             (col("ADC_UPDT") > max_adc_updt) &
             (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
-        .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
-        .agg(
-            min("earliest_diagnosis_date").alias("brc_diag_date"),
-            F.max("ADC_UPDT").alias("_src_adc_updt")
-        )
+        .agg(min("earliest_diagnosis_date").alias("brc_diag_date"))
     )
 
     # Process Chemotherapy data
@@ -2826,24 +2816,24 @@ def create_pharos_treatment_incr():
     treatment_chemo = (
         chemotherapy
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
-        .withColumn("treatment_type", lit("Chemotherapy"))
-        .withColumn("treatment_cycles",
+        .withColumn("treatment_type", lit("chemotherapy"))
+        .withColumn("treatment_cycles", 
                     when(
-                        (col("PlannedCycles") > col("CycleCancelledFrom")) & (col("CourseFinished") == "true"),
+                        (col("PlannedCycles") > col("CycleCancelledFrom")) & (col("CourseFinished") == "true"), 
                         F.coalesce(F.col("PlannedCycles"), F.lit(0)) - F.coalesce(F.col("CycleCancelledFrom"), F.lit(0)))
                     .otherwise(col("PlannedCycles"))
                     )
         .select(
             col("PERSON_ID"),
             col("treatment_type"),
+            col("SactName").alias("treatment_regimen"),
             col("Name").alias("treatment_name"),
             col("StartDate").alias("treatment_start_date"),
             col("CourseFinished").alias("therapy_ongoing"),
             col("EndDate").alias("treatment_end_date"),
             col("FinalTreatmentDate").alias("date_treatment_last_given"),
             col("treatment_cycles"),
-            col("brc_diag_date"),
-            col("_src_adc_updt")
+            col("brc_diag_date")
         )
         .dropDuplicates()
     )
@@ -2889,6 +2879,26 @@ def create_pharos_treatment_incr():
         1918231   # Niraparib
     ]
 
+    # These are included because they showed up in treatment_name values in the cdm.
+    #other_drugs = [ 
+    #    141704,   # Everolimus (mTOR Inhibitor) 
+    #    3264,     # Dexamethasone (Steroid) 
+    #    68442,    # G-CSF (Growth Factor) 
+    #    358255,   # Aprepitant (Antiemetic) 
+    #    26225,    # Ondansetron (Antiemetic)  
+    #    77655,    # Zoledronic acid (Bone Health) 
+    #   73056,    # Risedronate (Bone Health) 
+    #    11473,    # Pamidronate (Bone Health) 
+    #    32915,    # Teriparatide (Bone Health) 
+    #    1894,     # Calcitriol (Bone Health/Vitamin) 
+    #   39786,    # Venlafaxine (Supportive Care) 
+    #   25480,    # Gabapentin (Supportive Care) 
+    #  6313,     # Folinic acid (Supportive Care) 
+    #   8638,     # Prednisolone (Steroid) 
+    #  5492,     # Hydrocortisone (Steroid) 
+    #  6902      # Methylprednisolone (Steroid) 
+    #]
+
     treatment_other = (
         drug
         .filter(
@@ -2902,22 +2912,23 @@ def create_pharos_treatment_incr():
             .when(col("RXNORM_CUI").isin(cdk4_6_inhibitors), "CDK4/6 Inhibitor")
             .when(col("RXNORM_CUI").isin(parp_inhibitors), "PARP Inhibitor")
             .when(col("RXNORM_CUI").isin(chemotherapy_drugs), "Chemotherapy")
+            #.when(col("RXNORM_CUI").isin(other_drugs), "Other")
             .otherwise(lit(None))
         )
         .filter(col("treatment_type").isNotNull())
         .select(
-            "PERSON_ID",
-            "treatment_type",
-            col("RXNORM_STR").alias("treatment_name"),
-            # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course.
+            "PERSON_ID", 
+            "treatment_type", 
+            lit(None).alias("treatment_regimen"),
+            col("RXNORM_STR").alias("treatment_name"), 
+            # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course. 
             # A freetext audit is required to validate clinical 'Treatment Start/End' dates.
-            col("ADMIN_START_DT_TM").alias("treatment_start_date"),
+            col("ADMIN_START_DT_TM").alias("treatment_start_date"), 
             col("ADMIN_END_DT_TM").alias("treatment_end_date"),
             col("ADMIN_END_DT_TM").alias("date_treatment_last_given"),
             lit(None).alias("therapy_ongoing"),
             lit(None).alias("treatment_cycles"), # All records in this dataset have EndDates in the past. Freetext audit is required to determine if the treatment cycles.
-            col("brc_diag_date"),
-            col("_src_adc_updt")
+            col("brc_diag_date")
         )
     )
 
@@ -2939,13 +2950,13 @@ def create_pharos_treatment_incr():
             col("PERSON_ID").cast(LongType()).alias("person_id"),
             lit(None).alias("clinical_record_id").cast(LongType()),
             col("treatment_type").cast(StringType()),
-            lit(None).alias("treatment_regimen").cast(StringType()),
+            col("treatment_regimen").cast(StringType()),
             col("treatment_name").cast(StringType()),
             lit(None).alias("treatment_name_other").cast(StringType()),
             lit(None).alias("treatment_intent").cast(StringType()),
             col("treatment_start_date").cast(TimestampType()),
             col("days_diagnosis_treatmentstart").cast(IntegerType()),
-            col("therapy_ongoing").cast(BooleanType()),
+            col("therapy_ongoing").cast(StringType()),
             lit(None).alias("months_therapy_length").cast(IntegerType()),
             col("treatment_end_date").cast(TimestampType()),
             col("days_diagnosis_treatmentend").cast(IntegerType()),
@@ -2960,17 +2971,15 @@ def create_pharos_treatment_incr():
             lit(None).alias("radiotherapy_dose").cast(StringType()),
             lit(None).alias("radiotherapy_fraction").cast(StringType()),
             lit(None).alias("radiotherapy_boost").cast(StringType()),
-            col("_src_adc_updt").alias("ADC_UPDT"),
             lit(current_timestamp()).alias("date_checked_treatment")
         )
     )
 
-    return final_df
+    return final_df 
 
 updates_df = create_pharos_treatment_incr()
 
-# treatment_end_date removed from merge key: often NULL, which prevents proper updates
-update_table(updates_df, get_target_table("pharos_treatment"), ["person_id", "treatment_type", "treatment_name", "treatment_start_date"], schema_pharos_treatment, pharos_treatment_comment)
+update_table(updates_df, "8_dev.silver.pharos_treatment",["person_id", "treatment_type", "treatment_name", "treatment_start_date", "treatment_end_date"], schema_pharos_treatment, pharos_treatment_comment)
 
 
 # COMMAND ----------
@@ -3194,88 +3203,76 @@ pharos_comorbidities_comment = "This table records the co-existing medical condi
 
 schema_pharos_comorbidities = StructType([
     StructField(
-        "person_id",
-        LongType(),
-        True,
+        "person_id", 
+        LongType(), 
+        True, 
         {"comment": "Assigned unique ID for each participant (TBC)"}
     ),
     StructField(
-        "comorbidities",
-        StringType(),
-        True,
+        "comorbidities", 
+        StringType(), 
+        True, 
         {"comment": "Whether comorbidities are present"}
     ),
     StructField(
-        "icd_code",
-        StringType(),
-        True,
+        "icd_code", 
+        StringType(), 
+        True, 
         {"comment": "ICD code for each condition (from ICD-10)"}
     ),
     StructField(
-        "comorbidity_name",
-        StringType(),
-        True,
+        "comorbidity_name", 
+        StringType(), 
+        True, 
         {"comment": "ICD description name for condition (from ICD-10)"}
     ),
     StructField(
-        "comorbidity_temporality",
-        StringType(),
-        True,
+        "comorbidity_temporality", 
+        StringType(), 
+        True, 
         {"comment": "Whether comorbidity was diagnosed before or after cancer diagnosis"}
     ),
     StructField(
-        "diabetes",
-        StringType(),
-        True,
+        "diabetes", 
+        StringType(), 
+        True, 
         {"comment": "Whether patient is diabetic according to medical record"}
     ),
     StructField(
-        "diabetes_temporality",
-        StringType(),
-        True,
+        "diabetes_temporality", 
+        StringType(), 
+        True, 
         {"comment": "Whether diabetes was diagnosed before or after cancer diagnosis"}
     ),
     StructField(
-        "diabetes_meds",
-        StringType(),
-        True,
-        {"comment": "Medications taken to treat diabetes; multiple separated by semi-colon (;)"}
-    ),
-    StructField(
-        "date_assessed",
-        TimestampType(),
-        True,
+        "date_assessed", 
+        TimestampType(), 
+        True, 
         {"comment": "Date that this condition was entered"}
     ),
     StructField(
-        "days_diagnosis_comor",
-        IntegerType(),
-        True,
+        "days_diagnosis_comor", 
+        IntegerType(), 
+        True, 
         {"comment": "Time in days between date diagnosis and date of comorbidity condition assessment"}
     ),
     StructField(
-        "ADC_UPDT",
-        TimestampType(),
-        nullable=True,
-        metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
-    ),
-    StructField(
-        "date_checked_comorbidities",
-        TimestampType(),
-        nullable=True,
+        "date_checked_comorbidities", 
+        TimestampType(), 
+        nullable=True, 
         metadata={"comment": "Last update timestamp."}
     )
 ])
 
 def create_pharos_comorbidity_incr():
 
-    max_adc_updt = get_max_timestamp(get_target_table("pharos_comorbidities"), "ADC_UPDT")
+    max_adc_updt = get_max_timestamp("8_dev.silver.pharos_comorbidities", "date_checked_comorbidities")
 
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
     treatment = (
-        spark.table(get_target_table("pharos_treatment"))
+        spark.table("8_dev.silver.pharos_treatment")
         .select(col("person_id").alias("PERSON_ID"),"treatment_start_date","treatment_end_date")
-        .groupBy("PERSON_ID")
+        .groupBy("person_id")
         .agg(
             min("treatment_start_date").alias("treatment_start_date"),
             max("treatment_end_date").alias("treatment_end_date")
@@ -3288,17 +3285,13 @@ def create_pharos_comorbidity_incr():
             (col("ADC_UPDT") > max_adc_updt) &
             (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
-        .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
-        .agg(
-            min("earliest_diagnosis_date").alias("brc_diag_date"),
-            F.max("ADC_UPDT").alias("_src_adc_updt")
-        )
+        .agg(min("earliest_diagnosis_date").alias("brc_diag_date"))
     )
 
-    # The following medical condition with ICD10 codes are excluded,
+    # The following medical condition with ICD10 codes are excluded,  
     code_excluded = [
-        "C5",  # Breast cancer (regex prefix match, not glob)
+        "C5*",  # Breast cancer
         "C77", "C78", "C79",  # Metastasis
         "S", "T",  # Injury, poisoning and certain other consequences of external causes
         "V", "W", "X", "Y",  # External causes of morbidity and mortality
@@ -3306,8 +3299,8 @@ def create_pharos_comorbidity_incr():
         "U" # XXII Codes for special purposes
     ]
 
-    # Convert the wildcard list into a single regex for rlike
-    excluded_regex = r"^(?:{})".format("|".join(code_excluded))
+    # Convert the wildcard list into a single regex for rlike  
+    excluded_regex = r"^(?:{})".format("|".join(code_excluded))  
     window = Window.partitionBy("PERSON_ID","ICD10_CODE").orderBy(col("earliest_diagnosis_date").asc())
     comorbidity = (
         diagnosis
@@ -3316,9 +3309,9 @@ def create_pharos_comorbidity_incr():
         .withColumn("rn", row_number().over(window))
         .filter(col("rn") == 1)
         .drop("rn")
-        .join(treatment, ["PERSON_ID"], "left")
-
-        # COMORBIDITIES ---------------
+        .join(treatment, ["PERSON_ID"], "left") 
+        
+        # COMORBIDITIES --------------- 
         .withColumn(
             "comorbidities",
             when(col("ICD10_CODE").isNotNull(), lit("1 Yes"))
@@ -3329,13 +3322,12 @@ def create_pharos_comorbidity_incr():
             when(col("ICD10_CODE").isNull(), lit("9 Unknown temporality"))
             .when(col("earliest_diagnosis_date") < col("brc_diag_date"), lit("0 Pre-diagnosis"))
             .when(
-                (col("earliest_diagnosis_date") >= col("brc_diag_date")) &
+                (col("earliest_diagnosis_date") >= col("brc_diag_date")) & 
                 (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("1 Post-diagnosis"))
             .when(
-                (col("earliest_diagnosis_date") >= col("treatment_start_date")) &
+                (col("earliest_diagnosis_date") >= col("treatment_start_date")) & 
                 (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("2 During treatment"))
             .when(col("earliest_diagnosis_date") > col("treatment_end_date"), lit("1 Post-diagnosis"))
-            .otherwise(lit("9 Unknown temporality"))
         )
 
         # DIABETES ----------------
@@ -3352,6 +3344,13 @@ def create_pharos_comorbidity_incr():
                 (col("OMOP_CONCEPT_ID").isin(44808385, 37018196)),
                 "3 Pre-diabetic/borderline"
             )
+            # Probably this other type of diabetes can be included in the comorbidities (check)
+            # .when(
+            #     (col("ICD10_CODE").like("E14%")) | # Unspecified diabetes mellitus
+            #     (col("ICD10_CODE").like("E13%")) | # Other specified diabetes mellitus
+            #     (col("ICD10_CODE").like("E12%")) | # Malnutrition-related diabetes mellitus,
+            #     "4 Other diabetes types"
+            # )
             .otherwise(lit("9 Unknown"))
         )
         .withColumn(
@@ -3360,11 +3359,11 @@ def create_pharos_comorbidity_incr():
                 (col("diabetes")!= "9 Unknown") & (col("earliest_diagnosis_date") < col("brc_diag_date")), "0 Pre-diagnosis")
             .when(
                 (col("diabetes")!= "9 Unknown") &
-                (col("earliest_diagnosis_date") >= col("brc_diag_date")) &
+                (col("earliest_diagnosis_date") >= col("brc_diag_date")) & 
                 (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("1 Post-diagnosis"))
             .when(
                 (col("diabetes")!= "9 Unknown") &
-                (col("earliest_diagnosis_date") >= col("treatment_start_date")) &
+                (col("earliest_diagnosis_date") >= col("treatment_start_date")) & 
                 (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("2 During treatment"))
             .when(
                 (col("diabetes")!= "9 Unknown") &
@@ -3385,15 +3384,150 @@ def create_pharos_comorbidity_incr():
             col("comorbidity_temporality").cast(StringType()),
             col("diabetes").cast(StringType()),
             col("diabetes_temporality").cast(StringType()),
-            lit(None).alias("diabetes_meds").cast(StringType()),
             col("earliest_diagnosis_date").alias("date_assessed").cast(TimestampType()),
             col("days_diagnosis_comor").cast(IntegerType()),
-            col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("date_checked_comorbidities").cast(TimestampType())
         )
-        .dropDuplicates()
+        .dropDuplicates()  
     )
     return final_df
 
 updated_df = create_pharos_comorbidity_incr()
-update_table(updated_df, get_target_table("pharos_comorbidities"), ["person_id", "icd_code"], schema_pharos_comorbidities, pharos_comorbidities_comment)
+update_table(updated_df, "8_dev.silver.pharos_comorbidities",["person_id", "icd_code"], schema_pharos_comorbidities, pharos_comorbidities_comment)
+
+
+# COMMAND ----------
+
+pharos_meds_comment = "This table records the co-existing medical conditions (comorbidities) of participants in the Pharos cohort, with a specialized focus on diabetes management. It captures diagnostic data using ICD-10 standards, tracks the temporal relationship (pre- vs. post-cancer diagnosis) of each condition, and documents longitudinal diabetes care including associated medications. The data is structured to support analysis of how underlying health status impacts cancer treatment outcomes and patient survival."
+
+schema_pharos_meds = StructType([
+    StructField(
+        "person_id", 
+        LongType(), 
+        True, 
+        {"comment": "Assigned unique ID for each participant (TBC)"}
+    ),
+    StructField(
+        "clinical_record_id", 
+        LongType(), 
+        True, 
+        {"comment": "Unique clincial record PharosID"}
+    ),
+    StructField(
+        "indication_name", 
+        StringType(), 
+        True, 
+        {"comment": "Clinical condition, exposure, or indication at the time of diagnosis for which the recorded non-cancer medication was prescribed (e.g. diabetes, addiction, hormone replacement therapy)."}
+    ),
+    StructField(
+        "medication_name", 
+        StringType(), 
+        True, 
+        {"comment": "Name of the non-cancer medication the patient was taking at the time of cancer diagnosis, one medication per row, only one patient"}
+    ),
+    StructField(
+        "date_checked_non_cancer_meds", 
+        TimestampType(), 
+        True, 
+        {"comment": "Date medical record regarding Non-cancer Medications data was checked DD-MM-YYYY"}
+    )
+])
+
+
+def create_pharos_med_incr():
+
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    max_adc_updt = get_max_timestamp("8_dev.silver.pharos_noncancer_meds", "date_checked_non_cancer_meds")
+
+    medicine = spark.table("4_prod.bronze.map_med_admin")
+
+    # Get the breast cancer cohort
+    breast_cancer_cohort = (
+        diagnosis
+        .filter(
+            (col("ADC_UPDT") > max_adc_updt) &
+            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+        )
+        .groupBy("PERSON_ID")
+        .agg(min("earliest_diagnosis_date").alias("brc_diag_date"))
+    )
+
+    T1DM = [
+        "51428",    # Insulin Aspart
+        "86009",    # Insulin Lispro
+        "400008",   # Insulin Glulisine
+        "253181",   # Insulin Isophane
+        "253182",   # Human Regular Insulin
+        "139825",   # Insulin Detemir
+        "274783",   # Insulin Glargine
+        "1670007",  # Insulin Degludec
+        "261420",   # Insulin Lispro Protamine Mix
+        "2004040",  # Insulin Aspart Protamine Mix
+        "1650023"   # Insulin Isophane–Regular Mix
+    ]
+
+    T2DM = [
+        "4815",      # Glyburide
+        "4821",      # Glipizide
+        "6809",      # Metformin
+        "10635",     # Tolbutamide
+        "16681",     # Acarbose
+        "25789",     # Glimepiride
+        "33738",     # Pioglitazone
+        "60548",     # Exenatide
+        "73044",     # Repaglinide
+        "475968",    # Liraglutide
+        "593411",    # Sitagliptin
+        "607999",    # Metformin and pioglitazone
+        "729717",    # Metformin and sitagliptin
+        "857974",    # Saxagliptin
+        "1100699",   # Linagliptin
+        "1243019",   # Linagliptin / metformin
+        "1368001",   # Alogliptin
+        "1368384",   # Alogliptin-metformin
+        "1373458",   # Canagliflozin
+        "1440051",   # Lixisenatide
+        "1488564",   # Dapagliflozin
+        "1545653",   # Empagliflozin
+        "1551291",   # Dulaglutide
+        "1991302",   # Semaglutide
+        "2601723"    # Tirzepatide
+    ]
+
+    all_diabetes_meds = T1DM + T2DM
+
+    diabetes_med = (
+        medicine
+        .join(breast_cancer_cohort, "PERSON_ID", "left_semi")
+        .filter(col("RXNORM_CUI").isin(all_diabetes_meds))
+        .withColumn(
+            "indication_name", 
+            when(col("RXNORM_CUI").isin(T1DM), "T1DM")
+            .when(col("RXNORM_CUI").isin(T2DM), "T2DM"))   
+        .withColumn(
+            "date_checked_non_cancer_meds",
+            date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")
+        )
+        .select(
+            col("PERSON_ID").alias("person_id"),
+            col("indication_name"),
+            col("RXNORM_STR").alias("medication_name")
+        )  
+        .dropDuplicates()
+    )
+
+    final_df =(
+        diabetes_med
+        .select(
+            col("person_id").cast(LongType()),
+            lit(None).alias("clinical_record_id").cast(LongType()),
+            col("indication_name").cast(StringType()),
+            col("medication_name").cast(StringType()),
+            current_timestamp().alias("date_checked_non_cancer_meds").cast(TimestampType())
+        )  
+    )
+
+    return final_df
+
+updated_df = create_pharos_med_incr()
+update_table(updated_df, "8_dev.silver.pharos_noncancer_meds",["person_id", "medication_name"], schema_pharos_meds, pharos_meds_comment)
