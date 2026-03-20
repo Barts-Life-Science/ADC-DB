@@ -5,7 +5,8 @@
 # COMMAND ----------
 
 # Widgets
-dbutils.widgets.text("input_folder", "/Volumes/1_inland/sectra/vone/Hackathon2/", "Input DICOM Folder")
+dbutils.widgets.text("input_folder", "Hackathon2/", "Input DICOM Folder")
+dbutils.widgets.text("output_folder", "Hackathon2_ocr", "Output DICOM Folder")
 dbutils.widgets.text("ocr_log_table", "8_dev.pacs.image_ocr_text", "OCR Log Table")
 dbutils.widgets.text("preprocessing", "True", "OCR Preprocessing (True/False)")
 dbutils.widgets.text("min_text_length", "3", "Min OCR Text Length")
@@ -14,7 +15,7 @@ dbutils.widgets.text("padding", "10", "Redaction Padding (px)")
 # COMMAND ----------
 
 # Install dependencies
-%pip install paddlepaddle paddleocr opencv-python-headless SimpleITK --quiet
+#%pip install paddlepaddle paddleocr opencv-python-headless SimpleITK --quiet
 
 # COMMAND ----------
 
@@ -46,7 +47,7 @@ from pyspark.sql.types import (
 )
 
 # Read widget values
-INPUT_FOLDER = dbutils.widgets.get("input_folder")
+INPUT_FOLDER = os.path.join("/Volumes/1_inland/sectra/vone/", dbutils.widgets.get("input_folder"))
 OCR_LOG_TABLE = dbutils.widgets.get("ocr_log_table")
 PREPROCESSING = dbutils.widgets.get("preprocessing").strip().lower() == "true"
 MIN_TEXT_LENGTH = int(dbutils.widgets.get("min_text_length"))
@@ -55,7 +56,7 @@ PADDING = int(dbutils.widgets.get("padding"))
 # Derive output folder with timestamp
 _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 #OUTPUT_FOLDER = f"/Volumes/8_dev/pacs/anon_images/{_run_ts}/"
-OUTPUT_FOLDER = f"/Volumes/1_inland/evan_demo/misc/{_run_ts}/"
+OUTPUT_FOLDER = os.path.join("/Volumes/1_inland/sectra/vone/", dbutils.widgets.get("output_folder"))
 print(f"Input folder:  {INPUT_FOLDER}")
 print(f"Output folder: {OUTPUT_FOLDER}")
 print(f"OCR log table: {OCR_LOG_TABLE}")
