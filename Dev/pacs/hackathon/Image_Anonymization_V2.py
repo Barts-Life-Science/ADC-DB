@@ -20,7 +20,7 @@ dbutils.widgets.text("padding", "10", "Redaction Padding (px)")
 # COMMAND ----------
 
 # Must restart Python after pip install for paddle to pick up env vars
-dbutils.library.restartPython()
+#dbutils.library.restartPython()
 
 # COMMAND ----------
 
