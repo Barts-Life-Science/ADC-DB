@@ -34,7 +34,7 @@ from pathlib import Path
 # PaddleOCR environment — must be set before import
 os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-os.environ["PADDLEX_HOME"] = "/Volumes/1_inland/sectra/vone/paddlex/"
+os.environ.setdefault("PADDLEX_HOME", "/Volumes/1_inland/sectra/vone/paddlex/")
 
 import numpy as np
 import cv2
