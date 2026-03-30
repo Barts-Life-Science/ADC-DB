@@ -1119,8 +1119,7 @@ def run_incremental():
             StructField("similarity_score", DoubleType()),
             StructField("match_status", StringType())
         ])
-        cache_df = spark.createDataFrame(l5_cache_updates, schema=cache_schema) \
-            .withColumn("processed_at", F.current_timestamp())
+        cache_df = spark.createDataFrame(l5_cache_updates, schema=cache_schema).withColumn("record_count", F.lit(None).cast(LongType())).withColumn("created_at", F.current_timestamp())
         cache_df.write.mode("append").saveAsTable(CONFIG["layer5_matches"])
         print(f"    Saved {len(l5_cache_updates)} cache entries")
     
