@@ -2634,6 +2634,111 @@ update_table(updated_df, get_target_table("pharos_pathology"), ["person_id","sur
 
 # COMMAND ----------
 
+# ============================================================================
+# Drug Classification by OMOP Concept ID
+# ============================================================================
+# These are OMOP Standard Concept IDs (Ingredient level) used to classify
+# treatments into categories. Extended from original RXNORM-only lists.
+
+endocrine_drugs = [
+    1315946,   # letrozole
+    1436678,   # tamoxifen
+    1398399,   # exemestane
+    1366310,   # goserelin
+    1513103,   # raloxifene
+    1304044,   # fulvestrant
+]
+
+antibody_drugs = [
+    1387104,   # trastuzumab
+    42801287,  # pertuzumab
+    1397141,   # bevacizumab
+    45892628,  # nivolumab
+    40222444,  # denosumab
+]
+
+chemotherapy_drugs = [
+    1337620,   # capecitabine
+    1344905,   # carboplatin
+    1310317,   # cyclophosphamide
+    40230712,  # eribulin
+    955632,    # fluorouracil
+    1314924,   # gemcitabine
+    1305058,   # methotrexate
+    1389036,   # mitomycin
+    1315942,   # docetaxel
+    1378382,   # paclitaxel
+    1338512,   # doxorubicin
+    1344354,   # epirubicin
+]
+
+cdk4_6_inhibitors = [
+    45892075,  # palbociclib
+    1592911,   # ribociclib
+    792649,    # abemaciclib
+]
+
+parp_inhibitors = [
+    45892579,  # olaparib
+    1593861,   # niraparib
+]
+
+adc_drugs = [
+    902726,    # ado-trastuzumab emtansine (Kadcyla/T-DM1)
+    36118944,  # trastuzumab deruxtecan (Enhertu/T-DXd)
+]
+
+# Combined list for OMOP-based classification (used for ARIA stream)
+all_treatment_concept_ids = (
+    endocrine_drugs + antibody_drugs + chemotherapy_drugs +
+    cdk4_6_inhibitors + parp_inhibitors + adc_drugs
+)
+
+# Backward-compatible RXNORM CUI lists for the map_med_admin stream
+# (map_med_admin stores RXNORM_CUI as a string, mapped from Millennium orders)
+rxnorm_endocrine = [72965, 10324, 258494, 50610, 72143, 282357]
+rxnorm_antibody = [224905, 1298944, 253337, 1597876, 993449]
+rxnorm_chemotherapy = [194000, 40048, 3002, 1045453, 1160832, 12574, 6851, 632,
+                       1315942, 1378382, 1338512, 1344354]  # added docetaxel, paclitaxel, doxorubicin, epirubicin
+rxnorm_cdk4_6 = [1601374, 1873916, 1740938]
+rxnorm_parp = [1597582, 1918231]
+rxnorm_adc = [902726, 36118944]
+
+# COMMAND ----------
+
+def classify_treatment_type_omop(concept_id_col):
+    """
+    Classify a treatment type based on OMOP concept ID.
+    Used for the ARIA stream where we map agt_name -> OMOP concept -> treatment type.
+    """
+    return (
+        when(concept_id_col.isin(endocrine_drugs), "Endocrine")
+        .when(concept_id_col.isin(antibody_drugs), "Antibody")
+        .when(concept_id_col.isin(adc_drugs), "Antibody-Drug Conjugate")
+        .when(concept_id_col.isin(cdk4_6_inhibitors), "CDK4/6 Inhibitor")
+        .when(concept_id_col.isin(parp_inhibitors), "PARP Inhibitor")
+        .when(concept_id_col.isin(chemotherapy_drugs), "Chemotherapy")
+        .otherwise(lit(None))
+    )
+
+
+def classify_treatment_type_rxnorm(rxnorm_col):
+    """
+    Classify a treatment type based on RXNORM CUI.
+    Used for the map_med_admin stream (backward compatible with original pipeline).
+    """
+    return (
+        when(rxnorm_col.isin(rxnorm_endocrine), "Endocrine")
+        .when(rxnorm_col.isin(rxnorm_antibody), "Antibody")
+        .when(rxnorm_col.isin(rxnorm_adc), "Antibody-Drug Conjugate")
+        .when(rxnorm_col.isin(rxnorm_cdk4_6), "CDK4/6 Inhibitor")
+        .when(rxnorm_col.isin(rxnorm_parp), "PARP Inhibitor")
+        .when(rxnorm_col.isin(rxnorm_chemotherapy), "Chemotherapy")
+        .otherwise(lit(None))
+    )
+
+# COMMAND ----------
+
 pharos_treatment_comment = "This table captures comprehensive treatment for breast cancer patients. It includes details on systemic therapies (type, drugs, intent, cycles, start/end dates, and reasons for stopping), as well as radiotherapy administration (sites, dose, fractions, and boost)."
 
 schema_pharos_treatment = StructType([
@@ -2795,18 +2900,25 @@ schema_pharos_treatment = StructType([
     )
 ])
 
-
 def create_pharos_treatment_incr():
+    """
+    Creates incremental treatment data for the Pharos pipeline.
+
+    Three streams:
+      1. IQEMO chemotherapy — from raw iqemo_* tables
+      2. ARIA chemotherapy  — from raw aria_* tables, classified via OMOP concepts
+      3. Other systemic     — from map_med_admin (unchanged from v1)
+
+    Returns a DataFrame matching the pharos_treatment schema.
+    """
 
     max_adc_updt = get_max_timestamp(get_target_table("pharos_treatment"), "ADC_UPDT")
 
-    # Load Tables
+    # ------------------------------------------------------------------
+    # Shared: Breast cancer cohort
+    # ------------------------------------------------------------------
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
-    procedure = spark.table("4_prod.bronze.map_procedure")
-    drug = spark.table("4_prod.bronze.map_med_admin")
-    chemotherapy = spark.table("4_prod.rde.rde_iqemo")
 
-    # Get the breast cancer cohort
     breast_cancer_cohort = (
         diagnosis
         .filter(
@@ -2821,18 +2933,57 @@ def create_pharos_treatment_incr():
         )
     )
 
-    # Process Chemotherapy data
+    # ------------------------------------------------------------------
+    # Stream 1: IQEMO Chemotherapy (raw tables)
+    # ------------------------------------------------------------------
+    treatment_cycle   = spark.table("4_prod.raw.iqemo_treatment_cycle").alias("TC")
+    chemo_course      = spark.table("4_prod.raw.iqemo_chemotherapy_course").alias("CC")
+    regimen           = spark.table("4_prod.raw.iqemo_regimen").alias("RG")
+    iqemo_patient     = spark.table("4_prod.raw.iqemo_patient").alias("PT")
+    person_alias_iq   = spark.table("4_prod.raw.mill_person_alias").alias("PA_IQ")
 
-    treatment_chemo = (
-        chemotherapy
+    # Join chain: TC -> CC -> RG for regimen data, TC -> PT -> PA for PERSON_ID
+    iqemo_raw = (
+        treatment_cycle
+        .join(chemo_course, col("CC.ChemoTherapyCourseID") == col("TC.ChemoTherapyCourseID"), "left")
+        .join(regimen, col("CC.RegimenID") == col("RG.RegimenID"), "left")
+        .join(iqemo_patient, col("TC.PatientID") == col("PT.PatientID"), "left")
+        .join(
+            person_alias_iq,
+            (trim(col("PT.PrimaryIdentifier")) == trim(col("PA_IQ.ALIAS"))) &
+            (col("PA_IQ.PERSON_ALIAS_TYPE_CD") == 10) &
+            (col("PA_IQ.ALIAS_POOL_CD").isin(683996, 1115132483, 6200990, 6173940)),
+            "left"
+        )
+        .select(
+            col("PA_IQ.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+            col("RG.Name").cast(StringType()).alias("Name"),
+            col("CC.StartDate").cast(StringType()).alias("StartDate"),
+            col("CC.EndDate").cast(StringType()).alias("EndDate"),
+            col("CC.FinalTreatmentDate").cast(StringType()).alias("FinalTreatmentDate"),
+            col("CC.CourseFinished").cast(BooleanType()).alias("CourseFinished"),
+            col("CC.PlannedCycles").cast(IntegerType()).alias("PlannedCycles"),
+            col("CC.CycleCancelledFrom").cast(IntegerType()).alias("CycleCancelledFrom"),
+            greatest(
+                col("TC.ADC_UPDT"), col("CC.ADC_UPDT"), col("RG.ADC_UPDT"),
+                col("PT.ADC_UPDT"), col("PA_IQ.ADC_UPDT")
+            ).alias("ADC_UPDT")
+        )
+        .filter(col("PERSON_ID").isNotNull())
+        .filter(col("ADC_UPDT") > max_adc_updt)
+        .distinct()
+    )
+
+    treatment_iqemo = (
+        iqemo_raw
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
         .withColumn("treatment_type", lit("Chemotherapy"))
         .withColumn("treatment_cycles",
-                    when(
-                        (col("PlannedCycles") > col("CycleCancelledFrom")) & (col("CourseFinished") == "true"),
-                        F.coalesce(F.col("PlannedCycles"), F.lit(0)) - F.coalesce(F.col("CycleCancelledFrom"), F.lit(0)))
-                    .otherwise(col("PlannedCycles"))
-                    )
+            when(
+                (col("PlannedCycles") > col("CycleCancelledFrom")) & (col("CourseFinished") == True),
+                F.coalesce(col("PlannedCycles"), F.lit(0)) - F.coalesce(col("CycleCancelledFrom"), F.lit(0))
+            ).otherwise(col("PlannedCycles"))
+        )
         .select(
             col("PERSON_ID"),
             col("treatment_type"),
@@ -2848,82 +2999,129 @@ def create_pharos_treatment_incr():
         .dropDuplicates()
     )
 
-    # Other Systemic Therapies (Admin-based data)
+    # ------------------------------------------------------------------
+    # Stream 2: ARIA Chemotherapy (raw tables + OMOP classification)
+    # ------------------------------------------------------------------
+    pt_inst_key     = spark.table("4_prod.raw.aria_pt_inst_key").alias("Ptkey")
+    agt_rx          = spark.table("4_prod.raw.aria_agt_rx").alias("Arx")
+    aria_rx         = spark.table("4_prod.raw.aria_rx").alias("Rx")
+    person_alias_ar = spark.table("4_prod.raw.mill_person_alias").alias("PA_AR")
 
-    # Drug Lists for classification (Endocrine, Antibody, Inhibitors, and Supportive Care)
-    endocrine_drugs = [
-        72965,   # Letrozole
-        10324,   # Tamoxifen
-        258494,  # Exemestane
-        50610,   # Goserelin
-        72143,   # Raloxifene
-        282357   # Fulvestrant
-    ]
+    # OMOP concept lookup for drug classification
+    omop_ingredients = (
+        spark.table("3_lookup.omop.concept")
+        .filter(
+            (col("domain_id").isin("Drug", "Ingredient")) &
+            (col("standard_concept") == "S") &
+            (col("concept_class_id") == "Ingredient") &
+            (col("invalid_reason").isNull()) &
+            (col("concept_id").isin(all_treatment_concept_ids))
+        )
+        .select(
+            col("concept_id").alias("omop_concept_id"),
+            lower(col("concept_name")).alias("omop_drug_name")
+        )
+        .distinct()
+    )
 
-    antibody_drugs = [
-        224905,   # Trastuzumab
-        1298944,  # Pertuzumab
-        253337,   # Bevacizumab
-        1597876,  # Nivolumab
-        993449    # Denosumab (Bone Health)
-    ]
-    chemotherapy_drugs = [
-        194000,   # Capecitabine
-        40048,    # Carboplatin
-        3002,     # Cyclophosphamide
-        1045453,  # Eribulin
-        1160832,  # Fluorouracil (Topical)
-        12574,    # Gemcitabine
-        6851,     # Methotrexate
-        632,      # Mitomycin C
-    ]
+    # Join chain: Ptkey -> PA for PERSON_ID, Ptkey -> Arx -> Rx for drug/prescription data
+    aria_raw = (
+        pt_inst_key
+        .join(
+            person_alias_ar,
+            (regexp_replace(col("Ptkey.pt_key_value"), " ", "") == col("PA_AR.ALIAS")) &
+            (col("PA_AR.PERSON_ALIAS_TYPE_CD") == 18),
+            "left"
+        )
+        .join(agt_rx, col("Arx.pt_id") == col("Ptkey.pt_id"), "inner")
+        .join(aria_rx,
+              (col("Arx.pt_id") == col("Rx.pt_id")) & (col("Arx.rx_id") == col("Rx.rx_id")),
+              "inner")
+        .filter(col("PA_AR.PERSON_ID").isNotNull())
+        .filter(~col("Arx.agt_name").startswith("*"))  # Filter out instruction text
+        .filter(col("Arx.agt_name").isNotNull())
+        .select(
+            col("PA_AR.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+            trim(col("Arx.agt_name")).cast(StringType()).alias("agt_name"),
+            col("Arx.admn_start_date").cast(TimestampType()).alias("admn_start_date"),
+            col("Arx.tp_name").cast(StringType()).alias("tp_name"),
+            col("Rx.no_cycles").cast(IntegerType()).alias("no_cycles"),
+            col("Rx.completed_ind").cast(StringType()).alias("completed_ind"),
+            greatest(
+                col("Ptkey.ADC_UPDT"), col("Arx.ADC_UPDT"), col("Rx.ADC_UPDT"), col("PA_AR.ADC_UPDT")
+            ).alias("ADC_UPDT")
+        )
+        .filter(col("ADC_UPDT") > max_adc_updt)
+        .distinct()
+    )
 
-    cdk4_6_inhibitors = [
-        1601374,  # Palbociclib
-        1873916,  # Ribociclib
-        1740938   # Abemaciclib
-    ]
+    # Simplify drug name for matching: lowercase, take first word to handle
+    # entries like "LETROZOLE 2.5mg tablets" -> "letrozole"
+    aria_with_omop = (
+        aria_raw
+        .withColumn("agt_name_simplified",
+            lower(regexp_replace(trim(col("agt_name")), r"\s.*", ""))
+        )
+        .join(
+            broadcast(omop_ingredients),
+            col("agt_name_simplified") == col("omop_drug_name"),
+            "left"
+        )
+        .withColumn("treatment_type", classify_treatment_type_omop(col("omop_concept_id")))
+    )
 
-    parp_inhibitors = [
-        1597582,  # Olaparib
-        1918231   # Niraparib
-    ]
+    treatment_aria = (
+        aria_with_omop
+        .filter(col("treatment_type").isNotNull())
+        .join(breast_cancer_cohort, "PERSON_ID", "inner")
+        .select(
+            col("PERSON_ID"),
+            col("treatment_type"),
+            col("agt_name").alias("treatment_name"),
+            col("admn_start_date").alias("treatment_start_date"),
+            when(col("completed_ind") == "Y", lit(False))
+                .when(col("completed_ind") == "N", lit(True))
+                .otherwise(lit(None)).alias("therapy_ongoing"),
+            lit(None).cast(StringType()).alias("treatment_end_date"),
+            lit(None).cast(TimestampType()).alias("date_treatment_last_given"),
+            col("no_cycles").alias("treatment_cycles"),
+            col("brc_diag_date"),
+            col("_src_adc_updt")
+        )
+        .dropDuplicates()
+    )
+
+    # ------------------------------------------------------------------
+    # Stream 3: Other Systemic Therapies from map_med_admin (unchanged)
+    # ------------------------------------------------------------------
+    drug = spark.table("4_prod.bronze.map_med_admin")
 
     treatment_other = (
         drug
-        .filter(
-            (col("EVENT_TYPE_DISPLAY") == "Administered")
-        )
+        .filter(col("EVENT_TYPE_DISPLAY") == "Administered")
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
-        .withColumn(
-            "treatment_type",
-            when(col("RXNORM_CUI").isin(endocrine_drugs), "Endocrine")
-            .when(col("RXNORM_CUI").isin(antibody_drugs), "Antibody")
-            .when(col("RXNORM_CUI").isin(cdk4_6_inhibitors), "CDK4/6 Inhibitor")
-            .when(col("RXNORM_CUI").isin(parp_inhibitors), "PARP Inhibitor")
-            .when(col("RXNORM_CUI").isin(chemotherapy_drugs), "Chemotherapy")
-            .otherwise(lit(None))
-        )
+        .withColumn("treatment_type", classify_treatment_type_rxnorm(col("RXNORM_CUI")))
         .filter(col("treatment_type").isNotNull())
         .select(
             "PERSON_ID",
             "treatment_type",
             col("RXNORM_STR").alias("treatment_name"),
-            # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course.
-            # A freetext audit is required to validate clinical 'Treatment Start/End' dates.
             col("ADMIN_START_DT_TM").alias("treatment_start_date"),
             col("ADMIN_END_DT_TM").alias("treatment_end_date"),
             col("ADMIN_END_DT_TM").alias("date_treatment_last_given"),
             lit(None).alias("therapy_ongoing"),
-            lit(None).alias("treatment_cycles"), # All records in this dataset have EndDates in the past. Freetext audit is required to determine if the treatment cycles.
+            lit(None).alias("treatment_cycles"),
             col("brc_diag_date"),
             col("_src_adc_updt")
         )
     )
 
-    # Combine the treatment and calculate date differences
+    # ------------------------------------------------------------------
+    # Combine all streams and calculate date differences
+    # ------------------------------------------------------------------
     treatment = (
-        treatment_chemo
+        treatment_iqemo
+        .unionByName(treatment_aria)
         .unionByName(treatment_other)
         .filter(col("treatment_start_date") >= col("brc_diag_date"))
         .withColumn("days_diagnosis_treatmentstart", datediff(col("treatment_start_date"), col("brc_diag_date")))
@@ -2931,7 +3129,7 @@ def create_pharos_treatment_incr():
         .withColumn("days_treatmentlastgiven", datediff(col("date_treatment_last_given"), col("brc_diag_date")))
         .withColumn("treatment_duration", datediff(col("treatment_end_date"), col("treatment_start_date")))
         .dropDuplicates()
-        )
+    )
 
     final_df = (
         treatment
