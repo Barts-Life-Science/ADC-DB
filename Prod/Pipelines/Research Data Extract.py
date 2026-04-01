@@ -914,7 +914,7 @@ schema_rde_cds_apc = StructType([
         StructField("Priority_Desc", StringType(), True, metadata={"comment": "Text description of the CDS Priority code"}),
         StructField("Treat_Func_CD", IntegerType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION.\
 "}),
-        StructField("Spell_HRG_CD", IntegerType(), True, metadata={"comment": " Hospital provider spell healthcare resource group. This is derived from the Reference cost HRG grouper for completed spell activity. "}),
+        StructField("Spell_HRG_CD", StringType(), True, metadata={"comment": " Hospital provider spell healthcare resource group. This is derived from the Reference cost HRG grouper for completed spell activity. "}),
         StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
         StructField("Patient_Class_Desc", StringType(), True, metadata={"comment": "A detailed description of the  classification of PATIENTS who have been admitted to a Hospital Provider Spell. "}),
         StructField("PatClass_Desc", StringType(), True, metadata={"comment": "A  description of the  of the patient classification code"}),
@@ -983,7 +983,7 @@ def cds_apc_incr():
             col("WL.Priority_Type_Cd").cast(IntegerType()).alias("Priority_CD"),
             col("PT.Priority_Type_Desc").cast(StringType()).alias("Priority_Desc"),
             col("APC.Treat_Func_Cd").cast(IntegerType()).alias("Treat_Func_CD"),
-            col("HRG.Spell_HRG_Cd").cast(IntegerType()).alias("Spell_HRG_CD"),
+            col("HRG.Spell_HRG_Cd").cast(StringType()).alias("Spell_HRG_CD"),
             col("HRGDesc.HRG_Desc").cast(StringType()).alias("HRG_Desc"),
             col("PC.Patient_Class_Desc").cast(StringType()).alias("Patient_Class_Desc"),
             split(col("PC.Patient_Class_Desc"), "-").getItem(0).cast(StringType()).alias("PatClass_Desc"),
@@ -1051,6 +1051,7 @@ schema_rde_cds_opa = StructType([
         StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
         StructField("Treat_Func_Cd", IntegerType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION."}),
         StructField("Att_Type", StringType(), True, metadata={"comment": "First attendance  type description "}),
+        StructField("Atten_TypeDesc", StringType(), True, metadata={"comment": "Specific clinic or appointment type description"}),
         StructField("Attended_Desc", StringType(), True, metadata={"comment": "This indicates whether or not a patient attended for an appointment."}),
         StructField("Attendance_Outcome_Desc", StringType(), True, metadata={"comment": "Describes the outcome of an outpatient attendance."}),
         StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
@@ -1080,6 +1081,7 @@ def cds_opa_incr():
     lkp_cds_attended = spark.table("3_lookup.dwh.lkp_cds_attended").alias("AD")
     lkp_cds_attendance_outcome = spark.table("3_lookup.dwh.cds_attendance_outcome").alias("AO")
     pi_lkp_cde_code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("AttType")
+    pi_lkp_cde_appt_type_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("ApptTypeDesc")
     cds_op_all_tail = spark.table("4_prod.raw.cds_op_all_tail").alias("OPATail")
     encounter = dlt.read("rde_encounter").alias("Enc")
     
@@ -1101,18 +1103,17 @@ def cds_opa_incr():
 
     op_attendance = (
         cds_op_all_final
-        .join(mill_dir_cds_batch_content_hist, 
-              (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") == col("BHIST.CDS_BATCH_CONTENT_ID").cast("string")) & 
-              (to_date(col("OPALL.APPLICABLE_DT_TM")) == current_date()), 
-              "left")
+        .join(mill_dir_cds_batch_content_hist,
+                (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") ==
+  col("BHIST.CDS_BATCH_CONTENT_ID").cast("string")),
+                "left")
         .join(mill_dir_encounter, col("BHIST.ENCOUNTER_ID") == col("ENC.ENCNTR_ID"), "left")
         .join(mill_dir_sch_appt, (col("ENC.ENCNTR_ID") == col("APPT.ENCNTR_ID")) & (col("BHIST.PARENT_ENTITY_ID") == col("APPT.SCHEDULE_ID")), "left")
         .join(mill_dir_sch_event, col("APPT.SCH_EVENT_ID") == col("SCHE.SCH_EVENT_ID"), "left")
         .join(mill_dir_encntr_alias, (col("ENC.ENCNTR_ID") == col("EA.ENCNTR_ID")) & (col("EA.ENCNTR_ALIAS_TYPE_CD") == 1077) & (col("EA.ACTIVE_IND") == 1) & (col("EA.END_EFFECTIVE_DT_TM") > current_date()), "left")
-        .filter((col("BHIST.UPDT_DT_TM") >= current_date()) & 
-                (col("BHIST.CDS_TYPE_CD").isin(4446195, 14434936, 71834305)) & 
-                (col("BHIST.CDS_BATCH_ID") != 0) & 
-                (col("BHIST.ORGANIZATION_ID") == 8367658))
+        .filter((col("BHIST.CDS_TYPE_CD").isin(4446195, 14434936, 71834305)) &
+                  (col("BHIST.CDS_BATCH_ID") != 0) &
+                  (col("BHIST.ORGANIZATION_ID") == 8367658))
         .select(
             col("OPALL.CDS_OPA_ID").alias("CDS_BATCH_CONTENT_ID"),
             when(col("BHIST.CDS_TYPE_CD") == 71834305, col("BHIST.ACTIVITY_DT_TM")).otherwise(col("APPT.BEG_DT_TM")).alias("APPT_DT_TM"),
@@ -1146,6 +1147,7 @@ def cds_opa_incr():
         .join(encounter, col("OPATail.Encounter_ID") == col("Enc.ENCNTR_ID"), "left")
         .join(pi_lkp_cde_code_value_ref, col("Enc.ENCNTR_TYPE_CD") == col("AttType.CODE_VALUE_CD"), "left")
         .join(spark.table("op_attendance_view"), col("OPALL.CDS_OPA_ID") == col("op_attendance_view.CDS_BATCH_CONTENT_ID"), "left")
+        .join(pi_lkp_cde_appt_type_ref, col("op_attendance_view.APPT_TYPE_CD") == col("ApptTypeDesc.CODE_VALUE_CD"), "left")
         .select(
             col("OPALL.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             coalesce(col("Enc.ENC_TYPE"), lit("Outpatient")).cast(StringType()).alias("AttendanceType"),
@@ -1155,6 +1157,7 @@ def cds_opa_incr():
             col("HRGDesc.HRG_Desc").cast(StringType()).alias("HRG_Desc"),
             col("OPALL.Treat_Func_Cd").cast(IntegerType()).alias("Treat_Func_Cd"),
             coalesce(col("AttType.CODE_DESC_TXT"), col("FA.First_Attend_Desc")).cast(StringType()).alias("Att_Type"),
+            col("ApptTypeDesc.CODE_DESC_TXT").cast(StringType()).alias("Atten_TypeDesc"),
             col("AD.Attended_Desc").cast(StringType()).alias("Attended_Desc"),
             col("AO.Attendance_Outcome_Desc").cast(StringType()).alias("Attendance_Outcome_Desc"),
             col("Pat.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
