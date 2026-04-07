@@ -144,7 +144,19 @@ BRAND_GMDN_LOOKUP = {
     'pc iol': (35658, 'Posterior-chamber intraocular lens, pseudophakic'),
     'pciol': (35658, 'Posterior-chamber intraocular lens, pseudophakic'),
     'iol': (35658, 'Posterior-chamber intraocular lens, pseudophakic'),
-    
+     # J&J / DePuy Mitek - Tendon/ligament bone anchors (non-bioabsorbable) - Code 45062
+    'quickanchor': (45062, 'Tendon/ligament bone anchor, non-bioabsorbable'),
+    'quick anchor': (45062, 'Tendon/ligament bone anchor, non-bioabsorbable'),
+    'fastin': (45062, 'Tendon/ligament bone anchor, non-bioabsorbable'),
+
+    # J&J / DePuy Mitek - Tendon/ligament bone anchors (bioabsorbable) - Code 45061
+    'microfix': (45061, 'Tendon/ligament bone anchor, bioabsorbable'),
+    'lupine': (45061, 'Tendon/ligament bone anchor, bioabsorbable'),
+    'rigidfix': (45061, 'Tendon/ligament bone anchor, bioabsorbable'),
+    'versalok': (45061, 'Tendon/ligament bone anchor, bioabsorbable'),
+    # J&J / DePuy Mitek - Bioabsorbable screw - Code 45039
+    'milagro': (45039, 'Bioabsorbable orthopaedic bone screw'),
+
     # ===========================================
     # INTRAUTERINE DEVICES (IUD) - Code 41888
     # ===========================================

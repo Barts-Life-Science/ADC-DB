@@ -387,7 +387,7 @@ def encounter_incr():
             col("E.MED_SERVICE_CD").cast(IntegerType()).alias("TREATMENT_FUNCTION_CD"),
             col("TFC.DISPLAY").alias("TFC_DESC"),
             col("EA.ALIAS").cast(LongType()).alias("VISIT_ID"),
-            col("E.REG_DT_TM").alias("CREATE_DT_TM"),
+            coalesce(col("E.REG_DT_TM"), col("E.CREATE_DT_TM")).alias("CREATE_DT_TM"),
             greatest(col("E.ADC_UPDT"), col("D.ADC_UPDT")).alias("ADC_UPDT")
         )
     )
@@ -1084,6 +1084,10 @@ def cds_opa_incr():
     pi_lkp_cde_appt_type_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("ApptTypeDesc")
     cds_op_all_tail = spark.table("4_prod.raw.cds_op_all_tail").alias("OPATail")
     encounter = dlt.read("rde_encounter").alias("Enc")
+    mill_sch_appt_direct = spark.table("4_prod.raw.mill_sch_appt").alias("APPT_DIR")
+    mill_sch_event_direct = spark.table("4_prod.raw.mill_sch_event").alias("SCHE_DIR")
+    pi_lkp_cde_appt_type_ref_dir = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("ApptTypeDescDir")
+
     
     # Incorporating logic from PI_CDE_OP_ATTENDANCE
     mill_dir_cds_batch_content_hist = spark.table("4_prod.raw.mill_cds_batch_content_hist").alias("BHIST")
@@ -1104,9 +1108,9 @@ def cds_opa_incr():
     op_attendance = (
         cds_op_all_final
         .join(mill_dir_cds_batch_content_hist,
-                (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") ==
-  col("BHIST.CDS_BATCH_CONTENT_ID").cast("string")),
-                "left")
+        (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") ==
+         col("BHIST.CDS_BATCH_CONTENT_ID").cast("bigint").cast("string")),
+        "left")
         .join(mill_dir_encounter, col("BHIST.ENCOUNTER_ID") == col("ENC.ENCNTR_ID"), "left")
         .join(mill_dir_sch_appt, (col("ENC.ENCNTR_ID") == col("APPT.ENCNTR_ID")) & (col("BHIST.PARENT_ENTITY_ID") == col("APPT.SCHEDULE_ID")), "left")
         .join(mill_dir_sch_event, col("APPT.SCH_EVENT_ID") == col("SCHE.SCH_EVENT_ID"), "left")
@@ -1148,6 +1152,9 @@ def cds_opa_incr():
         .join(pi_lkp_cde_code_value_ref, col("Enc.ENCNTR_TYPE_CD") == col("AttType.CODE_VALUE_CD"), "left")
         .join(spark.table("op_attendance_view"), col("OPALL.CDS_OPA_ID") == col("op_attendance_view.CDS_BATCH_CONTENT_ID"), "left")
         .join(pi_lkp_cde_appt_type_ref, col("op_attendance_view.APPT_TYPE_CD") == col("ApptTypeDesc.CODE_VALUE_CD"), "left")
+        .join(mill_sch_appt_direct, col("Enc.ENCNTR_ID") == col("APPT_DIR.ENCNTR_ID"), "left")
+        .join(mill_sch_event_direct, col("APPT_DIR.SCH_EVENT_ID") == col("SCHE_DIR.SCH_EVENT_ID"), "left")
+        .join(pi_lkp_cde_appt_type_ref_dir, col("SCHE_DIR.APPT_TYPE_CD") == col("ApptTypeDescDir.CODE_VALUE_CD"), "left")
         .select(
             col("OPALL.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             coalesce(col("Enc.ENC_TYPE"), lit("Outpatient")).cast(StringType()).alias("AttendanceType"),
@@ -1157,7 +1164,7 @@ def cds_opa_incr():
             col("HRGDesc.HRG_Desc").cast(StringType()).alias("HRG_Desc"),
             col("OPALL.Treat_Func_Cd").cast(IntegerType()).alias("Treat_Func_Cd"),
             coalesce(col("AttType.CODE_DESC_TXT"), col("FA.First_Attend_Desc")).cast(StringType()).alias("Att_Type"),
-            col("ApptTypeDesc.CODE_DESC_TXT").cast(StringType()).alias("Atten_TypeDesc"),
+            coalesce(col("ApptTypeDesc.CODE_DESC_TXT"), col("ApptTypeDescDir.CODE_DESC_TXT")).cast(StringType()).alias("Atten_TypeDesc"),
             col("AD.Attended_Desc").cast(StringType()).alias("Attended_Desc"),
             col("AO.Attendance_Outcome_Desc").cast(StringType()).alias("Attendance_Outcome_Desc"),
             col("Pat.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
@@ -1223,6 +1230,7 @@ schema_rde_pathology = StructType([
         StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
         StructField("RequestDate", StringType(), True, metadata={"comment": "Pathology order requested date"}),
         StructField("TestCode", StringType(), True, metadata={"comment": "Any short code: like GLU for glucose or any arbitrary numeric id for the same.    This field has some shortcode related to text-not decoded"}),
+        StructField("TestCodeDesc", StringType(), True, metadata={"comment": "Description of TestCode from the order catalog. Direct lookup of the ORDER_MNEMONIC via mill_order_catalog."}),
         StructField("TestName", StringType(), True, metadata={"comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."}),
         StructField("TestDesc", StringType(), True, metadata={"comment": "Description of the test"}),
         StructField("Result_nbr", DoubleType(), True, metadata={"comment": "Numeric test result value "}),
@@ -1286,6 +1294,7 @@ def pathology_incr():
             encounter.NHS_Number.cast(StringType()).alias("NHS_Number"),
             orders.CURRENT_START_DT_TM.cast(StringType()).alias("RequestDate"),
             orders.ORDER_MNEMONIC.cast(StringType()).alias("TestCode"),
+            order_catalogue.DESCRIPTION.cast(StringType()).alias("TestCodeDesc"),  # NEW: Catalog description lookup for TestCode
             col("TESTnm.CODE_DESC_TXT").cast(StringType()).alias("TestName"),
             col("EVNTdes.CODE_DESC_TXT").cast(StringType()).alias("TestDesc"),
             col("EVE.RESULT_VAL").cast(DoubleType()).alias("Result_nbr"),
