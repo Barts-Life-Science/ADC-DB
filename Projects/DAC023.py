@@ -10,23 +10,23 @@ max_ig_severity = 4
 columns_to_exclude = ['ADC_UPDT']
 
 cohort_sql = f"""
-CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac023 AS
+CREATE OR REPLACE VIEW 6_mgmt.cohorts.{project_identifier} AS
 WITH matched_aliases AS (
   SELECT DISTINCT 
-    l.nhs_number, 
-    TRY_CAST(pa.PERSON_ID AS BIGINT) as PERSON_ID  -- Returns NULL for non-numeric
-  FROM 6_mgmt.cohort_lookup.dac023_lookup l
+    l.NHS_NUMBER, 
+    TRY_CAST(pa.PERSON_ID AS BIGINT) AS PERSON_ID
+  FROM 6_mgmt.cohort_lookup.phar001_lookup l
   JOIN 4_prod.raw.mill_person_alias pa
-  ON REGEXP_REPLACE(l.nhs_number, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
+    ON REGEXP_REPLACE(l.NHS_NUMBER, '[ -]', '') = REGEXP_REPLACE(pa.ALIAS, '[ -]', '')
 )
 SELECT DISTINCT
-  ma.PERSON_ID as PERSON_ID,
-  CAST(NULL as STRING) as subcohort
-FROM 6_mgmt.cohort_lookup.dac023_lookup l
-JOIN matched_aliases ma ON l.nhs_number = ma.nhs_number
-WHERE ma.PERSON_ID IS NOT NULL;
+  PERSON_ID,
+  CAST(NULL AS STRING) AS SUBCOHORT
+FROM matched_aliases
+WHERE PERSON_ID IS NOT NULL
 """
 spark.sql(cohort_sql)
+print(f"Created cohort view: 6_mgmt.cohorts.{project_identifier}")
 
 
 
