@@ -49,6 +49,22 @@ def table_exists_with_rows(table_name):
 
 # COMMAND ----------
 
+def _mill_code_lookup():
+    """Replacement for the CDE code value references
+    """
+    def _clean(c):
+        cleaned = trim(regexp_replace(col(c), "[\\x00\\n\\r\\t\\u00A0]", " "))
+        return when(cleaned == "", None).otherwise(cleaned)
+    cv = spark.table("3_lookup.mill.mill_code_value").alias("CV").filter(col("ACTIVE_IND") > 0)
+    return cv.select(
+        col("CV.CODE_VALUE").cast(LongType()).cast(StringType()).alias("CODE_VALUE_CD"),
+        _clean("CV.DESCRIPTION").alias("CODE_DESC_TXT"),
+        _clean("CV.DISPLAY").alias("CODE_DISP_TXT"),
+        col("CV.ADC_UPDT").alias("ADC_UPDT"),
+    )
+
+# COMMAND ----------
+
 
 @dlt.table(
     name="code_value",
@@ -149,18 +165,22 @@ def lookup_address():
 )
 def lookup_blob_content():
     window = Window.partitionBy("event_id").orderBy(
-        col("valid_until_dt_tm").desc(),
-        col("updt_dt_tm").desc()
+          col("valid_until_dt_tm").desc(),          # 1. live version first
+          col("updt_dt_tm").desc(),                 # 2. newest update
+          col("parser_version").desc_nulls_last(),  # 3. current pipeline (v2) over legacy(NULL)
+          col("TEXT_LENGTH").desc_nulls_last(),      # 4. richer extraction over truncated/mangled
+          col("valid_from_dt_tm").desc()             # 5. deterministic final key
     )
 
     return (
-        spark.table("4_prod.bronze.mill_blob_text")
-        .filter(col("STATUS") == "Decoded")
-        .filter(col("Trust") == "Barts")
-        .withColumn("row", row_number().over(window))
-        .filter(col("row") == 1)
-        .drop("row")
+          spark.table("4_prod.bronze.mill_blob_text")
+          .filter(col("STATUS") == "Decoded")
+          .filter(col("Trust") == "Barts")
+          .withColumn("row", row_number().over(window))
+          .filter(col("row") == 1)
+          .drop("row")
     )
+
 
 # COMMAND ----------
 
@@ -947,9 +967,26 @@ def cds_apc_incr():
     cds_eal_tail = spark.table("4_prod.raw.cds_eal_tail")
     cds_eal_entry = spark.table("4_prod.raw.cds_eal_entry")
     lkp_cds_priority_type = spark.table("3_lookup.dwh.cds_priority_type")
-    pi_cde_code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    pi_cde_code_value_ref = _mill_code_lookup()
     patient_demographics = dlt.read("rde_patient_demographics")
     encounter = dlt.read("rde_encounter")
+
+    mill_cds_batch_content_hist = spark.table("4_prod.raw.mill_cds_batch_content_hist")
+    _apc_enc_win = Window.partitionBy("CDS_BATCH_CONTENT_ID").orderBy(
+          col("TRANSACTION_DT_TM").desc_nulls_last(),
+          col("ENCOUNTER_ID").desc_nulls_last())
+    apc_enc_map = (
+          mill_cds_batch_content_hist
+          .filter((col("CDS_TYPE_CD") == 4446188)
+                  & col("ENCOUNTER_ID").isNotNull()
+                  & (col("ENCOUNTER_ID") != 0))
+          .withColumn("_rn", row_number().over(_apc_enc_win))
+          .filter(col("_rn") == 1)
+          .select(
+              col("CDS_BATCH_CONTENT_ID").cast("bigint").cast("string").alias("_APC_CONTENT_KEY"),
+              col("ENCOUNTER_ID").cast(LongType()).alias("_APC_ENCNTR_ID"))
+          .alias("APCMAP")
+    )
 
     cds_apc_ids = (
         slam_apc_hrg_v4.filter(col("ADC_UPDT") > max_adc_updt).select(trim(col("CDS_APC_Id")).alias("CDS_APC_Id"))
@@ -970,7 +1007,10 @@ def cds_apc_incr():
         .join(cds_eal_tail.alias("EalTl"), (col("Pat.PERSON_ID") == col("EalTl.Encounter_ID")) & (col("EalTl.Record_Type") == '060'), "left")
         .join(cds_eal_entry.alias("WL"), col("WL.CDS_EAL_Id") == col("EalTl.CDS_EAL_ID"), "left")
         .join(lkp_cds_priority_type.alias("PT"), col("PT.Priority_Type_Cd") == col("WL.Priority_Type_Cd"), "left")
-        .join(encounter.alias("Enc"), col("Pat.PERSON_ID") == col("Enc.PERSON_ID"), "left")
+        .join(apc_enc_map,
+                regexp_replace(regexp_replace(trim(col("APC.CDS_APC_ID")), "BR1H00", ""), "BRNJ00", "")
+                == col("APCMAP._APC_CONTENT_KEY"), "left")
+        .join(encounter.alias("Enc"), col("APCMAP._APC_ENCNTR_ID") == col("Enc.ENCNTR_ID"), "left")
         .join(pi_cde_code_value_ref.alias("Descr"), col("Enc.ENCNTR_TYPE_CD") == col("Descr.CODE_VALUE_CD"), "left")
         .select(
             col("APC.CDS_APC_ID").cast(StringType()).alias("CDS_APC_ID"),
@@ -1080,13 +1120,13 @@ def cds_opa_incr():
     lkp_cds_first_attend = spark.table("3_lookup.dwh.cds_first_attend").alias("FA")
     lkp_cds_attended = spark.table("3_lookup.dwh.lkp_cds_attended").alias("AD")
     lkp_cds_attendance_outcome = spark.table("3_lookup.dwh.cds_attendance_outcome").alias("AO")
-    pi_lkp_cde_code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("AttType")
-    pi_lkp_cde_appt_type_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("ApptTypeDesc")
+    pi_lkp_cde_code_value_ref = _mill_code_lookup().alias("AttType")
+    pi_lkp_cde_appt_type_ref = _mill_code_lookup().alias("ApptTypeDesc")
     cds_op_all_tail = spark.table("4_prod.raw.cds_op_all_tail").alias("OPATail")
     encounter = dlt.read("rde_encounter").alias("Enc")
     mill_sch_appt_direct = spark.table("4_prod.raw.mill_sch_appt").alias("APPT_DIR")
     mill_sch_event_direct = spark.table("4_prod.raw.mill_sch_event").alias("SCHE_DIR")
-    pi_lkp_cde_appt_type_ref_dir = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("ApptTypeDescDir")
+    pi_lkp_cde_appt_type_ref_dir = _mill_code_lookup().alias("ApptTypeDescDir")
 
     
     # Incorporating logic from PI_CDE_OP_ATTENDANCE
@@ -1259,7 +1299,7 @@ def pathology_incr():
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
     order_catalogue = spark.table("3_lookup.mill.mill_order_catalog").alias("CAT")
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     blob_content = dlt.read("current_blob_content").alias("d")
     encounter = dlt.read("rde_encounter").alias("ENC")
 
@@ -1730,7 +1770,7 @@ def radiology_incr():
 
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     blob_content = dlt.read("current_blob_content").alias("B")
     encounter = dlt.read("rde_encounter").alias("ENC")
     nhsi_exam_mapping = spark.table("4_prod.raw.tbl_nhsi_exam_mapping").alias("M")
@@ -1855,7 +1895,7 @@ def family_history_incr():
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
     person_patient_person_reltn = spark.table("4_prod.raw.mill_person_person_reltn").alias("REL")
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("R")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
         family_history.filter(col("ADC_UPDT") > max_adc_updt)
@@ -1968,7 +2008,7 @@ def blobdataset_incr():
     )
     
     encounter = dlt.read("rde_encounter").alias("E")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
         blob_content.filter(col("ADC_UPDT") > max_adc_updt)
@@ -3079,7 +3119,7 @@ def allergydetails_incr():
 
     allergy = spark.table("4_prod.raw.mill_allergy").filter(col("Trust") == "Barts").alias("A")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("Det")
 
     return (
@@ -3969,49 +4009,50 @@ schema_rde_powerforms = StructType([
     ])
 
 @dlt.table(name="rde_powerforms_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+          "skipChangeCommits": "true"}, temporary=True)
 def powerforms_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_powerforms")
+      # CUTOVER: read the rebuilt shared table (element/response grain) instead of the
+      # deprecated CDE tables + the inline label join. mill_form_activity already carries
+      # resolved Form/Section/Element/Component labels, decoded Status, and ACTIVE_IND tombstones.
+      max_adc_updt = get_max_adc_updt("4_prod.rde.rde_powerforms")
+      pf = spark.table("4_prod.bronze.mill_form_activity").alias("PF")
+      encounter = dlt.read("rde_encounter").alias("Enc")
 
-    doc_response = spark.table("4_prod.raw.pi_cde_doc_response").alias("DOC")
-    encounter = dlt.read("rde_encounter").alias("Enc")
-    doc_ref = spark.table("3_lookup.dwh.pi_lkp_cde_doc_ref").alias("Dref")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("Cref")
+      # Encounter-scoped watermark (re-emit the full response set for any changed encounter so
+      # apply_changes sees the complete per-encounter set for upserts AND ACTIVE_IND=0 deletes).
+      filtered = pf.filter(col("ADC_UPDT") > max_adc_updt)
+      relevant_encounter_ids = filtered.select("ENCNTR_ID").distinct()
 
-    filtered_doc_response = doc_response.filter(col("ADC_UPDT") > max_adc_updt)
-    filtered_doc_ref = doc_ref.filter(col("ADC_UPDT") > max_adc_updt)
-    filtered_code_value_ref = code_value_ref.filter(col("ADC_UPDT") > max_adc_updt)
+      return (
+          pf
+          .join(relevant_encounter_ids, "ENCNTR_ID", "inner")
+          .join(encounter, "ENCNTR_ID", "inner")
+          .select(
+              col("Enc.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+              col("Enc.NHS_Number").cast(StringType()).alias("NHS_Number"),
+              col("Enc.MRN").cast(StringType()).alias("MRN"),
+              col("Enc.ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
+              col("PF.PERFORMED_DT_TM").cast(StringType()).alias("PerformDate"),
+              col("PF.DOC_RESPONSE_KEY").cast(StringType()).alias("DOC_RESPONSE_KEY"),
+              col("PF.FORM_DESC_TXT").cast(StringType()).alias("Form"),
+              col("PF.FORM_EVENT_ID").cast(LongType()).alias("FormID"),
+              col("PF.SECTION_DESC_TXT").cast(StringType()).alias("Section"),
+              col("PF.SECTION_EVENT_ID").cast(LongType()).alias("SectionID"),
+              col("PF.ELEMENT_LABEL_TXT").cast(StringType()).alias("Element"),
+              col("PF.ELEMENT_EVENT_ID").cast(LongType()).alias("ElementID"),
+              col("PF.GRID_NAME_TXT").cast(StringType()).alias("Component"),
+              col("PF.GRID_COLUMN_DESC_TXT").cast(StringType()).alias("ComponentDesc"),
+              col("PF.GRID_EVENT_ID").cast(LongType()).alias("ComponentID"),
+              col("PF.RESPONSE_VALUE_TXT").cast(StringType()).alias("Response"),
+              # legacy 0/1 flag preserved verbatim (NOT the parsed value)
+              when(col("PF.RESPONSE_VALUE_TXT").cast("double").isNotNull(), lit(1)).otherwise(lit(0)).alias("ResponseNumeric"),
+              col("PF.STATUS").cast(StringType()).alias("Status"),
+              # carried for apply_as_deletes only; dropped from the target via except_column_list
+              col("PF.ACTIVE_IND").cast(IntegerType()).alias("ACTIVE_IND"),
+              greatest(col("PF.ADC_UPDT"), col("Enc.ADC_UPDT")).alias("ADC_UPDT")
+          )
+      )
 
-    relevant_encounter_ids = filtered_doc_response.select("ENCNTR_ID").distinct()
-
-    return (
-        doc_response
-        .join(relevant_encounter_ids, "ENCNTR_ID", "inner")
-        .join(encounter, "ENCNTR_ID", "inner")
-        .join(doc_ref, col("DOC.DOC_INPUT_ID") == col("Dref.DOC_INPUT_KEY"), "left")
-        .join(code_value_ref, col("DOC.FORM_STATUS_CD") == col("Cref.CODE_VALUE_CD"), "left")
-        .select(
-            col("Enc.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
-            col("Enc.NHS_Number").cast(StringType()).alias("NHS_Number"),
-            col("Enc.MRN").cast(StringType()).alias("MRN"),
-            col("Enc.ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
-            col("DOC.PERFORMED_DT_TM").cast(StringType()).alias("PerformDate"),
-            col("DOC.DOC_RESPONSE_KEY").cast(StringType()).alias("DOC_RESPONSE_KEY"),
-            col("Dref.FORM_DESC_TXT").cast(StringType()).alias("Form"),
-            col("DOC.FORM_EVENT_ID").cast(LongType()).alias("FormID"),
-            col("Dref.SECTION_DESC_TXT").cast(StringType()).alias("Section"),
-            col("DOC.SECTION_EVENT_ID").cast(LongType()).alias("SectionID"),
-            col("Dref.ELEMENT_LABEL_TXT").cast(StringType()).alias("Element"),
-            col("DOC.ELEMENT_EVENT_ID").cast(LongType()).alias("ElementID"),
-            col("Dref.GRID_NAME_TXT").cast(StringType()).alias("Component"),
-            col("Dref.GRID_COLUMN_DESC_TXT").cast(StringType()).alias("ComponentDesc"),
-            col("DOC.GRID_EVENT_ID").cast(LongType()).alias("ComponentID"),
-            col("DOC.RESPONSE_VALUE_TXT").cast(StringType()).alias("Response"),
-            when(col("DOC.RESPONSE_VALUE_TXT").cast("double").isNotNull(), lit(1)).otherwise(lit(0)).alias("ResponseNumeric"),
-            col("Cref.CODE_DESC_TXT").cast(StringType()).alias("Status"),
-            greatest(col("DOC.ADC_UPDT"), col("Enc.ADC_UPDT"), col("Dref.ADC_UPDT"), col("Cref.ADC_UPDT")).alias("ADC_UPDT")
-        )
-    )
 
 @dlt.view(name="powerforms_update")
 def powerforms_update():
@@ -4036,14 +4077,14 @@ dlt.create_target_table(
 )
 
 dlt.apply_changes(
-    target = "rde_powerforms",
-    source = "powerforms_update",
-    keys = ["ENCNTR_ID", "DOC_RESPONSE_KEY"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
+      target = "rde_powerforms",
+      source = "powerforms_update",
+      keys = ["ENCNTR_ID", "DOC_RESPONSE_KEY"],
+      sequence_by = "ADC_UPDT",
+      apply_as_deletes = F.expr("ACTIVE_IND = 0"),     
+      except_column_list = ["ACTIVE_IND"],             
+      stored_as_scd_type = 1
+  )
 
 # COMMAND ----------
 
@@ -4070,7 +4111,7 @@ def mill_powertrials_incr():
 
     mill_pt_prot_reg = spark.table("4_prod.raw.mill_pt_prot_reg").alias("RES")
     mill_pt_prot_master = spark.table("4_prod.raw.mill_prot_master").alias("STUDYM")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("LOOK")
+    code_value_ref = _mill_code_lookup().alias("LOOK")
     patient_demographics = dlt.read("rde_patient_demographics").alias("PDEM")
 
     window_spec = Window.partitionBy("RES.PROT_MASTER_ID", "RES.PERSON_ID").orderBy(desc("RES.BEG_EFFECTIVE_DT_TM"))
@@ -4493,7 +4534,7 @@ def measurements_incr():
 
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts").alias("cce")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
         clinical_event.filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
@@ -4853,7 +4894,7 @@ def medadmin_incr():
     order_ingredient = spark.table("4_prod.raw.mill_order_ingredient").alias("OI")
     order_catalog_synonym = spark.table("3_lookup.mill.mill_order_catalog_synonym").alias("OSYN")
     order_catalog = spark.table("3_lookup.mill.mill_order_catalog").alias("OCAT")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     window_spec = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
 
@@ -5008,7 +5049,7 @@ def pharmacyorders_incr():
 
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("O")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     order_detail = spark.table("4_prod.raw.mill_order_detail").alias("OD")
     order_comment = spark.table("4_prod.raw.mill_order_comment").alias("COM")
     long_text = spark.table("4_prod.raw.mill_long_text").alias("LNG")
