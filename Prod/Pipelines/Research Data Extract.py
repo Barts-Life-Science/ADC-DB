@@ -3203,49 +3203,138 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 1. SCR demographics
 scr_demo_comment = "Table containing demographic details of individuals in the Sommerset Cancer Registry"
 schema_rde_scr_demographics = StructType([
-        StructField("PATIENTID", LongType(), True, metadata={"comment": "Unique identifier for patients used in SCR."}),
-        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
-        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of the patient."}),
-        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier for the patient."}),
-        StructField("DeathDate", StringType(), True, metadata={"comment": "Date of death if applicable."}),
-        StructField("DeathCause", StringType(), True, metadata={"comment": "Text on cause of death if known."}),
-        StructField("PT_AT_RISK", StringType(), True, metadata={"comment": "True false if patient considered at risk."}),
-        StructField("REASON_RISK", StringType(), True, metadata={"comment": "If patient at risk, free text comment as to reason."}),
-        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
-    ])
+    StructField("PATIENTID", LongType(), True, metadata={"comment": "Unique identifier for patients used in SCR."}),
+    StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
+    StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of the patient."}),
+    StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier for the patient."}),
+    StructField("DeathDate", StringType(), True, metadata={"comment": "Date of death if applicable."}),
+    StructField("DeathCause", StringType(), True, metadata={"comment": "Text on cause of death if known."}),
+    StructField("PT_AT_RISK", StringType(), True, metadata={"comment": "True false if patient considered at risk."}),
+    StructField("REASON_RISK", StringType(), True, metadata={"comment": "If patient at risk, free text comment as to reason."}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+])
 
-@dlt.table(name="rde_scr_demographics_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+@dlt.table(
+    name="rde_scr_demographics_incr",
+    table_properties={"skipChangeCommits": "true"},
+    temporary=True
+)
 def scr_demographics_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_demographics")
+    # Keep only the SCR fields used by this output and normalize identifiers for matching.
+    scr_demographics = (
+        spark.table("4_prod.ancil_scr.scr_tbldemographics")
+        .select(
+            col("PATIENT_ID").cast(LongType()).alias("PATIENTID"),
+            trim(col("N1_1_NHS_NUMBER")).alias("_SCR_NHS"),
+            trim(col("N1_2_HOSPITAL_NUMBER")).alias("_SCR_MRN"),
+            col("N15_1_DATE_DEATH").cast(StringType()).alias("DeathDate"),
+            col("N15_3_DEATH_CAUSE").cast(StringType()).alias("DeathCause"),
+            col("PT_AT_RISK").cast(StringType()).alias("PT_AT_RISK"),
+            col("REASON_RISK").cast(StringType()).alias("REASON_RISK"),
+            col("ADC_UPDT").alias("_SCR_ADC_UPDT")
+        )
+    )
 
-    scr_demographics = spark.table("4_prod.ancil_scr.scr_tbldemographics").alias("SCR")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("PAT")
-    person_alias = spark.table("4_prod.raw.mill_person_alias").alias("ALIAS")
+    # Empty aliases caused very large false matches in the previous OR join.
+    # Collapse active aliases to one row per alias/person pair before matching.
+    person_alias = (
+        spark.table("4_prod.raw.mill_person_alias")
+        .filter(col("ACTIVE_IND") == 1)
+        .filter(col("ALIAS").isNotNull())
+        .filter(length(trim(col("ALIAS"))) > 0)
+        .filter(
+            col("END_EFFECTIVE_DT_TM").isNull()
+            | (col("END_EFFECTIVE_DT_TM") > current_timestamp())
+        )
+        .select(
+            trim(col("ALIAS")).alias("_ALIAS_VALUE"),
+            col("PERSON_ID").cast(LongType()).alias("_ALIAS_PERSON_ID"),
+            col("ADC_UPDT").alias("_ALIAS_ADC_UPDT")
+        )
+        .groupBy("_ALIAS_VALUE", "_ALIAS_PERSON_ID")
+        .agg(spark_max(col("_ALIAS_ADC_UPDT")).alias("_ALIAS_ADC_UPDT"))
+    )
+
+    patient_demographics = (
+        dlt.read("rde_patient_demographics")
+        .select(
+            col("PERSON_ID").cast(LongType()).alias("_PAT_PERSON_ID"),
+            trim(col("NHS_Number")).alias("_PAT_NHS"),
+            trim(col("MRN")).alias("_PAT_MRN"),
+            col("NHS_Number").cast(StringType()).alias("NHS_Number"),
+            col("MRN").cast(StringType()).alias("MRN"),
+            col("ADC_UPDT").alias("_PAT_ADC_UPDT")
+        )
+    )
+
+    # Separate equality joins avoid the expensive and duplicate-prone OR join.
+    nhs_candidates = (
+        scr_demographics
+        .filter(length(coalesce(col("_SCR_NHS"), lit(""))) > 0)
+        .join(
+            person_alias,
+            col("_SCR_NHS") == col("_ALIAS_VALUE"),
+            "inner"
+        )
+        .withColumn("_ALIAS_MATCH_PRIORITY", lit(0))
+    )
+
+    mrn_candidates = (
+        scr_demographics
+        .filter(length(coalesce(col("_SCR_MRN"), lit(""))) > 0)
+        .join(
+            person_alias,
+            col("_SCR_MRN") == col("_ALIAS_VALUE"),
+            "inner"
+        )
+        .withColumn("_ALIAS_MATCH_PRIORITY", lit(1))
+    )
+
+    link_candidates = (
+        nhs_candidates
+        .unionByName(mrn_candidates)
+        .join(
+            patient_demographics,
+            col("_ALIAS_PERSON_ID") == col("_PAT_PERSON_ID"),
+            "inner"
+        )
+        .withColumn(
+            "_MATCH_PRIORITY",
+            when(col("_SCR_NHS") == col("_PAT_NHS"), lit(0))
+            .when(col("_SCR_MRN") == col("_PAT_MRN"), lit(1))
+            .otherwise(col("_ALIAS_MATCH_PRIORITY") + lit(2))
+        )
+    )
+
+    link_rank = Window.partitionBy("PATIENTID").orderBy(
+        col("_MATCH_PRIORITY").asc(),
+        col("_ALIAS_ADC_UPDT").desc_nulls_last(),
+        col("_PAT_ADC_UPDT").desc_nulls_last(),
+        col("_PAT_PERSON_ID").asc()
+    )
 
     return (
-        scr_demographics.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(person_alias, 
-              (col("SCR.N1_1_NHS_NUMBER") == col("ALIAS.alias")) |
-              (col("SCR.N1_2_HOSPITAL_NUMBER") == col("ALIAS.alias")),
-              "left")
-        .join(patient_demographics, 
-              (col("ALIAS.PERSON_ID") == col("PAT.PERSON_ID")),
-              "inner")
+        link_candidates
+        .withColumn("_LINK_RANK", row_number().over(link_rank))
+        .filter(col("_LINK_RANK") == 1)
         .select(
-            col("SCR.PATIENT_ID").cast(LongType()).alias("PATIENTID"),
-            col("PAT.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
-            col("PAT.NHS_Number").cast(StringType()).alias("NHS_Number"),
-            col("PAT.MRN").cast(StringType()).alias("MRN"),
-            col("SCR.N15_1_DATE_DEATH").cast(StringType()).alias("DeathDate"),
-            col("SCR.N15_3_DEATH_CAUSE").cast(StringType()).alias("DeathCause"),
-            col("SCR.PT_AT_RISK").cast(StringType()).alias("PT_AT_RISK"),
-            col("SCR.REASON_RISK").cast(StringType()).alias("REASON_RISK"),
-            greatest(col("SCR.ADC_UPDT"), col("PAT.ADC_UPDT")).alias("ADC_UPDT")
+            col("PATIENTID"),
+            col("_PAT_PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+            col("NHS_Number"),
+            col("MRN"),
+            col("DeathDate"),
+            col("DeathCause"),
+            col("PT_AT_RISK"),
+            col("REASON_RISK"),
+            greatest(
+                col("_SCR_ADC_UPDT"),
+                col("_ALIAS_ADC_UPDT"),
+                col("_PAT_ADC_UPDT")
+            ).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="scr_demographics_update")
@@ -3260,7 +3349,7 @@ def scr_demographics_update():
 
 
 dlt.create_target_table(
-    name = "rde_scr_demographics",
+    name="rde_scr_demographics",
     comment=scr_demo_comment,
     schema=schema_rde_scr_demographics,
     table_properties={
@@ -3272,21 +3361,23 @@ dlt.create_target_table(
 )
 
 dlt.apply_changes(
-    target = "rde_scr_demographics",
-    source = "scr_demographics_update",
-    keys = ["PATIENTID", "PERSON_ID"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
+    target="rde_scr_demographics",
+    source="scr_demographics_update",
+    keys=["PATIENTID"],
+    sequence_by="ADC_UPDT",
+    apply_as_deletes=None,
+    except_column_list=[],
+    stored_as_scd_type=1
 )
 
 # COMMAND ----------
 
+# 2. SCR referrals
 scr_referrals_comment = "Referrals for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_referrals = StructType([
         StructField("CareID", StringType(), True, metadata={"comment": "Unique SCR identifier for care pathway."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital number."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "Patient NHS Number"}),
         StructField("PATIENT_ID", LongType(), True, metadata={"comment": "Unique Barts Patient ID"}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of the cancer, e.g. skin"}),
@@ -3335,10 +3426,13 @@ schema_rde_scr_referrals = StructType([
 @dlt.table(name="rde_scr_referrals_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_referrals_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_referrals")
 
     scr_referrals = spark.table("4_prod.ancil_scr.scr_tblmain_referrals").alias("REF")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
     priority_type = spark.table("4_prod.ancil_scr.scr_ltblpriority_type").alias("PT")
     ca_status = spark.table("4_prod.ancil_scr.scr_ltblca_status").alias("CA")
     cancer_type = spark.table("4_prod.ancil_scr.scr_ltblcancer_type").alias("TYP")
@@ -3350,7 +3444,6 @@ def scr_referrals_incr():
     scr_data = (
         scr_referrals
         .join(scr_demographics, col("REF.PATIENT_ID") == col("D.PATIENTID"), "inner")
-        .filter((col("REF.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
     )
 
     return (
@@ -3365,6 +3458,7 @@ def scr_referrals_incr():
         .select(
             col("REF.CARE_ID").cast(StringType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("REF.PATIENT_ID").cast(LongType()).alias("PATIENT_ID"),
             col("REF.L_CANCER_SITE").cast(StringType()).alias("CancerSite"),
@@ -3409,7 +3503,6 @@ def scr_referrals_incr():
             col("REF.SubsiteID").cast(LongType()).alias("SubSiteID"),
             greatest(col("REF.ADC_UPDT"), col("D.ADC_UPDT")).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="scr_referrals_update")
@@ -3447,9 +3540,11 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 3. SCR tracking comments
 scr_comments_comment = "Comments for patients in the Sommerset Cancer Registry"
 schema_rde_scr_trackingcomments = StructType([
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital ID."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("COM_ID", LongType(), True, metadata={"comment": "SCR comment ID."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR care pathway ID"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber for patient."}),
@@ -3461,17 +3556,20 @@ schema_rde_scr_trackingcomments = StructType([
 @dlt.table(name="rde_scr_trackingcomments_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_trackingcomments_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_trackingcomments")
 
     scr_tracking_comments = spark.table("4_prod.ancil_scr.scr_tbltracking_comments").alias("C")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_tracking_comments
         .join(scr_referrals, col("C.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("C.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("C.COM_ID").cast(LongType()).alias("COM_ID"),
             col("C.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
@@ -3516,10 +3614,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 4. SCR care plan
 scr_careplan_comment = "Details on the agreed care plan for patients in the Sommerset Cancer Registry"
 schema_rde_scr_careplan = StructType([
         StructField("PlanID", LongType(), True, metadata={"comment": "SCR ID for the care plan."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Barts Local hospital ID."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for the care pathway."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber of patient."}),
         StructField("MDTDate", StringType(), True, metadata={"comment": "Date of cancer multi disciplinary team meeting."}),
@@ -3540,18 +3640,21 @@ schema_rde_scr_careplan = StructType([
 @dlt.table(name="rde_scr_careplan_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_careplan_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_careplan")
 
     scr_careplan = spark.table("4_prod.ancil_scr.scr_tblmain_care_plan").alias("CP")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_careplan
         .join(scr_referrals, col("CP.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("CP.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("CP.PLAN_ID").cast(LongType()).alias("PlanID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("CP.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("CP.N5_2_MDT_DATE").cast(StringType()).alias("MDTDate"),
@@ -3605,10 +3708,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 5. SCR definitive treatment
 scr_treatment_comment = "Details on cancer treaments for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_deftreatment = StructType([
         StructField("TreatmentID", LongType(), True, metadata={"comment": "SCR id for the treatment."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID For the care plan."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
         StructField("DecisionDate", StringType(), True, metadata={"comment": "Date of treatment decision."}),
@@ -3632,18 +3737,21 @@ schema_rde_scr_deftreatment = StructType([
 @dlt.table(name="rde_scr_deftreatment_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_deftreatment_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_deftreatment")
 
     scr_deftreatment = spark.table("4_prod.ancil_scr.scr_tbldefinitive_treatment").alias("DT")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_deftreatment
         .join(scr_referrals, col("DT.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("DT.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("DT.TREATMENT_ID").cast(LongType()).alias("TreatmentID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("DT.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("DT.DECISION_DATE").cast(StringType()).alias("DecisionDate"),
@@ -3700,10 +3808,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 6. SCR diagnosis
 scr_diagnosis_comment = "Diagnoses for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_diagnosis = StructType([
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for care plan."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Skin"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "Nuhs number of patient."}),
         StructField("HospitalNumber", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
@@ -3730,18 +3840,21 @@ schema_rde_scr_diagnosis = StructType([
 @dlt.table(name="rde_scr_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_diagnosis_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_diagnosis")
 
     scr_diagnosis = spark.table("4_prod.ancil_scr.scr_bivwdiagnosis").alias("DIAG")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
 
     return (
         scr_diagnosis
         .join(scr_demographics, col("DIAG.NHS_Number") == col("D.NHS_Number"), "inner")
-        .filter((col("DIAG.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
         .select(
             col("DIAG.CARE_ID").cast(LongType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("DIAG.Cancer_Site").cast(StringType()).alias("CancerSite"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("DIAG.Hospital_Number").cast(StringType()).alias("HospitalNumber"),
@@ -3801,10 +3914,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 7. SCR investigations
 scr_investigations_comment = "Details of investigations undertaken for patients in the Sommerset Cancer Registry"
 schema_rde_scr_investigations = StructType([
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for care plan"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Lung"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS number of patient."}),
         StructField("HospitalNumber", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
@@ -3827,18 +3942,21 @@ schema_rde_scr_investigations = StructType([
 @dlt.table(name="rde_scr_investigations_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_investigations_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_investigations")
 
     scr_investigations = spark.table("4_prod.ancil_scr.scr_bivwinvestigations").alias("INV")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
 
     return (
         scr_investigations
         .join(scr_demographics, col("INV.NHS_Number") == col("D.NHS_Number"), "inner")
-        .filter((col("INV.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
         .select(
             col("INV.CARE_ID").cast(LongType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("INV.Cancer_Site").cast(StringType()).alias("CancerSite"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("INV.Hospital_Number").cast(StringType()).alias("HospitalNumber"),
@@ -3894,10 +4012,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 8. SCR pathology
 scr_pathology_comment = "Details of pathology performed for patients in the Sommerset Cancer Registry"
 schema_rde_scr_pathology = StructType([
         StructField("PathologyID", LongType(), True, metadata={"comment": "SCR pathology result identifier."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR care plan identifier."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
         StructField("PathologyType", StringType(), True, metadata={"comment": "Code for type of pathology."}),
@@ -3916,21 +4036,30 @@ schema_rde_scr_pathology = StructType([
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
 
-@dlt.table(name="rde_scr_pathology_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+@dlt.table(
+    name="rde_scr_pathology_incr",
+    table_properties={"skipChangeCommits": "true"},
+    temporary=True
+)
 def scr_pathology_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_pathology")
-
     scr_pathology = spark.table("4_prod.ancil_scr.scr_tblmain_pathology").alias("P")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_pathology
-        .join(scr_referrals, col("P.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("P.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
+        .join(
+            scr_referrals,
+            col("P.CARE_ID") == col("R.CareID"),
+            "inner"
+        )
         .select(
             col("P.PATHOLOGY_ID").cast(LongType()).alias("PathologyID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("P.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("P.N8_1_PATHOLOGY_TYPE").cast(StringType()).alias("PathologyType"),
