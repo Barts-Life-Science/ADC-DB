@@ -608,8 +608,8 @@ def create_pharos_person_incr():
         .filter(col("ADC_UPDT") > max_adc_updt)
         .withColumn(
             "sex",
-            when(col("gender_cd") == 362.0, lit("F"))
-            .when(col("gender_cd") == 363.0, lit("M"))
+            when(col("gender_cd").cast("long") == 362, lit("F"))
+            .when(col("gender_cd").cast("long") == 363, lit("M"))
             .otherwise(lit("Unknown"))
         )
         .withColumn(
@@ -647,8 +647,9 @@ def create_pharos_person_incr():
     )
 
     map_diagnosis = (
-    spark.table("4_prod.bronze.map_diagnosis")
-    .select("PERSON_ID","OMOP_CONCEPT_ID","ICD10_CODE")
+        spark.table("4_prod.bronze.map_diagnosis")
+        .select("PERSON_ID", "OMOP_CONCEPT_ID", "ICD10_CODE")
+        .withColumn("_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", ""))
     )
 
     # Omop concept_id for the subtype of the breast cancer which are not captured with ICD10 coding:
@@ -662,7 +663,7 @@ def create_pharos_person_incr():
         map_diagnosis
         .withColumn(
             "tumour_group",
-            when(col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(brc_add_ids), "breast")
+            when(col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(brc_add_ids), "breast")
             .otherwise(None)
         )
         .dropDuplicates(["PERSON_ID"])
@@ -687,6 +688,7 @@ def create_pharos_person_incr():
     )
 
     return final_df
+
 
 updates_df = create_pharos_person_incr()
 
@@ -981,18 +983,45 @@ def create_medical_history_incr():
         table_name=get_target_table("pharos_medical_history"),
         ts_column="ADC_UPDT")
 
-    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")
-    map_problem = spark.table("4_prod.bronze.map_problem")
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
+    map_problem = spark.table("4_prod.bronze.map_problem").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
     map_numeric_events = spark.table("4_prod.bronze.map_numeric_events")
     map_family_history = spark.table("4_prod.bronze.map_family_history")
     map_birth = spark.table("4_prod.bronze.map_mat_birth")
+
+    if all(
+        c in map_birth.columns
+        for c in [
+            "Pregnancy_ID", "BirthOrder", "BabyPerson_ID",
+            "BirthSourceRecordUpdatedDateTime", "BirthSourceADC_UPDT",
+            "BirthSourceCtrl_ID", "BirthRow_ID"
+        ]
+    ):
+        latest_birth = Window.partitionBy(
+            "Pregnancy_ID", "BirthOrder", "BabyPerson_ID"
+        ).orderBy(
+            F.col("BirthSourceRecordUpdatedDateTime").desc_nulls_last(),
+            F.col("BirthSourceADC_UPDT").desc_nulls_last(),
+            F.col("BirthSourceCtrl_ID").desc_nulls_last(),
+            F.col("BirthRow_ID").asc_nulls_last()
+        )
+        map_birth = (
+            map_birth
+            .withColumn("_birth_revision_rn", F.row_number().over(latest_birth))
+            .filter(F.col("_birth_revision_rn") == 1)
+            .drop("_birth_revision_rn")
+        )
 
     # Get the breast cancer cohort
     breast_cancer_cohort = (
         map_diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -1012,10 +1041,10 @@ def create_medical_history_incr():
 
     comb_prob_diag = (
         problem
-        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
+        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", "_ICD10_COMPACT", col("ONSET_DT_TM").alias("condition_date"))
         .unionByName(
             diagnosis
-            .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
+            .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", "_ICD10_COMPACT", col("DIAG_DT_TM").alias("condition_date")))
         .dropDuplicates()
     ).alias("c")
 
@@ -1097,7 +1126,7 @@ def create_medical_history_incr():
         .withColumn(
         "has_cancer_history",
         when(
-            (col("OMOP_CONCEPT_ID").isin(personal_history_ids)) | (col("ICD10_CODE").like("Z85%")), col("SOURCE_STRING"))
+            (col("OMOP_CONCEPT_ID").isin(personal_history_ids)) | (col("_ICD10_COMPACT").like("Z85%")), col("SOURCE_STRING"))
         .otherwise(None)
         )
         .filter(col("has_cancer_history").isNotNull())
@@ -1171,7 +1200,7 @@ def create_medical_history_incr():
             "familyhistory_bca_flag",
             when(
                 # ICD-10 Z803: Family history of malignant neoplasm of breast
-                (col("c.ICD10_CODE").like("Z803")) |
+                (col("c._ICD10_COMPACT") == "Z803") |
                 # OMOP concept_ids containing for family history breast cancer
                 (col("c.OMOP_CONCEPT_ID").isin(4179963, 4329111, 4160695, 42535500, 46270135, 4210263, 4176765, 4328583, 35624517, 46270155, 46270130)) |
                 (col("f.CONDITION_DESC") == "Breast cancer"),
@@ -1215,7 +1244,7 @@ def create_medical_history_incr():
             "familyhistory_cancer_flag",
             when(
                 (col("c.OMOP_CONCEPT_ID").isin(family_history_add_ids)) |
-                (col("c.ICD10_CODE").like("Z80%")) |
+                (col("c._ICD10_COMPACT").like("Z80%")) |
                 (col("familyhistory_bca_flag") == "1 Breast") |
                 (col("familyhistory_ovarian_flag") == "1 Ovarian"), "1 yes")
             .otherwise("9 Unknown")
@@ -1879,7 +1908,9 @@ def create_pharos_tumour_incr():
 
     max_adc_updt = get_max_timestamp(get_target_table("pharos_tumour"), "ADC_UPDT")
 
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
     person = spark.table("4_prod.bronze.map_person").select(col("person_id").alias("PERSON_ID"),"birth_year")
 
             # Get the breast cancer cohort
@@ -1887,7 +1918,7 @@ def create_pharos_tumour_incr():
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") |
+            (col("_ICD10_COMPACT").like("C50%") |
             col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .groupBy("PERSON_ID")
@@ -1934,6 +1965,7 @@ def create_pharos_tumour_incr():
         )
     )
     return final_df
+
 
 
 updated_df = create_pharos_tumour_incr()
@@ -2035,7 +2067,9 @@ schema_pharos_imaging = StructType([
 def create_pharos_imaging_incr():
 
     max_adc_updt = get_max_timestamp(get_target_table("pharos_imaging"), "ADC_UPDT")
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
     imaging_meta = spark.table("4_prod.pacs.imaging_metadata")
 
     # Get the breast cancer cohort
@@ -2043,7 +2077,7 @@ def create_pharos_imaging_incr():
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -2110,6 +2144,7 @@ def create_pharos_imaging_incr():
     )
 
     return final_df
+
 
 
 updated_df = create_pharos_imaging_incr()
@@ -2521,7 +2556,9 @@ def create_pharos_pathology_incr():
 
     max_adc_updt = get_max_timestamp(get_target_table("pharos_pathology"), "ADC_UPDT")
 
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
     person = spark.table("4_prod.bronze.map_person").select(col("person_id").alias("PERSON_ID"),"birth_year")
     procedure = spark.table("4_prod.bronze.map_procedure")
 
@@ -2531,7 +2568,7 @@ def create_pharos_pathology_incr():
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -2917,13 +2954,15 @@ def create_pharos_treatment_incr():
     # ------------------------------------------------------------------
     # Shared: Breast cancer cohort
     # ------------------------------------------------------------------
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
 
     breast_cancer_cohort = (
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -3284,14 +3323,26 @@ def create_pharos_followup_incr():
     # Incremental update based on silver table timestamp
     max_adc_updt = get_max_timestamp(get_target_table("pharos_followup"), "ADC_UPDT")
     death = spark.table("4_prod.bronze.map_death")
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
 
     # Identify latest contact date from hospital encounter records
+    encounter_source = spark.table("4_prod.bronze.map_encounter")
+    arrival_col = "ARRIVAL_DT_TM_BEST" if "ARRIVAL_DT_TM_BEST" in encounter_source.columns else "ARRIVE_DT_TM"
+    departure_col = "DEPARTURE_DT_TM_BEST" if "DEPARTURE_DT_TM_BEST" in encounter_source.columns else "DEPART_DT_TM"
     encounter = (
-        spark.table("4_prod.bronze.map_encounter")
-        .withColumn("date_of_last_followup", F.to_timestamp(F.coalesce("DEPART_DT_TM", "ARRIVE_DT_TM")))
+        encounter_source
+        .withColumn(
+            "date_of_last_followup",
+            F.coalesce(
+                F.to_timestamp(F.col(departure_col)),
+                F.to_timestamp(F.col(arrival_col))
+            )
+        )
+        .filter(F.col("date_of_last_followup").isNotNull())
         .groupBy("PERSON_ID")
-        .agg(max("date_of_last_followup").alias("date_of_last_followup"))
+        .agg(F.max("date_of_last_followup").alias("date_of_last_followup"))
     )
 
         # Filter cohort by ICD-10 and incremental update logic
@@ -3299,7 +3350,7 @@ def create_pharos_followup_incr():
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -3382,6 +3433,7 @@ def create_pharos_followup_incr():
     )
 
     return final_df
+
 
 updates_df = create_pharos_followup_incr()
 update_table(updates_df, get_target_table("pharos_followup"), "person_id", schema_pharos_followup, pharos_followup_comment)
@@ -3469,7 +3521,9 @@ def create_pharos_comorbidity_incr():
 
     max_adc_updt = get_max_timestamp(get_target_table("pharos_comorbidities"), "ADC_UPDT")
 
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis").withColumn(
+        "_ICD10_COMPACT", F.regexp_replace(F.upper(F.trim(F.col("ICD10_CODE"))), r"\.", "")
+    )
     treatment = (
         spark.table(get_target_table("pharos_treatment"))
         .select(col("person_id").alias("PERSON_ID"),"treatment_start_date","treatment_end_date")
@@ -3484,7 +3538,7 @@ def create_pharos_comorbidity_incr():
         diagnosis
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
-            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+            (col("_ICD10_COMPACT").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
         )
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
@@ -3509,7 +3563,7 @@ def create_pharos_comorbidity_incr():
     window = Window.partitionBy("PERSON_ID","ICD10_CODE").orderBy(col("earliest_diagnosis_date").asc())
     comorbidity = (
         diagnosis
-        .filter((~col("ICD10_CODE").rlike(excluded_regex)))
+        .filter((~col("_ICD10_COMPACT").rlike(excluded_regex)))
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
         .withColumn("rn", row_number().over(window))
         .filter(col("rn") == 1)
@@ -3539,14 +3593,14 @@ def create_pharos_comorbidity_incr():
         # DIABETES ----------------
         .withColumn(
             "diabetes",
-            when(col("ICD10_CODE").like("E10%"), "1 Type I diabetes")
+            when(col("_ICD10_COMPACT").like("E10%"), "1 Type I diabetes")
             .when(
-                (col("ICD10_CODE").like("E11%")) |
+                (col("_ICD10_COMPACT").like("E11%")) |
                 (col("OMOP_CONCEPT_ID") == 45757508),
                 "2 Type II diabetes"
             )
             .when(
-                (col("ICD10_CODE").like("R73%")) |
+                (col("_ICD10_COMPACT").like("R73%")) |
                 (col("OMOP_CONCEPT_ID").isin(44808385, 37018196)),
                 "3 Pre-diabetic/borderline"
             )
@@ -3592,6 +3646,5 @@ def create_pharos_comorbidity_incr():
         .dropDuplicates()
     )
     return final_df
-
 updated_df = create_pharos_comorbidity_incr()
 update_table(updated_df, get_target_table("pharos_comorbidities"), ["person_id", "icd_code"], schema_pharos_comorbidities, pharos_comorbidities_comment)
