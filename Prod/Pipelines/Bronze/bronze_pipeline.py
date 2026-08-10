@@ -5,14 +5,14 @@
 # MAGIC Single weekly entry point for the Bronze layer. Runs every domain pipeline in
 # MAGIC dependency order and reports one consolidated result.
 # MAGIC
-# MAGIC Release `20260726_v1`.
+# MAGIC Release `20260808_activity_v2`.
 # MAGIC
 # MAGIC ## Defaults
 # MAGIC
-# MAGIC The defaults are the ordinary weekly ones: incremental (`force_full_refresh=false`),
-# MAGIC no cutover backups, post-deployment checks on. Every pipeline is enabled except
-# MAGIC PowerForms, which stays off until its v3.1 source contract, 30-day source retention
-# MAGIC and initial full build are complete.
+# MAGIC The defaults are the ordinary weekly ones: production target, incremental
+# MAGIC (`force_full_refresh=false`), no cutover backups, and post-deployment checks on.
+# MAGIC Scheduling, theatre, medication orders and PACS are enabled after their initial
+# MAGIC production backfills complete.
 # MAGIC
 # MAGIC ## Dependencies and failure handling
 # MAGIC
@@ -32,6 +32,7 @@
 
 # COMMAND ----------
 
+import builtins
 import traceback
 from datetime import datetime, timezone
 
@@ -49,6 +50,36 @@ print(f"[BRONZE] target_schema={_bronze_target_schema}")
 print(f"[BRONZE] force_full_refresh={_bronze_force_full_refresh}")
 print(f"[BRONZE] create_cutover_backups={_bronze_create_cutover_backups}")
 print(f"[BRONZE] run_post_deployment_checks={_bronze_run_post_deployment_checks}")
+
+# A failed or in-progress production cutover leaves this lock active so the scheduled
+# weekly orchestrator cannot enter a partially bootstrapped release. Direct feed runs
+# made by the cutover notebook are intentionally unaffected.
+_bronze_deployment_lock_table = (
+    f"{bronze_control_schema(_bronze_target_schema)}.activity_bronze_release_lock"
+)
+if _bronze_target_schema.lower() == "4_prod.bronze" and bronze_table_exists(
+    _bronze_deployment_lock_table
+):
+    _bronze_deployment_lock_qname = ".".join(
+        "`" + part.replace("`", "``") + "`"
+        for part in _bronze_deployment_lock_table.split(".")
+    )
+    _bronze_active_deployment_locks = spark.sql(
+        f"""
+        SELECT release_id, owner_run_id, acquired_at, expires_at
+        FROM {_bronze_deployment_lock_qname}
+        WHERE lock_name = 'activity_bronze_production_cutover'
+          AND status = 'ACTIVE'
+          AND expires_at > current_timestamp()
+        LIMIT 1
+        """
+    ).collect()
+    if _bronze_active_deployment_locks:
+        _bronze_lock = _bronze_active_deployment_locks[0].asDict(recursive=True)
+        raise RuntimeError(
+            "The production activity-bronze deployment/backfill lock is active; "
+            f"weekly run is held until cutover completes: {bronze_json(_bronze_lock)}"
+        )
 
 # COMMAND ----------
 
@@ -132,7 +163,7 @@ _BRONZE_STEPS = [
         "name": "powerform_pipeline",
         "notebook": "powerform_pipeline",
         "enabled_widget": "run_powerform_pipeline",
-        "enabled_default": True,
+        "enabled_default": False,
         "arguments": dict(_bronze_schema_refresh_args, run_mode="incremental"),
         "requires": [],
         "timeout_seconds": 6 * 60 * 60,
@@ -172,6 +203,42 @@ _BRONZE_STEPS = [
         "arguments": _bronze_production_write_args,
         "requires": ["map_pipeline"],
         "timeout_seconds": 4 * 60 * 60,
+    },
+    {
+        "name": "scheduling_pipeline",
+        "notebook": "scheduling_pipeline",
+        "enabled_widget": "run_scheduling_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_production_write_args,
+        "requires": ["map_pipeline"],
+        "timeout_seconds": 4 * 60 * 60,
+    },
+    {
+        "name": "theatre_pipeline",
+        "notebook": "theatre_pipeline",
+        "enabled_widget": "run_theatre_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_production_write_args,
+        "requires": ["map_pipeline"],
+        "timeout_seconds": 4 * 60 * 60,
+    },
+    {
+        "name": "medication_order_pipeline",
+        "notebook": "medication_order_pipeline",
+        "enabled_widget": "run_medication_order_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_production_write_args,
+        "requires": ["map_pipeline"],
+        "timeout_seconds": 6 * 60 * 60,
+    },
+    {
+        "name": "pacs_pipeline",
+        "notebook": "pacs_pipeline",
+        "enabled_widget": "run_pacs_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_production_write_args,
+        "requires": [],
+        "timeout_seconds": 6 * 60 * 60,
     },
 ]
 
@@ -255,7 +322,7 @@ for _bronze_step in _BRONZE_STEPS:
             "step": _bronze_name,
             "status": "SUCCESS",
             "notebook": _bronze_path,
-            "elapsed_seconds": round(_bronze_elapsed, 1),
+            "elapsed_seconds": builtins.round(_bronze_elapsed, 1),
             "output": (_bronze_output or "")[:4000],
         })
     except Exception as _bronze_exc:
@@ -268,7 +335,7 @@ for _bronze_step in _BRONZE_STEPS:
             "step": _bronze_name,
             "status": "FAILED",
             "notebook": _bronze_path,
-            "elapsed_seconds": round(_bronze_elapsed, 1),
+            "elapsed_seconds": builtins.round(_bronze_elapsed, 1),
             "exception_type": type(_bronze_exc).__name__,
             "message": str(_bronze_exc)[:4000],
         })
@@ -292,7 +359,7 @@ _bronze_summary = {
     "run_id": _bronze_run_id,
     "started_at": _bronze_started_at.isoformat(),
     "finished_at": bronze_utc_now(),
-    "elapsed_seconds": round(
+    "elapsed_seconds": builtins.round(
         (datetime.now(timezone.utc) - _bronze_started_at).total_seconds(), 1
     ),
     "force_full_refresh": _bronze_force_full_refresh,
@@ -313,4 +380,5 @@ if _bronze_failed or _bronze_blocked:
     )
 
 dbutils.notebook.exit(bronze_json(_bronze_summary))
+
 
