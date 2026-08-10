@@ -807,6 +807,138 @@ update_table(
 
 # COMMAND ----------
 
+tumour_group_comment = (
+    "This table records the tumour group associated with each Pharos participant. "
+    "It links the participant to their primary tumour group, such as Breast, "
+    "Pancreatic, or Lung, based on clinical diagnosis records."
+)
+
+
+schema_tumour_group = StructType([
+    StructField(
+        "tumour_group_id",
+        LongType(),
+        True,
+        {"comment": "Surrogate primary key for each tumour group record."}
+    ),
+    StructField(
+        "person_id",
+        LongType(),
+        True,
+        {"comment": "Assigned unique ID for each participant."}
+    ),
+    StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "FK to person."}
+    ),
+    StructField(
+        "clinical_record_id",
+        LongType(),
+        True,
+        {"comment": "Unique clinical record PharosID."}
+    ),
+    StructField(
+        "tumour_group",
+        StringType(),
+        True,
+        {"comment": "Tumour group, e.g. Breast, Pancreatic, Lung."}
+    ),
+    StructField(
+        "ADC_UPDT",
+        TimestampType(),
+        True,
+        {"comment": "Last update timestamp."}
+    ),
+    StructField(
+        "date_checked",
+        TimestampType(),
+        True,
+        {"comment": "Last update timestamp."}
+    ),
+    StructField(
+        "created_at",
+        TimestampType(),
+        True,
+        {"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        "updated_at",
+        TimestampType(),
+        True,
+        {"comment": "Row last-updated timestamp."}
+    )
+])
+
+
+def create_tumour_group_incr():
+
+    max_adc_updt = get_max_timestamp(
+        table_name=get_target_table("tumour_group"),
+        ts_column="ADC_UPDT"
+    )
+
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+
+    tumour_group_cohort = (
+        map_diagnosis
+        .filter(col("ADC_UPDT") > max_adc_updt)
+        .filter(col("PERSON_ID").isNotNull())
+        .withColumn(
+            "tumour_group",
+            F.when(
+                (col("ICD10_CODE").like("C50%")) |
+                (col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331)),
+                "Breast"
+            )
+            .when(
+                col("ICD10_CODE").like("C25%"),
+                "Pancreatic"
+            )
+            .when(
+                col("ICD10_CODE").like("C33%") |
+                col("ICD10_CODE").like("C34%"),
+                "Lung"
+            )
+        )
+        .filter(col("tumour_group").isNotNull())
+        .groupBy("PERSON_ID", "tumour_group")
+        .agg(
+            F.max("ADC_UPDT").alias("_src_adc_updt")
+        )
+    )
+
+    final_df = (
+        tumour_group_cohort
+        .select(
+            lit(None).cast(LongType()).alias("tumour_group_id"),
+            col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(LongType()).alias("clinical_record_id"),
+            col("tumour_group"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
+        )
+    )
+
+    return final_df
+
+
+updates_df = create_tumour_group_incr()
+
+update_table(
+    updates_df,
+    "8_dev.silver.tumour_group",
+    ["person_id"],
+    schema_tumour_group,
+    tumour_group_comment
+)
+
+# COMMAND ----------
+
 pharos_medical_history_comment = "The table contains the medical history of partcipants."
 schema_pharos_medical_history = StructType([
     StructField(
@@ -1732,9 +1864,15 @@ update_table(updates_df,"8_dev.silver.pharos_medical_history", ["person_id"], sc
 
 # COMMAND ----------
 
-pharos_fh_comment = "The table contains demographic information about patients, including identifiers such as person ID, gender, birth year, and ethnicity, etc."
+pharos_fh_comment = "This table captures family history of cancer."
 
 schema_pharos_fh = StructType([
+    StructField(
+        name="family_history_id",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "Surrogate PK."}
+    ), 
     StructField(
         name="person_id",
         dataType=LongType(),
@@ -1742,7 +1880,7 @@ schema_pharos_fh = StructType([
         metadata={"comment": "Assigned unique ID for each participant."}
     ),   
     StructField(
-        name="pharos_id",
+        name="pharosid",
         dataType=StringType(),
         nullable=True,
         metadata={"comment": "FK to person."}
@@ -1761,23 +1899,17 @@ schema_pharos_fh = StructType([
     ),
     StructField(
         name="relation_degree",
-        dataType=StringType()
+        dataType=StringType(),
         nullable=True,
         metadata={"comment": "Highest degree relation."}
     ),
     StructField(
         name="relation_detail",
-        dataType=StringType()
+        dataType=StringType(),
         nullable=True,
         metadata={"comment": "Specific relation (e.g. Mother, Sister, Aunt)."}
     ),
     StructField(
-        name="familyhistory_relation",
-        dataType=StringType(),
-        nullable=True,
-        metadata={"comment": "Where there is a family history of breast or ovarian cancer, the highest degree relation."}
-    ),
-        StructField(
         name="date_checked",
         dataType=TimestampType(),
         nullable=True,
@@ -1797,18 +1929,22 @@ schema_pharos_fh = StructType([
     )
 ])
 
+# Family history is derived from two sources:
+# 1. The map_family_history table
+# 2. The map_problem and map_diagnosis tables using relevant family history codes
+
 def create_fh_incr():
     max_adc_updt = get_max_timestamp(
         table_name=get_target_table("pharos_family_cancer_history"),
         ts_column="ADC_UPDT")
 
     map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    map_problem = spark.table("4_prod.bronze.map_problem")
     map_family_history = spark.table("4_prod.bronze.map_family_history")
 
     # Get the breast cancer cohort
     breast_cancer_cohort = (
         map_diagnosis
-        .join(pharos_cohort, col("m.PERSON_ID") == col("p.person_id"), "left_semi")
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
             (
@@ -1823,8 +1959,74 @@ def create_fh_incr():
             F.max("ADC_UPDT").alias("_src_adc_updt")
         )
     )
-    processed_family_relation = (
-        family_history
+
+    comb_prob_diag = (
+    map_problem
+    .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
+    .unionByName(
+        map_diagnosis
+        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
+    .dropDuplicates())
+    # Get data from map_family_history
+
+    cancer_type = (
+        when(col("ICD10_CODE").rlike("^C74"), "001 - Adrenal cancer")
+        .when(col("ICD10_CODE").rlike("^C21"), "002 - Anal cancer")
+        .when(col("ICD10_CODE").rlike("^(C22\\.1|C24\\.0)"), "003 - Bile duct cancer")
+        .when(col("ICD10_CODE").rlike("^C67"), "004 - Bladder cancer")
+        .when(col("ICD10_CODE").rlike("^(C40|C41)"), "005 - Bone cancer")
+        .when(col("ICD10_CODE").rlike("^C71"), "006 - Brain cancer")
+        .when(col("ICD10_CODE").rlike("^C50"), "007 - Breast cancer")
+        .when(col("ICD10_CODE").rlike("^C53"), "008 - Cervical cancer")
+        .when(col("ICD10_CODE").rlike("^C18"), "010 - Colon cancer")
+        .when(col("ICD10_CODE").rlike("^(C18|C19|C20)"), "011 - Colorectal cancer")
+        .when(col("ICD10_CODE").rlike("^C54\\.1"), "012 - Endometrial cancer")
+        .when(col("ICD10_CODE").rlike("^C69"), "013 - Eye cancer")
+        .when(col("ICD10_CODE").rlike("^C57\\.0"), "014 - Fallopian tube cancer")
+        .when(col("ICD10_CODE").rlike("^C23"), "015 - Gallbladder cancer")
+        .when(col("ICD10_CODE").rlike("^C16"), "016 - Gastric cancer")
+        .when(col("ICD10_CODE").rlike("^C64"), "019 - Kidney cancer")
+        .when(col("ICD10_CODE").rlike("^C32"), "020 - Laryngeal cancer")
+        .when(col("ICD10_CODE").rlike("^(C91|C92|C93|C94|C95)"), "021 - Leukaemia")
+        .when(col("ICD10_CODE").rlike("^C22"), "022 - Liver cancer")
+        .when(col("ICD10_CODE").rlike("^C34"), "023 - Lung cancer")
+        .when(col("ICD10_CODE").rlike("^(C81|C82|C83|C84|C85|C86|C88)"), "024 - Lymphoma")
+        .when(col("ICD10_CODE").rlike("^C38"), "025 - Mediastinal cancer")
+        .when(col("ICD10_CODE").rlike("^C43"), "026 - Melanoma")
+        .when(col("ICD10_CODE").rlike("^D46"), "027 - Myelodysplastic syndrome")
+        .when(col("ICD10_CODE").rlike("^C90"), "028 - Myeloma")
+        .when(col("ICD10_CODE").rlike("^(D45|D47\\.1|D47\\.3|D47\\.4)"), "029 - Myeloproliferative neoplasm")
+        .when(col("ICD10_CODE").rlike("^C11"), "030 - Nasopharyngeal cancer")
+        .when(col("ICD10_CODE").rlike("^C15"), "033 - Oesophageal cancer")
+        .when(col("ICD10_CODE").rlike("^(C00|C01|C02|C03|C04|C05|C06)"), "034 - Oral cancer")
+        .when(col("ICD10_CODE").rlike("^(C09|C10)"), "035 - Oropharyngeal cancer")
+        .when(col("ICD10_CODE").rlike("^C56"), "036 - Ovarian cancer")
+        .when(col("ICD10_CODE").rlike("^C25"), "037 - Pancreatic cancer")
+        .when(col("ICD10_CODE").rlike("^C75\\.0"), "038 - Parathyroid cancer")
+        .when(col("ICD10_CODE").rlike("^C60"), "039 - Penile cancer")
+        .when(col("ICD10_CODE").rlike("^(C38\\.4|C45\\.0)"), "040 - Pleural cancer")
+        .when(col("ICD10_CODE").rlike("^C48"), "041 - Primary peritoneal cancer")
+        .when(col("ICD10_CODE").rlike("^C61"), "042 - Prostate cancer")
+        .when(col("ICD10_CODE").rlike("^C20"), "043 - Rectal cancer")
+        .when(col("ICD10_CODE").rlike("^(C07|C08)"), "044 - Salivary gland cancer")
+        .when(col("ICD10_CODE").rlike("^(C30\\.0|C31)"), "045 - Sinonasal cancer")
+        .when(col("ICD10_CODE").rlike("^(C43|C44)"), "046 - Skin cancer")
+        .when(col("ICD10_CODE").rlike("^C17"), "047 - Small bowel cancer")
+        .when(col("ICD10_CODE").rlike("^(C47|C49)"), "048 - Soft tissue sarcoma")
+        .when(col("ICD10_CODE").rlike("^C72\\.0"), "049 - Spinal cord cancer")
+        .when(col("ICD10_CODE").rlike("^C62"), "050 - Testicular cancer")
+        .when(col("ICD10_CODE").rlike("^C37"), "051 - Thymus cancer")
+        .when(col("ICD10_CODE").rlike("^C73"), "052 - Thyroid cancer")
+        .when(col("ICD10_CODE").rlike("^(C65|C66)"), "053 - Upper urinary tract cancer")
+        .when(col("ICD10_CODE").rlike("^C68\\.0"), "054 - Urethral cancer")
+        .when(col("ICD10_CODE").rlike("^C52"), "055 - Vaginal cancer")
+        .when(col("ICD10_CODE").rlike("^C51"), "056 - Vulvar cancer")
+        .otherwise("G09 - Unknown")
+    )
+    family_history_1 = (
+        map_family_history
+        .filter(col("ICD10_CODE").rlike(r"^(C|D)"))
+        .join(breast_cancer_cohort, "PERSON_ID", "left")
         .withColumn(
             "familyhistory_re",
             # 1st degree relatives: Mother, Father, Sister, Brother, Daughter, Son
@@ -1834,98 +2036,216 @@ def create_fh_incr():
             # 3rd degree relatives: Cousin
             .when(col("RELATION_CD") == 81849761, 3)
             # 7 None: Spouse, Partner, Wife, Husband, Step Parents, Foster Parents
-            .when(col("RELATION_CD").isin(634771,81849794,81849793,81849762,81849777,81849797),0)
+            .when(col("RELATION_CD").isin(634771,81849794,81849793,81849762,81849777,81849797),7)
             # 9 Unknown: Not Specified, Null
             .otherwise(lit(9))
         )
-        .select("PERSON_ID","familyhistory_re","CONDITION_DESC")
-    ).alias("f")
-
-        # Where there is a family history of breast or ovarian cancer, the highest degree relation
         .withColumn(
-            "final_rel_val",
-            least(
-                when(col("c.OMOP_CONCEPT_ID").isin(
-                    46270135,  # Family history of breast cancer gene mutation in first degree relative
-                    4328583,   # Family history of malignant neoplasm of breast in first degree relative
-                    46270130,  # Family history of malignant neoplasm of breast in first degree relative less than 50 years of age
-                    37117109   # Family history of ovarian cancer in first degree relative
-                    ), 1)
-                .when(col("c.OMOP_CONCEPT_ID").isin(
-                    35624517,  # Family history of breast cancer <50 in second degree female relative
-                    37109210   # Family history of malignant neoplasm of ovary in second degree relative
-                    ), 2),
-                col("f.familyhistory_re")
-            )
+            "relation_degree",
+            when(col("familyhistory_re") == 1, "001 - First degree")
+            .when(col("familyhistory_re") == 2, "002 - Second degree")
+            .when(col("familyhistory_re") == 3, "003 - Third degree")
+            .when(col("familyhistory_re") == 7, "000 - None")
+            .otherwise("G09 - Unknown")
         )
-        .withColumn(
-            "familyhistory_relation_flag",
-            when(col("final_rel_val") == 1, "001 First degree")
-            .when(col("final_rel_val") == 2, "002 Second degree")
-            .when(col("final_rel_val") == 3, "003 Third degree")
-            .when(col("final_rel_val") == 0, "000 None")
-        )
-    family_history = (
-        comb_prob_diag
-        .join(processed_family_relation, ["PERSON_ID"], "left")
-        .withColumn(
-            "familyhistory_bca_flag",
-            when(
-                # ICD-10 Z803: Family history of malignant neoplasm of breast
-                (col("c.ICD10_CODE").like("Z803")) |
-                # OMOP concept_ids containing for family history breast cancer
-                (col("c.OMOP_CONCEPT_ID").isin(4179963, 4329111, 4160695, 42535500, 46270135, 4210263, 4176765, 4328583, 35624517, 46270155, 46270130)) |
-                (col("f.CONDITION_DESC") == "Breast cancer"),
-                "G01 - Yes")
-            .when (
-                # Concept_id for "No FH: breast carcinoma": 4209112
-                (col("c.OMOP_CONCEPT_ID") == 4209112), "G00 - No")
-        )
-        .withColumn(
-            "familyhistory_ovarian_flag",
-            ## OMOP concept_ids containing for family history ovarian cancer
-            when(col("c.OMOP_CONCEPT_ID").isin(4326681, 37117109, 37109210), "G01 - Yes")
-            # Concept_id for No family history of ovarian cancer: 44804658
-            .when(col("c.OMOP_CONCEPT_ID") == 44804658, "G00 - No")
-        )
-
-        .withColumn(
-            "familyhistory_cancer_flag",
-            when(
-                (col("c.OMOP_CONCEPT_ID").isin(family_history_add_ids)) |
-                (col("c.ICD10_CODE").like("Z80%")) |
-                (col("familyhistory_bca_flag") == "1 Breast") |
-                (col("familyhistory_ovarian_flag") == "1 Ovarian"), "G01 - Yes")
-
-        )
-        .groupBy("PERSON_ID")
-        .agg(
-            F.max("familyhistory_bca_flag").alias("familyhistory_bca"),
-            F.max("familyhistory_ovarian_flag").alias("familyhistory_ovarian"),
-            F.min("familyhistory_relation_flag").alias("familyhistory_relation"),
-            F.min("familyhistory_cancer_flag").alias("familyhistory_cancer")
-            )
+        .withColumn("cancer_type", cancer_type)
+        .select("PERSON_ID", "relation_degree", col("RELATION_DESC").alias("relation_detail"),"cancer_type", "_src_adc_updt")
     )
 
-# COMMAND ----------
 
-comb_prob_diag.filter(col("ICD10_CODE").like("Z80%")).display()
-    comb_prob_diag = (
-        problem
-        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
-        .unionByName(
-            diagnosis
-            .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
+    # OMOP concept mappings
+    omop_to_category = {
+        # 005 - Bone cancer
+        4324203: "005 - Bone cancer",      # Family history of bone cancer
+
+        # 006 - Brain cancer
+        4323762: "006 - Brain cancer",     # Family history of brain cancer
+
+        # 007 - Breast cancer
+        42535500: "007 - Breast cancer",   # Family history of breast cancer gene BRCA mutation
+        3078338013: "007 - Breast cancer", # Family history of breast cancer gene mutation in first degree relative
+        4176765: "007 - Breast cancer",    # Family history of male breast cancer
+        4328583: "007 - Breast cancer",    # Family history of breast cancer in first degree relative <50
+        35624517: "007 - Breast cancer",   # Family history of breast cancer <50 in second degree female relative
+        4179963: "007 - Breast cancer",    # Family history of breast cancer
+        4329111: "007 - Breast cancer",    # Family history of breast cancer 2 gene mutation
+        4160695: "007 - Breast cancer",    # Family history of breast cancer 1 gene mutation
+        46270135: "007 - Breast cancer",   # Family history of breast cancer gene mutation in first degree relative
+        46270155: "007 - Breast cancer",   # Family history of malignant neoplasm of breast diagnosed before 45 years of age
+        46270130: "007 - Breast cancer",   # Family history of malignant neoplasm of breast at under age 50 in second degree female relative
+
+        # 008 - Cervical cancer
+        4175994: "008 - Cervical cancer",  # Family history of malignant neoplasm of cervix uteri
+
+        # 010 - Colon cancer
+        4195970: "010 - Colon cancer",     # Family history of cancer of colon
+        45884753: "010 - Colon cancer",    # Family history of colon cancer
+        42535054: "010 - Colon cancer",    # Family history of colon cancer over age 50
+
+        # 011 - Colorectal cancer
+        43530673: "011 - Colorectal cancer",   # Family history of colorectal cancer
+        46273481: "011 - Colorectal cancer",   # Family history of hereditary nonpolyposis colon cancer
+
+        # 012 - Endometrial cancer
+        46274041: "012 - Endometrial cancer",  # Family history of endometrium cancer
+
+        # 013 - Eye cancer
+        4179082: "013 - Eye cancer",       # Family history of eye cancer
+
+        # 016 - Gastric cancer
+        1243977: "016 - Gastric cancer",   # Family history of hereditary diffuse gastric cancer
+
+        # 022 - Liver cancer
+        4324202: "022 - Liver cancer",     # Family history of liver cancer
+
+        # 033 - Oesophageal cancer
+        4326336: "033 - Oesophageal cancer",   # Family history of cancer of esophagus
+
+        # 034 - Oral cancer
+        764948: "034 - Oral cancer",       # Family history of oral cavity cancer
+
+        # 036 - Ovarian cancer
+        37117109: "036 - Ovarian cancer",  # Family history of malignant neoplasm of ovary in first degree relative
+        4326681: "036 - Ovarian cancer",   # Family history of malignant neoplasm of ovary
+        37109210: "036 - Ovarian cancer",  # Family history of malignant neoplasm of ovary in second degree relative
+
+        # 037 - Pancreatic cancer
+        4179232: "037 - Pancreatic cancer",    # Family history of pancreatic cancer
+
+        # 042 - Prostate cancer
+        4210263: "042 - Prostate cancer",  # Family history of malignant neoplasm of prostate
+
+        # 047 - Small bowel cancer
+        4177058: "047 - Small bowel cancer",   # Family history of ileum cancer
+
+        # 050 - Testicular cancer
+        4327415: "050 - Testicular cancer",    # Family history of testis cancer
+
+        # 052 - Thyroid cancer
+        4328801: "052 - Thyroid cancer",   # Family history of thyroid cancer
+
+        # 053 - Upper urinary tract cancer
+        37311977: "053 - Upper urinary tract cancer",   # Family history of malignant neoplasm of urinary tract
+        46273150: "053 - Upper urinary tract cancer",   # Family history of ureter cancer
+
+        # 054 - Urethral cancer
+        46273151: "054 - Urethral cancer", # Family history of urethra cancer
+
+        # 055 - Vaginal cancer
+        4322902: "055 - Vaginal cancer",   # Family history of vagina cancer
+
+        # G09 - Unknown
+        4334494: "G09 - Unknown",          # Family history of digestive organ cancer
+        4334339: "G09 - Unknown",          # Family history of thoracic cavity structure cancer
+    }
+
+    icd10_to_category = {
+        "Z80.0": "G09 - Unknown",
+        "Z80.1": "023 - Lung cancer",
+        "Z80.2": "G09 - Unknown",
+        "Z80.3": "007 - Breast cancer",
+        "Z80.4": "036 - Ovarian cancer",
+        "Z80.5": "053 - Upper urinary tract cancer",
+        "Z80.6": "021 - Leukaemia",
+        "Z80.7": "024 - Lymphoma",
+        "Z80.8": "G09 - Unknown",
+        "Z80.9": "G09 - Unknown",
+    }
+    # Convert Python dictionaries to Spark maps
+    omop_map = F.create_map(
+        *[F.lit(x) for kv in omop_to_category.items() for x in kv]
+    )
+
+    icd10_map = F.create_map(
+        *[F.lit(x) for kv in icd10_to_category.items() for x in kv]
+    )
+
+    family_history_2 = (
+        comb_prob_diag
+        .join(breast_cancer_cohort, "PERSON_ID", "left")
+        .withColumn(
+            "cancer_type",
+            F.coalesce(
+                omop_map[F.col("OMOP_CONCEPT_ID")],
+                icd10_map[F.col("ICD10_CODE")]
+            )
+        )
+        .filter(col("cancer_type").isNotNull())
+        .withColumn(
+            "relation_degree",
+            when(col("OMOP_CONCEPT_ID").isin(3078338013, 46270135, 4328583, 37117109), "001 - 1st degree")
+            .when(col("OMOP_CONCEPT_ID").isin(35624517, 46270130, 37109210), "002 - 2nd degree")
+            .otherwise("G09 - Unknown")
+        )
+        .withColumn("relation_detail", F.lit(None))
+        .select("PERSON_ID", "relation_degree", "relation_detail","cancer_type","_src_adc_updt")
+    )
+    # Combine the two data source together
+    combined_family_history = (
+        family_history_1
+        .unionByName(family_history_2)
         .dropDuplicates()
-    ).alias("c")
+    )
+    # Select the highest degree relation
+    ranked_family_history = (
+        combined_family_history
+        .withColumn(
+            "relation_rank",
+            F.when(F.col("relation_degree").startswith("001"), 1)
+            .when(F.col("relation_degree").startswith("002"), 2)
+            .when(F.col("relation_degree").startswith("003"), 3)
+            .when(F.col("relation_degree") == "G09 - Unknown", 4)
+            .when(F.col("relation_degree") == "000 - None", 5)
+            .otherwise(99)
+        )
+    )
+
+    w = Window.partitionBy("PERSON_ID", "cancer_type") \
+            .orderBy(F.col("relation_rank"))
+
+    result = (
+        ranked_family_history
+        .withColumn("rn", F.row_number().over(w))
+        .filter(F.col("rn") == 1)
+        .drop("rn", "relation_rank")
+    )
+
+
+    final_df = (
+        result
+        .select(
+            lit(None).alias("family_history_id"),
+            lit(None).alias("pharosid"),
+            lit(None).alias("clinical_record_id"),
+            col("PERSON_ID").alias("person_id"),
+            col("cancer_type"),
+            col("relation_degree"),
+            col("relation_detail"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at"),
+            current_timestamp().alias("date_checked"),            
+            )
+    )
+    return final_df
+
+
+updated_df = create_fh_incr()
+
+update_table(updated_df, get_target_table("pharos_family_cancer_history"), ["person_id", "cancer_type"], schema_pharos_fh, pharos_fh_comment)
+
 
 # COMMAND ----------
 
 pharos_tumour_comment = "Clinical characteristics at breast cancer diagnosis for participants in the PHAROS cohort."
 
-from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType, DoubleType, BooleanType
-
 schema_pharos_tumour = StructType([
+    StructField(
+        "tumour_id",
+        LongType(),
+        True,
+        {"comment": "Surrogate PK"}
+    ),
     StructField(
         "person_id",
         LongType(),
@@ -2083,10 +2403,22 @@ schema_pharos_tumour = StructType([
         metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
     ),
     StructField(
-        "date_checked_tumour",
+        "date_checked",
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
 ])
 
@@ -2120,8 +2452,9 @@ def create_pharos_tumour_incr():
     final_df = (
         breast_cancer_cohort
         .select(
+            lit(None).cast(LongType()).alias("tumour_id"),
             col("PERSON_ID").cast(LongType()).alias("person_id"),
-            lit(None).cast(LongType()).alias("clinical_record_id")
+            lit(None).cast(LongType()).alias("clinical_record_id"),
             col("date_of_diagnosis").cast(DateType()),
             col("year_of_diagnosis").cast(IntegerType()),
             col("age_at_diagnosis").cast(IntegerType()),
@@ -2146,7 +2479,9 @@ def create_pharos_tumour_incr():
             lit(None).cast(IntegerType()).alias("oncotype_dx_score"),
             lit(None).cast(StringType()).alias("clin_response"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_tumour")
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
     return final_df
@@ -2162,6 +2497,12 @@ update_table(updated_df, get_target_table("pharos_tumour"), "person_id", schema_
 pharos_imaging_comment = "This table contains longitudinal diagnostic imaging data for patients within the Pharos breast cancer cohort. It captures specific radiology metrics including lesion counts, breast density, ACR BI-RADS scores, and timing relative to the initial diagnosis date. Each row represents a unique imaging event per patient."
 
 schema_pharos_imaging = StructType([
+    StructField(
+        "imaging_id",
+        LongType(),
+        True,
+        {"comment": "Assigned unique ID for each participant"}
+    ),
     StructField(
         "person_id",
         LongType(),
@@ -2179,6 +2520,12 @@ schema_pharos_imaging = StructType([
         DateType(),
         True,
         {"comment": "Imaging date"}
+    ),
+        StructField(
+        "imaging_session_id",
+        StringType(),
+        True,
+        {"comment": "The session ID for the imaging event"}
     ),
     StructField(
         "days_diagnosis_imaging",
@@ -2277,10 +2624,22 @@ schema_pharos_imaging = StructType([
         metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
     ),
     StructField(
-        "date_checked_image",
+        "date_checked",
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
 ])
 
@@ -2319,22 +2678,22 @@ def create_pharos_imaging_incr():
         .withColumn(
             "imaging_type",
             # 0: Mammogram (Standard 2D)
-            when((lower(col("ExaminationModality")) == "mg") & (~lower(col("ExaminationModality")).contains("tomo")), "0 Mammogram")
+            when((lower(col("ExaminationModality")) == "mg") & (~lower(col("ExaminationModality")).contains("tomo")), "000 - Mammogram")
             # 1: Ultrasound
-            .when(lower(col("ExaminationModality")).rlike("us|ivus"), "1 Ultrasound")
+            .when(lower(col("ExaminationModality")).rlike("us|ivus"), "001 - Ultrasound")
             # 2: PET
-            .when(lower(col("ExaminationModality")).rlike("pt|pet|gems pet raw"), "2 PET")
+            .when(lower(col("ExaminationModality")).rlike("pt|pet|gems pet raw"), "002 - PET")
             # 3: CT
-            .when(lower(col("ExaminationModality")) == "ct", "3 CT")
+            .when(lower(col("ExaminationModality")) == "ct", "003 - CT")
             # 4: MRI
-            .when(lower(col("ExaminationModality")).rlike("mr"), "4 MRI")
+            .when(lower(col("ExaminationModality")).rlike("mr"), "004 - MRI")
             # 5: Tomosynthesis (3D Mammography)
-            .when(lower(col("ExaminationModality")).contains("tomo"), "5 Tomosynthesis")
+            .when(lower(col("ExaminationModality")).contains("tomo"), "005 - Tomosynthesis")
             # 6: X-ray
-            .when(lower(col("ExaminationModality")).rlike("dx|cr|xa|fl|rf|px|io"), "6 X-ray")
+            .when(lower(col("ExaminationModality")).rlike("dx|cr|xa|fl|rf|px|io"), "006 - X-ray")
             # 7: Nuclear medicine (NM)
-            .when(lower(col("ExaminationModality")).rlike("nm"), "7 Nuclear medicine (NM)")
-            .otherwise("8 Other")
+            .when(lower(col("ExaminationModality")).rlike("nm"), "007 - Nuclear medicine (NM)")
+            .otherwise("G09 - Unknown")
         )
         .select(col("PERSON_ID").alias("person_id"), col("MillEventDate").alias("image_date"), "days_diagnosis_imaging", "imaging_type", col("ExaminationBodyPart").alias("image_site"), col("_src_adc_updt"))
         .dropDuplicates()
@@ -2362,7 +2721,9 @@ def create_pharos_imaging_incr():
             lit(None).alias("index_lesion_laterality"),
             lit(None).alias("image_quality_notes"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_image")
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
     return final_df
@@ -2378,10 +2739,22 @@ pharos_sample_comment = "This table serves as the biospecimen inventory for the 
 
 schema_pharos_sample = StructType([
     StructField(
-        "person_id",
+        "sample_id",
         StringType(),
         True,
+        {"comment": "Unique ID for each sample"}
+    ),
+    StructField(
+        "person_id",
+        LongTypeType(),
+        True,
         {"comment": "Assigned unique ID for each participant"}
+    ),
+    StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "FK to person"}
     ),
     StructField(
         name="clinical_record_id",
@@ -2390,10 +2763,10 @@ schema_pharos_sample = StructType([
         metadata={"comment": "Unique clincial record PharosID."}
     ),
     StructField(
-        "sample_id",
+        "procedure_id",
         StringType(),
         True,
-        {"comment": "Unique ID for each sample"}
+        {"comment": "FK to pathology"}
     ),
     StructField(
         "sample_collection_date",
@@ -2460,8 +2833,78 @@ schema_pharos_sample = StructType([
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        "date_checked",
+        TimestampType(),
+        nullable=True,
+        metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
 ])
+
+def create_pharos_sample_incr():
+    max_adc_updt = get_max_timestamp(
+        table_name=get_target_table("pharos_sample"),
+        ts_column="ADC_UPDT")
+
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")    
+    breast_cancer_cohort = (
+        map_diagnosis
+        .filter(
+            (col("ADC_UPDT") > max_adc_updt) &
+            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+        )
+        .filter(col("PERSON_ID").isNotNull())
+        .groupBy("PERSON_ID")
+        .agg(
+            min("earliest_diagnosis_date").alias("brc_diag_date"),
+            F.max("ADC_UPDT").alias("_src_adc_updt")
+        )
+    )
+    
+    final_df = (
+        breast_cancer_cohort
+        .select(
+            lit(None).cast(StringType()).alias("sample_id"),
+            col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(LongType()).alias("clinical_record_id"),
+            lit(None).cast(StringType()).alias("procedure_id"),
+            lit(None).cast(TimestampType()).alias("sample_collection_date"),
+            lit(None).cast(IntegerType()).alias("days_diagnosistosample"),
+            lit(None).cast(StringType()).alias("tissue_type"),
+            lit(None).cast(StringType()).alias("tumour_sample"),
+            lit(None).cast(StringType()).alias("sample_type"),
+            lit(None).cast(StringType()).alias("tissue_site"),
+            lit(None).cast(StringType()).alias("sample_procedure_1"),
+            lit(None).cast(StringType()).alias("sample_procedure_2"),
+            lit(None).cast(StringType()).alias("sample_procedure_3"),
+            lit(None).cast(StringType()).alias("sample_laterality"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
+        )
+    )
+
+    return final_df
+
+
+updates_df = create_pharos_sample_incr()
+
+update_table(updates_df,"8_dev.silver.pharos_sample", ["person_id"], schema_pharos_sample, pharos_sample_comment)
 
 # COMMAND ----------
 
@@ -2469,22 +2912,28 @@ pharos_pathology_comment = "This table contains detailed pathology and surgical 
 
 schema_pharos_pathology = StructType([
     StructField(
+        "pathology_id",
+        LongType(),
+        nullable=True,
+        metadata={"comment": "Surrogate PK"}
+    ),
+    StructField(
         "person_id",
         LongType(),
         nullable=True,
         metadata={"comment": "Assigned unique ID for each participant"}
     ),
     StructField(
+        name="pharosid",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "FK to person."}
+    ),
+    StructField(
         name="clinical_record_id",
         dataType=LongType(),
         nullable=True,
         metadata={"comment": "Unique clincial record PharosID."}
-    ),
-    StructField(
-        name="pharosid",
-        dataType=LongType(),
-        nullable=True,
-        metadata={"comment": "FK to person."}
     ),
     StructField(
         name="procedure_id",
@@ -2583,16 +3032,16 @@ schema_pharos_pathology = StructType([
         metadata={"comment": "Biopsy category (B1-B5c) or FNA category (C1-C5)"}
     ),
     StructField(
-        "lvi",
-        StringType(),
-        nullable=True,
-        metadata={"comment": "Presence of lymphovascular invasion"}
-    ),
-    StructField(
         "multifocal",
         StringType(),
         nullable=True,
         metadata={"comment": "Whether tumour was multifocal or not. Unifocal = one focus of either invasive carcinoma or pure DCIS; Multifocal = two or more foci of either invasive carcinoma or pure DCIS"}
+    ),
+    StructField(
+        "lvi",
+        StringType(),
+        nullable=True,
+        metadata={"comment": "Presence of lymphovascular invasion"}
     ),
     StructField(
         "margin",
@@ -2726,17 +3175,17 @@ def create_pharos_pathology_incr():
         .join(person, ["PERSON_ID"],"left")
         .withColumn("breast_procedure",
                     # The available data do not provide sufficient detail to identify specific sub-categories of mastectomy or excision, and a free-text review is required.
-                    when(col("OPCS4_CODE").like("%B27%") | col("OPCS4_CODE").like("%B28%"), "Mastectomy")
-                    .when(col("OPCS4_CODE").rlike("B311"), "Reduction mammoplasty")
-                    .when(col("OPCS4_CODE") == "B374", "Capsulectomy")
-                    .when(col("OPCS4_CODE") == "B321", "Core Needle Biopsy")
-                    .when(col("OPCS4_CODE") == "B323", "Image-guided Biopsy")
-                    .when(col("OPCS4_CODE") == "B324", "Vacuum-assisted Biopsy")
+                    when(col("OPCS4_CODE").like("%B27%") | col("OPCS4_CODE").like("%B28%"), "001 - Mastectomy")
+                    .when(col("OPCS4_CODE").rlike("B311"), "006 - Reduction mammoplasty")
+                    .when(col("OPCS4_CODE") == "B374", "012 - Capsulectomy")
+                    .when(col("OPCS4_CODE") == "B321", "013 - Core Needle Biopsy")
+                    .when(col("OPCS4_CODE") == "B324", "014 - Vacuum-assisted Biopsy")
                     .when(col("OPCS4_CODE").isin(
+                        "B323",  # Image-guided Biopsy
                         "B322",  # Biopsy of lesion of breast NEC
                         "B328",  # Other specified biopsy of breast
                         "B329"   # Unspecified biopsy of breast
-                        ), "Biopsy Other")
+                        ), "015 - Biopsy Other")
         )
         .withColumn("days_diagnosis_surgery", datediff(col("PROC_DT_TM"), col("brc_diag_date")))
         .withColumn("age_at_surgery",year(col("PROC_DT_TM")) - col("birth_year"))
@@ -2748,8 +3197,11 @@ def create_pharos_pathology_incr():
     final_df = (
         breast_procedure
         .select(
+            lit(None).cast(LongType()).alias("pathology_id"),
             col("person_id").cast(LongType()),
+            lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
+            lit(None).cast(StringType()).alias("procedure_id"),
             lit(None).cast(StringType()).alias("laterality_of_surgery"),
             lit(None).cast(StringType()).alias("side_of_surgery"),
             col("surgery_date").cast(TimestampType()),
@@ -2780,7 +3232,9 @@ def create_pharos_pathology_incr():
             lit(None).cast(StringType()).alias("rcb_volume"),
             lit(None).cast(IntegerType()).alias("nodes_showing_prev_involvement"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().cast(TimestampType()).alias("date_checked_pathology")
+            current_timestamp().cast(TimestampType()).alias("date_checked"),
+            current_timestamp().cast(TimestampType()).alias("created_at"),
+            current_timestamp().cast(TimestampType()).alias("updated_at")
         )
     )
 
@@ -2793,6 +3247,33 @@ update_table(updated_df, get_target_table("pharos_pathology"), ["person_id","sur
 
 # COMMAND ----------
 
+pharos_pathology_tf_comment = "This table contains detailed pathology and surgical information related to breast cancer samples collected from participants."
+
+schema_pharos_pathology_tf = StructType([
+    StructField(
+        "pathology_focus_id",
+        LongType(),
+        nullable=True,
+        metadata={"comment": "Surrogate PK"}
+    ),
+    StructField(
+        "pathology_id",
+        LongType(),
+        nullable=True,
+        metadata={"comment": "FK to pathology"}
+    ),
+    StructField(
+        name="person_id",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "Assigned unique ID for each participant."}
+    ),
+    StructField(
+        name="pharosid",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "FK to person."}
+    ),
     StructField(
         "invasive_present",
         StringType(),
@@ -2907,8 +3388,60 @@ update_table(updated_df, get_target_table("pharos_pathology"), ["person_id","sur
         nullable=True,
         metadata={"comment": "Presence of necrosis"}
     ),
+    StructField(
+        name="date_checked",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Date the relevant medical record was last checked."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
+    )
+])
 
-                lit(None).cast(StringType()).alias("invasive_present"),
+def create_pharos_pathology_incr():
+
+    max_adc_updt = get_max_timestamp(get_target_table("pharos_pathology"), "ADC_UPDT")
+
+    diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+    person = spark.table("4_prod.bronze.map_person").select(col("person_id").alias("PERSON_ID"),"birth_year")
+    procedure = spark.table("4_prod.bronze.map_procedure")
+
+
+    # Get the breast cancer cohort
+    breast_cancer_cohort = (
+        diagnosis
+        .filter(
+            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+        )
+        .filter(col("PERSON_ID").isNotNull())
+        .groupBy("PERSON_ID")
+        .agg(
+            min("earliest_diagnosis_date").alias("brc_diag_date"),
+            F.max("ADC_UPDT").alias("_src_adc_updt")
+        )
+    )
+
+
+    final_df = (
+        breast_cancer_cohort
+
+        .select(
+            lit(None).cast(LongType()).alias("pathology_focus_id"),
+            lit(None).cast(LongType()).alias("pathology_id"),
+            col("person_id").cast(LongType()),
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(LongType()).alias("clinical_record_id"),
+            lit(None).cast(StringType()).alias("invasive_present"),
             lit(None).cast(StringType()).alias("morphology"),
             lit(None).cast(StringType()).alias("invasive_size_path"),
             lit(None).cast(StringType()).alias("grade"),
@@ -2927,6 +3460,18 @@ update_table(updated_df, get_target_table("pharos_pathology"), ["person_id","sur
             lit(None).cast(StringType()).alias("insitu_grade"),
             lit(None).cast(StringType()).alias("microinvasion"),
             lit(None).cast(StringType()).alias("necrosis"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().cast(TimestampType()).alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
+        )
+    )
+
+    return final_df
+
+updated_df = create_pharos_pathology_incr()
+
+update_table(updated_df, get_target_table("pharos_pathology_tumourfocus"), ["person_id","surgery_date","breast_procedure"], schema_pharos_pathology_tf, pharos_pathology_tf_comment)
 
 
 # COMMAND ----------
@@ -2935,16 +3480,34 @@ pharos_treatment_comment = "This table captures comprehensive treatment for brea
 
 schema_pharos_treatment = StructType([
     StructField(
+        "treatment_id", 
+        LongType(), 
+        nullable=True, 
+        metadata={"comment": "Assigned unique ID for each participant (TBC)"}
+    ),
+    StructField(
         "person_id", 
         LongType(), 
         nullable=True, 
         metadata={"comment": "Assigned unique ID for each participant (TBC)"}
     ),
     StructField(
+        "pharosid", 
+        StringType(), 
+        nullable=True, 
+        metadata={"comment": "FK to person"}
+    ),
+    StructField(
         "clinical_record_id", 
         LongType(), 
         nullable=True, 
         metadata={"comment": "Unique clincial record PharosID"}
+    ),
+    StructField(
+        "tumour_id", 
+        LongType(), 
+        nullable=True, 
+        metadata={"comment": "FK to tumour (if linkable)"}
     ),
     StructField(
         "treatment_type", 
@@ -3083,13 +3646,25 @@ schema_pharos_treatment = StructType([
         TimestampType(), 
         nullable=True, 
         metadata={"comment": "Last update timestamp."}
+    ),    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
+
 ])
 
 
 def create_pharos_treatment_incr():
 
-    max_adc_updt = get_max_timestamp("8_dev.silver.pharos_treatment", "date_checked_treatment")
+    max_adc_updt = get_max_timestamp("4_prod.bronze.pharos_treatment", "date_checked_treatment")
 
         # Load Tables
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
@@ -3210,11 +3785,11 @@ def create_pharos_treatment_incr():
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
         .withColumn(
             "treatment_type",
-            when(col("RXNORM_CUI").isin(endocrine_drugs), "Endocrine")
-            .when(col("RXNORM_CUI").isin(antibody_drugs), "Antibody")
-            .when(col("RXNORM_CUI").isin(cdk4_6_inhibitors), "CDK4/6 Inhibitor")
-            .when(col("RXNORM_CUI").isin(parp_inhibitors), "PARP Inhibitor")
-            .when(col("RXNORM_CUI").isin(chemotherapy_drugs), "Chemotherapy")
+            when(col("RXNORM_CUI").isin(endocrine_drugs), "001 - Endocrine")
+            .when(col("RXNORM_CUI").isin(antibody_drugs), "003 - Antibody")
+            .when(col("RXNORM_CUI").isin(cdk4_6_inhibitors), "004 - CDK4/6 Inhibitor")
+            .when(col("RXNORM_CUI").isin(parp_inhibitors), "006 - PARP Inhibitor")
+            .when(col("RXNORM_CUI").isin(chemotherapy_drugs), "002 - Chemotherapy")
             #.when(col("RXNORM_CUI").isin(other_drugs), "Other")
             .otherwise(lit(None))
         )
@@ -3252,7 +3827,9 @@ def create_pharos_treatment_incr():
         treatment
         .select(
             col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
+            lit(None).alias("tumour_id").cast(LongType()),
             col("treatment_type").cast(StringType()),
             col("treatment_regimen").cast(StringType()),
             col("treatment_name").cast(StringType()),
@@ -3276,7 +3853,9 @@ def create_pharos_treatment_incr():
             lit(None).alias("radiotherapy_fraction").cast(StringType()),
             lit(None).alias("radiotherapy_boost").cast(StringType()),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            lit(current_timestamp()).alias("date_checked_treatment")
+            current_timestamp().cast(TimestampType()).alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
 
@@ -3292,6 +3871,11 @@ update_table(updates_df, "8_dev.silver.pharos_treatment",["person_id", "treatmen
 pharos_followup_comment = "This table tracks longitudinal outcomes for breast cancer patients, including detailed recurrence data (local and distant metastasis), survival metrics, and vital status. It captures the chronology of disease progression through event-specific dates and site locations, alongside calculated time-to-event intervals (years from diagnosis)."
 
 schema_pharos_followup= StructType([
+    StructField(
+        "followup_id",
+        LongType(),
+        metadata={"comment": "Surrogate PK"}
+    ),
     StructField(
         "person_id",
         LongType(),
@@ -3309,39 +3893,9 @@ schema_pharos_followup= StructType([
         metadata={"comment": "Whether or not patient had local recurrence"}
     ),
     StructField(
-        "localrec_dates",
-        StringType(),
-        metadata={"comment": "Dates of each local recurrence separated by a semi-colon (;)"}
-    ),
-    StructField(
-        "localrec_sites",
-        StringType(),
-        metadata={"comment": "Sites of each local recurrence, corresponding to dates in the same order, separated by a semi-colon (;)"}
-    ),
-    StructField(
         "distant_metastasis",
         StringType(),
         metadata={"comment": "Whether or not patient had a distant recurrence"}
-    ),
-    StructField(
-        "metastasis_dates",
-        StringType(),
-        metadata={"comment": "Dates of each distant recurrence separated by a semi-colon (;)"}
-    ),
-    StructField(
-        "metastasis_sites",
-        StringType(),
-        metadata={"comment": "Sites of each distant recurrence, corresponding to dates in the same order, separated by a semi-colon (;)"}
-    ),
-    StructField(
-        "years_diagnosis_metastasis",
-        IntegerType(),
-        metadata={"comment": "Time (in years) between first diagnosis date and first date of distant metastasis"}
-    ),
-    StructField(
-        "years_diagnosis_localrec",
-        IntegerType(),
-        metadata={"comment": "Time (in years) between first diagnosis date and first date of local recurrence"}
     ),
     StructField(
         "denovo_metastasis",
@@ -3399,6 +3953,18 @@ schema_pharos_followup= StructType([
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
 ])
 
@@ -3449,8 +4015,8 @@ def create_pharos_followup_incr():
         .join(breast_cancer_cohort, "PERSON_ID", "right")
         .withColumn(
             "vital_status",
-            when(col("DECEASED_DT_TM").isNotNull(), lit("1 Deceased"))
-            .otherwise(lit("0 Alive"))
+            when(col("DECEASED_DT_TM").isNotNull(), lit("001 Deceased"))
+            .otherwise(lit("000 Alive"))
         )
         .withColumn(
             "years_diagnosistodeath",
@@ -3481,15 +4047,10 @@ def create_pharos_followup_incr():
         .select(
             # Recurrence/Metastasis placeholders reserved for future free-text audit results
             col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
             lit(None).cast(StringType()).alias("local_recurrence"),
-            lit(None).cast(StringType()).alias("localrec_dates"),
-            lit(None).cast(StringType()).alias("localrec_sites"),
             lit(None).cast(StringType()).alias("distant_metastasis"),
-            lit(None).cast(StringType()).alias("metastasis_dates"),
-            lit(None).cast(StringType()).alias("metastasis_sites"),
-            lit(None).cast(IntegerType()).alias("years_diagnosis_metastasis"),
-            lit(None).cast(IntegerType()).alias("years_diagnosis_localrec"),
             lit(None).cast(StringType()).alias("denovo_metastasis"),
             col("vital_status").cast(StringType()),
             col("date_of_death").cast(TimestampType()),
@@ -3500,7 +4061,9 @@ def create_pharos_followup_incr():
             col("years_lastfollowup").cast(IntegerType()),
             lit(None).cast(StringType()).alias("lost_to_followup"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            lit(current_timestamp()).cast(TimestampType()).alias("date_checked_follow_up")
+            lit(current_timestamp()).cast(TimestampType()).alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
 
@@ -3511,14 +4074,256 @@ update_table(updates_df, get_target_table("pharos_followup"), "person_id", schem
 
 # COMMAND ----------
 
+
+pharos_recurrence_comment = "Stores cancer recurrence information for each person, including recurrence details and record audit timestamps."
+
+schema_pharos_recurrence = StructType([
+    StructField(
+        "recurrence_id",
+        IntegerType(),
+        True,
+        {"comment": "Surrogate PK"}
+    ),
+    StructField(
+        "person_id",
+        LongTypeType(),
+        True,
+        {"comment": "Assigned unique ID for each participant"}
+    ),
+    StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "FK to person"}
+    ),
+    StructField(
+        "recurrence_date",
+        TimestampType(),
+        metadata={"comment": "Date of local recurrence"}
+    ),
+    StructField(
+        "days_diagnosis_recurrence",
+        IntegerType(),
+        metadata={"comment": "Date of local recurrence"}
+    ),
+    StructField(
+        "recurrence_sites",
+        StringType(),
+        metadata={"comment": "Site: Ipsilateral breast, Ipsilateral axilla, Chest wall, etc."}
+    ),
+    StructField(
+        "ADC_UPDT",
+        TimestampType(),
+        nullable=True,
+        metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        "date_checked",
+        TimestampType(),
+        nullable=True,
+        metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
+    )
+])
+
+def create_pharos_recurrence_incr():
+    max_adc_updt = get_max_timestamp(
+        table_name=get_target_table("pharos_sample"),
+        ts_column="ADC_UPDT")
+
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")    
+    breast_cancer_cohort = (
+        map_diagnosis
+        .filter(
+            (col("ADC_UPDT") > max_adc_updt) &
+            (col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331))
+        )
+        .filter(col("PERSON_ID").isNotNull())
+        .groupBy("PERSON_ID")
+        .agg(
+            min("earliest_diagnosis_date").alias("brc_diag_date"),
+            F.max("ADC_UPDT").alias("_src_adc_updt")
+        )
+    )
+    
+    final_df = (
+        breast_cancer_cohort
+        .select(
+            lit(None).cast(IntegerType()).alias("recurrence_id"),
+            col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(TimestampType()).alias("recurrence_date"),
+            lit(None).cast(IntegerType()).alias("days_diagnosis_recurrence"),
+            lit(None).cast(StringType()).alias("recurrence_site"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
+        )
+    )
+
+    return final_df
+
+
+updates_df = create_pharos_recurrence_incr()
+
+update_table(updates_df, get_target_table("pharos_recurrence"), "person_id", schema_pharos_recurrence,pharos_recurrence_comment)
+
+
+
+# COMMAND ----------
+
+pharos_metastasis_comment = (
+    "Stores cancer metastasis information for each person, including metastasis details and record audit timestamps."
+)
+
+schema_pharos_metastasis = StructType([
+    StructField(
+        "metastasis_id",
+        IntegerType(),
+        True,
+        {"comment": "Surrogate PK"}
+    ),
+        StructField(
+        "person_id",
+        LongTypeType(),
+        True,
+        {"comment": "Assigned unique ID for each participant"}
+    ),
+    StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "FK to followup/person"}
+    ),
+    StructField(
+        "metastasis_date",
+        TimestampType(),
+        True,
+        {"comment": "Date of distant recurrence episode"}
+    ),
+    StructField(
+        "days_diagnosis_metastasis",
+        IntegerType(),
+        True,
+        {"comment": "Days between primary diagnosis and this metastasis"}
+    ),
+    StructField(
+        "metastasis_site",
+        StringType(),
+        True,
+        {"comment": "Anatomical site of metastasis"}
+    ),
+    StructField(
+        "ADC_UPDT",
+        TimestampType(),
+        nullable=True,
+        metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        "date_checked",
+        TimestampType(),
+        True,
+        {"comment": "Date the relevant medical record was last checked"}
+    ),
+    StructField(
+        "created_at",
+        TimestampType(),
+        True,
+        {"comment": "Row creation timestamp"}
+    ),
+    StructField(
+        "updated_at",
+        TimestampType(),
+        True,
+        {"comment": "Row last-updated timestamp"}
+    )
+])
+
+
+def create_pharos_metastasis_incr():
+    max_adc_updt = get_max_timestamp(
+        table_name=get_target_table("pharos_metastasis"),
+        ts_column="ADC_UPDT"
+    )
+
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")
+
+    breast_cancer_cohort = (
+        map_diagnosis
+        .filter(
+            (col("ADC_UPDT") > max_adc_updt) &
+            (
+                col("ICD10_CODE").like("C50%") |
+                col("OMOP_CONCEPT_ID").isin(45768522, 35624616, 602331)
+            )
+        )
+        .filter(col("PERSON_ID").isNotNull())
+        .groupBy("PERSON_ID")
+        .agg(
+            min("earliest_diagnosis_date").alias("brc_diag_date"),
+            F.max("ADC_UPDT").alias("_src_adc_updt")
+        )
+    )
+
+    final_df = (
+        breast_cancer_cohort
+        .select(
+            lit(None).cast(IntegerType()).alias("metastasis_id"),
+            col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(TimestampType()).alias("metastasis_date"),
+            lit(None).cast(IntegerType()).alias("days_diagnosis_metastasis"),
+            lit(None).cast(StringType()).alias("metastasis_site"),
+            col("_src_adc_updt").alias("ADC_UPDT"),
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
+        )
+    )
+
+    return final_df
+
+
+updates_df = create_pharos_metastasis_incr()
+
+update_table(
+    updates_df,get_target_table("pharos_metastasis"),"person_id",schema_pharos_metastasis,pharos_metastasis_comment
+)
+
+# COMMAND ----------
+
 pharos_comorbidities_comment = "This table records the co-existing medical conditions (comorbidities) of participants in the Pharos cohort, with a specialized focus on diabetes management. It captures diagnostic data using ICD-10 standards, tracks the temporal relationship (pre- vs. post-cancer diagnosis) of each condition, and documents longitudinal diabetes care including associated medications. The data is structured to support analysis of how underlying health status impacts cancer treatment outcomes and patient survival."
 
 schema_pharos_comorbidities = StructType([
+    StructField(
+        "comorbidity_id",
+        StringType(),
+        True,
+        {"comment": "Surrogate PK"}
+    ),
     StructField(
         "person_id", 
         LongType(), 
         True, 
         {"comment": "Assigned unique ID for each participant (TBC)"}
+    ),
+    StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "FK to person"}
     ),
     StructField(
         "clinical_record_id", 
@@ -3581,11 +4386,24 @@ schema_pharos_comorbidities = StructType([
         metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
     ),
     StructField(
-        "date_checked_comorbidities", 
+        "date_checked", 
         TimestampType(), 
         nullable=True, 
-        metadata={"comment": "Last update timestamp."}
+        metadata={"comment": "Date the relevant medical record was last checked."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
+
 ])
 
 def create_pharos_comorbidity_incr():
@@ -3705,8 +4523,10 @@ def create_pharos_comorbidity_incr():
     final_df = (
         comorbidity
         .select(
+            lit(None).cast(StringType()).alias("comorbidity_id"),
             col("PERSON_ID").alias("person_id").cast(LongType()),
-            lit(None).cast(LongType()).alias("clinical_record_id")
+            lit(None).cast(StringType()).alias("pharosid"),
+            lit(None).cast(LongType()).alias("clinical_record_id"),
             col("comorbidities").cast(StringType()),
             col("ICD10_CODE").alias("icd_code").cast(StringType()),
             col("ICD10_TERM").alias("comorbidity_name").cast(StringType()),
@@ -3716,7 +4536,9 @@ def create_pharos_comorbidity_incr():
             col("earliest_diagnosis_date").alias("date_assessed").cast(TimestampType()),
             col("days_diagnosis_comor").cast(IntegerType()),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_comorbidities").cast(TimestampType())
+            current_timestamp().alias("date_checked").cast(TimestampType()),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
         .dropDuplicates()  
     )
@@ -3732,6 +4554,12 @@ pharos_meds_comment = "This table records the co-existing medical conditions (co
 
 schema_pharos_meds = StructType([
     StructField(
+        "medication_id", 
+        LongType(), 
+        True, 
+        {"comment": "Surrogate PK"}
+    ),
+    StructField(
         "person_id", 
         LongType(), 
         True, 
@@ -3742,12 +4570,6 @@ schema_pharos_meds = StructType([
         LongType(), 
         True, 
         {"comment": "Unique clincial record PharosID"}
-    ),
-    StructField(
-        "indication_name", 
-        StringType(), 
-        True, 
-        {"comment": "Clinical condition, exposure, or indication at the time of diagnosis for which the recorded non-cancer medication was prescribed (e.g. diabetes, addiction, hormone replacement therapy)."}
     ),
     StructField(
         "medication_name", 
@@ -3836,53 +4658,63 @@ def create_pharos_med_incr():
 
     all_diabetes_meds = T1DM + T2DM
 
-    diabetes_med = (
+    med = (
         medicine
         .join(breast_cancer_cohort, "PERSON_ID", "left_semi")
         .filter(col("RXNORM_CUI").isin(all_diabetes_meds))
         .withColumn(
-            "indication_name", 
-            when(col("RXNORM_CUI").isin(T1DM), "T1DM")
-            .when(col("RXNORM_CUI").isin(T2DM), "T2DM"))   
-        .withColumn(
-            "date_checked_non_cancer_meds",
-            date_format(current_timestamp(), "yyyy-MM-dd HH:mm:ss")
-        )
+            "medication_category", 
+            when(col("RXNORM_CUI").isin(T1DM), "007 - T1DM Meds")
+            .when(col("RXNORM_CUI").isin(T2DM), "008 - T2DM Meds"))   
         .select(
             col("PERSON_ID").alias("person_id"),
             col("indication_name"),
-            col("RXNORM_STR").alias("medication_name")
         )  
         .dropDuplicates()
     )
 
     final_df =(
-        diabetes_med
+        med
         .select(
+            lit(None).alias("medication_id").cast(LongType()),
             col("person_id").cast(LongType()),
+            lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
-            col("indication_name").cast(StringType()),
-            col("medication_name").cast(StringType()),
+            col("medication_category").cast(StringType()),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_non_cancer_meds").cast(TimestampType())
+            current_timestamp().alias("date_checked").cast(TimestampType()),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )  
     )
 
     return final_df
 
 updated_df = create_pharos_med_incr()
-update_table(updates_df, get_target_table("pharos_noncancer_meds"), ["person_id", "medication_name"], schema_pharos_meds, pharos_meds_comment)
+update_table(updates_df, get_target_table("pharos_medication"), ["person_id", "medication_category"], schema_pharos_meds, pharos_meds_comment)
 
 # COMMAND ----------
 
-pharos_ph_comment = "This table contains a harmonized and standardised record of personal history of cancer diagnoses."
+pharos_ph_comment = "This table contains a harmonised and standardised record of personal history of cancer diagnoses."
 
 schema_pharos_ph = StructType([
+    StructField(
+        "history_id", 
+        LongType(), 
+        True, 
+        {"comment": "Surrogate PK"}
+    )
     StructField(
         "person_id", 
         LongType(), 
         True, 
         {"comment": "Assigned unique ID for each participant (TBC)"}
+    ),
+    StructField(
+        "pharosid", 
+        StringType(), 
+        True, 
+        {"comment": "FK to person"}
     ),
     StructField(
         "clinical_record_id", 
@@ -3891,13 +4723,19 @@ schema_pharos_ph = StructType([
         {"comment": "Unique clincial record PharosID"}
     ),
     StructField(
-        "cancer_type", 
+        "cancer_type_code", 
         StringType(), 
         True, 
         {"comment": "Anatomical or diagnostic category of the historical cancer"}
     ),
     StructField(
-        "date_checked_cancer_history", 
+        "cancer_type_detail", 
+        StringType(), 
+        True, 
+        {"comment": "Free-text detail if not in reference list"}
+    ),
+    StructField(
+        "date_checked", 
         StringType(), 
         True, 
         {"comment": "Date the medical record was reviewed for cancer history data DD-MM-YYYY"}
@@ -3907,13 +4745,25 @@ schema_pharos_ph = StructType([
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
+    ),
+    StructField(
+        name="created_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row creation timestamp."}
+    ),
+    StructField(
+        name="updated_at",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Row last-updated timestamp."}
     )
 ])
 
 def create_pharos_ph_incr():
 
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
-    max_adc_updt = get_max_timestamp("8_dev.silver.pharos_personal_history", "date_checked_personal_history")
+    max_adc_updt = get_max_timestamp("4_prod.silver.pharos_personal_history", "date_checked_personal_history")
 
     # Get the breast cancer cohort
     breast_cancer_cohort = (
@@ -3931,83 +4781,85 @@ def create_pharos_ph_incr():
     )
 
     omop_map = {
-        4333465:  "1 - Brain/nervous system cancer",    # History of malignant neoplasm of nervous system
-        46269969: "1 - Brain cancer",                   # History of cancer metastatic to brain
-        3175032:  "3 - Head and neck cancer",           # History of cancer of ear
-        3190039:  "3 - Head and neck cancer",           # History of cancer of head and neck
-        4333345:  "3 - Head and neck cancer",           # History of malignant neoplasm of head and/or neck
-        3189194:  "4 - Oral cancer",                    # History of cancer of mouth
-        3184244:  "7 - Laryngeal cancer",               # History of cancer of larynx
-        46270611: "8 - Salivary gland cancer",          # History of malignant neoplasm of parotid gland
-        1246982:  "9 - Metastatic cancer (unknown primary)",  # History of metastatic cancer
-        3181707:  "10 - Sinonasal cancer",              # History of cancer of nares
-        3184017:  "10 - Sinonasal cancer",              # History of sinus cancer
-        4212564:  "12 - Lung cancer",                   # History of malignant neoplasm of bronchus
-        4324190:  "12 - Breast cancer",                 # History of malignant neoplasm of breast
-        4187205:  "12 - Lung cancer",                   # History of malignant neoplasm of lung
-        4187206:  "12 - Lung cancer",                   # History of malignant neoplasm of trachea
-        4323367:  "13 - Pleural cancer",                # History of malignant mesothelioma
-        4178640:  "13 - Pleural cancer",                # History of malignant neoplasm of pleura
-        4179069:  "14 - Thoracic cavity cancer",        # History of malignant neoplasm of thoracic cavity structure
-        4177071:  "15 - Mediastinal cancer",            # History of malignant neoplasm of mediastinum
-        46273376: "18 - Small bowel cancer",            # History of cancer of ampulla of duodenum
-        35610791: "19 - Gastrointestinal cancer",       # History of malignant neoplasm of digestive organ
-        4190633:  "19 - Colorectal cancer",             # History of malignant neoplasm of gastrointestinal tract
-        3184515:  "19 - Splenic/haematologic cancer",   # History of splenic cancer
-        46273480: "19 - Colorectal cancer",             # History of rectosigmoid junction cancer
-        4327107:  "20 - Colon cancer",                  # History of malignant neoplasm of colon
-        4324189:  "21 - Rectal cancer",                 # History of malignant neoplasm of rectum
-        37016142: "22 - Anal cancer",                   # History of malignant neoplasm of anus
-        3189077:  "23 - Liver cancer",                  # History of liver cancer
-        4180749:  "27 - Prostate cancer",               # History of malignant neoplasm of prostate
-        3169330:  "27 - Prostate cancer",               # Personal history of prostate cancer
-        43021271: "28 - Testicular cancer",             # History of malignant neoplasm of testis
-        4327872:  "29 - Penile cancer",                 # History of malignant neoplasm of penis
-        4187203:  "30 - Gynaecological cancer",         # History of malignant neoplasm of female genital organ
-        4323346:  "30 - Gynaecological cancer",         # History of malignant neoplasm of uterine adnexa
-        46273417: "31 - Primary peritoneal cancer",     # History of malignant neoplasm of peritoneum
-        4178782:  "32 - Cervical cancer",               # History of malignant neoplasm of cervix
-        45763611: "33 - Endometrial cancer",            # History of carcinosarcoma of uterus
-        37159719: "33 - Endometrial cancer",            # History of choriocarcinoma
-        4179084:  "33 - Endometrial cancer",            # History of malignant neoplasm of uterine body
-        4325186:  "34 - Vaginal cancer",                # History of malignant neoplasm of vagina
-        4181024:  "35 - Vulvar cancer",                 # History of malignant neoplasm of vulva
-        4216132:  "37 - Bladder/urinary cancer",        # History of malignant neoplasm of urinary system
-        4325868:  "38 - Upper urinary tract cancer",    # History of malignant neoplasm of ureter
-        46273500: "39 - Urethral cancer",               # History of cancer of urethra
-        3174258:  "40 - Thyroid cancer",                # History of thyroid cancer
-        4197758:  "41 - Endocrine cancer",              # History of malignant neoplasm of endocrine gland
-        46270077: "43 - Neuroendocrine tumour",         # History of neuroendocrine malignant neoplasm
-        4058705:  "45 - Melanoma",                      # H/O Malignant melanoma
-        4179242:  "46 - Non-melanoma skin cancer",      # History of malignant neoplasm of skin
-        3176981:  "47 - Bone cancer",                   # History of bone cancer
-        4180113:  "47 - Bone cancer",                   # History of malignant neoplasm of bone
-        4325206:  "47 - Bone cancer",                   # History of osteosarcoma
-        4323212:  "48 - Soft tissue sarcoma",           # History of Kaposi's sarcoma
-        46273501: "48 - Retroperitoneal sarcoma",       # History of malignant neoplasm of retroperitoneum
-        46273380: "48 - Soft tissue sarcoma",           # History of rhabdomyosarcoma
-        3176052:  "48 - Soft tissue sarcoma",           # History of sarcoma
-        46270545: "48 - Soft tissue sarcoma",           # History of soft tissue sarcoma
-        44782983: "49 - Leukaemia/Lymphoma",            # History of malignant hematologic neoplasm
-        3180053:  "50 - Lymphoma",                      # History of Hodgkins disease
-        4180131:  "54 - Germ cell tumour",              # History of malignant neoplasm of epididymis
-        4190635:  "54 - Male genital cancer",           # History of malignant neoplasm of male genital organ
-        4332932:  "55 - Childhood cancer",              # History of neuroblastoma
-        44782997: "55 - Childhood cancer"               # History of primitive neuroectodermal tumor
+        4333465:  "006 - Brain cancer",                  # History of malignant neoplasm of nervous system
+        46269969: "006 - Brain cancer",                  # History of cancer metastatic to brain
+        3175032:  "018 - Head and neck cancer",          # History of cancer of ear
+        3190039:  "018 - Head and neck cancer",          # History of cancer of head and neck
+        4333345:  "018 - Head and neck cancer",          # History of malignant neoplasm of head and/or neck
+        3189194:  "034 - Oral cancer",                   # History of cancer of mouth
+        3184244:  "020 - Laryngeal cancer",              # History of cancer of larynx
+        46270611: "044 - Salivary gland cancer",         # History of malignant neoplasm of parotid gland
+        1246982:  "G09 - Unknown",                       # History of metastatic cancer
+        3181707:  "045 - Sinonasal cancer",              # History of cancer of nares
+        3184017:  "045 - Sinonasal cancer",              # History of sinus cancer
+        4212564:  "023 - Lung cancer",                   # History of malignant neoplasm of bronchus
+        4324190:  "007 - Breast cancer",                 # History of malignant neoplasm of breast
+        4187205:  "023 - Lung cancer",                   # History of malignant neoplasm of lung
+        4187206:  "023 - Lung cancer",                   # History of malignant neoplasm of trachea
+        4323367:  "040 - Pleural cancer",                # History of malignant mesothelioma
+        4178640:  "040 - Pleural cancer",                # History of malignant neoplasm of pleura
+        4179069:  "G09 - Unknown",                       # History of malignant neoplasm of thoracic cavity structure
+        4177071:  "025 - Mediastinal cancer",            # History of malignant neoplasm of mediastinum
+        46273376: "047 - Small bowel cancer",            # History of cancer of ampulla of duodenum
+        35610791: "G09 - Unknown",                       # History of malignant neoplasm of digestive organ
+        4190633:  "011 - Colorectal cancer",             # History of malignant neoplasm of gastrointestinal tract
+        3184515:  "G09 - Unknown",                       # History of splenic cancer
+        46273480: "011 - Colorectal cancer",             # History of rectosigmoid junction cancer
+        4327107:  "010 - Colon cancer",                  # History of malignant neoplasm of colon
+        4324189:  "043 - Rectal cancer",                 # History of malignant neoplasm of rectum
+        37016142: "002 - Anal cancer",                   # History of malignant neoplasm of anus
+        3189077:  "022 - Liver cancer",                  # History of liver cancer
+        4180749:  "042 - Prostate cancer",               # History of malignant neoplasm of prostate
+        3169330:  "042 - Prostate cancer",               # Personal history of prostate cancer
+        43021271: "050 - Testicular cancer",             # History of malignant neoplasm of testis
+        4327872:  "039 - Penile cancer",                 # History of malignant neoplasm of penis
+        4187203:  "G09 - Unknown",                       # History of malignant neoplasm of female genital organ
+        4323346:  "G09 - Unknown",                       # History of malignant neoplasm of uterine adnexa
+        46273417: "041 - Primary peritoneal cancer",     # History of malignant neoplasm of peritoneum
+        4178782:  "008 - Cervical cancer",               # History of malignant neoplasm of cervix
+        45763611: "012 - Endometrial cancer",            # History of carcinosarcoma of uterus
+        37159719:  "012 - Endometrial cancer",           # History of choriocarcinoma
+        4179084:  "012 - Endometrial cancer",            # History of malignant neoplasm of uterine body
+        4325186:  "055 - Vaginal cancer",                # History of malignant neoplasm of vagina
+        4181024:  "056 - Vulvar cancer",                 # History of malignant neoplasm of vulva
+        4216132:  "004 - Bladder cancer",                # History of malignant neoplasm of urinary system
+        4325868:  "053 - Upper urinary tract cancer",    # History of malignant neoplasm of ureter
+        46273500: "054 - Urethral cancer",               # History of cancer of urethra
+        3174258:  "052 - Thyroid cancer",                # History of thyroid cancer
+        4197758:  "G09 - Unknown",                       # History of malignant neoplasm of endocrine gland
+        46270077: "031 - Neuroendocrine tumour",         # History of neuroendocrine malignant neoplasm
+        4058705:  "026 - Melanoma",                      # H/O Malignant melanoma
+        4179242:  "032 - Non-melanoma skin cancer",      # History of malignant neoplasm of skin
+        3176981:  "005 - Bone cancer",                   # History of bone cancer
+        4180113:  "005 - Bone cancer",                   # History of malignant neoplasm of bone
+        4325206:  "005 - Bone cancer",                   # History of osteosarcoma
+        4323212:  "048 - Soft tissue sarcoma",           # History of Kaposi's sarcoma
+        46273501: "048 - Soft tissue sarcoma",           # History of malignant neoplasm of retroperitoneum
+        46273380: "048 - Soft tissue sarcoma",           # History of rhabdomyosarcoma
+        3176052:  "048 - Soft tissue sarcoma",           # History of sarcoma
+        46270545: "048 - Soft tissue sarcoma",           # History of soft tissue sarcoma
+        44782983: "G09 - Unknown",                       # History of malignant hematologic neoplasm
+        3180053:  "024 - Lymphoma",                      # History of Hodgkins disease
+        4180131:  "017 - Germ cell tumour",              # History of malignant neoplasm of epididymis
+        4190635:  "G09 - Unknown",                       # History of malignant neoplasm of male genital organ
+        4332932:  "009 - Childhood cancer",              # History of neuroblastoma
+        44782997: "009 - Childhood cancer"               # History of primitive neuroectodermal tumor
     }
 
     icd10_map = {
-        "Z85.0": "19 - Gastrointestinal cancer",   # digestive organs
-        "Z85.1": "12 - Lung cancer",               # trachea, bronchus, lung
-        "Z85.2": "14 - Thoracic cavity cancer",    # other respiratory/intrathoracic
-        "Z85.3": "12 - Breast cancer",             # breast
-        "Z85.4": "30 - Gynaecological cancer",     # genital organs
-        "Z85.5": "37 - Bladder/urinary cancer",    # urinary tract
-        "Z85.6": "49 - Leukaemia/Lymphoma",        # leukaemia
-        "Z85.7": "49 - Leukaemia/Lymphoma",        # lymphoid/haematopoietic
-        "Z85.8": "9 - Metastatic cancer (unknown primary)",  # other organs
-        "Z85.9": "9 - Metastatic cancer (unknown primary)"   # unspecified
+        "Z85.0": "G09 - Unknown",                       # digestive organs
+        "Z85.1": "023 - Lung cancer",                   # trachea, bronchus, lung
+        "Z85.2": "G09 - Unknown",                       # other respiratory/intrathoracic
+        "Z85.3": "007 - Breast cancer",                 # breast
+        "Z85.4": "G09 - Unknown",                       # genital organs
+        "Z85.5": "G09 - Unknown",                       # urinary tract
+        "Z85.6": "021 - Leukaemia",                     # leukaemia
+        "Z85.7": "G09 - Unknown",                       # lymphoid/haematopoietic
+        "Z85.8": "G09 - Unknown",                       # other organs
+        "Z85.9": "G09 - Unknown"                        # unspecified
     }
+
+
 
     combined_cancer_map = {
         **{str(k): v for k, v in omop_map.items()},
@@ -4036,10 +4888,14 @@ def create_pharos_ph_incr():
         .filter(col("cancer_type").isNotNull())
         .select(
             col("person_id"),
+            lit(None).alias("pharosid"),
             lit(None).alias("clinical_record_id"),
-            col("cancer_type"),
+            col("cancer_type_code"),
+            lit(None).alias("cancer_type_detail"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_cancer_history")
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
 
@@ -4053,49 +4909,4 @@ update_table(updated_df, get_target_table("pharos_personal_history"), ["person_i
 
 # COMMAND ----------
 
-pharos_ph_comment = "This table contains a harmonized and standardised record of personal history of cancer diagnoses."
 
-schema_pharos_metastasis = StructType([
-    StructField(
-        "pharosid",
-        LongType(),
-        True,
-        {"comment": "Assigned unique ID for each participant (TBC)"}
-    ),
-    StructField(
-        "clinical_record_id",
-        LongType(),
-        True,
-        {"comment": "Unique clinical record PharosID"}
-    ),
-    StructField(
-        "recurrence_date",
-        StringType(),
-        True,
-        {"comment": "Date of distant recurrence episode (DD-MM-YYYY)"}
-    ),
-    StructField(
-        "metastasis_site",
-        StringType(),
-        True,
-        {"comment": "Anatomical site of metastasis; one row per metastasis site"}
-    ),
-    StructField(
-        "met_site_date",
-        StringType(),
-        True,
-        {"comment": "Date of distant recurrence episode (DD-MM-YYYY)"}
-    ),
-    StructField(
-        "date_checked_met_sites",
-        StringType(),
-        True,
-        {"comment": "Date medical record regarding metastasis data was reviewed (DD-MM-YYYY)"}
-    ),
-    StructField(
-        "ADC_UPDT",
-        TimestampType(),
-        nullable=True,
-        metadata={"comment": "Last update timestamp."}
-    )
-])
