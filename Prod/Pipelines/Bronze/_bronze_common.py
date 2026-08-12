@@ -5,7 +5,7 @@
 # MAGIC Lightweight widget, JSON and table helpers shared by `bronze_pipeline` and the
 # MAGIC domain pipelines it orchestrates. No Spark cache or persistence is used.
 # MAGIC
-# MAGIC Release `20260808_activity_v2`.
+# MAGIC Release `20260811_luna_wl_v2`.
 # MAGIC
 # MAGIC Defaults are the **weekly incremental** defaults: `force_full_refresh=false` and
 # MAGIC `create_cutover_backups=false`. Backups are taken once by the release cutover
@@ -18,7 +18,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-_BRONZE_RELEASE_ID = "20260808_activity_v2"
+_BRONZE_RELEASE_ID = "20260811_luna_wl_v2"
 
 _BRONZE_WIDGET_DEFAULTS = {
     "pipeline_run_id": "",
@@ -39,6 +39,10 @@ _BRONZE_WIDGET_DEFAULTS = {
     "run_theatre_pipeline": "true",
     "run_medication_order_pipeline": "true",
     "run_pacs_pipeline": "true",
+    "run_referral_rtt_pipeline": "true",
+    "run_waiting_list_pipeline": "true",
+    "run_snapshots": "false",
+    "refresh_decodes": "false",
     "run_powerform_pipeline": "true",
 }
 

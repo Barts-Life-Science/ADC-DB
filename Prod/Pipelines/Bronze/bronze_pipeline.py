@@ -5,14 +5,15 @@
 # MAGIC Single weekly entry point for the Bronze layer. Runs every domain pipeline in
 # MAGIC dependency order and reports one consolidated result.
 # MAGIC
-# MAGIC Release `20260808_activity_v2`.
+# MAGIC Release `20260811_luna_wl_v1`.
 # MAGIC
 # MAGIC ## Defaults
 # MAGIC
 # MAGIC The defaults are the ordinary weekly ones: production target, incremental
 # MAGIC (`force_full_refresh=false`), no cutover backups, and post-deployment checks on.
 # MAGIC Scheduling, theatre, medication orders and PACS are enabled after their initial
-# MAGIC production backfills complete.
+# MAGIC production backfills complete. Referral/RTT and waiting-list are registered but
+# MAGIC disabled by default until their production deployment/backfill gate is approved.
 # MAGIC
 # MAGIC ## Dependencies and failure handling
 # MAGIC
@@ -42,6 +43,8 @@ _bronze_target_schema = bronze_value("target_schema", "4_prod.bronze")
 _bronze_force_full_refresh = "true" if bronze_bool("force_full_refresh", False) else "false"
 _bronze_create_cutover_backups = "true" if bronze_bool("create_cutover_backups", False) else "false"
 _bronze_run_post_deployment_checks = "true" if bronze_bool("run_post_deployment_checks", True) else "false"
+_bronze_run_snapshots = "true" if bronze_bool("run_snapshots", False) else "false"
+_bronze_refresh_decodes = "true" if bronze_bool("refresh_decodes", False) else "false"
 
 print(f"[BRONZE] release={_BRONZE_RELEASE_ID}")
 print(f"[BRONZE] run_id={_bronze_run_id}")
@@ -50,6 +53,8 @@ print(f"[BRONZE] target_schema={_bronze_target_schema}")
 print(f"[BRONZE] force_full_refresh={_bronze_force_full_refresh}")
 print(f"[BRONZE] create_cutover_backups={_bronze_create_cutover_backups}")
 print(f"[BRONZE] run_post_deployment_checks={_bronze_run_post_deployment_checks}")
+print(f"[BRONZE] run_snapshots={_bronze_run_snapshots}")
+print(f"[BRONZE] refresh_decodes={_bronze_refresh_decodes}")
 
 # A failed or in-progress production cutover leaves this lock active so the scheduled
 # weekly orchestrator cannot enter a partially bootstrapped release. Direct feed runs
@@ -111,6 +116,21 @@ _bronze_schema_refresh_args = dict(
 _bronze_production_write_args = dict(
     _bronze_schema_refresh_args,
     allow_production_write="true",
+)
+
+_bronze_new_feed_args = dict(
+    _bronze_schema_refresh_args,
+    allow_production_write=(
+        "true" if _bronze_target_schema.lower() == "4_prod.bronze" else "false"
+    ),
+    full_reconciliation="false",
+    bootstrap_mode="false",
+)
+
+_bronze_waiting_list_args = dict(
+    _bronze_new_feed_args,
+    run_snapshots=_bronze_run_snapshots,
+    refresh_decodes=_bronze_refresh_decodes,
 )
 
 _BRONZE_STEPS = [
@@ -240,6 +260,24 @@ _BRONZE_STEPS = [
         "requires": [],
         "timeout_seconds": 6 * 60 * 60,
     },
+    {
+        "name": "referral_rtt_pipeline",
+        "notebook": "referral_rtt_pipeline",
+        "enabled_widget": "run_referral_rtt_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_new_feed_args,
+        "requires": [],
+        "timeout_seconds": 4 * 60 * 60,
+    },
+    {
+        "name": "waiting_list_pipeline",
+        "notebook": "waiting_list_pipeline",
+        "enabled_widget": "run_waiting_list_pipeline",
+        "enabled_default": False,
+        "arguments": _bronze_waiting_list_args,
+        "requires": [],
+        "timeout_seconds": 8 * 60 * 60,
+    },
 ]
 
 _bronze_step_names = [step["name"] for step in _BRONZE_STEPS]
@@ -363,6 +401,8 @@ _bronze_summary = {
         (datetime.now(timezone.utc) - _bronze_started_at).total_seconds(), 1
     ),
     "force_full_refresh": _bronze_force_full_refresh,
+    "run_snapshots": _bronze_run_snapshots,
+    "refresh_decodes": _bronze_refresh_decodes,
     "target_schema": _bronze_target_schema,
     "succeeded": _bronze_succeeded,
     "failed": _bronze_failed,

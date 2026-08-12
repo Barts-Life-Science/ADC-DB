@@ -197,6 +197,7 @@ schema_rde_patient_demographics = StructType([
         StructField("ETHNIC_CD", IntegerType(), True, metadata={"comment": "Ethnicity CD"}),
         StructField("Ethnicity", StringType(), True, metadata={"comment": "The ethnicity of a PERSON, as specified by the PERSON."}),
         StructField("Date_of_Death", TimestampType(), True, metadata={"comment": "*Date of death of the patient  if deceased. May not be up to date if patient record has not been updated since the last spine lookup and patient died out of trust."}),
+        StructField("Year_of_Death", IntegerType(), True, metadata={"comment": "The year in which the PERSON died, if deceased. Derived from Date_of_Death; subject to the same caveat that it may not be up to date if the patient died out of trust."}),
         StructField("Postcode", StringType(), True, metadata={"comment": "A code that is used to assist with finding or navigating to a specific location or delivery point. In some countries, this may provide better resolution than the standard postal address."}),
         StructField("City", StringType(), True, metadata={"comment": "The city field is the text name of the city associated with the address row."}),
         StructField("MARITAL_STATUS_CD", IntegerType(), True, metadata={"comment": "Marital status CD"}),
@@ -264,6 +265,7 @@ def patient_demographics_incr():
             col("Eth.CODE_VALUE").cast(IntegerType()).alias("ETHNIC_CD"),
             col("Eth.DISPLAY").alias("Ethnicity"),
             col("Pers.DECEASED_DT_TM").alias("Date_of_Death"),
+            year(col("Pers.DECEASED_DT_TM")).alias("Year_of_Death"),
             col("A.ZIPCODE").alias("Postcode"),
             col("A.CITY").alias("City"),
             col("Pers.MARITAL_TYPE_CD").cast(IntegerType()).alias("MARITAL_STATUS_CD"),
@@ -1978,6 +1980,7 @@ schema_rde_blobdataset = StructType([
         StructField("ChildTagText", StringType(), True, metadata={"comment": "child event tag text"}),
         StructField("BlobContents", StringType(), True, metadata={"comment": "Detailed description or report about the clinical event"}),
         StructField("AnonymizedText", StringType(), True, metadata={"comment": "Blob after anonymization."}),
+        StructField("BlobStatus", StringType(), True, metadata={"comment": "Plain-text CE_BLOB_RESULT succession status, e.g. Interim, Final or Addendum."}),
         StructField("EventDesc", StringType(), True, metadata={"comment": "Event description"}),
         StructField("EventResultText", StringType(), True, metadata={"comment": "Event result as text"}),
         StructField("EventResultNBR", DoubleType(), True, metadata={"comment": "Event result as numbers for numeric values"}),
@@ -1994,7 +1997,44 @@ schema_rde_blobdataset = StructType([
 def blobdataset_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_blobdataset")
 
-    blob_content = dlt.read("current_blob_content").alias("B")
+    blob_content_all = dlt.read("current_blob_content")
+
+    blob_result_window = Window.partitionBy("EVENT_ID").orderBy(
+      F.col("VALID_UNTIL_DT_TM").desc(),
+      F.col("UPDT_CNT").desc_nulls_last(),
+      F.col("UPDT_DT_TM").desc_nulls_last(),
+      F.col("VALID_FROM_DT_TM").desc_nulls_last(),
+    )
+
+    blob_result_current = (
+      spark.table("4_prod.raw.mill_ce_blob_result")
+      .withColumn("EVENT_ID", F.col("EVENT_ID").cast(LongType()))
+      .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+      .withColumn("_rn", F.row_number().over(blob_result_window))
+      .filter(F.col("_rn") == 1)
+      .drop("_rn")
+      .select("EVENT_ID", "SUCCESSION_TYPE_CD", "ADC_UPDT")
+    )
+
+    # Include blob-status-only changes in the incremental update.
+    changed_event_ids = (
+      blob_content_all
+      .filter(F.col("ADC_UPDT") > F.lit(max_adc_updt))
+      .select("EVENT_ID")
+      .unionByName(
+          blob_result_current
+          .filter(F.col("ADC_UPDT") > F.lit(max_adc_updt))
+          .select("EVENT_ID")
+      )
+      .distinct()
+    )
+
+    blob_content = (
+      blob_content_all
+      .join(changed_event_ids, "EVENT_ID", "inner")
+      .alias("B")
+    )
+
     
     # Window to select the clinical event with highest UPDT_CNT per EVENT_ID
     ce_window = Window.partitionBy("EVENT_ID").orderBy(F.col("UPDT_CNT").desc())
@@ -2011,7 +2051,7 @@ def blobdataset_incr():
     code_value_ref = _mill_code_lookup()
 
     return (
-        blob_content.filter(col("ADC_UPDT") > max_adc_updt)
+        blob_content
         .join(clinical_event.alias("CE"), col("B.EVENT_ID") == col("CE.EVENT_ID"), "inner")
         .join(encounter, col("CE.ENCNTR_ID") == col("E.ENCNTR_ID"), "inner")
         .join(clinical_event.alias("CE2"), col("CE.PARENT_EVENT_ID") == col("CE2.EVENT_ID"), "left")
@@ -2021,6 +2061,8 @@ def blobdataset_incr():
         .join(code_value_ref.alias("RecStat"), col("CE.RECORD_STATUS_CD").cast(IntegerType()) == col("RecStat.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("ConSys"), col("CE.CONTRIBUTOR_SYSTEM_CD").cast(IntegerType()) == col("ConSys.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("EvntCls"), col("CE.EVENT_CLASS_CD").cast(IntegerType()) == col("EvntCls.CODE_VALUE_CD"), "left")
+        .join(blob_result_current.alias("BR"), col("B.EVENT_ID") == col("BR.EVENT_ID"), "left")
+        .join(code_value_ref.alias("BlobStat"), col("BR.SUCCESSION_TYPE_CD").cast(LongType()).cast(StringType()) == col("BlobStat.CODE_VALUE_CD"), "left")
         .select(
             col("E.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("E.NHS_Number").cast(StringType()).alias("NHS_Number"),
@@ -2034,6 +2076,7 @@ def blobdataset_incr():
             col("CE.EVENT_TAG").cast(StringType()).alias("ChildTagText"),
             col("B.BLOB_TEXT").cast(StringType()).alias("BlobContents"),
             col("B.ANON_TEXT").cast(StringType()).alias("AnonymizedText"),
+            col("BlobStat.CODE_DISP_TXT").cast(StringType()).alias("BlobStatus"),
             col("Evntcd.CODE_DISP_TXT").cast(StringType()).alias("EventDesc"),
             col("CE.RESULT_VAL").cast(StringType()).alias("EventResultText"),
             col("CE.RESULT_VAL").cast(DoubleType()).alias("EventResultNBR"),
@@ -2043,7 +2086,7 @@ def blobdataset_incr():
             col("EvntCls.CODE_DESC_TXT").cast(StringType()).alias("ClassDesc"),
             col("CE.PARENT_EVENT_ID").cast(LongType()).alias("ParentEventID"),
             col("CE.EVENT_ID").cast(LongType()).alias("EventID"),
-            greatest(col("B.ADC_UPDT"), col("CE.ADC_UPDT"), col("E.ADC_UPDT"), col("CE2.ADC_UPDT")).alias("ADC_UPDT")
+            greatest(col("B.ADC_UPDT"),col("CE.ADC_UPDT"),col("E.ADC_UPDT"),col("CE2.ADC_UPDT"),col("BR.ADC_UPDT")).alias("ADC_UPDT")
         )
         .filter(col("ADC_UPDT") > max_adc_updt)
         .filter(col("BlobContents").isNotNull())
