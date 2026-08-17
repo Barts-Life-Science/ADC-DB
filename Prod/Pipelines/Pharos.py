@@ -18,7 +18,7 @@ from functools import reduce
 # ============================================================================
 # Environment Configuration
 # ============================================================================
-ENVIRONMENT = "prod"  # Change to "prod" for production
+ENVIRONMENT = "dev"  # Change to "prod" for production
 
 if ENVIRONMENT == "dev":
     TARGET_CATALOG = "8_dev"
@@ -525,7 +525,10 @@ def update_table(source_df, target_table: str, index_columns,
 
 # COMMAND ----------
 
-pharos_person_comment = "The table contains demographic information about patients, including identifiers such as person ID, gender, birth year, and ethnicity, etc."
+pharos_person_comment = """
+The table contains demographic information about patients, including identifiers
+such as person ID, gender, birth year, and ethnicity.
+"""
 
 schema_pharos_person = StructType([
     StructField(
@@ -536,7 +539,7 @@ schema_pharos_person = StructType([
     ),
     StructField(
         name="pharosid",
-        dataType=LongType(),
+        dataType=StringType(),
         nullable=True,
         metadata={"comment": "Assigned unique ID for each participant."}
     ),
@@ -544,8 +547,8 @@ schema_pharos_person = StructType([
         name="clinical_record_id",
         dataType=LongType(),
         nullable=True,
-        metadata={"comment": "Unique clincial record PharosID."}
-    ),    
+        metadata={"comment": "Unique clinical record PharosID."}
+    ),
     StructField(
         name="tumour_group",
         dataType=StringType(),
@@ -608,105 +611,140 @@ schema_pharos_person = StructType([
     )
 ])
 
+
 def create_pharos_person_incr():
 
     max_adc_updt = get_max_timestamp(
-        table_name=get_target_table("pharos_general"),
-        ts_column="ADC_UPDT")
+        table_name=get_target_table("pharos_person"),
+        ts_column="ADC_UPDT"
+    )
 
-    pharos_cohort = spark.table("6_mgmt.cohorts.phar001").alias("p")
-    map_person = spark.table("4_prod.bronze.map_person").alias("m")
+    map_person = spark.table(
+        "4_prod.bronze.map_person"
+    )
 
     processed_person = (
-        .join(pharos_cohort, on = "p.person_id", how="left_semi")
-        .filter(col("ADC_UPDT") > max_adc_updt)
-        .withColumn(
-            "sex",
-            when(col("gender_cd") == 362.0, lit("001 Female"))
-            .when(col("gender_cd") == 363.0, lit("002 Male"))
-            .otherwise(lit("9 Unknown"))
+        map_person
+        .filter(
+            col("ADC_UPDT") > max_adc_updt
+            if max_adc_updt is not None
+            else lit(True)
         )
         .withColumn(
-            "ethnicity",
-            when(col("ethnicity_cd").isin(3767643,3767645,3767650), lit("010 White"))
-            .when(col("ethnicity_cd").isin(3767649,3767652,3767653,3767654), lit("020 Mixed"))
-            .when(col("ethnicity_cd").isin(3767640,3767644,3767651,3767647), lit("030 Asian"))
-            .when(col("ethnicity_cd").isin(3767638,3767641,3767648), lit("040 Black"))
-            .when(col("ethnicity_cd").isin(312508, 3767639, 3767642), lit("050 Other"))
-            .when(col("ethnicity_cd").isin(0, 3767646), "G09 Unknown")
+            "sex",
+            when(col("gender_cd") == 362.0, lit("001 - Female"))
+            .when(col("gender_cd") == 363.0, lit("002 - Male"))
             .otherwise(lit("G09 Unknown"))
         )
         .withColumn(
+            "ethnicity",
+            when(
+                col("ethnicity_cd").isin(3767643, 3767645, 3767650),
+                lit("010 - White")
+            )
+            .when(
+                col("ethnicity_cd").isin(3767649, 3767652, 3767653, 3767654),
+                lit("020 - Mixed")
+            )
+            .when(
+                col("ethnicity_cd").isin(3767640, 3767644, 3767651, 3767647),
+                lit("030 - Asian")
+            )
+            .when(
+                col("ethnicity_cd").isin(3767638, 3767641, 3767648),
+                lit("040 - Black")
+            )
+            .when(
+                col("ethnicity_cd").isin(312508, 3767639, 3767642),
+                lit("050 - Other")
+            )
+            .otherwise(lit("G09 - Unknown"))
+        )
+        .withColumn(
             "ethnic_group",
-            when(col("ethnicity_cd") == 3767643, "011 White - British")
-            .when(col("ethnicity_cd") == 3767645, "012 White - Irish")
-            .when(col("ethnicity_cd") == 3767650, "013 White - White-Other")
-            .when(col("ethnicity_cd") == 3767654, "021 Mixed - White and Black Caribbean")
-            .when(col("ethnicity_cd") == 3767653, "022 Mixed - White and Black African")
-            .when(col("ethnicity_cd") == 3767652, "023 Mixed - White Asian")
-            .when(col("ethnicity_cd") == 3767649, "024 Mixed - Mixed-Other")
-            .when(col("ethnicity_cd") == 3767644, "031 Asian - Indian")
-            .when(col("ethnicity_cd") == 3767651, "032 Asian - Pakistani")
-            .when(col("ethnicity_cd") == 3767640, "033 Asian - Bangladeshi")
-            .when(col("ethnicity_cd") == 3767647, "034 Asian - Asian-Other")
-            .when(col("ethnicity_cd") == 3767641, "041 Black - Caribbean")
-            .when(col("ethnicity_cd") == 3767638, "042 Black - African")
-            .when(col("ethnicity_cd") == 3767648, "043 Black - Black-Other")
-            .when(col("ethnicity_cd") == 3767642, "051 Other - Chinese")
-            .when(col("ethnicity_cd").isin(3767639, 312508), "054 Other - Other")
-            .when(col("ethnicity_cd").isin(0, 3767646), "G09 Unknown")
-            .otherwise("G09 Unknown")
+            when(col("ethnicity_cd") == 3767643, lit("011 White - British"))
+            .when(col("ethnicity_cd") == 3767645, lit("012 White - Irish"))
+            .when(col("ethnicity_cd") == 3767650, lit("013 White - White Other"))
+            .when(col("ethnicity_cd") == 3767654, lit("021 Mixed - White and Black Caribbean"))
+            .when(col("ethnicity_cd") == 3767653, lit("022 Mixed - White and Black African"))
+            .when(col("ethnicity_cd") == 3767652, lit("023 Mixed - White and Asian"))
+            .when(col("ethnicity_cd") == 3767649, lit("024 Mixed - Other"))
+            .when(col("ethnicity_cd") == 3767644, lit("031 Asian - Indian"))
+            .when(col("ethnicity_cd") == 3767651, lit("032 Asian - Pakistani"))
+            .when(col("ethnicity_cd") == 3767640, lit("033 Asian - Bangladeshi"))
+            .when(col("ethnicity_cd") == 3767647, lit("034 Asian - Other"))
+            .when(col("ethnicity_cd") == 3767641, lit("041 Black - Caribbean"))
+            .when(col("ethnicity_cd") == 3767638, lit("042 Black - African"))
+            .when(col("ethnicity_cd") == 3767648, lit("043 Black - Other"))
+            .when(col("ethnicity_cd") == 3767642, lit("051 Other - Chinese"))
+            .when(col("ethnicity_cd").isin(3767639, 312508), lit("054 Other"))
+            .when(col("ethnicity_cd").isin(0, 3767646), lit("G09 Unknown"))
+            .otherwise(lit("G09 Unknown"))
         )
         .dropDuplicates()
     )
-    
+
     map_diagnosis = (
-    spark.table("4_prod.bronze.map_diagnosis")
-    .select("PERSON_ID","OMOP_CONCEPT_ID","ICD10_CODE")
+        spark.table("4_prod.bronze.map_diagnosis")
+        .select(
+            "PERSON_ID",
+            "OMOP_CONCEPT_ID",
+            "ICD10_CODE"
+        )
     )
 
-    # Omop concept_id for the subtype of the breast cancer which are not captured with ICD10 coding:
+    # OMOP concept IDs for breast cancer subtypes
     brc_add_ids = [
-        45768522, # Triple-negative breast cancer
-        35624616, # Germline BRCA-mutated, HER2-negative metastatic breast cancer
-        602331    # Metastatic malignant neoplasm to left breast
+        45768522,  # Triple-negative breast cancer
+        35624616,  # Germline BRCA-mutated, HER2-negative metastatic breast cancer
+        602331     # Metastatic malignant neoplasm to left breast
     ]
 
     site = (
         map_diagnosis
         .withColumn(
             "tumour_group",
-            when(col("ICD10_CODE").like("C50%") | col("OMOP_CONCEPT_ID").isin(brc_add_ids), "001 Breast")
-            .otherwise(None)
+            when(
+                col("ICD10_CODE").like("C50%")
+                | col("OMOP_CONCEPT_ID").isin(brc_add_ids),
+                lit("001 Breast")
+            )
         )
+        .filter(col("tumour_group").isNotNull())
         .dropDuplicates(["PERSON_ID"])
-    ).alias("s")
+    )
 
     final_df = (
-        map_person.alias("p")
-        .join(site.alias("s"),col("p.person_id") == col("s.PERSON_ID"),"inner")
+        processed_person.alias("p")
+        .join(
+            site.alias("s"),
+            col("p.person_id") == col("s.PERSON_ID"),
+            "inner"
+        )
         .select(
-            col("p.person_id").cast(LongType()),
-            lit(None).cast(StringType()),alias("pharosid"),
+            col("p.person_id").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
-            col("s.tumour_group").cast(StringType()),
+            col("s.tumour_group").cast(StringType()).alias("tumour_group"),
             lit(None).cast(StringType()).alias("site"),
             col("p.birth_year").cast(IntegerType()).alias("yob"),
-            col("p.ethnicity").cast(StringType()),
-            col("p.ethnic_group").cast(StringType()),
-            col("p.sex").cast(StringType()),
+            col("p.sex").cast(StringType()).alias("sex"),
+            col("p.ethnicity").cast(StringType()).alias("ethnicity"),
+            col("p.ethnic_group").cast(StringType()).alias("ethnic_group"),
             col("p.ADC_UPDT"),
-            current_timestamp().alias("date_checked")
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
         .dropDuplicates(["person_id"])
     )
 
     return final_df
 
-updates_df = create_pharos_general_incr()
 
-update_table(updates_df, get_target_table("pharos_person"), "person_id", schema_pharos_general, pharos_general_comment)
+updates_df = create_pharos_person_incr()
 
+update_table(updates_df,get_target_table("pharos_person"),"person_id",schema_pharos_person,pharos_person_comment)
 
 # COMMAND ----------
 
@@ -747,13 +785,11 @@ def create_pharos_cohort_incr():
         ts_column="ADC_UPDT"
     )
 
-    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis").alias("m")
-    pharos_cohort = spark.table("6_mgmt.cohorts.phar001").alias("p")
+    map_diagnosis = spark.table("4_prod.bronze.map_diagnosis")
 
     # Get the breast cancer cohort
     breast_cancer_cohort = (
         map_diagnosis
-        .join(pharos_cohort, col("m.PERSON_ID") == col("p.person_id"), "left_semi")
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
             (
@@ -797,20 +833,13 @@ def create_pharos_cohort_incr():
 
 updates_df = create_pharos_cohort_incr()
 
-update_table(
-    updates_df,
-    get_target_table("pharos_cohort"),
-    ["person_id", "cohort"],
-    schema_pharos_cohort,pharos_cohort_comment
-)
+update_table(updates_df,get_target_table("pharos_cohort"),["person_id", "cohort"],schema_pharos_cohort,pharos_cohort_comment)
 
 
 # COMMAND ----------
 
 tumour_group_comment = (
-    "This table records the tumour group associated with each Pharos participant. "
-    "It links the participant to their primary tumour group, such as Breast, "
-    "Pancreatic, or Lung, based on clinical diagnosis records."
+    "This table records the tumour group associated with each Pharos participant. It links the participant to their primary tumour group, such as Breast, Pancreatic, or Lung, based on clinical diagnosis records."
 )
 
 
@@ -929,13 +958,7 @@ def create_tumour_group_incr():
 
 updates_df = create_tumour_group_incr()
 
-update_table(
-    updates_df,
-    "8_dev.silver.tumour_group",
-    ["person_id"],
-    schema_tumour_group,
-    tumour_group_comment
-)
+update_table(updates_df,"8_dev.silver.pharos_tumour_group",["person_id"],schema_tumour_group,tumour_group_comment)
 
 # COMMAND ----------
 
@@ -1244,7 +1267,6 @@ def create_medical_history_incr():
     # Get the breast cancer cohort
     breast_cancer_cohort = (
         map_diagnosis
-        .join(pharos_cohort, col("m.PERSON_ID") == col("p.person_id"), "left_semi")
         .filter(
             (col("ADC_UPDT") > max_adc_updt) &
             (
@@ -1276,8 +1298,6 @@ def create_medical_history_incr():
             .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
         .dropDuplicates()
     ).alias("c")
-
-
 
     #-------------FAMILY_CANCER_HISTORY
 
@@ -1340,16 +1360,16 @@ def create_medical_history_incr():
             # Concept_id for No family history of ovarian cancer: 44804658
             .when(col("c.OMOP_CONCEPT_ID") == 44804658, "G00 - No")
         )
-
         .withColumn(
             "familyhistory_cancer_flag",
             when(
                 (col("c.OMOP_CONCEPT_ID").isin(family_history_add_ids)) |
                 (col("c.ICD10_CODE").like("Z80%")) |
-                (col"f.ICD10_CODE").rlike("^[CD]")|
+                (col("f.ICD10_CODE").rlike("^[CD]")) |
                 (col("familyhistory_bca_flag") == "1 Breast") |
-                (col("familyhistory_ovarian_flag") == "1 Ovarian"), "G01 - Yes")
-
+                (col("familyhistory_ovarian_flag") == "1 Ovarian"),
+                "G01 - Yes"
+            ).otherwise("G09 - Unknown")
         )
         .groupBy("PERSON_ID")
         .agg(
@@ -1366,7 +1386,6 @@ def create_medical_history_incr():
         .withColumn("check_offset_date", date_add(col("brc_diag_date"), 7))
         .select("PERSON_ID", "check_onset_date", "check_offset_date")
     )
-
 
     #-------------SMOKING, ALCOHOL & DRUGS
     # Get the range of dates to check for the personal lifestyles
@@ -1514,23 +1533,23 @@ def create_medical_history_incr():
             "smoking",
             when(
                 col("SOURCE_IDENTIFIER").isin(never_smoker),
-                "000 Never smoked"
+                "000 - Never smoked"
             )
             .when(
                 col("SOURCE_IDENTIFIER").isin(non_smoker),
-                "001 Non-smoker"
+                "001 - Non-smoker"
             )
             .when(
                 col("SOURCE_IDENTIFIER").isin(current_smoker),
-                "002 Yes, current smoker"
+                "002 - Yes, current smoker"
             )
             .when(
                 col("SOURCE_IDENTIFIER").isin(past_smoker),
-                "003 Yes, past smoker"
+                "003 - Yes, past smoker"
             )
             .when(
                 col("SOURCE_IDENTIFIER").isin(smoking_unknown_usage),
-                "004 Yes, unknown usage"
+                "004 - Yes, unknown usage"
             )
         )
 
@@ -1538,11 +1557,11 @@ def create_medical_history_incr():
         .withColumn(
             "vape",
             when(col("SOURCE_IDENTIFIER").isin(current_vaper),
-                    "002 Yes, current smoker"
+                    "002 - Yes, current smoker"
             )
-            .when(col("SOURCE_IDENTIFIER") == "5169692013", "003 Yes, past smoker")
+            .when(col("SOURCE_IDENTIFIER") == "5169692013", "003 - Yes, past smoker")
             .when(col("SOURCE_IDENTIFIER").isin(vaping_usage_unknown),
-                    "004 Yes, unknown usage"
+                    "004 - Yes, unknown usage"
             )
         )
 
@@ -1551,16 +1570,16 @@ def create_medical_history_incr():
             "alcohol",
             when(
                 col("SOURCE_IDENTIFIER").isin(non_alcoholic),
-                "000 No alcohol use"
+                "000 - No alcohol use"
             )
             .when(
                 col("SOURCE_IDENTIFIER").isin(alcoholic),
-                "001 Drinks alcohol"
+                "001 - Drinks alcohol"
             )
             .when(
                 # 2988881016 "Drinks alcohol daily"
                 col("SOURCE_IDENTIFIER") == "2988881016",
-                "002 Drinks alcohol - Regularly"
+                "002 - Drinks alcohol - Regularly"
             )
         )
 
@@ -1591,7 +1610,8 @@ def create_medical_history_incr():
         })
     )
 
-        # MENOPAUSE ----------------
+    # MENOPAUSE ----------------
+
     pre_menop = ["Before menopause", "Premenopausal state", "Excessive bleeding in the premenopausal period"]
 
     post_menop = [
@@ -1632,9 +1652,9 @@ def create_medical_history_incr():
         .withColumn(
             "menopausal_status_flag",
             when(col("sex") == "M", "G04 - Not applicable")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(pre_menop_lower), "001 Pre-menopausal")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(peri_menop_lower), "002 Peri-menopausal")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(post_menop_lower), "003 Post-menopausal")
+            .when(lower(trim(col("SOURCE_STRING"))).isin(pre_menop_lower), "001 - Pre-menopausal")
+            .when(lower(trim(col("SOURCE_STRING"))).isin(peri_menop_lower), "002 - Peri-menopausal")
+            .when(lower(trim(col("SOURCE_STRING"))).isin(post_menop_lower), "003 - Post-menopausal")
         )
         .groupBy(col("b.PERSON_ID"))
         .agg(max("menopausal_status_flag").alias("menopausal_status"))
@@ -1653,8 +1673,7 @@ def create_medical_history_incr():
         )
     )
 
-    # Get"))
-    # Source codes for the smoking amount and aclcohol amount
+    # Get source codes for the smoking amount and aclcohol amount
     smoke_codes = [
         4127902,    # Number of Cigarettes Per Day Now
         71834925,   # Cigarettes Per Day at Booking
@@ -1670,6 +1689,7 @@ def create_medical_history_incr():
         71835548,   # Alcohol Units at Delivery Per Week
         71844122    # (M) Alcohol Units Pre Pregnancy Per Week
         ]
+    
     # Get the smoking and alcohol numbers for each patient if it exists
     window = Window.partitionBy("PERSON_ID", "lifestyle").orderBy(col("abs_diff").asc())
 
@@ -1687,10 +1707,9 @@ def create_medical_history_incr():
         .agg(first("NUMERIC_RESULT"))
     )
 
-        #-------------HEIGHT, WEIGHT, BMI
+    # HEIGHT, WEIGHT, BMI
 
-        # Closest measurement per PERSON
-
+    # Closest measurement per PERSON
     window = (
         Window
         .partitionBy("PERSON_ID", "OMOP_MANUAL_CONCEPT_NAME")
@@ -1714,8 +1733,9 @@ def create_medical_history_incr():
         .select("PERSON_ID", "height", "weight", "bmi")
     )
 
-        #-------------PREGNANCY
-        # Get the largest parity & gravidity number for each person
+    #PREGNANCY
+    
+    # Get the largest parity & gravidity number for each person
     window = Window.partitionBy("PERSON_ID", "EVENT_CD_DISPLAY").orderBy(col("NUMERIC_RESULT").desc())
     parity_gravidity = (
         numeric_events
@@ -1798,7 +1818,7 @@ def create_medical_history_incr():
         .join(height_weight, ["PERSON_ID"], "left")
         .join(menopause,["PERSON_ID"], "left")
         .join(pregnancy, ["PERSON_ID"], "left")
-        .fillna("G09 Unknown", ["familyhistory_bca","familyhistory_ovarian","familyhistory_relation","familyhistory_cancer","menopausal_status"])
+        .fillna("G09 Unknown", ["familyhistory_bca","familyhistory_ovarian","familyhistory_cancer","menopausal_status"])
         .drop("brc_diag_date")
         .dropDuplicates())
 
@@ -1806,10 +1826,10 @@ def create_medical_history_incr():
         processed_df
         .select(
             col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
             col("familyhistory_bca").cast(StringType()),
             col("familyhistory_ovarian").cast(StringType()),
-            col("familyhistory_relation").cast(StringType()),
             col("familyhistory_cancer").cast(StringType()),
             lit(None).cast(StringType()).alias("genetic_testing"),
             lit(None).cast(StringType()).alias("any_germline_mutation"),
@@ -1850,7 +1870,9 @@ def create_medical_history_incr():
             lit(None).cast(StringType()).alias("pabc"),
             lit(None).cast(StringType()).alias("time_pregnancytobc"),
             col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked_med_history")
+            current_timestamp().alias("date_checked"),
+            current_timestamp().alias("created_at"),
+            current_timestamp().alias("updated_at")
         )
     )
 
@@ -1931,7 +1953,7 @@ schema_pharos_fh = StructType([
 
 # Family history is derived from two sources:
 # 1. The map_family_history table
-# 2. The map_problem and map_diagnosis tables using relevant family history codes
+# 2. The map_problem and map_diagnosis tables using relevant family history codes (OMOP and ICD10)
 
 def create_fh_incr():
     max_adc_updt = get_max_timestamp(
@@ -2253,6 +2275,12 @@ schema_pharos_tumour = StructType([
         {"comment": "Assigned unique ID for each participant"}
     ),
     StructField(
+        "pharosid",
+        StringType(),
+        True,
+        {"comment": "Surrogate PK"}
+    ),
+    StructField(
         name="clinical_record_id",
         dataType=LongType(),
         nullable=True,
@@ -2429,7 +2457,7 @@ def create_pharos_tumour_incr():
     diagnosis = spark.table("4_prod.bronze.map_diagnosis")
     person = spark.table("4_prod.bronze.map_person").select(col("person_id").alias("PERSON_ID"),"birth_year")
 
-            # Get the breast cancer cohort
+    # Get the breast cancer cohort
     breast_cancer_cohort = (
         diagnosis
         .filter(
@@ -2454,6 +2482,7 @@ def create_pharos_tumour_incr():
         .select(
             lit(None).cast(LongType()).alias("tumour_id"),
             col("PERSON_ID").cast(LongType()).alias("person_id"),
+            lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
             col("date_of_diagnosis").cast(DateType()),
             col("year_of_diagnosis").cast(IntegerType()),
@@ -2489,7 +2518,7 @@ def create_pharos_tumour_incr():
 
 updated_df = create_pharos_tumour_incr()
 
-update_table(updated_df, get_target_table("pharos_tumour"), "person_id", schema_pharos_tumour, pharos_tumour_comment)
+update_table(updated_df, get_target_table("pharos_tumour"), ["person_id", "tumour_id"], schema_pharos_tumour, pharos_tumour_comment)
 
 
 # COMMAND ----------
@@ -2508,6 +2537,12 @@ schema_pharos_imaging = StructType([
         LongType(),
         True,
         {"comment": "Assigned unique ID for each participant"}
+    ),
+    StructField(
+        name="pharosid",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "FK to person."}
     ),
     StructField(
         name="clinical_record_id",
@@ -2704,26 +2739,27 @@ def create_pharos_imaging_incr():
         .select(
             col("person_id").cast(LongType()),
             col("image_date").cast(DateType()),
-            lit(None).alias("clinical_record_id"),
+            lit(None).alias("pharosid").cast(StringType()),
+            lit(None).alias("clinical_record_id").cast(LongType()),
             col("days_diagnosis_imaging").cast(IntegerType()),
             col("imaging_type").cast(StringType()),
-            lit(None).alias("image_status"),
+            lit(None).alias("image_status").cast(StringType()),
             col("image_site").cast(StringType()),
-            lit(None).alias("image_contrast"),
-            lit(None).alias("image_lesions"),
-            lit(None).alias("image_cal"),
-            lit(None).alias("breast_density"),
-            lit(None).alias("acr_score"),
-            lit(None).alias("rcr_score"),
-            lit(None).alias("index_lesion_size"),
-            lit(None).alias("index_lesion_quadrant"),
-            lit(None).alias("index_lesion_distance"),
-            lit(None).alias("index_lesion_laterality"),
-            lit(None).alias("image_quality_notes"),
-            col("_src_adc_updt").alias("ADC_UPDT"),
-            current_timestamp().alias("date_checked"),
-            current_timestamp().alias("created_at"),
-            current_timestamp().alias("updated_at")
+            lit(None).alias("image_contrast").cast(StringType()),
+            lit(None).alias("image_lesions").cast(IntegerType()),
+            lit(None).alias("image_cal").cast(StringType()),
+            lit(None).alias("breast_density").cast(StringType()),
+            lit(None).alias("acr_score").cast(StringType()),
+            lit(None).alias("rcr_score").cast(StringType()),
+            lit(None).alias("index_lesion_size").cast(StringType()),
+            lit(None).alias("index_lesion_quadrant").cast(StringType()),
+            lit(None).alias("index_lesion_distance").cast(FloatType()),
+            lit(None).alias("index_lesion_laterality").cast(StringType()),
+            lit(None).alias("image_quality_notes").cast(StringType()),
+            col("_src_adc_updt").alias("ADC_UPDT").cast(TimestampType()),
+            current_timestamp().alias("date_checked").cast(TimestampType()),
+            current_timestamp().alias("created_at").cast(TimestampType()),
+            current_timestamp().alias("updated_at").cast(TimestampType())
         )
     )
     return final_df
@@ -2746,7 +2782,7 @@ schema_pharos_sample = StructType([
     ),
     StructField(
         "person_id",
-        LongTypeType(),
+        LongType(),
         True,
         {"comment": "Assigned unique ID for each participant"}
     ),
@@ -2904,7 +2940,7 @@ def create_pharos_sample_incr():
 
 updates_df = create_pharos_sample_incr()
 
-update_table(updates_df,"8_dev.silver.pharos_sample", ["person_id"], schema_pharos_sample, pharos_sample_comment)
+update_table(updates_df,"8_dev.silver.pharos_sample", ["person_id","sample_id"], schema_pharos_sample, pharos_sample_comment)
 
 # COMMAND ----------
 
@@ -3167,7 +3203,6 @@ def create_pharos_pathology_incr():
         )
     )
 
-
     breast_procedure = (
         procedure
         .filter(col("ADC_UPDT") > max_adc_updt)
@@ -3273,6 +3308,12 @@ schema_pharos_pathology_tf = StructType([
         dataType=StringType(),
         nullable=True,
         metadata={"comment": "FK to person."}
+    ),
+    StructField(
+        name="clinical_record_id",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "Assigned unique ID for each participant."}
     ),
     StructField(
         "invasive_present",
@@ -3462,8 +3503,8 @@ def create_pharos_pathology_incr():
             lit(None).cast(StringType()).alias("necrosis"),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().cast(TimestampType()).alias("date_checked"),
-            current_timestamp().alias("created_at"),
-            current_timestamp().alias("updated_at")
+            current_timestamp().cast(TimestampType()).alias("created_at"),
+            current_timestamp().cast(TimestampType()).alias("updated_at")
         )
     )
 
@@ -3471,7 +3512,7 @@ def create_pharos_pathology_incr():
 
 updated_df = create_pharos_pathology_incr()
 
-update_table(updated_df, get_target_table("pharos_pathology_tumourfocus"), ["person_id","surgery_date","breast_procedure"], schema_pharos_pathology_tf, pharos_pathology_tf_comment)
+update_table(updated_df, get_target_table("pharos_pathology_tumourfocus"), ["person_id","pathology_focus_id"], schema_pharos_pathology_tf, pharos_pathology_tf_comment)
 
 
 # COMMAND ----------
@@ -3642,7 +3683,19 @@ schema_pharos_treatment = StructType([
         metadata={"comment": "Indicates if a boost dose of radiotherapy was given"}
     ),
     StructField(
-        "date_checked_treatment", 
+        "radiotherapy_cd", 
+        StringType(), 
+        nullable=True, 
+        metadata={"comment": "Procedure codes related to radiology (Barts internal use)"}
+    ),
+    StructField(
+        "radiotherapy_desc", 
+        StringType(), 
+        nullable=True, 
+        metadata={"comment": "Description of the procedure codes related to radiology (Barts internal use)"}
+    ),
+    StructField(
+        "date_checked", 
         TimestampType(), 
         nullable=True, 
         metadata={"comment": "Last update timestamp."}
@@ -3701,7 +3754,6 @@ def create_pharos_treatment_incr():
                     )
         .select(
             col("PERSON_ID"),
-            lit(None).alias("clinical_record_id"),
             col("treatment_type"),
             col("SactName").alias("treatment_regimen"),
             col("Name").alias("treatment_name"),
@@ -3797,7 +3849,6 @@ def create_pharos_treatment_incr():
         .select(
             "PERSON_ID", 
             "treatment_type", 
-            lit(None).alias("treatment_regimen"),
             col("RXNORM_STR").alias("treatment_name"), 
             # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course. 
             # A freetext audit is required to validate clinical 'Treatment Start/End' dates.
@@ -3810,11 +3861,131 @@ def create_pharos_treatment_incr():
             col("_src_adc_updt")
         )
     )
+    
+    # Radiotherapy
+    snomed_radiotherapy_codes = [
+
+        485444010,            # External beam radiotherapy
+        485446012,            # EB - External beam radiotherapy
+
+        2693115017,           # Radiotherapy
+        5260791015,           # Radiotherapy
+        2579750017,           # Radiotherapy
+        1219393012,           # RT - Radiotherapy
+        1784774011,           # XRT - Radiotherapy
+        496531014,            # DXT - Radiotherapy
+
+        372591000000111,      # Radiotherapy delivery (procedure)
+        372601000000117,      # Radiotherapy delivery
+        5034790019,           # Radiotherapy course of treatment
+        261699013,            # Radiotherapy completed
+        261687018,            # Post-operative course of radiotherapy
+        550255014,            # Post-operative course of radiotherapy (procedure)
+        261691011,            # Palliative course of radiotherapy
+        550258011,            # Palliative course of radiotherapy (procedure)
+
+        5172441014,           # Chemoradiotherapy
+        3008687012,           # Combined chemotherapy and radiation therapy
+        1488636014,           # Combined pre-operative chemotherapy and radiotherapy
+        1468875011,           # Combined post-operative chemotherapy and radiotherapy
+        262799017,            # Combined radiotherapy
+        4551480018,           # Radiotherapy after chemotherapy
+
+        1469036012,           # Stereotactic radiotherapy (procedure)
+        1488795016,           # Stereotactic radiotherapy
+        1894781000000115,     # SABR of prostate
+
+        1786801012,           # Internal radiotherapy
+        1786803010,           # Radiotherapy - internal
+        3654594010,           # Selective internal radiotherapy (SIRT)
+
+        236999019,            # Brachytherapy
+        1786800013,           # Brachytherapy
+        1490935011,           # Brachytherapy
+        1490936012,           # Brachytherapy procedure
+        2310961000000118,     # High dose rate brachytherapy
+        4575691014,           # Low dose rate brachytherapy
+        1479016010,           # Intracavitary brachytherapy
+        2901374011,           # Intracavitary brachytherapy of female genital tract
+        342822018,            # Gammamed brachytherapy
+        342832013,            # Tantalum-182 brachytherapy
+        342830017,            # Ruthenium-106 brachytherapy
+        616308010,            # Iodine-125 brachytherapy
+        2897350016,           # Brachytherapy using radioiodine
+        2900753017,           # Brachytherapy using radioiodine
+        2343691000000115,     # Ultrasound-guided prostate brachytherapy
+        2343711000000118,     # Ultrasound-guided prostate brachytherapy
+        2769780012,           # Fluoroscopy-guided prostate brachytherapy
+        701171000000117,      # Fluoroscopy-guided prostate brachytherapy
+        2981444017,           # Insertion of brachytherapy device
+
+        2692176019,           # Radiotherapy to breast
+        2694527018,           # Radiotherapy to head
+        2694899018,           # Radiotherapy to neck
+        2694686018,           # Radiotherapy to pelvis
+        3077942015,           # Radiotherapy to thorax
+        266761014,            # Radiotherapy to lacrimal gland
+        261693014,            # Radiotherapy for tumour palliation
+        2695397018,           # Radiotherapy by body site
+        2689480017,           # Plaque radiotherapy of retina
+        2695785016,           # Plaque radiotherapy of retina
+        2623096012,           # Radiotherapy using radioactive plaque on eye
+        262834017             # Radiotherapy seeds implanted into brain
+    ]
+
+    radiotherapy = (
+        procedure
+        .filter(
+            col("SOURCE_IDENTIFIER").startswith("X65")  # Radiotherapy delivery
+            | col("SOURCE_IDENTIFIER").startswith("Y89")  # Brachytherapy treatment
+            | col("SOURCE_IDENTIFIER").startswith("Y91")  # External beam radiotherapy
+            # additional OPCS4 codes
+            | col("SOURCE_IDENTIFIER").isin(
+                "Y90.2",  # Radiotherapy NEC
+                "J12.3",  # Selective Internal Radiation Therapy (SIRT)
+                "C82.3",  # External beam radiotherapy to retina
+                "C82.4",  # Plaque radiotherapy to retina
+                "A61.3",  # Radiotherapy to peripheral nerve lesion
+                "C24.2",  # Radiotherapy to lacrimal gland
+                "C39.5"   # Radiotherapy to conjunctival lesion
+            )
+
+            # additional SNOMED CT radiotherapy codes
+            | col("SOURCE_IDENTIFIER").isin(
+                *[str(x) for x in snomed_radiotherapy_codes]
+            )
+        )
+        .select("PERSON_ID", col("SOURCE_IDENTIFIER").alias("radiotherapy_cd"),col("SOURCE_STRING").alias("radiotherapy_desc"), col("PROC_DT_TM"))
+    )
+    treatment_radio = (
+        radiotherapy
+        .join(breast_cancer_cohort, "PERSON_ID", "inner")
+        .withColumn("treatment_type", lit("006 - Radiotherapy"))
+        .select(
+            "PERSON_ID", 
+            "treatment_type", 
+            lit(None).alias("treatment_name"), 
+            "radiotherapy_cd",
+            "radiotherapy_desc",
+            # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course. 
+            # A freetext audit is required to validate clinical 'Treatment Start/End' dates.
+            col("PROC_DT_TM").alias("treatment_start_date"), 
+            col("PROC_DT_TM").alias("treatment_end_date"),
+            col("PROC_DT_TM").alias("date_treatment_last_given"),
+            lit(None).alias("therapy_ongoing"),
+            lit(None).alias("treatment_cycles"), # All records in this dataset have EndDates in the past. Freetext audit is required to determine if the treatment cycles.
+            col("brc_diag_date"),
+            col("_src_adc_updt")
+        )
+    )
+
+
 
     # Combine the treatment and calculate date differences
     treatment = (
         treatment_chemo
-        .unionByName(treatment_other)
+        .unionByName(treatment_other, allowMissingColumns=True)
+        .unionByName(treatment_radio, allowMissingColumns=True)
         .filter(col("treatment_start_date") >= col("brc_diag_date"))
         .withColumn("days_diagnosis_treatmentstart", datediff(col("treatment_start_date"), col("brc_diag_date")))
         .withColumn("days_diagnosis_treatmentend", datediff(col("treatment_end_date"), col("brc_diag_date")))
@@ -3826,6 +3997,7 @@ def create_pharos_treatment_incr():
     final_df = (
         treatment
         .select(
+            lit(None).alias("treatment_id").cast(StringType()),
             col("PERSON_ID").cast(LongType()).alias("person_id"),
             lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
@@ -3852,10 +4024,12 @@ def create_pharos_treatment_incr():
             lit(None).alias("radiotherapy_dose").cast(StringType()),
             lit(None).alias("radiotherapy_fraction").cast(StringType()),
             lit(None).alias("radiotherapy_boost").cast(StringType()),
-            col("_src_adc_updt").alias("ADC_UPDT"),
+            col("radiotherapy_cd").cast(StringType()),
+            col("radiotherapy_desc").cast(StringType()),
+            col("_src_adc_updt").cast(TimestampType()).alias("ADC_UPDT"),
             current_timestamp().cast(TimestampType()).alias("date_checked"),
-            current_timestamp().alias("created_at"),
-            current_timestamp().alias("updated_at")
+            current_timestamp().cast(TimestampType()).alias("created_at"),
+            current_timestamp().cast(TimestampType()).alias("updated_at")
         )
     )
 
@@ -3949,7 +4123,7 @@ schema_pharos_followup= StructType([
         metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
     ),
     StructField(
-        "date_checked_follow_up",
+        "date_checked",
         TimestampType(),
         nullable=True,
         metadata={"comment": "Last update timestamp."}
@@ -4015,8 +4189,8 @@ def create_pharos_followup_incr():
         .join(breast_cancer_cohort, "PERSON_ID", "right")
         .withColumn(
             "vital_status",
-            when(col("DECEASED_DT_TM").isNotNull(), lit("001 Deceased"))
-            .otherwise(lit("000 Alive"))
+            when(col("DECEASED_DT_TM").isNotNull(), lit("001 - Deceased"))
+            .otherwise(lit("000 - Alive"))
         )
         .withColumn(
             "years_diagnosistodeath",
@@ -4046,6 +4220,7 @@ def create_pharos_followup_incr():
         )
         .select(
             # Recurrence/Metastasis placeholders reserved for future free-text audit results
+            lit(None).cast(StringType()).alias("followup_id"),
             col("PERSON_ID").cast(LongType()).alias("person_id"),
             lit(None).cast(StringType()).alias("pharosid"),
             lit(None).cast(LongType()).alias("clinical_record_id"),
@@ -4074,7 +4249,6 @@ update_table(updates_df, get_target_table("pharos_followup"), "person_id", schem
 
 # COMMAND ----------
 
-
 pharos_recurrence_comment = "Stores cancer recurrence information for each person, including recurrence details and record audit timestamps."
 
 schema_pharos_recurrence = StructType([
@@ -4086,7 +4260,7 @@ schema_pharos_recurrence = StructType([
     ),
     StructField(
         "person_id",
-        LongTypeType(),
+        LongType(),
         True,
         {"comment": "Assigned unique ID for each participant"}
     ),
@@ -4197,7 +4371,7 @@ schema_pharos_metastasis = StructType([
     ),
         StructField(
         "person_id",
-        LongTypeType(),
+        LongType(),
         True,
         {"comment": "Assigned unique ID for each participant"}
     ),
@@ -4550,6 +4724,19 @@ update_table(updated_df, get_target_table("pharos_comorbidities"),["person_id", 
 
 # COMMAND ----------
 
+med =spark.table("8_dev.bronze.map_med_admin")
+
+
+med1 = med.filter(
+    lower(col("RXNORM_STR")).rlike(
+        "(?i)(ambrisentan|bosentan|clopidogrel|dornase alfa|enoxaparin|enoximone|eplerenone|epoprostenol|flecainide acetate|furosemide|glibenclamide|heparin|iloprost|lisinopril|macitentan|mannitol|milrinone|nintedanib|pirfenidone|pravastatin|riociguat|salbutamol|selexipag|sildenafil|tadalafil|treprostinil)"
+    )
+)
+med1.select("RXNORM_STR","RXNORM_CUI").distinct().display()
+
+
+# COMMAND ----------
+
 pharos_meds_comment = "This table records the co-existing medical conditions (comorbidities) of participants in the Pharos cohort, with a specialized focus on diabetes management. It captures diagnostic data using ICD-10 standards, tracks the temporal relationship (pre- vs. post-cancer diagnosis) of each condition, and documents longitudinal diabetes care including associated medications. The data is structured to support analysis of how underlying health status impacts cancer treatment outcomes and patient survival."
 
 schema_pharos_meds = StructType([
@@ -4578,13 +4765,19 @@ schema_pharos_meds = StructType([
         {"comment": "Name of the non-cancer medication the patient was taking at the time of cancer diagnosis, one medication per row, only one patient"}
     ),
     StructField(
+        "medication_category", 
+        StringType(), 
+        True, 
+        {"comment": "Category of the non-cancer medication the patient was taking at the time of cancer diagnosis"}
+    ),
+    StructField(
         "ADC_UPDT",
         TimestampType(),
         nullable=True,
         metadata={"comment": "Max source ADC_UPDT for incremental watermarking"}
     ),
     StructField(
-        "date_checked_non_cancer_meds", 
+        "date_checked", 
         TimestampType(), 
         True, 
         {"comment": "Date medical record regarding Non-cancer Medications data was checked DD-MM-YYYY"}
@@ -4656,19 +4849,62 @@ def create_pharos_med_incr():
         "2601723"    # Tirzepatide
     ]
 
-    all_diabetes_meds = T1DM + T2DM
+    OTHER_MEDS = [
+        "67108",    # Enoxaparin
+        "32968",    # Clopidogrel
+        "4603",     # Furosemide
+        "235473",   # Heparin
+        "298869",   # Eplerenone
+        "104462",   # Heparin Flush
+        "42463",    # Pravastatin
+        "29046",    # Lisinopril
+        "52769",    # Milrinone
+        "6628",     # Mannitol
+        "337623",   # Dornase Alfa
+        "1592737",  # Nintedanib
+        "8814",     # Epoprostenol
+        "136411",   # Sildenafil
+        "358263",   # Tadalafil
+        "214618"    # Hydrochlorothiazide-Lisinopril
+    ]
+
+    all_diabetes_meds = T1DM + T2DM + OTHER_MEDS
 
     med = (
         medicine
-        .join(breast_cancer_cohort, "PERSON_ID", "left_semi")
+        .join(breast_cancer_cohort, "PERSON_ID", "inner")
         .filter(col("RXNORM_CUI").isin(all_diabetes_meds))
+        # Time window for the medication record selection (<=90 days)
+        .filter(
+            (col("ADMIN_START_DT_TM") <= col("earliest_diagnosis_date")) &
+            (datediff(col("earliest_diagnosis_date"), col("ADMIN_START_DT_TM")) <= 90)
+        )
         .withColumn(
-            "medication_category", 
-            when(col("RXNORM_CUI").isin(T1DM), "007 - T1DM Meds")
-            .when(col("RXNORM_CUI").isin(T2DM), "008 - T2DM Meds"))   
+            "medication_category",
+            when(col("RXNORM_CUI").isin("32968", "52769"), "001 - Heart related medications")  # Clopidogrel, Milrinone
+            .when(col("RXNORM_CUI").isin("42463"), "002 - Statins")  # Pravastatin
+            .when(
+                col("RXNORM_CUI").isin(
+                    "29046",   # Lisinopril
+                    "214618",  # Hydrochlorothiazide-Lisinopril
+                    "298869",  # Eplerenone
+                    "8814",    # Epoprostenol
+                    "136411",  # Sildenafil
+                    "358263"   # Tadalafil
+                ),
+                "003 - Hypertension drugs"
+            )
+            .when(col("RXNORM_CUI").isin("67108", "235473", "104462"), "004 - Anticoagulants")  # Enoxaparin, Heparin, Heparin Flush
+            .when(col("RXNORM_CUI").isin("6628"), "005 - Inhalers and respiratory meds")  # Mannitol
+            .when(col("RXNORM_CUI").isin("337623", "1592737"), "006 - COPD medications")  # Dornase Alfa, Nintedanib
+            .when(col("RXNORM_CUI").isin(T1DM), "007 - T1DM Meds")
+            .when(col("RXNORM_CUI").isin(T2DM), "008 - T2DM Meds")
+        )
         .select(
             col("PERSON_ID").alias("person_id"),
-            col("indication_name"),
+            col("RXNORM_STR").alias("medication_name"),
+            col("medication_category"),
+            col("_src_adc_updt")
         )  
         .dropDuplicates()
     )
@@ -4680,6 +4916,7 @@ def create_pharos_med_incr():
             col("person_id").cast(LongType()),
             lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
+            col("medication_name").cast(StringType()),
             col("medication_category").cast(StringType()),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("date_checked").cast(TimestampType()),
@@ -4691,7 +4928,7 @@ def create_pharos_med_incr():
     return final_df
 
 updated_df = create_pharos_med_incr()
-update_table(updates_df, get_target_table("pharos_medication"), ["person_id", "medication_category"], schema_pharos_meds, pharos_meds_comment)
+update_table(updated_df, get_target_table("pharos_medication"), ["person_id", "medication_name"], schema_pharos_meds, pharos_meds_comment)
 
 # COMMAND ----------
 
@@ -4703,7 +4940,7 @@ schema_pharos_ph = StructType([
         LongType(), 
         True, 
         {"comment": "Surrogate PK"}
-    )
+    ),
     StructField(
         "person_id", 
         LongType(), 
@@ -4727,6 +4964,12 @@ schema_pharos_ph = StructType([
         StringType(), 
         True, 
         {"comment": "Anatomical or diagnostic category of the historical cancer"}
+    ),
+    StructField(
+        "Source_cd", 
+        StringType(), 
+        True, 
+        {"comment": "Original code for the person history (Barts internal use)."}
     ),
     StructField(
         "cancer_type_detail", 
@@ -4867,7 +5110,7 @@ def create_pharos_ph_incr():
     }
 
     mapping_df = spark.createDataFrame([
-        Row(code=str(k), cancer=v) for k, v in combined_cancer_map.items()
+        Row(code=str(k), cancer_type_code=v) for k, v in combined_cancer_map.items()
     ])
 
     # Normalize diagnosis codes
@@ -4880,18 +5123,18 @@ def create_pharos_ph_incr():
         diagnosis
         .join(breast_cancer_cohort, "PERSON_ID", "left")
         .join(mapping_df, "code", "inner")
-        .withColumnRenamed("cancer", "cancer_type")
     )
 
     final_df = (
         person_history
-        .filter(col("cancer_type").isNotNull())
+        .filter(col("cancer_type_code").isNotNull())
         .select(
             col("person_id"),
             lit(None).alias("pharosid"),
             lit(None).alias("clinical_record_id"),
             col("cancer_type_code"),
-            lit(None).alias("cancer_type_detail"),
+            col("code").alias("Source_cd"),
+            col("SOURCE_STRING").alias("cancer_type_detail"),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("date_checked"),
             current_timestamp().alias("created_at"),
@@ -4903,10 +5146,6 @@ def create_pharos_ph_incr():
 
 updated_df = create_pharos_ph_incr()
 
-update_table(updated_df, get_target_table("pharos_personal_history"), ["person_id","cancer_type"], schema_pharos_ph, pharos_ph_comment)
-
-
-
-# COMMAND ----------
+update_table(updated_df, get_target_table("pharos_personal_history"), ["person_id","cancer_type_code"], schema_pharos_ph, pharos_ph_comment)
 
 
