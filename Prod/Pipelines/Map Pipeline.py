@@ -1,9 +1,14 @@
 # Databricks notebook source
+# MAGIC %pip install openai pyarrow
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 from pyspark.sql.functions import *
 from pyspark.sql.functions import max as spark_max
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 from pyspark.sql import functions as F
@@ -77,6 +82,10 @@ def table_exists(table_name: str) -> bool:
     """
     # Spark 3.4+ – Databricks – works with Unity Catalog
     return spark.catalog.tableExists(table_name)
+
+# COMMAND ----------
+
+# MAGIC  %run ./pathology_embed_increment
 
 # COMMAND ----------
 
@@ -505,42 +514,31 @@ def apply_column_comments(target_table: str, schema: StructType):
 # ============================================================================
 # Main Update Function
 # ============================================================================
-def update_table(source_df, target_table: str, index_column, 
-                 target_schema: StructType = None, table_comment: str = None):
-    
+def update_table(source_df, target_table: str, index_column,
+                 target_schema: StructType = None, table_comment: str = None,
+                 update_condition: str = None):   # v+ : optional change-detection predicate
     if table_exists(target_table):
         print(f"[INFO] Table {target_table} exists. Checking for schema updates...")
-        
         if target_schema or table_comment:
             schema_changes = detect_schema_changes(target_table, target_schema, table_comment)
             if schema_changes['has_changes']:
                 print(f"[INFO] Schema changes detected for {target_table}")
                 apply_schema_changes(target_table, schema_changes)
-        
-        # Check if empty using take(1) to avoid full table scan
         if len(source_df.take(1)) == 0:
             print(f"[INFO] Source DataFrame is empty. Skipping update for {target_table}")
             return
-        
-        # Perform merge operation
         print(f"[INFO] Performing merge on {target_table} using column {index_column}")
-        
-        if isinstance(index_column, str):
-            index_keys = [index_column]
-        else:
-            index_keys = index_column
-        
+        index_keys = [index_column] if isinstance(index_column, str) else index_column
         merge_condition = " AND ".join([f"t.{col} <=> s.{col}" for col in index_keys])
         tgt = DeltaTable.forName(spark, target_table)
-        (
-            tgt.alias("t")
-            .merge(source_df.alias("s"), merge_condition)
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
-        )
+        merged = tgt.alias("t").merge(source_df.alias("s"), merge_condition)
+        # v+ : only rewrite matched rows that actually changed, when a predicate is supplied.
+        if update_condition:
+            merged = merged.whenMatchedUpdateAll(condition=update_condition)
+        else:
+            merged = merged.whenMatchedUpdateAll()
+        merged.whenNotMatchedInsertAll().execute()
         print(f"[INFO] Successfully merged data into {target_table}")
-        
     else:
         print(f"[INFO] Table {target_table} does not exist. Creating new table...")
         create_table_with_schema(source_df, target_table, target_schema, table_comment)
@@ -9650,6 +9648,11 @@ def create_implant_details_incr():
     ).pivot(
         'EVENT_TITLE_TEXT'
     ).agg(first('EVENT_TAG'))
+
+    for expected_col in column_mapping.values():
+          if expected_col not in pivoted.columns:
+              pivoted = pivoted.withColumn(expected_col, lit(None).cast(StringType()))
+
     
     # Helper to extract date from format "1:YYYYMMDD00000000:0.000000:0:0"
     def extract_date(col_name):
@@ -9735,3 +9738,542 @@ if implant_details_df is not None:
         target_schema=schema_map_implant_details,
         table_comment=map_implant_details_comment
     )
+
+# COMMAND ----------
+
+
+TARGET_SCHEMA = "4_prod.bronze"
+MAP_SCHEMA    = "3_lookup.omop"
+TEST_MAP   = f"{MAP_SCHEMA}.pathology_test_concept_map"
+RESULT_MAP = f"{MAP_SCHEMA}.pathology_result_concept_map"
+UNIT_MAP   = f"{MAP_SCHEMA}.pathology_unit_map"
+EXCL_TBL   = f"{MAP_SCHEMA}.pathology_result_value_exclusions"
+CONCEPT    = "3_lookup.omop.concept"
+# NOTE: no override-table join — overrides are baked into the maps upstream (matches oracle).
+
+# ── Branch L (linked / Cerner) source CTE — VERBATIM (Task 4) ────────────────────────────────────
+LINKED_SRC_CTE = r"""
+pa_mrn AS (
+  SELECT PERSON_ID, ALIAS FROM (
+    SELECT a.PERSON_ID, a.ALIAS, ROW_NUMBER() OVER (
+      PARTITION BY a.PERSON_ID ORDER BY a.BEG_EFFECTIVE_DT_TM DESC NULLS LAST, a.PERSON_ALIAS_ID DESC NULLS LAST) rn
+    FROM 4_prod.raw.mill_person_alias a
+    WHERE a.ACTIVE_IND = 1 AND a.PERSON_ALIAS_TYPE_CD = 10
+  ) WHERE rn = 1
+),
+pa_nhs AS (
+  SELECT PERSON_ID, ALIAS FROM (
+    SELECT a.PERSON_ID, a.ALIAS, ROW_NUMBER() OVER (
+      PARTITION BY a.PERSON_ID ORDER BY a.BEG_EFFECTIVE_DT_TM DESC NULLS LAST, a.PERSON_ALIAS_ID DESC NULLS LAST) rn
+    FROM 4_prod.raw.mill_person_alias a
+    WHERE a.ACTIVE_IND = 1 AND a.PERSON_ALIAS_TYPE_CD = 18
+  ) WHERE rn = 1
+),
+linked_base AS (
+  SELECT
+    ce.EVENT_ID, ce.PERSON_ID, ce.ENCNTR_ID, ce.EVENT_CD,
+    ce.PERFORMED_DT_TM, ce.RESULT_VAL, ce.RESULT_UNITS_CD,
+    ce.NORMAL_LOW, ce.NORMAL_HIGH, ce.NORMALCY_CD, ce.ADC_UPDT,
+    ce.REFERENCE_NBR,
+    o.ORDER_MNEMONIC,
+    ROW_NUMBER() OVER (PARTITION BY ce.EVENT_ID ORDER BY ce.ADC_UPDT DESC NULLS LAST) AS rn
+  FROM 4_prod.raw.mill_clinical_event ce
+  LEFT JOIN 3_lookup.mill.mill_order_catalog oc ON oc.CATALOG_CD = ce.CATALOG_CD
+  LEFT JOIN 4_prod.raw.mill_orders o ON o.ORDER_ID = ce.ORDER_ID
+  WHERE ce.EVENT_CLASS_CD IN (233, 236)
+    AND oc.CATALOG_TYPE_CD = 2513
+),
+linked_src AS (
+  SELECT
+    'linked' AS source_table,
+    ce.EVENT_ID AS source_event_id,
+    FALSE AS is_synthetic_key,
+    SUBSTRING(ce.REFERENCE_NBR, 1, 11) AS lab_no,
+    ce.PERSON_ID, ce.ENCNTR_ID,
+    pa_mrn.ALIAS AS MRN, pa_nhs.ALIAS AS NHS_Number,
+    ce.EVENT_CD, cv.DESCRIPTION AS EVENT_CD_DISPLAY,
+    ce.PERFORMED_DT_TM AS measurement_datetime,
+    'CERNER_TESTCODE' AS code_system,
+    ce.ORDER_MNEMONIC AS code,
+    cv.DESCRIPTION AS description,
+    CAST(NULL AS DOUBLE) AS result_nbr,   -- deferred to Task 7 (result_derived); placeholder for UNION contract
+    ce.RESULT_VAL AS result_txt,
+    CAST(NULL AS INT) AS result_numeric,  -- deferred to Task 7 (result_derived); placeholder for UNION contract
+    ucv.DESCRIPTION AS unit_source_value,
+    TRY_CAST(ce.NORMAL_LOW AS DOUBLE) AS range_low,
+    TRY_CAST(ce.NORMAL_HIGH AS DOUBLE) AS range_high,
+    ncv.DESCRIPTION AS normalcy,
+    ce.PERFORMED_DT_TM AS ReportDate,
+    CAST(NULL AS STRING) AS WkgCode, CAST(NULL AS STRING) AS nlmc_id,
+    ce.ADC_UPDT
+  FROM linked_base ce
+  LEFT JOIN 3_lookup.mill.mill_code_value cv  ON cv.CODE_VALUE  = ce.EVENT_CD
+  LEFT JOIN 3_lookup.mill.mill_code_value ucv ON ucv.CODE_VALUE = ce.RESULT_UNITS_CD
+  LEFT JOIN 3_lookup.mill.mill_code_value ncv ON ncv.CODE_VALUE = ce.NORMALCY_CD
+  LEFT JOIN pa_mrn ON pa_mrn.PERSON_ID = ce.PERSON_ID
+  LEFT JOIN pa_nhs ON pa_nhs.PERSON_ID = ce.PERSON_ID
+  WHERE ce.rn = 1
+)
+"""
+
+# ── Branch T (raw / TFC-LIMS) source CTE — VERBATIM (Task 5) ─────────────────────────────────────
+# THREE dedups (sl1 / m1 / a1) + NHS fallback (a1_nhs) keep n == R (no fan-out).
+# The leading `rl AS (... WHERE MonthYear='1224')` is the DEV-SLICE validation form; the assembly
+# splices DEV_WHERE_RAW (full-table for prod) over that exact line (see Cell 4).
+RAW_SRC_CTE = r"""
+  rl_raw AS (
+    SELECT * FROM 4_prod.raw.path_patient_resultlevel WHERE MonthYear='1224'
+  ),
+  rl_scope AS (
+    -- FULL build: /*RL_WM_SCOPE*/ -> empty, so rl_scope == rl_raw (all rows).
+    -- INCREMENTAL: a LEFT SEMI JOIN keeps only (LabNo,TFCCode) groups with ANY line changed
+    -- since the watermark, but reads ALL their lines so each island re-assembles in full.
+    SELECT r.* FROM rl_raw r
+    /*RL_WM_SCOPE*/
+  ),
+  rl_island AS (
+    SELECT *,
+      CASE WHEN TFCCode RLIKE '^(INTER|UNU)' THEN CAST(TFCResultSeq AS BIGINT)
+           ELSE TFCResultSeq - ROW_NUMBER() OVER (PARTITION BY LabNo, TFCCode ORDER BY TFCResultSeq)
+      END AS _island
+    FROM rl_scope
+    WHERE LabNo IS NOT NULL AND TFCCode IS NOT NULL
+  ),
+  rl AS (
+    SELECT
+      LabNo, TFCCode,
+      MIN(WkgCode)      AS WkgCode,
+      MIN(MonthYear)    AS MonthYear,
+      MIN(TFCResultSeq) AS TFCResultSeq,
+      CONCAT_WS('\n', SORT_ARRAY(COLLECT_LIST(STRUCT(TFCResultSeq, TFCValue))).TFCValue) AS TFCValue,
+      MAX(ADC_UPDT)     AS ADC_UPDT
+    FROM rl_island
+    GROUP BY LabNo, TFCCode, _island
+  ),
+sl1 AS (   -- one sample row per LabNo (deterministic) — samplelevel is NOT unique on LabNo
+  -- v0.6.1: the template's (ADC_UPDT, LIMSNo) key left 17 LabNo ties on '1224' (non-deterministic
+  -- MRN/NHSNo/SampleDT/ReportDate). No single column is unique per LabNo, so a terminal tiebreaker
+  -- chain over the downstream-emitted fields + identity columns is appended → 0 residual ties.
+  SELECT * FROM (
+    SELECT sl.*, ROW_NUMBER() OVER (
+      PARTITION BY sl.LabNo ORDER BY
+        sl.ADC_UPDT   DESC NULLS LAST,
+        sl.LIMSNo     DESC NULLS LAST,
+        sl.SampleDT   DESC NULLS LAST,
+        sl.ReportDate DESC NULLS LAST,
+        sl.ReceiptDT  DESC NULLS LAST,
+        sl.BookedInDT DESC NULLS LAST,
+        sl.OrderNo    ASC  NULLS LAST,
+        sl.VisitID    ASC  NULLS LAST,
+        sl.MRN        ASC  NULLS LAST,
+        sl.NHSNo      ASC  NULLS LAST
+    ) rn
+    FROM 4_prod.raw.path_patient_samplelevel sl
+  ) WHERE rn = 1
+),
+m1 AS (    -- one master row per (WkgCode, TFCCode) [defensive dedup]
+  SELECT * FROM (
+    SELECT m.*, ROW_NUMBER() OVER (
+      PARTITION BY m.WkgCode, m.TFCCode ORDER BY m.LastUpdateDT DESC NULLS LAST
+    ) rn
+    FROM 4_prod.raw.path_master_resultable m
+  ) WHERE rn = 1
+),
+a1 AS (    -- one PERSON_ID per MRN alias (type 10)
+  SELECT * FROM (
+    SELECT a.PERSON_ID, a.ALIAS, a.PERSON_ALIAS_TYPE_CD, ROW_NUMBER() OVER (
+      PARTITION BY a.PERSON_ALIAS_TYPE_CD, a.ALIAS ORDER BY a.BEG_EFFECTIVE_DT_TM DESC NULLS LAST, a.PERSON_ALIAS_ID DESC NULLS LAST
+    ) rn
+    FROM 4_prod.raw.mill_person_alias a
+    WHERE a.ACTIVE_IND = 1 AND a.PERSON_ALIAS_TYPE_CD = 10
+  ) WHERE rn = 1
+),
+a1_nhs AS (  -- NHS-number fallback resolver (type 18)
+  SELECT * FROM (
+    SELECT a.PERSON_ID, a.ALIAS, ROW_NUMBER() OVER (
+      PARTITION BY a.ALIAS ORDER BY a.BEG_EFFECTIVE_DT_TM DESC NULLS LAST, a.PERSON_ALIAS_ID DESC NULLS LAST
+    ) rn
+    FROM 4_prod.raw.mill_person_alias a
+    WHERE a.ACTIVE_IND = 1 AND a.PERSON_ALIAS_TYPE_CD = 18
+  ) WHERE rn = 1
+),
+raw_src AS (
+  SELECT
+    'raw' AS source_table,
+    COALESCE(rl.TFCResultSeq, xxhash64(CONCAT_WS('|', rl.LabNo, rl.TFCCode, rl.TFCValue, CAST(sl1.SampleDT AS STRING)))) AS source_event_id,
+    (rl.TFCResultSeq IS NULL) AS is_synthetic_key,
+    rl.LabNo AS lab_no,
+    COALESCE(a1.PERSON_ID, a1_nhs.PERSON_ID) AS PERSON_ID,
+    CAST(NULL AS BIGINT) AS ENCNTR_ID,
+    COALESCE(pa_mrn.ALIAS, sl1.MRN) AS MRN, COALESCE(pa_nhs.ALIAS, sl1.NHSNo) AS NHS_Number,
+    CAST(NULL AS INT) AS EVENT_CD, CAST(NULL AS STRING) AS EVENT_CD_DISPLAY,
+    sl1.SampleDT AS measurement_datetime,
+    'TFC' AS code_system, rl.TFCCode AS code,
+    COALESCE(m1.TFCDesc_Full, m1.TFCDesc_Rep, m1.TFCDesc_WP) AS description,
+    CAST(NULL AS DOUBLE) AS result_nbr,   -- numeric/operator parse deferred to Task 7
+    rl.TFCValue AS result_txt,
+    CAST(NULL AS INT) AS result_numeric,  -- deferred to Task 7
+    m1.Units AS unit_source_value,
+    CAST(NULL AS DOUBLE) AS range_low, CAST(NULL AS DOUBLE) AS range_high,
+    CAST(NULL AS STRING) AS normalcy,
+    sl1.ReportDate,
+    rl.WkgCode, m1.NLMC_ID AS nlmc_id,
+    GREATEST(rl.ADC_UPDT, sl1.ADC_UPDT) AS ADC_UPDT
+  FROM rl
+  LEFT JOIN sl1 ON sl1.LabNo = rl.LabNo
+  LEFT JOIN m1  ON m1.WkgCode = rl.WkgCode AND m1.TFCCode = rl.TFCCode
+  LEFT JOIN a1  ON a1.ALIAS = sl1.MRN
+  LEFT JOIN a1_nhs ON a1_nhs.ALIAS = sl1.NHSNo
+  LEFT JOIN pa_mrn ON pa_mrn.PERSON_ID = COALESCE(a1.PERSON_ID, a1_nhs.PERSON_ID)
+  LEFT JOIN pa_nhs ON pa_nhs.PERSON_ID = COALESCE(a1.PERSON_ID, a1_nhs.PERSON_ID)
+)
+"""
+
+# ── Test-side concept-map CTE — VERBATIM (Task 6) ────────────────────────────────────────────────
+# NO override join — overrides are baked into {TEST_MAP} as rows (matches oracle).
+TEST_JOINED_CTE = f"""
+test_joined AS (
+  SELECT c.*,
+    tm.measurement_concept_id,
+    tm.concept_name    AS measurement_concept_name,
+    tm.confidence_tier AS test_confidence_tier
+  FROM combined c
+  LEFT JOIN {TEST_MAP} tm
+    ON tm.code_system = c.code_system AND tm.code = c.code AND tm.description = c.description
+   AND tm.confidence_tier IN ('curated','auto_high','auto_low','auto_anchor','auto_value','auto_genpos')
+   AND tm.measurement_concept_id IS NOT NULL
+)
+"""
+
+# ── Result-side CTE — VERBATIM (Task 7). RAW f-string: `\\s`,`\\b` -> Spark sees `\s`,`\b`. ───────
+RESULT_JOINED_CTE = rf"""
+result_derived AS (
+  SELECT t.*,
+    -- result_numeric: 1 iff result_txt is a (comparator-prefixed) plain number (oracle ResultNumeric parity)
+    -- NOTE: these numeric-detection RLIKEs must stay identical across the three derivations.
+    CASE WHEN t.result_txt RLIKE '^\\s*[<>]?=?\\s*-?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)\\s*$' THEN 1 ELSE 0 END AS rd_result_numeric,
+    -- operator from the leading comparator on result_txt (NET-NEW vs oracle; NULL => equals/4172703)
+    CASE
+      WHEN t.result_txt RLIKE '^\\s*<='  THEN 4171754
+      WHEN t.result_txt RLIKE '^\\s*>='  THEN 4171755
+      WHEN t.result_txt RLIKE '^\\s*<'   THEN 4171756
+      WHEN t.result_txt RLIKE '^\\s*>'   THEN 4172704
+      ELSE NULL END AS rd_operator_concept_id,
+    -- value_as_number: only for numeric rows; strip leading comparator (+ optional ws) before cast
+    CASE WHEN t.result_txt RLIKE '^\\s*[<>]?=?\\s*-?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)\\s*$'
+         THEN TRY_CAST(REGEXP_REPLACE(TRIM(t.result_txt),'^[<>]=?\\s*','') AS DOUBLE) END AS rd_value_as_number,
+    -- result_normalized: text rows only (NULL for numeric) — LOWER/TRIM/collapse-ws (oracle parity)
+    CASE WHEN NOT (t.result_txt RLIKE '^\\s*[<>]?=?\\s*-?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)\\s*$')
+         THEN LOWER(TRIM(REGEXP_REPLACE(t.result_txt,'\\s+',' '))) END AS rd_result_normalized
+  FROM test_joined t
+),
+result_joined AS (
+  SELECT
+    d.*,
+    rm.value_as_concept_id,
+    rm.concept_name    AS result_concept_name,
+    rm.confidence_tier AS result_confidence_tier,
+    rm.is_suspected    AS result_is_suspected,
+    rm.growth_grade    AS result_growth_grade
+  FROM result_derived d
+  LEFT JOIN {RESULT_MAP} rm
+    ON  rm.code_system       = d.code_system
+    AND rm.code              = d.code
+    AND rm.description       = d.description
+    AND rm.result_normalized = d.rd_result_normalized
+    AND rm.confidence_tier  IN ('curated','auto_high','auto_low','auto_anchor','auto_value','auto_genpos')
+    AND rm.value_as_concept_id IS NOT NULL
+    AND d.rd_result_numeric = 0
+)
+"""
+
+# ── Unit-mapping CTE — VERBATIM (Task 8) ─────────────────────────────────────────────────────────
+UNIT_JOINED_CTE = f"""
+unit_joined AS (
+  SELECT r.*, um.unit_concept_id, um.ucum_code
+  FROM result_joined r
+  LEFT JOIN {UNIT_MAP} um
+    ON um.unit_source_value = r.unit_source_value AND r.unit_source_value IS NOT NULL
+)
+"""
+
+# ── EXCL_REGEX_SQL rebuild — VERBATIM (Task 7). Runtime-computed, DOUBLED backslashes ────────────
+# (proven oracle v1.1 fix: double every backslash so Spark's SQL string-literal parser halves them
+#  back to the intended single-backslash regex tokens \b, \(, \. ). MUST be built BEFORE
+#  FINAL_PROJECTION_SQL is read (that f-string captures EXCL_REGEX_SQL at definition time).
+excl_pats = [r.pattern for r in spark.table(EXCL_TBL).select("pattern").collect()]
+EXCL_REGEX = "(" + "|".join(excl_pats) + ")"
+EXCL_REGEX_SQL = EXCL_REGEX.replace("\\", "\\\\")   # double backslashes; see note above
+
+# ── FULL 44-column FINAL projection — VERBATIM (Task 8). Column ORDER == DDL/schema. ─────────────
+FINAL_PROJECTION_SQL = f"""
+  SELECT
+    -- ── identity / source (DDL cols 1-14) ──────────────────────────────
+    u.source_table,
+    u.source_event_id,
+    u.is_synthetic_key,
+    u.lab_no,
+    u.PERSON_ID,
+    u.ENCNTR_ID,
+    u.MRN,
+    u.NHS_Number,
+    u.EVENT_CD,
+    u.EVENT_CD_DISPLAY,
+    u.measurement_datetime,
+    u.code_system,
+    u.code,
+    u.description,
+    -- ── test concept vocab/code split (family-style) ──────────────────
+    CASE WHEN mc.vocabulary_id = 'SNOMED' THEN mc.concept_code END AS test_snomed_code,
+    CASE WHEN mc.vocabulary_id = 'LOINC'  THEN mc.concept_code END AS test_loinc_code,
+    u.measurement_concept_id                 AS test_omop_concept_id,
+    mc.standard_concept                      AS test_omop_standard_concept,
+    mc.vocabulary_id                         AS test_vocabulary_id,
+    -- ── test concept (mapped id/name/tier) ────────────────────────────
+    u.measurement_concept_id,
+    u.measurement_concept_name,
+    u.test_confidence_tier,
+    -- ── result value / operator / status (DDL cols 27-32) ─────────────
+    u.rd_value_as_number                     AS value_as_number,
+    u.rd_operator_concept_id                 AS operator_concept_id,
+    CASE WHEN u.rd_result_numeric = 1 THEN NULL ELSE u.value_as_concept_id END AS value_as_concept_id,
+    u.result_concept_name,
+    u.result_confidence_tier,
+    u.result_is_suspected,
+    u.result_growth_grade,
+    -- ── result-value concept vocab/code split (family-style) ──────────
+    CASE WHEN rc.vocabulary_id = 'SNOMED' THEN rc.concept_code END AS result_snomed_code,
+    CASE WHEN rc.vocabulary_id = 'LOINC'  THEN rc.concept_code END AS result_loinc_code,
+    u.value_as_concept_id                    AS result_omop_concept_id,
+    rc.standard_concept                      AS result_omop_standard_concept,
+    rc.vocabulary_id                         AS result_vocabulary_id,
+    CASE
+      WHEN u.rd_result_numeric = 1                          THEN 'numeric'
+      WHEN u.value_as_concept_id IS NOT NULL                THEN 'mapped'
+      WHEN u.rd_result_normalized IS NOT NULL
+       AND u.rd_result_normalized RLIKE '{EXCL_REGEX_SQL}'  THEN 'excluded'
+      ELSE 'free_text'
+    END                                      AS result_status,
+    -- ── value/unit source + units (DDL cols 33-36) ────────────────────
+    u.result_txt                             AS value_source_value,
+    u.unit_source_value,
+    u.unit_concept_id,
+    u.ucum_code,
+    -- ── ranges / normalcy / raw-branch codes / dates (DDL cols 37-43) ──
+    u.range_low,
+    u.range_high,
+    u.normalcy,
+    u.WkgCode,
+    u.nlmc_id,
+    u.ReportDate,
+    CURRENT_TIMESTAMP()                      AS ADC_UPDT
+  FROM unit_joined u
+  LEFT JOIN {CONCEPT} mc ON mc.concept_id = u.measurement_concept_id
+  LEFT JOIN {CONCEPT} rc ON rc.concept_id = u.value_as_concept_id
+"""
+
+# ── 44-col target schema (StructType) + comment ─────────────────────────────────────────────────
+# Built from the standalone's CREATE TABLE DDL (CC/map_pathology_pipeline cols/comments verbatim).
+# The standalone created the table via a DDL STRING; update_table wants a `target_schema` StructType
+# (so create_table_with_schema enforces column types + applies comments, and detect_schema_changes
+# can compare). So the DDL is reproduced here as a StructType (1:1 with the DDL columns/comments).
+from pyspark.sql.types import (StructType, StructField, StringType, LongType,
+                               IntegerType, BooleanType, DoubleType, TimestampType)
+
+map_pathology_comment = ("Coded pathology measurements (OMOP-aligned) from the Cerner linked branch "
+                         "(mill_clinical_event) UNION the TFC/LIMS raw branch (path_patient_resultlevel), "
+                         "with test/result/unit concept mapping. Built by create_map_pathology() in the "
+                         "Map Pipeline family job (FULL_REBUILD CTAS or incremental MERGE + embed-loop backfill).")
+
+schema_map_pathology = StructType([
+    StructField("source_table",             StringType(),   True, {"comment": "linked | raw"}),
+    StructField("source_event_id",          LongType(),     True, {"comment": "EVENT_ID (linked) | TFCResultSeq or synthetic hash (raw)"}),
+    StructField("is_synthetic_key",         BooleanType(),  True, {"comment": "TRUE when source_event_id is a synthetic hash (raw rows w/ NULL TFCResultSeq)"}),
+    StructField("lab_no",                   StringType(),   True, {"comment": "LabNo: SUBSTRING(REFERENCE_NBR,1,11) for linked; resultlevel LabNo for raw"}),
+    StructField("PERSON_ID",                LongType(),     True, {"comment": "Cerner PERSON_ID; native for linked; raw branch resolves via MRN alias (type 10), NHS-number (type 18) fallback (may be NULL — unresolved rows kept)"}),
+    StructField("ENCNTR_ID",                LongType(),     True, {"comment": "native for linked; NULL for raw"}),
+    StructField("MRN",                      StringType(),   True, {"comment": "MRN: mill_person_alias type 10 by PERSON_ID (canonical); samplelevel MRN fallback (raw, unresolved)"}),
+    StructField("NHS_Number",               StringType(),   True, {"comment": "NHS number: mill_person_alias type 18 by PERSON_ID (canonical); samplelevel NHSNo fallback (raw, unresolved)"}),
+    StructField("EVENT_CD",                 IntegerType(),  True, {"comment": "linked only"}),
+    StructField("EVENT_CD_DISPLAY",         StringType(),   True, {"comment": "linked: mill_code_value DESCRIPTION of EVENT_CD; NULL for raw"}),
+    StructField("measurement_datetime",     TimestampType(),True, {"comment": "linked: PERFORMED_DT_TM; raw: SampleDT"}),
+    StructField("code_system",              StringType(),   True, {"comment": "CERNER_TESTCODE | TFC"}),
+    StructField("code",                     StringType(),   True, {"comment": "test code = map join key: ORDER_MNEMONIC (linked) | TFCCode (raw)"}),
+    StructField("description",              StringType(),   True, {"comment": "test description: code_value DESCRIPTION (linked) | TFCDesc_Full/Rep/WP (raw)"}),
+    StructField("test_snomed_code",          StringType(), True, {"comment": "SNOMED source code of the test/measurement concept (concept_code where vocab=SNOMED; NULL otherwise)"}),
+    StructField("test_loinc_code",           StringType(), True, {"comment": "LOINC source code of the test concept (concept_code where vocab=LOINC; NULL otherwise)"}),
+    StructField("test_omop_concept_id",      LongType(),   True, {"comment": "OMOP concept_id of the test concept (== measurement_concept_id; the OMOP-coded column, distinct identifier from the SNOMED/LOINC source code)"}),
+    StructField("test_omop_standard_concept",StringType(), True, {"comment": "standard_concept flag (S/C/NULL) of the test concept"}),
+    StructField("test_vocabulary_id",        StringType(), True, {"comment": "vocabulary_id of the test concept (SNOMED | LOINC)"}),
+    StructField("measurement_concept_id",   LongType(),     True, {"comment": "mapped OMOP test/measurement concept_id (NULL if unmapped)"}),
+    StructField("measurement_concept_name", StringType(),   True, {"comment": "name of the mapped measurement concept"}),
+    StructField("test_confidence_tier",     StringType(),   True, {"comment": "curated | auto_high | auto_low (NULL if unmapped)"}),
+    StructField("value_as_number",          DoubleType(),   True, {"comment": "numeric result parsed from result_txt (NULL if non-numeric)"}),
+    StructField("operator_concept_id",      LongType(),     True, {"comment": "OMOP comparator for thresholded numerics; NULL = equals"}),
+    StructField("value_as_concept_id",      LongType(),     True, {"comment": "categorical result-value concept; NULL when the result is numeric"}),
+    StructField("result_concept_name",      StringType(),   True, {"comment": "name of the mapped result-value concept"}),
+    StructField("result_confidence_tier",   StringType(),   True, {"comment": "curated | auto_high | auto_low | auto_anchor | auto_value | auto_genpos (NULL if unmapped)"}),
+    StructField("result_is_suspected",      BooleanType(),  True, {"comment": "micro arm: analyzer 'suspected' flag (trailing-? or hedge language possible/suggests/presumptive); NULL unless an organism/suspected result"}),
+    StructField("result_growth_grade",      StringType(),   True, {"comment": "micro arm: analyzer growth grade (heavy/moderate/scanty/light/++/3+ etc.) captured off the result text; NULL if none"}),
+    StructField("result_snomed_code",        StringType(), True, {"comment": "SNOMED source code of the result-value concept (concept_code where vocab=SNOMED; NULL otherwise)"}),
+    StructField("result_loinc_code",         StringType(), True, {"comment": "LOINC source code of the result-value concept (concept_code where vocab=LOINC; NULL otherwise)"}),
+    StructField("result_omop_concept_id",    LongType(),   True, {"comment": "OMOP concept_id of the result-value concept (== value_as_concept_id)"}),
+    StructField("result_omop_standard_concept",StringType(), True, {"comment": "standard_concept flag (S/C/NULL) of the result-value concept"}),
+    StructField("result_vocabulary_id",      StringType(), True, {"comment": "vocabulary_id of the result-value concept (SNOMED | LOINC)"}),
+    StructField("result_status",            StringType(),   True, {"comment": "numeric | mapped | excluded | free_text"}),
+    StructField("value_source_value",       StringType(),   True, {"comment": "raw result text (result_txt) as received from source"}),
+    StructField("unit_source_value",        StringType(),   True, {"comment": "raw unit string: code_value DESCRIPTION of RESULT_UNITS_CD (linked) | master Units (raw)"}),
+    StructField("unit_concept_id",          LongType(),     True, {"comment": "mapped UCUM unit concept_id (via pathology_unit_map)"}),
+    StructField("ucum_code",                StringType(),   True, {"comment": "UCUM code for the mapped unit"}),
+    StructField("range_low",                DoubleType(),   True, {"comment": "reference-range low: NORMAL_LOW (linked only; NULL for raw)"}),
+    StructField("range_high",               DoubleType(),   True, {"comment": "reference-range high: NORMAL_HIGH (linked only; NULL for raw)"}),
+    StructField("normalcy",                 StringType(),   True, {"comment": "normalcy flag: code_value DESCRIPTION of NORMALCY_CD (linked only; NULL for raw)"}),
+    StructField("WkgCode",                  StringType(),   True, {"comment": "raw branch: LIMS working code (part of master join key)"}),
+    StructField("nlmc_id",                  StringType(),   True, {"comment": "raw branch: National Lab Medicine Catalogue code"}),
+    StructField("ReportDate",               TimestampType(),True, {"comment": "linked: PERFORMED_DT_TM; raw: samplelevel ReportDate"}),
+    StructField("ADC_UPDT",                 TimestampType(),True, {"comment": "build/load timestamp (CURRENT_TIMESTAMP() at write); the incremental watermark column"}),
+])
+print(f"map_pathology build SQL + schema loaded ({len(schema_map_pathology.fields)} cols).")
+
+# COMMAND ----------
+
+# ── Section-owned config + flag-table helpers ────────────────────────────────────────────────────
+# MP_TARGET / MP_FLAG flip with MAP_SCHEMA on promotion (see Cell 1).
+MP_TARGET = f"{TARGET_SCHEMA}.map_pathology"          # dev: 8_dev.bronze.map_pathology ; prod: 4_prod.bronze.map_pathology
+MP_FLAG   = f"{MAP_SCHEMA}.pathology_map_rebuild_flag" # dev: 8_dev.omop.* ; prod: 3_lookup.omop.*
+
+# 6-key row identity (the VERIFIED unique grain). The 3-key (source_table,source_event_id,lab_no)
+# is NOT unique — 1021 raw collisions share a TFCResultSeq and differ only on value_source_value.
+# update_table builds its MERGE condition with `<=>` (NULL-safe) per key, so NULL code/description/
+# value_source_value match correctly.
+MP_SIX_KEY = ["source_table", "source_event_id", "lab_no", "code", "description", "value_source_value"]
+
+# Change-detection predicate for the incremental MERGE (Task-12 MERGE's whenMatchedUpdateAll cond):
+# rewrite ONLY matched rows whose mapped/derived columns actually changed (avoids churning unchanged
+# rows). Passed to the patched update_table via update_condition=.
+MP_CHANGE_PRED = (
+    "t.measurement_concept_id IS DISTINCT FROM s.measurement_concept_id "
+    "OR t.value_as_concept_id IS DISTINCT FROM s.value_as_concept_id "
+    "OR t.result_status IS DISTINCT FROM s.result_status "
+    "OR t.unit_concept_id IS DISTINCT FROM s.unit_concept_id "
+    "OR t.value_as_number IS DISTINCT FROM s.value_as_number "
+    "OR t.operator_concept_id IS DISTINCT FROM s.operator_concept_id"
+)
+
+# ── Flag helpers — the SECTION owns the correction state end-to-end (replaces the dropped
+#    map_pathology_state.rebuild_flagged). Tiny single-row table {MAP_SCHEMA}.pathology_map_rebuild_flag.
+def _mp_read_rebuild_flag() -> bool:
+    """Return rebuild_flagged for id=1. Missing table/row => FALSE (treat as 'no correction outstanding')."""
+    try:
+        if not table_exists(MP_FLAG):
+            return False
+        row = spark.sql(f"SELECT rebuild_flagged FROM {MP_FLAG} WHERE id = 1").first()
+        return bool(row["rebuild_flagged"]) if row is not None and row["rebuild_flagged"] is not None else False
+    except Exception as e:
+        print(f"[map_pathology] _mp_read_rebuild_flag: defaulting FALSE ({e})")
+        return False
+
+def _mp_set_rebuild_flag():
+    """Set rebuild_flagged=TRUE for id=1 (a concept CORRECTION is outstanding -> next run FULL_REBUILDs)."""
+    spark.sql(f"UPDATE {MP_FLAG} SET rebuild_flagged = TRUE WHERE id = 1")
+
+def _mp_clear_rebuild_flag():
+    """Clear rebuild_flagged=FALSE for id=1 (a FULL_REBUILD has reconciled the table)."""
+    spark.sql(f"UPDATE {MP_FLAG} SET rebuild_flagged = FALSE WHERE id = 1")
+
+# COMMAND ----------
+
+# ── create_map_pathology(): auto-selects FULL_REBUILD vs INCREMENTAL via the correction flag ─────
+# FULL_REBUILD  : no target table OR rebuild_flagged=TRUE  -> full CTAS DF -> update_table ->
+#                 snapshot_baseline(force=True) -> clear flag.
+# INCREMENTAL   : else -> get_max_timestamp watermark -> src_df (ADC_UPDT > wm) -> update_table with
+#                 MP_CHANGE_PRED -> embed loop (discover/embed/remap) -> classify_map_delta ->
+#                   correction -> set flag + SKIP backfill ;
+#                   additive   -> apply_to_map_pathology(additive_df, correction_present=False) + snapshot_baseline().
+#
+# DEV SLICE (the ONLY scope controls; PROD full build sets DEV_SLICE=False so both scan full tables):
+#   DEV_WHERE_RAW    swaps the standalone's `WHERE MonthYear='1224'` line in RAW_SRC_CTE;
+#   DEV_WHERE_LINKED is appended after the LINKED catalog-type predicate line.
+# The splice mechanism mirrors CC/map_pathology_pipeline (Task 9) byte-for-byte.
+DEV_SLICE        = False                                   # PROD/full build: set False
+DEV_WHERE_RAW    = "WHERE MonthYear IN ('1224','0125')"   # Branch T slice (Dec24 + Jan25, MMYY)
+DEV_WHERE_LINKED = "    AND ce.ADC_UPDT >= '2026-05-01'"  # Branch L slice (recent CDC window)
+if not DEV_SLICE:
+    DEV_WHERE_RAW, DEV_WHERE_LINKED = "WHERE 1=1", ""
+
+def _mp_build_select(wm_lit=None):
+    """Build the WITH ... SELECT body (NOT a CREATE TABLE / NOT the MERGE). When wm_lit is None this
+    is the FULL_REBUILD body; when wm_lit is a `TIMESTAMP'...'` literal the source window is narrowed
+    to ADC_UPDT > wm on BOTH branches (the incremental src_df). Splice is identical to the standalone."""
+    _RAW_SLICED = RAW_SRC_CTE.replace(
+          "SELECT * FROM 4_prod.raw.path_patient_resultlevel WHERE MonthYear='1224'",
+          "SELECT * FROM 4_prod.raw.path_patient_resultlevel " + DEV_WHERE_RAW,
+      )
+    _RAW_SLICED = _RAW_SLICED.replace(
+          "/*RL_WM_SCOPE*/",
+          (f"LEFT SEMI JOIN (SELECT DISTINCT LabNo, TFCCode FROM rl_raw "
+           f"WHERE ADC_UPDT > {wm_lit}) c ON r.LabNo = c.LabNo AND r.TFCCode = c.TFCCode")
+          if wm_lit else "",
+      )
+    _LINKED_SLICED = LINKED_SRC_CTE.replace(
+          "    AND oc.CATALOG_TYPE_CD = 2513",
+          "    AND oc.CATALOG_TYPE_CD = 2513\n" + DEV_WHERE_LINKED
+          + (f"\n    AND ce.ADC_UPDT > {wm_lit}" if wm_lit else ""),
+      )  
+
+    return f"""
+    WITH
+    {_LINKED_SLICED},
+    {_RAW_SLICED},
+    combined AS (SELECT * FROM linked_src UNION ALL SELECT * FROM raw_src),
+    {TEST_JOINED_CTE},
+    {RESULT_JOINED_CTE},
+    {UNIT_JOINED_CTE}
+    {FINAL_PROJECTION_SQL}
+    WHERE source_event_id IS NOT NULL
+    """
+
+def create_map_pathology():
+    # ensure flag table exists (id=1, FALSE) — the SECTION owns this table end-to-end.
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {MP_FLAG} (id INT, rebuild_flagged BOOLEAN) USING DELTA")
+    if spark.table(MP_FLAG).where("id=1").count() == 0:
+        spark.sql(f"INSERT INTO {MP_FLAG} VALUES (1, FALSE)")
+
+    # flag table already created+seeded above, so _mp_read_rebuild_flag() is safe here even on the
+    # first-ever run (and `not table_exists(MP_TARGET)` independently forces FULL_REBUILD then anyway).
+    full = (not table_exists(MP_TARGET)) or _mp_read_rebuild_flag()
+    if full:
+        print("[map_pathology] FULL_REBUILD")
+        _df = spark.sql(_mp_build_select(wm_lit=None))
+        update_table(_df, MP_TARGET, MP_SIX_KEY, schema_map_pathology, map_pathology_comment)
+        snapshot_baseline(force=True)        # force => skips the module's flag-table TOCTOU read
+        _mp_clear_rebuild_flag()
+        print("[map_pathology] FULL_REBUILD done; baseline re-aligned; rebuild flag cleared.")
+        return
+
+    print("[map_pathology] INCREMENTAL")
+    wm = get_max_timestamp(MP_TARGET) - timedelta(days=2)   # safety lookback: target ADC_UPDT is build-clock, not source-max; re-process a 2d window (MERGE is idempotent)
+    _wm_lit = f"TIMESTAMP'{wm}'"
+    _src = spark.sql(_mp_build_select(wm_lit=_wm_lit))
+    # change-detection MERGE (only rewrite matched rows whose mapped cols changed); insert new rows.
+    update_table(_src, MP_TARGET, MP_SIX_KEY, schema_map_pathology, map_pathology_comment,
+                 update_condition=MP_CHANGE_PRED)
+
+    # embed loop (module fns via %run): discover new context keys, embed pending, remap into maps.
+    discover_new_keys(wm)
+    embed_pending_capped()
+    remap_keys()
+
+    # classify the map delta the SECTION owns the gate: correction -> flag + skip backfill;
+    # additive -> bounded additive backfill (always correction_present=False so the module's
+    # correction branch — which writes the shared rebuild flag — is never taken here).
+    _delta = classify_map_delta()
+    if _delta["n_correction_keys"] > 0:
+        _mp_set_rebuild_flag()
+        print(f"[map_pathology] CORRECTION ({_delta['n_correction_keys']} keys) -> rebuild flagged; backfill skipped.")
+    else:
+        apply_to_map_pathology(_delta.get("additive_df"), correction_present=False)
+        snapshot_baseline()
+        print(f"[map_pathology] INCREMENTAL done; additive backfill applied ({_delta['n_additive_keys']} keys); baseline re-snapshotted.")
+
+create_map_pathology()

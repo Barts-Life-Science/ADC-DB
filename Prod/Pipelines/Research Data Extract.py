@@ -49,6 +49,22 @@ def table_exists_with_rows(table_name):
 
 # COMMAND ----------
 
+def _mill_code_lookup():
+    """Replacement for the CDE code value references
+    """
+    def _clean(c):
+        cleaned = trim(regexp_replace(col(c), "[\\x00\\n\\r\\t\\u00A0]", " "))
+        return when(cleaned == "", None).otherwise(cleaned)
+    cv = spark.table("3_lookup.mill.mill_code_value").alias("CV").filter(col("ACTIVE_IND") > 0)
+    return cv.select(
+        col("CV.CODE_VALUE").cast(LongType()).cast(StringType()).alias("CODE_VALUE_CD"),
+        _clean("CV.DESCRIPTION").alias("CODE_DESC_TXT"),
+        _clean("CV.DISPLAY").alias("CODE_DISP_TXT"),
+        col("CV.ADC_UPDT").alias("ADC_UPDT"),
+    )
+
+# COMMAND ----------
+
 
 @dlt.table(
     name="code_value",
@@ -149,18 +165,22 @@ def lookup_address():
 )
 def lookup_blob_content():
     window = Window.partitionBy("event_id").orderBy(
-        col("valid_until_dt_tm").desc(),
-        col("updt_dt_tm").desc()
+          col("valid_until_dt_tm").desc(),          # 1. live version first
+          col("updt_dt_tm").desc(),                 # 2. newest update
+          col("parser_version").desc_nulls_last(),  # 3. current pipeline (v2) over legacy(NULL)
+          col("TEXT_LENGTH").desc_nulls_last(),      # 4. richer extraction over truncated/mangled
+          col("valid_from_dt_tm").desc()             # 5. deterministic final key
     )
 
     return (
-        spark.table("4_prod.bronze.mill_blob_text")
-        .filter(col("STATUS") == "Decoded")
-        .filter(col("Trust") == "Barts")
-        .withColumn("row", row_number().over(window))
-        .filter(col("row") == 1)
-        .drop("row")
+          spark.table("4_prod.bronze.mill_blob_text")
+          .filter(col("STATUS") == "Decoded")
+          .filter(col("Trust") == "Barts")
+          .withColumn("row", row_number().over(window))
+          .filter(col("row") == 1)
+          .drop("row")
     )
+
 
 # COMMAND ----------
 
@@ -177,6 +197,7 @@ schema_rde_patient_demographics = StructType([
         StructField("ETHNIC_CD", IntegerType(), True, metadata={"comment": "Ethnicity CD"}),
         StructField("Ethnicity", StringType(), True, metadata={"comment": "The ethnicity of a PERSON, as specified by the PERSON."}),
         StructField("Date_of_Death", TimestampType(), True, metadata={"comment": "*Date of death of the patient  if deceased. May not be up to date if patient record has not been updated since the last spine lookup and patient died out of trust."}),
+        StructField("Year_of_Death", IntegerType(), True, metadata={"comment": "The year in which the PERSON died, if deceased. Derived from Date_of_Death; subject to the same caveat that it may not be up to date if the patient died out of trust."}),
         StructField("Postcode", StringType(), True, metadata={"comment": "A code that is used to assist with finding or navigating to a specific location or delivery point. In some countries, this may provide better resolution than the standard postal address."}),
         StructField("City", StringType(), True, metadata={"comment": "The city field is the text name of the city associated with the address row."}),
         StructField("MARITAL_STATUS_CD", IntegerType(), True, metadata={"comment": "Marital status CD"}),
@@ -244,6 +265,7 @@ def patient_demographics_incr():
             col("Eth.CODE_VALUE").cast(IntegerType()).alias("ETHNIC_CD"),
             col("Eth.DISPLAY").alias("Ethnicity"),
             col("Pers.DECEASED_DT_TM").alias("Date_of_Death"),
+            year(col("Pers.DECEASED_DT_TM")).alias("Year_of_Death"),
             col("A.ZIPCODE").alias("Postcode"),
             col("A.CITY").alias("City"),
             col("Pers.MARITAL_TYPE_CD").cast(IntegerType()).alias("MARITAL_STATUS_CD"),
@@ -387,7 +409,7 @@ def encounter_incr():
             col("E.MED_SERVICE_CD").cast(IntegerType()).alias("TREATMENT_FUNCTION_CD"),
             col("TFC.DISPLAY").alias("TFC_DESC"),
             col("EA.ALIAS").cast(LongType()).alias("VISIT_ID"),
-            col("E.REG_DT_TM").alias("CREATE_DT_TM"),
+            coalesce(col("E.REG_DT_TM"), col("E.CREATE_DT_TM")).alias("CREATE_DT_TM"),
             greatest(col("E.ADC_UPDT"), col("D.ADC_UPDT")).alias("ADC_UPDT")
         )
     )
@@ -914,7 +936,7 @@ schema_rde_cds_apc = StructType([
         StructField("Priority_Desc", StringType(), True, metadata={"comment": "Text description of the CDS Priority code"}),
         StructField("Treat_Func_CD", IntegerType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION.\
 "}),
-        StructField("Spell_HRG_CD", IntegerType(), True, metadata={"comment": " Hospital provider spell healthcare resource group. This is derived from the Reference cost HRG grouper for completed spell activity. "}),
+        StructField("Spell_HRG_CD", StringType(), True, metadata={"comment": " Hospital provider spell healthcare resource group. This is derived from the Reference cost HRG grouper for completed spell activity. "}),
         StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
         StructField("Patient_Class_Desc", StringType(), True, metadata={"comment": "A detailed description of the  classification of PATIENTS who have been admitted to a Hospital Provider Spell. "}),
         StructField("PatClass_Desc", StringType(), True, metadata={"comment": "A  description of the  of the patient classification code"}),
@@ -947,9 +969,26 @@ def cds_apc_incr():
     cds_eal_tail = spark.table("4_prod.raw.cds_eal_tail")
     cds_eal_entry = spark.table("4_prod.raw.cds_eal_entry")
     lkp_cds_priority_type = spark.table("3_lookup.dwh.cds_priority_type")
-    pi_cde_code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    pi_cde_code_value_ref = _mill_code_lookup()
     patient_demographics = dlt.read("rde_patient_demographics")
     encounter = dlt.read("rde_encounter")
+
+    mill_cds_batch_content_hist = spark.table("4_prod.raw.mill_cds_batch_content_hist")
+    _apc_enc_win = Window.partitionBy("CDS_BATCH_CONTENT_ID").orderBy(
+          col("TRANSACTION_DT_TM").desc_nulls_last(),
+          col("ENCOUNTER_ID").desc_nulls_last())
+    apc_enc_map = (
+          mill_cds_batch_content_hist
+          .filter((col("CDS_TYPE_CD") == 4446188)
+                  & col("ENCOUNTER_ID").isNotNull()
+                  & (col("ENCOUNTER_ID") != 0))
+          .withColumn("_rn", row_number().over(_apc_enc_win))
+          .filter(col("_rn") == 1)
+          .select(
+              col("CDS_BATCH_CONTENT_ID").cast("bigint").cast("string").alias("_APC_CONTENT_KEY"),
+              col("ENCOUNTER_ID").cast(LongType()).alias("_APC_ENCNTR_ID"))
+          .alias("APCMAP")
+    )
 
     cds_apc_ids = (
         slam_apc_hrg_v4.filter(col("ADC_UPDT") > max_adc_updt).select(trim(col("CDS_APC_Id")).alias("CDS_APC_Id"))
@@ -970,7 +1009,10 @@ def cds_apc_incr():
         .join(cds_eal_tail.alias("EalTl"), (col("Pat.PERSON_ID") == col("EalTl.Encounter_ID")) & (col("EalTl.Record_Type") == '060'), "left")
         .join(cds_eal_entry.alias("WL"), col("WL.CDS_EAL_Id") == col("EalTl.CDS_EAL_ID"), "left")
         .join(lkp_cds_priority_type.alias("PT"), col("PT.Priority_Type_Cd") == col("WL.Priority_Type_Cd"), "left")
-        .join(encounter.alias("Enc"), col("Pat.PERSON_ID") == col("Enc.PERSON_ID"), "left")
+        .join(apc_enc_map,
+                regexp_replace(regexp_replace(trim(col("APC.CDS_APC_ID")), "BR1H00", ""), "BRNJ00", "")
+                == col("APCMAP._APC_CONTENT_KEY"), "left")
+        .join(encounter.alias("Enc"), col("APCMAP._APC_ENCNTR_ID") == col("Enc.ENCNTR_ID"), "left")
         .join(pi_cde_code_value_ref.alias("Descr"), col("Enc.ENCNTR_TYPE_CD") == col("Descr.CODE_VALUE_CD"), "left")
         .select(
             col("APC.CDS_APC_ID").cast(StringType()).alias("CDS_APC_ID"),
@@ -983,7 +1025,7 @@ def cds_apc_incr():
             col("WL.Priority_Type_Cd").cast(IntegerType()).alias("Priority_CD"),
             col("PT.Priority_Type_Desc").cast(StringType()).alias("Priority_Desc"),
             col("APC.Treat_Func_Cd").cast(IntegerType()).alias("Treat_Func_CD"),
-            col("HRG.Spell_HRG_Cd").cast(IntegerType()).alias("Spell_HRG_CD"),
+            col("HRG.Spell_HRG_Cd").cast(StringType()).alias("Spell_HRG_CD"),
             col("HRGDesc.HRG_Desc").cast(StringType()).alias("HRG_Desc"),
             col("PC.Patient_Class_Desc").cast(StringType()).alias("Patient_Class_Desc"),
             split(col("PC.Patient_Class_Desc"), "-").getItem(0).cast(StringType()).alias("PatClass_Desc"),
@@ -1051,6 +1093,7 @@ schema_rde_cds_opa = StructType([
         StructField("HRG_Desc", StringType(), True, metadata={"comment": "Description of the HRG code"}),
         StructField("Treat_Func_Cd", IntegerType(), True, metadata={"comment": "A unique identifier for a TREATMENT FUNCTION."}),
         StructField("Att_Type", StringType(), True, metadata={"comment": "First attendance  type description "}),
+        StructField("Atten_TypeDesc", StringType(), True, metadata={"comment": "Specific clinic or appointment type description"}),
         StructField("Attended_Desc", StringType(), True, metadata={"comment": "This indicates whether or not a patient attended for an appointment."}),
         StructField("Attendance_Outcome_Desc", StringType(), True, metadata={"comment": "Describes the outcome of an outpatient attendance."}),
         StructField("NHS_NUMBER", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
@@ -1079,9 +1122,14 @@ def cds_opa_incr():
     lkp_cds_first_attend = spark.table("3_lookup.dwh.cds_first_attend").alias("FA")
     lkp_cds_attended = spark.table("3_lookup.dwh.lkp_cds_attended").alias("AD")
     lkp_cds_attendance_outcome = spark.table("3_lookup.dwh.cds_attendance_outcome").alias("AO")
-    pi_lkp_cde_code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("AttType")
+    pi_lkp_cde_code_value_ref = _mill_code_lookup().alias("AttType")
+    pi_lkp_cde_appt_type_ref = _mill_code_lookup().alias("ApptTypeDesc")
     cds_op_all_tail = spark.table("4_prod.raw.cds_op_all_tail").alias("OPATail")
     encounter = dlt.read("rde_encounter").alias("Enc")
+    mill_sch_appt_direct = spark.table("4_prod.raw.mill_sch_appt").alias("APPT_DIR")
+    mill_sch_event_direct = spark.table("4_prod.raw.mill_sch_event").alias("SCHE_DIR")
+    pi_lkp_cde_appt_type_ref_dir = _mill_code_lookup().alias("ApptTypeDescDir")
+
     
     # Incorporating logic from PI_CDE_OP_ATTENDANCE
     mill_dir_cds_batch_content_hist = spark.table("4_prod.raw.mill_cds_batch_content_hist").alias("BHIST")
@@ -1101,18 +1149,17 @@ def cds_opa_incr():
 
     op_attendance = (
         cds_op_all_final
-        .join(mill_dir_cds_batch_content_hist, 
-              (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") == col("BHIST.CDS_BATCH_CONTENT_ID").cast("string")) & 
-              (to_date(col("OPALL.APPLICABLE_DT_TM")) == current_date()), 
-              "left")
+        .join(mill_dir_cds_batch_content_hist,
+        (regexp_replace(regexp_replace(col("OPALL.CDS_OPA_ID"), "BR1H00", ""), "BRNJ00", "") ==
+         col("BHIST.CDS_BATCH_CONTENT_ID").cast("bigint").cast("string")),
+        "left")
         .join(mill_dir_encounter, col("BHIST.ENCOUNTER_ID") == col("ENC.ENCNTR_ID"), "left")
         .join(mill_dir_sch_appt, (col("ENC.ENCNTR_ID") == col("APPT.ENCNTR_ID")) & (col("BHIST.PARENT_ENTITY_ID") == col("APPT.SCHEDULE_ID")), "left")
         .join(mill_dir_sch_event, col("APPT.SCH_EVENT_ID") == col("SCHE.SCH_EVENT_ID"), "left")
         .join(mill_dir_encntr_alias, (col("ENC.ENCNTR_ID") == col("EA.ENCNTR_ID")) & (col("EA.ENCNTR_ALIAS_TYPE_CD") == 1077) & (col("EA.ACTIVE_IND") == 1) & (col("EA.END_EFFECTIVE_DT_TM") > current_date()), "left")
-        .filter((col("BHIST.UPDT_DT_TM") >= current_date()) & 
-                (col("BHIST.CDS_TYPE_CD").isin(4446195, 14434936, 71834305)) & 
-                (col("BHIST.CDS_BATCH_ID") != 0) & 
-                (col("BHIST.ORGANIZATION_ID") == 8367658))
+        .filter((col("BHIST.CDS_TYPE_CD").isin(4446195, 14434936, 71834305)) &
+                  (col("BHIST.CDS_BATCH_ID") != 0) &
+                  (col("BHIST.ORGANIZATION_ID") == 8367658))
         .select(
             col("OPALL.CDS_OPA_ID").alias("CDS_BATCH_CONTENT_ID"),
             when(col("BHIST.CDS_TYPE_CD") == 71834305, col("BHIST.ACTIVITY_DT_TM")).otherwise(col("APPT.BEG_DT_TM")).alias("APPT_DT_TM"),
@@ -1146,6 +1193,10 @@ def cds_opa_incr():
         .join(encounter, col("OPATail.Encounter_ID") == col("Enc.ENCNTR_ID"), "left")
         .join(pi_lkp_cde_code_value_ref, col("Enc.ENCNTR_TYPE_CD") == col("AttType.CODE_VALUE_CD"), "left")
         .join(spark.table("op_attendance_view"), col("OPALL.CDS_OPA_ID") == col("op_attendance_view.CDS_BATCH_CONTENT_ID"), "left")
+        .join(pi_lkp_cde_appt_type_ref, col("op_attendance_view.APPT_TYPE_CD") == col("ApptTypeDesc.CODE_VALUE_CD"), "left")
+        .join(mill_sch_appt_direct, col("Enc.ENCNTR_ID") == col("APPT_DIR.ENCNTR_ID"), "left")
+        .join(mill_sch_event_direct, col("APPT_DIR.SCH_EVENT_ID") == col("SCHE_DIR.SCH_EVENT_ID"), "left")
+        .join(pi_lkp_cde_appt_type_ref_dir, col("SCHE_DIR.APPT_TYPE_CD") == col("ApptTypeDescDir.CODE_VALUE_CD"), "left")
         .select(
             col("OPALL.CDS_OPA_ID").cast(StringType()).alias("CDS_OPA_ID"),
             coalesce(col("Enc.ENC_TYPE"), lit("Outpatient")).cast(StringType()).alias("AttendanceType"),
@@ -1155,6 +1206,7 @@ def cds_opa_incr():
             col("HRGDesc.HRG_Desc").cast(StringType()).alias("HRG_Desc"),
             col("OPALL.Treat_Func_Cd").cast(IntegerType()).alias("Treat_Func_Cd"),
             coalesce(col("AttType.CODE_DESC_TXT"), col("FA.First_Attend_Desc")).cast(StringType()).alias("Att_Type"),
+            coalesce(col("ApptTypeDesc.CODE_DESC_TXT"), col("ApptTypeDescDir.CODE_DESC_TXT")).cast(StringType()).alias("Atten_TypeDesc"),
             col("AD.Attended_Desc").cast(StringType()).alias("Attended_Desc"),
             col("AO.Attendance_Outcome_Desc").cast(StringType()).alias("Attendance_Outcome_Desc"),
             col("Pat.NHS_Number").cast(StringType()).alias("NHS_NUMBER"),
@@ -1220,6 +1272,7 @@ schema_rde_pathology = StructType([
         StructField("NHS_Number", StringType(), True, metadata={"comment": "The NHS NUMBER, the primary identifier of a PERSON, is a unique identifier for a PATIENT within the NHS in England and Wales. Based on this field we identify the COHORT patients from the DWH"}),
         StructField("RequestDate", StringType(), True, metadata={"comment": "Pathology order requested date"}),
         StructField("TestCode", StringType(), True, metadata={"comment": "Any short code: like GLU for glucose or any arbitrary numeric id for the same.    This field has some shortcode related to text-not decoded"}),
+        StructField("TestCodeDesc", StringType(), True, metadata={"comment": "Description of TestCode from the order catalog. Direct lookup of the ORDER_MNEMONIC via mill_order_catalog."}),
         StructField("TestName", StringType(), True, metadata={"comment": "It is the code that identifies the most basic unit of the storage, i.e. RBC, discharge summary, image."}),
         StructField("TestDesc", StringType(), True, metadata={"comment": "Description of the test"}),
         StructField("Result_nbr", DoubleType(), True, metadata={"comment": "Numeric test result value "}),
@@ -1248,7 +1301,7 @@ def pathology_incr():
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
     order_catalogue = spark.table("3_lookup.mill.mill_order_catalog").alias("CAT")
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     blob_content = dlt.read("current_blob_content").alias("d")
     encounter = dlt.read("rde_encounter").alias("ENC")
 
@@ -1283,6 +1336,7 @@ def pathology_incr():
             encounter.NHS_Number.cast(StringType()).alias("NHS_Number"),
             orders.CURRENT_START_DT_TM.cast(StringType()).alias("RequestDate"),
             orders.ORDER_MNEMONIC.cast(StringType()).alias("TestCode"),
+            order_catalogue.DESCRIPTION.cast(StringType()).alias("TestCodeDesc"),  # NEW: Catalog description lookup for TestCode
             col("TESTnm.CODE_DESC_TXT").cast(StringType()).alias("TestName"),
             col("EVNTdes.CODE_DESC_TXT").cast(StringType()).alias("TestDesc"),
             col("EVE.RESULT_VAL").cast(DoubleType()).alias("Result_nbr"),
@@ -1718,7 +1772,7 @@ def radiology_incr():
 
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts")
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("ORD")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     blob_content = dlt.read("current_blob_content").alias("B")
     encounter = dlt.read("rde_encounter").alias("ENC")
     nhsi_exam_mapping = spark.table("4_prod.raw.tbl_nhsi_exam_mapping").alias("M")
@@ -1843,7 +1897,7 @@ def family_history_incr():
     patient_demographics = dlt.read("rde_patient_demographics").alias("E")
     person_patient_person_reltn = spark.table("4_prod.raw.mill_person_person_reltn").alias("REL")
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("R")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
         family_history.filter(col("ADC_UPDT") > max_adc_updt)
@@ -1926,6 +1980,7 @@ schema_rde_blobdataset = StructType([
         StructField("ChildTagText", StringType(), True, metadata={"comment": "child event tag text"}),
         StructField("BlobContents", StringType(), True, metadata={"comment": "Detailed description or report about the clinical event"}),
         StructField("AnonymizedText", StringType(), True, metadata={"comment": "Blob after anonymization."}),
+        StructField("BlobStatus", StringType(), True, metadata={"comment": "Plain-text CE_BLOB_RESULT succession status, e.g. Interim, Final or Addendum."}),
         StructField("EventDesc", StringType(), True, metadata={"comment": "Event description"}),
         StructField("EventResultText", StringType(), True, metadata={"comment": "Event result as text"}),
         StructField("EventResultNBR", DoubleType(), True, metadata={"comment": "Event result as numbers for numeric values"}),
@@ -1942,7 +1997,44 @@ schema_rde_blobdataset = StructType([
 def blobdataset_incr():
     max_adc_updt = get_max_adc_updt("4_prod.rde.rde_blobdataset")
 
-    blob_content = dlt.read("current_blob_content").alias("B")
+    blob_content_all = dlt.read("current_blob_content")
+
+    blob_result_window = Window.partitionBy("EVENT_ID").orderBy(
+      F.col("VALID_UNTIL_DT_TM").desc(),
+      F.col("UPDT_CNT").desc_nulls_last(),
+      F.col("UPDT_DT_TM").desc_nulls_last(),
+      F.col("VALID_FROM_DT_TM").desc_nulls_last(),
+    )
+
+    blob_result_current = (
+      spark.table("4_prod.raw.mill_ce_blob_result")
+      .withColumn("EVENT_ID", F.col("EVENT_ID").cast(LongType()))
+      .filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp())
+      .withColumn("_rn", F.row_number().over(blob_result_window))
+      .filter(F.col("_rn") == 1)
+      .drop("_rn")
+      .select("EVENT_ID", "SUCCESSION_TYPE_CD", "ADC_UPDT")
+    )
+
+    # Include blob-status-only changes in the incremental update.
+    changed_event_ids = (
+      blob_content_all
+      .filter(F.col("ADC_UPDT") > F.lit(max_adc_updt))
+      .select("EVENT_ID")
+      .unionByName(
+          blob_result_current
+          .filter(F.col("ADC_UPDT") > F.lit(max_adc_updt))
+          .select("EVENT_ID")
+      )
+      .distinct()
+    )
+
+    blob_content = (
+      blob_content_all
+      .join(changed_event_ids, "EVENT_ID", "inner")
+      .alias("B")
+    )
+
     
     # Window to select the clinical event with highest UPDT_CNT per EVENT_ID
     ce_window = Window.partitionBy("EVENT_ID").orderBy(F.col("UPDT_CNT").desc())
@@ -1956,10 +2048,10 @@ def blobdataset_incr():
     )
     
     encounter = dlt.read("rde_encounter").alias("E")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
-        blob_content.filter(col("ADC_UPDT") > max_adc_updt)
+        blob_content
         .join(clinical_event.alias("CE"), col("B.EVENT_ID") == col("CE.EVENT_ID"), "inner")
         .join(encounter, col("CE.ENCNTR_ID") == col("E.ENCNTR_ID"), "inner")
         .join(clinical_event.alias("CE2"), col("CE.PARENT_EVENT_ID") == col("CE2.EVENT_ID"), "left")
@@ -1969,6 +2061,8 @@ def blobdataset_incr():
         .join(code_value_ref.alias("RecStat"), col("CE.RECORD_STATUS_CD").cast(IntegerType()) == col("RecStat.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("ConSys"), col("CE.CONTRIBUTOR_SYSTEM_CD").cast(IntegerType()) == col("ConSys.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("EvntCls"), col("CE.EVENT_CLASS_CD").cast(IntegerType()) == col("EvntCls.CODE_VALUE_CD"), "left")
+        .join(blob_result_current.alias("BR"), col("B.EVENT_ID") == col("BR.EVENT_ID"), "left")
+        .join(code_value_ref.alias("BlobStat"), col("BR.SUCCESSION_TYPE_CD").cast(LongType()).cast(StringType()) == col("BlobStat.CODE_VALUE_CD"), "left")
         .select(
             col("E.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("E.NHS_Number").cast(StringType()).alias("NHS_Number"),
@@ -1982,6 +2076,7 @@ def blobdataset_incr():
             col("CE.EVENT_TAG").cast(StringType()).alias("ChildTagText"),
             col("B.BLOB_TEXT").cast(StringType()).alias("BlobContents"),
             col("B.ANON_TEXT").cast(StringType()).alias("AnonymizedText"),
+            col("BlobStat.CODE_DISP_TXT").cast(StringType()).alias("BlobStatus"),
             col("Evntcd.CODE_DISP_TXT").cast(StringType()).alias("EventDesc"),
             col("CE.RESULT_VAL").cast(StringType()).alias("EventResultText"),
             col("CE.RESULT_VAL").cast(DoubleType()).alias("EventResultNBR"),
@@ -1991,7 +2086,7 @@ def blobdataset_incr():
             col("EvntCls.CODE_DESC_TXT").cast(StringType()).alias("ClassDesc"),
             col("CE.PARENT_EVENT_ID").cast(LongType()).alias("ParentEventID"),
             col("CE.EVENT_ID").cast(LongType()).alias("EventID"),
-            greatest(col("B.ADC_UPDT"), col("CE.ADC_UPDT"), col("E.ADC_UPDT"), col("CE2.ADC_UPDT")).alias("ADC_UPDT")
+            greatest(col("B.ADC_UPDT"),col("CE.ADC_UPDT"),col("E.ADC_UPDT"),col("CE2.ADC_UPDT"),col("BR.ADC_UPDT")).alias("ADC_UPDT")
         )
         .filter(col("ADC_UPDT") > max_adc_updt)
         .filter(col("BlobContents").isNotNull())
@@ -3067,7 +3162,7 @@ def allergydetails_incr():
 
     allergy = spark.table("4_prod.raw.mill_allergy").filter(col("Trust") == "Barts").alias("A")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     nomenclature_ref = spark.table("3_lookup.mill.mill_nomenclature").alias("Det")
 
     return (
@@ -3151,49 +3246,138 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 1. SCR demographics
 scr_demo_comment = "Table containing demographic details of individuals in the Sommerset Cancer Registry"
 schema_rde_scr_demographics = StructType([
-        StructField("PATIENTID", LongType(), True, metadata={"comment": "Unique identifier for patients used in SCR."}),
-        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
-        StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of the patient."}),
-        StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier for the patient."}),
-        StructField("DeathDate", StringType(), True, metadata={"comment": "Date of death if applicable."}),
-        StructField("DeathCause", StringType(), True, metadata={"comment": "Text on cause of death if known."}),
-        StructField("PT_AT_RISK", StringType(), True, metadata={"comment": "True false if patient considered at risk."}),
-        StructField("REASON_RISK", StringType(), True, metadata={"comment": "If patient at risk, free text comment as to reason."}),
-        StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
-    ])
+    StructField("PATIENTID", LongType(), True, metadata={"comment": "Unique identifier for patients used in SCR."}),
+    StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
+    StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number of the patient."}),
+    StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier for the patient."}),
+    StructField("DeathDate", StringType(), True, metadata={"comment": "Date of death if applicable."}),
+    StructField("DeathCause", StringType(), True, metadata={"comment": "Text on cause of death if known."}),
+    StructField("PT_AT_RISK", StringType(), True, metadata={"comment": "True false if patient considered at risk."}),
+    StructField("REASON_RISK", StringType(), True, metadata={"comment": "If patient at risk, free text comment as to reason."}),
+    StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
+])
 
-@dlt.table(name="rde_scr_demographics_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+@dlt.table(
+    name="rde_scr_demographics_incr",
+    table_properties={"skipChangeCommits": "true"},
+    temporary=True
+)
 def scr_demographics_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_demographics")
+    # Keep only the SCR fields used by this output and normalize identifiers for matching.
+    scr_demographics = (
+        spark.table("4_prod.ancil_scr.scr_tbldemographics")
+        .select(
+            col("PATIENT_ID").cast(LongType()).alias("PATIENTID"),
+            trim(col("N1_1_NHS_NUMBER")).alias("_SCR_NHS"),
+            trim(col("N1_2_HOSPITAL_NUMBER")).alias("_SCR_MRN"),
+            col("N15_1_DATE_DEATH").cast(StringType()).alias("DeathDate"),
+            col("N15_3_DEATH_CAUSE").cast(StringType()).alias("DeathCause"),
+            col("PT_AT_RISK").cast(StringType()).alias("PT_AT_RISK"),
+            col("REASON_RISK").cast(StringType()).alias("REASON_RISK"),
+            col("ADC_UPDT").alias("_SCR_ADC_UPDT")
+        )
+    )
 
-    scr_demographics = spark.table("4_prod.ancil_scr.scr_tbldemographics").alias("SCR")
-    patient_demographics = dlt.read("rde_patient_demographics").alias("PAT")
-    person_alias = spark.table("4_prod.raw.mill_person_alias").alias("ALIAS")
+    # Empty aliases caused very large false matches in the previous OR join.
+    # Collapse active aliases to one row per alias/person pair before matching.
+    person_alias = (
+        spark.table("4_prod.raw.mill_person_alias")
+        .filter(col("ACTIVE_IND") == 1)
+        .filter(col("ALIAS").isNotNull())
+        .filter(length(trim(col("ALIAS"))) > 0)
+        .filter(
+            col("END_EFFECTIVE_DT_TM").isNull()
+            | (col("END_EFFECTIVE_DT_TM") > current_timestamp())
+        )
+        .select(
+            trim(col("ALIAS")).alias("_ALIAS_VALUE"),
+            col("PERSON_ID").cast(LongType()).alias("_ALIAS_PERSON_ID"),
+            col("ADC_UPDT").alias("_ALIAS_ADC_UPDT")
+        )
+        .groupBy("_ALIAS_VALUE", "_ALIAS_PERSON_ID")
+        .agg(spark_max(col("_ALIAS_ADC_UPDT")).alias("_ALIAS_ADC_UPDT"))
+    )
+
+    patient_demographics = (
+        dlt.read("rde_patient_demographics")
+        .select(
+            col("PERSON_ID").cast(LongType()).alias("_PAT_PERSON_ID"),
+            trim(col("NHS_Number")).alias("_PAT_NHS"),
+            trim(col("MRN")).alias("_PAT_MRN"),
+            col("NHS_Number").cast(StringType()).alias("NHS_Number"),
+            col("MRN").cast(StringType()).alias("MRN"),
+            col("ADC_UPDT").alias("_PAT_ADC_UPDT")
+        )
+    )
+
+    # Separate equality joins avoid the expensive and duplicate-prone OR join.
+    nhs_candidates = (
+        scr_demographics
+        .filter(length(coalesce(col("_SCR_NHS"), lit(""))) > 0)
+        .join(
+            person_alias,
+            col("_SCR_NHS") == col("_ALIAS_VALUE"),
+            "inner"
+        )
+        .withColumn("_ALIAS_MATCH_PRIORITY", lit(0))
+    )
+
+    mrn_candidates = (
+        scr_demographics
+        .filter(length(coalesce(col("_SCR_MRN"), lit(""))) > 0)
+        .join(
+            person_alias,
+            col("_SCR_MRN") == col("_ALIAS_VALUE"),
+            "inner"
+        )
+        .withColumn("_ALIAS_MATCH_PRIORITY", lit(1))
+    )
+
+    link_candidates = (
+        nhs_candidates
+        .unionByName(mrn_candidates)
+        .join(
+            patient_demographics,
+            col("_ALIAS_PERSON_ID") == col("_PAT_PERSON_ID"),
+            "inner"
+        )
+        .withColumn(
+            "_MATCH_PRIORITY",
+            when(col("_SCR_NHS") == col("_PAT_NHS"), lit(0))
+            .when(col("_SCR_MRN") == col("_PAT_MRN"), lit(1))
+            .otherwise(col("_ALIAS_MATCH_PRIORITY") + lit(2))
+        )
+    )
+
+    link_rank = Window.partitionBy("PATIENTID").orderBy(
+        col("_MATCH_PRIORITY").asc(),
+        col("_ALIAS_ADC_UPDT").desc_nulls_last(),
+        col("_PAT_ADC_UPDT").desc_nulls_last(),
+        col("_PAT_PERSON_ID").asc()
+    )
 
     return (
-        scr_demographics.filter(col("ADC_UPDT") > max_adc_updt)
-        .join(person_alias, 
-              (col("SCR.N1_1_NHS_NUMBER") == col("ALIAS.alias")) |
-              (col("SCR.N1_2_HOSPITAL_NUMBER") == col("ALIAS.alias")),
-              "left")
-        .join(patient_demographics, 
-              (col("ALIAS.PERSON_ID") == col("PAT.PERSON_ID")),
-              "inner")
+        link_candidates
+        .withColumn("_LINK_RANK", row_number().over(link_rank))
+        .filter(col("_LINK_RANK") == 1)
         .select(
-            col("SCR.PATIENT_ID").cast(LongType()).alias("PATIENTID"),
-            col("PAT.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
-            col("PAT.NHS_Number").cast(StringType()).alias("NHS_Number"),
-            col("PAT.MRN").cast(StringType()).alias("MRN"),
-            col("SCR.N15_1_DATE_DEATH").cast(StringType()).alias("DeathDate"),
-            col("SCR.N15_3_DEATH_CAUSE").cast(StringType()).alias("DeathCause"),
-            col("SCR.PT_AT_RISK").cast(StringType()).alias("PT_AT_RISK"),
-            col("SCR.REASON_RISK").cast(StringType()).alias("REASON_RISK"),
-            greatest(col("SCR.ADC_UPDT"), col("PAT.ADC_UPDT")).alias("ADC_UPDT")
+            col("PATIENTID"),
+            col("_PAT_PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+            col("NHS_Number"),
+            col("MRN"),
+            col("DeathDate"),
+            col("DeathCause"),
+            col("PT_AT_RISK"),
+            col("REASON_RISK"),
+            greatest(
+                col("_SCR_ADC_UPDT"),
+                col("_ALIAS_ADC_UPDT"),
+                col("_PAT_ADC_UPDT")
+            ).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="scr_demographics_update")
@@ -3208,7 +3392,7 @@ def scr_demographics_update():
 
 
 dlt.create_target_table(
-    name = "rde_scr_demographics",
+    name="rde_scr_demographics",
     comment=scr_demo_comment,
     schema=schema_rde_scr_demographics,
     table_properties={
@@ -3220,21 +3404,23 @@ dlt.create_target_table(
 )
 
 dlt.apply_changes(
-    target = "rde_scr_demographics",
-    source = "scr_demographics_update",
-    keys = ["PATIENTID", "PERSON_ID"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
+    target="rde_scr_demographics",
+    source="scr_demographics_update",
+    keys=["PATIENTID"],
+    sequence_by="ADC_UPDT",
+    apply_as_deletes=None,
+    except_column_list=[],
+    stored_as_scd_type=1
 )
 
 # COMMAND ----------
 
+# 2. SCR referrals
 scr_referrals_comment = "Referrals for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_referrals = StructType([
         StructField("CareID", StringType(), True, metadata={"comment": "Unique SCR identifier for care pathway."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital number."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "Patient NHS Number"}),
         StructField("PATIENT_ID", LongType(), True, metadata={"comment": "Unique Barts Patient ID"}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of the cancer, e.g. skin"}),
@@ -3283,10 +3469,13 @@ schema_rde_scr_referrals = StructType([
 @dlt.table(name="rde_scr_referrals_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_referrals_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_referrals")
 
     scr_referrals = spark.table("4_prod.ancil_scr.scr_tblmain_referrals").alias("REF")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
     priority_type = spark.table("4_prod.ancil_scr.scr_ltblpriority_type").alias("PT")
     ca_status = spark.table("4_prod.ancil_scr.scr_ltblca_status").alias("CA")
     cancer_type = spark.table("4_prod.ancil_scr.scr_ltblcancer_type").alias("TYP")
@@ -3298,7 +3487,6 @@ def scr_referrals_incr():
     scr_data = (
         scr_referrals
         .join(scr_demographics, col("REF.PATIENT_ID") == col("D.PATIENTID"), "inner")
-        .filter((col("REF.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
     )
 
     return (
@@ -3313,6 +3501,7 @@ def scr_referrals_incr():
         .select(
             col("REF.CARE_ID").cast(StringType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("REF.PATIENT_ID").cast(LongType()).alias("PATIENT_ID"),
             col("REF.L_CANCER_SITE").cast(StringType()).alias("CancerSite"),
@@ -3357,7 +3546,6 @@ def scr_referrals_incr():
             col("REF.SubsiteID").cast(LongType()).alias("SubSiteID"),
             greatest(col("REF.ADC_UPDT"), col("D.ADC_UPDT")).alias("ADC_UPDT")
         )
-        .filter(col("ADC_UPDT") > max_adc_updt)
     )
 
 @dlt.view(name="scr_referrals_update")
@@ -3395,9 +3583,11 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 3. SCR tracking comments
 scr_comments_comment = "Comments for patients in the Sommerset Cancer Registry"
 schema_rde_scr_trackingcomments = StructType([
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital ID."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("COM_ID", LongType(), True, metadata={"comment": "SCR comment ID."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR care pathway ID"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber for patient."}),
@@ -3409,17 +3599,20 @@ schema_rde_scr_trackingcomments = StructType([
 @dlt.table(name="rde_scr_trackingcomments_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_trackingcomments_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_trackingcomments")
 
     scr_tracking_comments = spark.table("4_prod.ancil_scr.scr_tbltracking_comments").alias("C")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_tracking_comments
         .join(scr_referrals, col("C.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("C.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("C.COM_ID").cast(LongType()).alias("COM_ID"),
             col("C.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
@@ -3464,10 +3657,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 4. SCR care plan
 scr_careplan_comment = "Details on the agreed care plan for patients in the Sommerset Cancer Registry"
 schema_rde_scr_careplan = StructType([
         StructField("PlanID", LongType(), True, metadata={"comment": "SCR ID for the care plan."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Barts Local hospital ID."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for the care pathway."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS NUmber of patient."}),
         StructField("MDTDate", StringType(), True, metadata={"comment": "Date of cancer multi disciplinary team meeting."}),
@@ -3488,18 +3683,21 @@ schema_rde_scr_careplan = StructType([
 @dlt.table(name="rde_scr_careplan_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_careplan_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_careplan")
 
     scr_careplan = spark.table("4_prod.ancil_scr.scr_tblmain_care_plan").alias("CP")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_careplan
         .join(scr_referrals, col("CP.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("CP.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("CP.PLAN_ID").cast(LongType()).alias("PlanID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("CP.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("CP.N5_2_MDT_DATE").cast(StringType()).alias("MDTDate"),
@@ -3553,10 +3751,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 5. SCR definitive treatment
 scr_treatment_comment = "Details on cancer treaments for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_deftreatment = StructType([
         StructField("TreatmentID", LongType(), True, metadata={"comment": "SCR id for the treatment."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts hospital identifier."}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID For the care plan."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
         StructField("DecisionDate", StringType(), True, metadata={"comment": "Date of treatment decision."}),
@@ -3580,18 +3780,21 @@ schema_rde_scr_deftreatment = StructType([
 @dlt.table(name="rde_scr_deftreatment_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_deftreatment_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_deftreatment")
 
     scr_deftreatment = spark.table("4_prod.ancil_scr.scr_tbldefinitive_treatment").alias("DT")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_deftreatment
         .join(scr_referrals, col("DT.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("DT.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
         .select(
             col("DT.TREATMENT_ID").cast(LongType()).alias("TreatmentID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("DT.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("DT.DECISION_DATE").cast(StringType()).alias("DecisionDate"),
@@ -3648,10 +3851,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 6. SCR diagnosis
 scr_diagnosis_comment = "Diagnoses for individuals in the Sommerset Cancer Registry"
 schema_rde_scr_diagnosis = StructType([
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for care plan."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Skin"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "Nuhs number of patient."}),
         StructField("HospitalNumber", StringType(), True, metadata={"comment": "Barts Local Hospital ID"}),
@@ -3678,18 +3883,21 @@ schema_rde_scr_diagnosis = StructType([
 @dlt.table(name="rde_scr_diagnosis_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_diagnosis_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_diagnosis")
 
     scr_diagnosis = spark.table("4_prod.ancil_scr.scr_bivwdiagnosis").alias("DIAG")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
 
     return (
         scr_diagnosis
         .join(scr_demographics, col("DIAG.NHS_Number") == col("D.NHS_Number"), "inner")
-        .filter((col("DIAG.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
         .select(
             col("DIAG.CARE_ID").cast(LongType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("DIAG.Cancer_Site").cast(StringType()).alias("CancerSite"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("DIAG.Hospital_Number").cast(StringType()).alias("HospitalNumber"),
@@ -3749,10 +3957,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 7. SCR investigations
 scr_investigations_comment = "Details of investigations undertaken for patients in the Sommerset Cancer Registry"
 schema_rde_scr_investigations = StructType([
         StructField("CareID", LongType(), True, metadata={"comment": "SCR ID for care plan"}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CancerSite", StringType(), True, metadata={"comment": "Site of cancer, e.g. Lung"}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS number of patient."}),
         StructField("HospitalNumber", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
@@ -3775,18 +3985,21 @@ schema_rde_scr_investigations = StructType([
 @dlt.table(name="rde_scr_investigations_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def scr_investigations_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_investigations")
 
     scr_investigations = spark.table("4_prod.ancil_scr.scr_bivwinvestigations").alias("INV")
-    scr_demographics = dlt.read("rde_scr_demographics").alias("D")
+    scr_demographics = (
+        dlt.read("rde_scr_demographics")
+        .select("PATIENTID", "PERSON_ID", "NHS_Number", "MRN", "ADC_UPDT")
+        .alias("D")
+    )
 
     return (
         scr_investigations
         .join(scr_demographics, col("INV.NHS_Number") == col("D.NHS_Number"), "inner")
-        .filter((col("INV.ADC_UPDT") > max_adc_updt) | (col("D.ADC_UPDT") > max_adc_updt))
         .select(
             col("INV.CARE_ID").cast(LongType()).alias("CareID"),
             col("D.MRN").cast(StringType()).alias("MRN"),
+            col("D.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("INV.Cancer_Site").cast(StringType()).alias("CancerSite"),
             col("D.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("INV.Hospital_Number").cast(StringType()).alias("HospitalNumber"),
@@ -3842,10 +4055,12 @@ dlt.apply_changes(
 
 # COMMAND ----------
 
+# 8. SCR pathology
 scr_pathology_comment = "Details of pathology performed for patients in the Sommerset Cancer Registry"
 schema_rde_scr_pathology = StructType([
         StructField("PathologyID", LongType(), True, metadata={"comment": "SCR pathology result identifier."}),
         StructField("MRN", StringType(), True, metadata={"comment": "Local Barts Hospital ID"}),
+        StructField("PERSON_ID", LongType(), True, metadata={"comment": "Unique Barts identifier for the patient."}),
         StructField("CareID", LongType(), True, metadata={"comment": "SCR care plan identifier."}),
         StructField("NHS_Number", StringType(), True, metadata={"comment": "NHS Number for the patient."}),
         StructField("PathologyType", StringType(), True, metadata={"comment": "Code for type of pathology."}),
@@ -3864,21 +4079,30 @@ schema_rde_scr_pathology = StructType([
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
 
-@dlt.table(name="rde_scr_pathology_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+@dlt.table(
+    name="rde_scr_pathology_incr",
+    table_properties={"skipChangeCommits": "true"},
+    temporary=True
+)
 def scr_pathology_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_scr_pathology")
-
     scr_pathology = spark.table("4_prod.ancil_scr.scr_tblmain_pathology").alias("P")
-    scr_referrals = dlt.read("rde_scr_referrals").alias("R")
+    scr_referrals = (
+        dlt.read("rde_scr_referrals")
+        .select("CareID", "MRN", "PERSON_ID", "NHS_Number", "ADC_UPDT")
+        .alias("R")
+    )
 
     return (
         scr_pathology
-        .join(scr_referrals, col("P.CARE_ID") == col("R.CareID"), "inner")
-        .filter((col("P.ADC_UPDT") > max_adc_updt) | (col("R.ADC_UPDT") > max_adc_updt))
+        .join(
+            scr_referrals,
+            col("P.CARE_ID") == col("R.CareID"),
+            "inner"
+        )
         .select(
             col("P.PATHOLOGY_ID").cast(LongType()).alias("PathologyID"),
             col("R.MRN").cast(StringType()).alias("MRN"),
+            col("R.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
             col("P.CARE_ID").cast(LongType()).alias("CareID"),
             col("R.NHS_Number").cast(StringType()).alias("NHS_Number"),
             col("P.N8_1_PATHOLOGY_TYPE").cast(StringType()).alias("PathologyType"),
@@ -3957,49 +4181,50 @@ schema_rde_powerforms = StructType([
     ])
 
 @dlt.table(name="rde_powerforms_incr", table_properties={
-        "skipChangeCommits": "true"}, temporary=True)
+          "skipChangeCommits": "true"}, temporary=True)
 def powerforms_incr():
-    max_adc_updt = get_max_adc_updt("4_prod.rde.rde_powerforms")
+      # CUTOVER: read the rebuilt shared table (element/response grain) instead of the
+      # deprecated CDE tables + the inline label join. mill_form_activity already carries
+      # resolved Form/Section/Element/Component labels, decoded Status, and ACTIVE_IND tombstones.
+      max_adc_updt = get_max_adc_updt("4_prod.rde.rde_powerforms")
+      pf = spark.table("4_prod.bronze.mill_form_activity").alias("PF")
+      encounter = dlt.read("rde_encounter").alias("Enc")
 
-    doc_response = spark.table("4_prod.raw.pi_cde_doc_response").alias("DOC")
-    encounter = dlt.read("rde_encounter").alias("Enc")
-    doc_ref = spark.table("3_lookup.dwh.pi_lkp_cde_doc_ref").alias("Dref")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("Cref")
+      # Encounter-scoped watermark (re-emit the full response set for any changed encounter so
+      # apply_changes sees the complete per-encounter set for upserts AND ACTIVE_IND=0 deletes).
+      filtered = pf.filter(col("ADC_UPDT") > max_adc_updt)
+      relevant_encounter_ids = filtered.select("ENCNTR_ID").distinct()
 
-    filtered_doc_response = doc_response.filter(col("ADC_UPDT") > max_adc_updt)
-    filtered_doc_ref = doc_ref.filter(col("ADC_UPDT") > max_adc_updt)
-    filtered_code_value_ref = code_value_ref.filter(col("ADC_UPDT") > max_adc_updt)
+      return (
+          pf
+          .join(relevant_encounter_ids, "ENCNTR_ID", "inner")
+          .join(encounter, "ENCNTR_ID", "inner")
+          .select(
+              col("Enc.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
+              col("Enc.NHS_Number").cast(StringType()).alias("NHS_Number"),
+              col("Enc.MRN").cast(StringType()).alias("MRN"),
+              col("Enc.ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
+              col("PF.PERFORMED_DT_TM").cast(StringType()).alias("PerformDate"),
+              col("PF.DOC_RESPONSE_KEY").cast(StringType()).alias("DOC_RESPONSE_KEY"),
+              col("PF.FORM_DESC_TXT").cast(StringType()).alias("Form"),
+              col("PF.FORM_EVENT_ID").cast(LongType()).alias("FormID"),
+              col("PF.SECTION_DESC_TXT").cast(StringType()).alias("Section"),
+              col("PF.SECTION_EVENT_ID").cast(LongType()).alias("SectionID"),
+              col("PF.ELEMENT_LABEL_TXT").cast(StringType()).alias("Element"),
+              col("PF.ELEMENT_EVENT_ID").cast(LongType()).alias("ElementID"),
+              col("PF.GRID_NAME_TXT").cast(StringType()).alias("Component"),
+              col("PF.GRID_COLUMN_DESC_TXT").cast(StringType()).alias("ComponentDesc"),
+              col("PF.GRID_EVENT_ID").cast(LongType()).alias("ComponentID"),
+              col("PF.RESPONSE_VALUE_TXT").cast(StringType()).alias("Response"),
+              # legacy 0/1 flag preserved verbatim (NOT the parsed value)
+              when(col("PF.RESPONSE_VALUE_TXT").cast("double").isNotNull(), lit(1)).otherwise(lit(0)).alias("ResponseNumeric"),
+              col("PF.STATUS").cast(StringType()).alias("Status"),
+              # carried for apply_as_deletes only; dropped from the target via except_column_list
+              col("PF.ACTIVE_IND").cast(IntegerType()).alias("ACTIVE_IND"),
+              greatest(col("PF.ADC_UPDT"), col("Enc.ADC_UPDT")).alias("ADC_UPDT")
+          )
+      )
 
-    relevant_encounter_ids = filtered_doc_response.select("ENCNTR_ID").distinct()
-
-    return (
-        doc_response
-        .join(relevant_encounter_ids, "ENCNTR_ID", "inner")
-        .join(encounter, "ENCNTR_ID", "inner")
-        .join(doc_ref, col("DOC.DOC_INPUT_ID") == col("Dref.DOC_INPUT_KEY"), "left")
-        .join(code_value_ref, col("DOC.FORM_STATUS_CD") == col("Cref.CODE_VALUE_CD"), "left")
-        .select(
-            col("Enc.PERSON_ID").cast(LongType()).alias("PERSON_ID"),
-            col("Enc.NHS_Number").cast(StringType()).alias("NHS_Number"),
-            col("Enc.MRN").cast(StringType()).alias("MRN"),
-            col("Enc.ENCNTR_ID").cast(LongType()).alias("ENCNTR_ID"),
-            col("DOC.PERFORMED_DT_TM").cast(StringType()).alias("PerformDate"),
-            col("DOC.DOC_RESPONSE_KEY").cast(StringType()).alias("DOC_RESPONSE_KEY"),
-            col("Dref.FORM_DESC_TXT").cast(StringType()).alias("Form"),
-            col("DOC.FORM_EVENT_ID").cast(LongType()).alias("FormID"),
-            col("Dref.SECTION_DESC_TXT").cast(StringType()).alias("Section"),
-            col("DOC.SECTION_EVENT_ID").cast(LongType()).alias("SectionID"),
-            col("Dref.ELEMENT_LABEL_TXT").cast(StringType()).alias("Element"),
-            col("DOC.ELEMENT_EVENT_ID").cast(LongType()).alias("ElementID"),
-            col("Dref.GRID_NAME_TXT").cast(StringType()).alias("Component"),
-            col("Dref.GRID_COLUMN_DESC_TXT").cast(StringType()).alias("ComponentDesc"),
-            col("DOC.GRID_EVENT_ID").cast(LongType()).alias("ComponentID"),
-            col("DOC.RESPONSE_VALUE_TXT").cast(StringType()).alias("Response"),
-            when(col("DOC.RESPONSE_VALUE_TXT").cast("double").isNotNull(), lit(1)).otherwise(lit(0)).alias("ResponseNumeric"),
-            col("Cref.CODE_DESC_TXT").cast(StringType()).alias("Status"),
-            greatest(col("DOC.ADC_UPDT"), col("Enc.ADC_UPDT"), col("Dref.ADC_UPDT"), col("Cref.ADC_UPDT")).alias("ADC_UPDT")
-        )
-    )
 
 @dlt.view(name="powerforms_update")
 def powerforms_update():
@@ -4024,14 +4249,14 @@ dlt.create_target_table(
 )
 
 dlt.apply_changes(
-    target = "rde_powerforms",
-    source = "powerforms_update",
-    keys = ["ENCNTR_ID", "DOC_RESPONSE_KEY"],
-    sequence_by = "ADC_UPDT",
-    apply_as_deletes = None,
-    except_column_list = [],
-    stored_as_scd_type = 1
-)
+      target = "rde_powerforms",
+      source = "powerforms_update",
+      keys = ["ENCNTR_ID", "DOC_RESPONSE_KEY"],
+      sequence_by = "ADC_UPDT",
+      apply_as_deletes = F.expr("ACTIVE_IND = 0"),     
+      except_column_list = ["ACTIVE_IND"],             
+      stored_as_scd_type = 1
+  )
 
 # COMMAND ----------
 
@@ -4058,7 +4283,7 @@ def mill_powertrials_incr():
 
     mill_pt_prot_reg = spark.table("4_prod.raw.mill_pt_prot_reg").alias("RES")
     mill_pt_prot_master = spark.table("4_prod.raw.mill_prot_master").alias("STUDYM")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref").alias("LOOK")
+    code_value_ref = _mill_code_lookup().alias("LOOK")
     patient_demographics = dlt.read("rde_patient_demographics").alias("PDEM")
 
     window_spec = Window.partitionBy("RES.PROT_MASTER_ID", "RES.PERSON_ID").orderBy(desc("RES.BEG_EFFECTIVE_DT_TM"))
@@ -4481,7 +4706,7 @@ def measurements_incr():
 
     clinical_event = spark.table("4_prod.raw.mill_clinical_event").filter(col("Trust") == "Barts").alias("cce")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     return (
         clinical_event.filter(col("VALID_UNTIL_DT_TM") > current_timestamp())
@@ -4841,7 +5066,7 @@ def medadmin_incr():
     order_ingredient = spark.table("4_prod.raw.mill_order_ingredient").alias("OI")
     order_catalog_synonym = spark.table("3_lookup.mill.mill_order_catalog_synonym").alias("OSYN")
     order_catalog = spark.table("3_lookup.mill.mill_order_catalog").alias("OCAT")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
 
     window_spec = Window.partitionBy("EVENT_ID").orderBy(desc("VALID_FROM_DT_TM"))
 
@@ -4996,7 +5221,7 @@ def pharmacyorders_incr():
 
     orders = spark.table("4_prod.raw.mill_orders").filter(col("Trust") == "Barts").alias("O")
     encounter = dlt.read("rde_encounter").alias("ENC")
-    code_value_ref = spark.table("3_lookup.dwh.pi_cde_code_value_ref")
+    code_value_ref = _mill_code_lookup()
     order_detail = spark.table("4_prod.raw.mill_order_detail").alias("OD")
     order_comment = spark.table("4_prod.raw.mill_order_comment").alias("COM")
     long_text = spark.table("4_prod.raw.mill_long_text").alias("LNG")

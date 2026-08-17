@@ -5,7 +5,7 @@
 # COMMAND ----------
 
 # Widgets
-dbutils.widgets.text("input_folder", "/Volumes/1_inland/sectra/vone/", "Input DICOM Folder")
+dbutils.widgets.text("input_folder", "/Volumes/1_inland/sectra/vone/Hackathon2/", "Input DICOM Folder")
 dbutils.widgets.text("ocr_log_table", "8_dev.pacs.image_ocr_text", "OCR Log Table")
 dbutils.widgets.text("preprocessing", "True", "OCR Preprocessing (True/False)")
 dbutils.widgets.text("min_text_length", "3", "Min OCR Text Length")
@@ -54,8 +54,8 @@ PADDING = int(dbutils.widgets.get("padding"))
 
 # Derive output folder with timestamp
 _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_FOLDER = f"/Volumes/8_dev/pacs/anon_images/{_run_ts}/"
-
+#OUTPUT_FOLDER = f"/Volumes/8_dev/pacs/anon_images/{_run_ts}/"
+OUTPUT_FOLDER = f"/Volumes/1_inland/evan_demo/misc/{_run_ts}/"
 print(f"Input folder:  {INPUT_FOLDER}")
 print(f"Output folder: {OUTPUT_FOLDER}")
 print(f"OCR log table: {OCR_LOG_TABLE}")
@@ -974,3 +974,7 @@ print(f"  Text regions:      {stats['text_regions']}")
 print(f"  Redacted regions:  {stats['redacted_regions']}")
 print(f"  OCR log table:     {OCR_LOG_TABLE}")
 print("=" * 60)
+
+# COMMAND ----------
+
+

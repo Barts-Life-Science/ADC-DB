@@ -144,19 +144,21 @@
 # MAGIC );
 # MAGIC
 # MAGIC INSERT INTO 5_projects.dac003_breastonestop.breast_patient_opa_list_202406
-# MAGIC SELECT
-# MAGIC   ce.person_id,
-# MAGIC   'MILL_SCH_APPT',
-# MAGIC   NULL,
-# MAGIC   NULL,
-# MAGIC   COALESCE(ce.EVENT_START_DT_TM, ce.EVENT_END_DT_TM),
-# MAGIC   ce.EVENT_CD
-# MAGIC FROM 4_prod.raw.mill_sch_appt AS sa 
-# MAGIC INNER JOIN 4_prod.raw.mill_clinical_event AS ce 
-# MAGIC ON ce.EVENT_ID = sa.SCH_EVENT_ID
-# MAGIC WHERE 
-# MAGIC   sa.DESCRIPTION ILIKE '%breast%'
-# MAGIC   AND COALESCE(ce.EVENT_START_DT_TM, ce.EVENT_END_DT_TM) BETWEEN '2010-01-01' AND '2024-01-25';
+# MAGIC   SELECT
+# MAGIC     e.PERSON_ID,
+# MAGIC     'MILL_SCH_APPT',
+# MAGIC     CAST(sa.SCH_APPT_ID AS STRING),
+# MAGIC     'SCH_APPT_ID',
+# MAGIC     COALESCE(sa.BEG_DT_TM, sa.END_DT_TM),
+# MAGIC     NULL
+# MAGIC   FROM 4_prod.raw.mill_sch_appt AS sa
+# MAGIC   INNER JOIN 4_prod.raw.mill_encounter AS e
+# MAGIC     ON e.ENCNTR_ID = sa.ENCNTR_ID
+# MAGIC   WHERE
+# MAGIC     sa.DESCRIPTION ILIKE '%breast%'
+# MAGIC     AND sa.ENCNTR_ID IS NOT NULL AND sa.ENCNTR_ID <> 0
+# MAGIC     AND COALESCE(sa.BEG_DT_TM, sa.END_DT_TM) >= '2010-01-01'
+# MAGIC     AND COALESCE(sa.BEG_DT_TM, sa.END_DT_TM) <= current_timestamp();
 # MAGIC
 # MAGIC
 
@@ -265,7 +267,7 @@
 # MAGIC SELECT 
 # MAGIC     COUNT(DISTINCT PERSON_ID) AS person_count
 # MAGIC FROM 5_projects.dac003_breastonestop.breast_patient_list_202406
-# MAGIC WHERE src_event_dt_tm BETWEEN '2010-01-01' AND '2024-01-25'
+# MAGIC WHERE src_event_dt_tm >= '2010-01-01'
 # MAGIC
 
 # COMMAND ----------
@@ -274,7 +276,9 @@
 
 project_identifier = 'dac003'
 
-rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_blobdataset', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology']
+rde_tables = ['rde_aliases', 'rde_all_procedures', 'rde_blobdataset', 'rde_all_diagnosis', 'rde_allergydetails', 'rde_apc_diagnosis', 'rde_apc_opcs', 'rde_ariapharmacy', 'rde_blobdataset', 'rde_cds_apc', 'rde_cds_opa', 'rde_critactivity', 'rde_critopcs', 'rde_critperiod', 'rde_emergencyd', 'rde_encounter', 'rde_family_history', 'rde_iqemo', 'rde_measurements', 'rde_medadmin', 'rde_op_diagnosis', 'rde_opa_opcs', 'rde_pathology', 'rde_patient_demographics', 'rde_pc_diagnosis', 'rde_pc_problems', 'rde_pc_procedures', 'rde_pharmacyorders', 'rde_radiology', 'rde_raw_pathology', 'rde_scr_careplan', 'rde_scr_deftreatment', 'rde_scr_demographics', 'rde_scr_diagnosis', 'rde_scr_investigations', 'rde_scr_pathology', 'rde_scr_referrals', 'rde_scr_trackingcomments',
+'rde_mat_nnu_episodes', 'rde_mat_nnu_exam', 'rde_mat_nnu_nccmds', 'rde_measurements', 'rde_medadmin', 'rde_mill_powertrials', 'rde_msds_booking', 'rde_msds_carecontact', 'rde_msds_delivery', 'rde_msds_diagnosis',
+'rde_powerforms',]
 
 map_tables = ['map_address']
 
@@ -285,32 +289,23 @@ columns_to_exclude = ['ADC_UPDT', 'full_street_address', 'UPRN', 'LATITUDE', 'LO
 cohort_sql = f"""
 CREATE OR REPLACE VIEW 6_mgmt.cohorts.dac003 AS
 WITH cte AS (
+      -- Extracted from MILL_SCH_APPT (instead of PI_CDE_OP_ATTENDANCE)
+      SELECT DISTINCT PERSON_ID
+      FROM 5_projects.dac003_breastonestop.breast_patient_opa_list_202406
+      WHERE src_event_dt_tm >= '2010-01-01'
+      UNION
+      -- Extracted from MILL_DIR_DIAGNOSIS, MILL_DIR_PROCEDURE
+      SELECT DISTINCT PERSON_ID
+      FROM 5_projects.dac003_breastonestop.breast_patient_list_202406
+      WHERE src_event_dt_tm >= '2010-01-01'
+      UNION
+      -- Extracted from MILL_DIR_ORDERS
+      SELECT DISTINCT PERSON_ID
+      FROM 5_projects.dac003_breastonestop.breast_patient_order_list_202406
+      WHERE order_dt_tm >= '2010-01-01'
+  )
+  SELECT DISTINCT PERSON_ID FROM cte;
 
-    -- Extracted from MILL_SCH_APPT (instead of PI_CDE_OP_ATTENDANCE)
-    SELECT DISTINCT PERSON_ID
-    FROM 5_projects.dac003_breastonestop.breast_patient_opa_list_202406
-    WHERE src_event_dt_tm BETWEEN '2010-01-01' AND '2024-01-25'
-
-    UNION
-
-    -- Extracted from MILL_DIR_DIAGNOSIS, MILL_DIR_PROCEDURE
-    SELECT DISTINCT PERSON_ID
-    FROM 5_projects.dac003_breastonestop.breast_patient_list_202406
-    WHERE src_event_dt_tm BETWEEN '2010-01-01' AND '2024-01-25'
-
-    UNION
-
-    -- Extracted from MILL_DIR_ORDERS
-    SELECT DISTINCT PERSON_ID
-    FROM 5_projects.dac003_breastonestop.breast_patient_order_list_202406
-    WHERE order_dt_tm BETWEEN '2010-01-01' AND '2024-01-25'
-
-
-
-
-)
-SELECT DISTINCT PERSON_ID
-FROM cte;
 """
 spark.sql(cohort_sql)
 
