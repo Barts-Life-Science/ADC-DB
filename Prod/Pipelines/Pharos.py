@@ -12,6 +12,7 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import *
 from pyspark.sql import functions as F
 from functools import reduce
+from pyspark.sql import SparkSession
 
 # COMMAND ----------
 
@@ -525,6 +526,85 @@ def update_table(source_df, target_table: str, index_columns,
 
 # COMMAND ----------
 
+
+# Sex lookup
+sex = [
+    (362.0, "001 - Female", "248152002", "Female (finding)"),
+    (363.0, "002 - Male", "248153007", "Male (finding)")
+]
+
+sex_lookup = spark.createDataFrame(
+    sex,
+    [
+        "gender_cd",
+        "sex",
+        "sex_snomed_code",
+        "sex_snomed_term"
+    ]
+)
+
+# Ethnicity lookup
+ethnicity = [
+    (3767643, "010 - White", "011 White - British", "976631000000101", "White: English or Welsh or Scottish or Northern Irish or British - England and Wales ethnic category 2011 census (finding)"),
+    (3767645, "010 - White", "012 White - Irish", "976651000000108", "White: Irish - England and Wales ethnic category 2011 census (finding)"),
+    (3767650, "010 - White", "013 White - White Other", "976691000000100", "White: any other White background - England and Wales ethnic category 2011 census (finding)"),
+
+    (3767654, "020 - Mixed", "021 Mixed - White and Black Caribbean", "976711000000103", "Mixed multiple ethnic groups: White and Black Caribbean - England and Wales ethnic category 2011 census (finding)"),
+    (3767653, "020 - Mixed", "022 Mixed - White and Black African", "976731000000106", "Mixed multiple ethnic groups: White and Black African - England and Wales ethnic category 2011 census (finding)"),
+    (3767652, "020 - Mixed", "023 Mixed - White and Asian", "976751000000104", "Mixed multiple ethnic groups: White and Asian - England and Wales ethnic category 2011 census (finding)"),
+    (3767649, "020 - Mixed", "024 Mixed - Other", "976771000000108", "Mixed multiple ethnic groups: any other mixed or multiple ethnic background - England and Wales ethnic category 2011 census (finding)"),
+
+    (3767644, "030 - Asian", "031 Asian - Indian", "976791000000107", "Asian or Asian British: Indian - England and Wales ethnic category 2011 census (finding)"),
+    (3767651, "030 - Asian", "032 Asian - Pakistani", "976811000000108", "Asian or Asian British: Pakistani - England and Wales ethnic category 2011 census (finding)"),
+    (3767640, "030 - Asian", "033 Asian - Bangladeshi", "976831000000100", "Asian or Asian British: Bangladeshi - England and Wales ethnic category 2011 census (finding)"),
+    (3767647, "030 - Asian", "034 Asian - Other", "976871000000103", "Asian or Asian British: any other Asian background - England and Wales ethnic category 2011 census (finding)"),
+
+    (3767641, "040 - Black", "041 Black - Caribbean", "976911000000101", "Black or African or Caribbean or Black British: Caribbean - England and Wales ethnic category 2011 census (finding)"),
+    (3767638, "040 - Black", "042 Black - African", "976891000000104", "Black or African or Caribbean or Black British: African - England and Wales ethnic category 2011 census (finding)"),
+    (3767648, "040 - Black", "043 Black - Other", "976931000000109", "Black or African or Caribbean or Black British: other Black or African or Caribbean background - England and Wales ethnic category 2011 census (finding)"),
+
+    (3767642, "050 - Other", "051 Other - Chinese", "976851000000107", "Asian or Asian British: Chinese - England and Wales ethnic category 2011 census (finding)"),
+    (3767639, "050 - Other", "054 Other", "976971000000106", "Other ethnic group: any other ethnic group - England and Wales ethnic category 2011 census (finding)"),
+    (312508,  "050 - Other", "054 Other", "976971000000106", "Other ethnic group: any other ethnic group - England and Wales ethnic category 2011 census (finding)"),
+
+    (0,       "G09 - Unknown", "G09 Unknown", None, None),
+    (3767646, "G09 - Unknown", "G09 Unknown", None, None)
+]
+
+ethnicity_lookup = spark.createDataFrame(
+    ethnicity,
+    [
+        "ethnicity_cd",
+        "ethnicity",
+        "ethnic_group",
+        "ethnic_group_snomed_code",
+        "ethnic_group_snomed_term"
+    ]
+)
+imaging_type = [
+    ("000 - Mammogram", 71651007, "Mammography (procedure)"),
+    ("001 - Ultrasound", 16310003, "Ultrasonography (procedure)"),
+    ("002 - PET", 82918005, "Positron emission tomography (procedure)"),
+    ("003 - CT",  77477000, "Computed tomography (procedure)"),
+    ("004 - MRI", 113091000, "Computed tomography (procedure)"),
+    # This needs rechecking. The tomosythesis has more detailed types based on the cites.
+    ("005 - Tomosynthesis", 1771571000000102,"Digital tomosynthesis of chest (procedure)"),
+    ("006 - X-ray", 168537006, "Plain X-ray (procedure)"),
+    ("007 - Nuclear medicine (NM)", "371572003", "Nuclear medicine procedure (procedure)"),
+    ("G09 - Unknown", None, None)
+]
+imaging_type_lookup = spark.createDataFrame(
+    imaging_type,
+    [
+    "imaging_type",
+    "imaging_type_snomed_code",
+    "imaging_type_snomed_term"
+    ]
+)
+
+
+# COMMAND ----------
+
 pharos_person_comment = """
 The table contains demographic information about patients, including identifiers
 such as person ID, gender, birth year, and ethnicity.
@@ -574,6 +654,18 @@ schema_pharos_person = StructType([
         metadata={"comment": "Sex at birth."}
     ),
     StructField(
+        name="sex_snomed_code",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code mapped to sex category."}
+    ),
+    StructField(
+        name="sex_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term mapped to the sex category."}
+    ),
+    StructField(
         name="ethnicity",
         dataType=StringType(),
         nullable=True,
@@ -584,6 +676,18 @@ schema_pharos_person = StructType([
         dataType=StringType(),
         nullable=True,
         metadata={"comment": "Ethnicity category (granular group)."}
+    ),
+    StructField(
+        name="ethnic_group_snomed_code",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code mapped to ethnicity category."}
+    ),
+    StructField(
+        name="ethnic_group_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term mapped to the ethnicity category."}
     ),
     StructField(
         name="ADC_UPDT",
@@ -721,6 +825,12 @@ def create_pharos_person_incr():
             col("p.person_id") == col("s.PERSON_ID"),
             "inner"
         )
+        .join(
+            sex_lookup, on = "gender_cd", how = "left"
+        )
+        .join(
+            ethnicity_lookup, on = "ethnicity_cd", how = "left"
+        )
         .select(
             col("p.person_id").cast(LongType()).alias("person_id"),
             lit(None).cast(StringType()).alias("pharosid"),
@@ -729,8 +839,12 @@ def create_pharos_person_incr():
             lit(None).cast(StringType()).alias("site"),
             col("p.birth_year").cast(IntegerType()).alias("yob"),
             col("p.sex").cast(StringType()).alias("sex"),
+            col("sex_snomed_code"),
+            col("sex_snomed_term"),
             col("p.ethnicity").cast(StringType()).alias("ethnicity"),
             col("p.ethnic_group").cast(StringType()).alias("ethnic_group"),
+            col("ethnic_group_snomed_code"),
+            col("ethnic_group_snomed_term"),
             col("p.ADC_UPDT"),
             current_timestamp().alias("date_checked"),
             current_timestamp().alias("created_at"),
@@ -1068,6 +1182,18 @@ schema_pharos_medical_history = StructType([
         metadata={"comment": "Recorded menopausal status at time of first diagnosis."}
     ),
     StructField(
+        name="menopausal_snomed_code",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code corresponding to the recorded menopausal status."}
+    ),
+    StructField(
+        name="menopausal_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term corresponding to the recorded menopausal status."}
+    ),
+    StructField(
         name="menopause_age",
         dataType=IntegerType(),
         nullable=True,
@@ -1146,10 +1272,34 @@ schema_pharos_medical_history = StructType([
         metadata={"comment": "Number of years smoked."}
     ),
     StructField(
+        name="smoke_snomed_code",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code corresponding to the smoking status."}
+    ),
+    StructField(
+        name="smoke_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term corresponding to the smoking status."}
+    ),
+    StructField(
         name="vape",
         dataType=StringType(),
         nullable=True,
         metadata={"comment": "E-cigarettes used at time of diagnosis."}
+    ),
+    StructField(
+        name="vape_snomed_code",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code corresponding to the vaping status."}
+    ),
+    StructField(
+        name="vape_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term corresponding to the vaping status."}
     ),
     StructField(
         name="alcohol",
@@ -1162,6 +1312,18 @@ schema_pharos_medical_history = StructType([
         dataType=FloatType(),
         nullable=True,
         metadata={"comment": "Units per week.  If a range is given, then the highest number is recorded."}
+    ),
+    StructField(
+        name="alcohol_snomed_code",
+        dataType=IntegerType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code corresponding to the alcohol use."}
+    ),
+    StructField(
+        name="alcohol_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term corresponding to the alcohol use."}
     ),
     StructField(
         name="drug",
@@ -1292,10 +1454,10 @@ def create_medical_history_incr():
 
     comb_prob_diag = (
         problem
-        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
+        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "SNOMED_TERM","ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
         .unionByName(
             diagnosis
-            .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
+            .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "SNOMED_TERM", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
         .dropDuplicates()
     ).alias("c")
 
@@ -1341,7 +1503,7 @@ def create_medical_history_incr():
         comb_prob_diag
         .join(family_history, ["PERSON_ID"], "left")
         .withColumn(
-            "familyhistory_bca_flag",
+            "familyhistory_bca",
             when(
                 # ICD-10 Z803: Family history of malignant neoplasm of breast
                 (col("c.ICD10_CODE").like("Z803")) |
@@ -1354,29 +1516,23 @@ def create_medical_history_incr():
                 (col("c.OMOP_CONCEPT_ID") == 4209112), "G00 - No")
         )
         .withColumn(
-            "familyhistory_ovarian_flag",
+            "familyhistory_ovarian",
             ## OMOP concept_ids containing for family history ovarian cancer
             when(col("c.OMOP_CONCEPT_ID").isin(4326681, 37117109, 37109210), "G01 - Yes")
             # Concept_id for No family history of ovarian cancer: 44804658
             .when(col("c.OMOP_CONCEPT_ID") == 44804658, "G00 - No")
         )
         .withColumn(
-            "familyhistory_cancer_flag",
+            "familyhistory_cancer",
             when(
                 (col("c.OMOP_CONCEPT_ID").isin(family_history_add_ids)) |
                 (col("c.ICD10_CODE").like("Z80%")) |
                 (col("f.ICD10_CODE").rlike("^[CD]")) |
-                (col("familyhistory_bca_flag") == "1 Breast") |
-                (col("familyhistory_ovarian_flag") == "1 Ovarian"),
+                (col("familyhistory_bca") == "1 Breast") |
+                (col("familyhistory_ovarian") == "1 Ovarian"),
                 "G01 - Yes"
             ).otherwise("G09 - Unknown")
         )
-        .groupBy("PERSON_ID")
-        .agg(
-            F.max("familyhistory_bca_flag").alias("familyhistory_bca"),
-            F.max("familyhistory_ovarian_flag").alias("familyhistory_ovarian"),
-            F.min("familyhistory_cancer_flag").alias("familyhistory_cancer")
-            )
     )
         # Restrict lifestyle and biometric features to the peri-diagnostic period. # Window: [Diagnosis - 1 year] to [Diagnosis + 7 days].
 
@@ -1522,6 +1678,34 @@ def create_medical_history_incr():
         "253490011",  # Suspected abuse hard drugs
     ]
 
+    smoke_cond = col("SOURCE_IDENTIFIER").isin(
+        never_smoker +
+        non_smoker +
+        current_smoker +
+        past_smoker +
+        smoking_unknown_usage
+    )
+
+    vape_cond = (
+        col("SOURCE_IDENTIFIER").isin(
+            current_vaper + vaping_usage_unknown
+        ) |
+        (col("SOURCE_IDENTIFIER") == "5169692013")
+    )
+
+    alcohol_cond = (
+        col("SOURCE_IDENTIFIER").isin(
+            non_alcoholic + alcoholic
+        ) |
+        (col("SOURCE_IDENTIFIER") == "2988881016")
+    )
+
+    drug_cond = col("SOURCE_IDENTIFIER").isin(
+        recreational_drug_use +
+        drug_abuse
+    )
+
+
     smoke_alcohol_drug = (
         comb_prob_diag
         .join(check_date_range, ["PERSON_ID"], "left")
@@ -1552,6 +1736,8 @@ def create_medical_history_incr():
                 "004 - Yes, unknown usage"
             )
         )
+        .withColumn("smoke_snomed_code", when(smoke_cond, col("SNOMED_CODE")))
+        .withColumn("smoke_snomed_term", when(smoke_cond, col("SNOMED_TERM")))
 
         # VAPING ----------------
         .withColumn(
@@ -1564,6 +1750,8 @@ def create_medical_history_incr():
                     "004 - Yes, unknown usage"
             )
         )
+        .withColumn("vape_snomed_code", when(vape_cond, col("SNOMED_CODE")))
+        .withColumn("vape_snomed_term", when(vape_cond, col("SNOMED_TERM")))
 
         # ALCOHOL ----------------
         .withColumn(
@@ -1582,6 +1770,8 @@ def create_medical_history_incr():
                 "002 - Drinks alcohol - Regularly"
             )
         )
+        .withColumn("alcohol_snomed_code", when(alcohol_cond, col("SNOMED_CODE")))
+        .withColumn("alcohol_snomed_term", when(alcohol_cond, col("SNOMED_TERM")))
 
         # DRUGS ----------------
         .withColumn(
@@ -1591,17 +1781,69 @@ def create_medical_history_incr():
             .when(col("SOURCE_IDENTIFIER").isin(drug_abuse),
             "002 Yes - Abuses drugs")
         )
+        .withColumn("drug_snomed_code", when(drug_cond, col("SNOMED_CODE")))
+        .withColumn("drug_snomed_term", when(drug_cond, col("SNOMED_TERM")))
     )
+
     smoke_alcohol_drug = (
         smoke_alcohol_drug
         .groupBy("PERSON_ID")
         .agg(
-            F.max("smoking").alias("smoking"),
-            F.max("vape").alias("vape"),
-            F.max("alcohol").alias("alcohol"),
-            F.max("drug").alias("drug")
+            F.max_by(
+                F.struct(
+                    "smoking",
+                    "smoke_snomed_code",
+                    "smoke_snomed_term"
+                ),
+                F.when(F.col("smoking").isNotNull(), F.col("condition_date"))
+            ).alias("smoke"),
+
+            F.max_by(
+                F.struct(
+                    "vape",
+                    "vape_snomed_code",
+                    "vape_snomed_term"
+                ),
+                F.when(F.col("vape").isNotNull(), F.col("condition_date"))
+            ).alias("vape_rec"),
+
+            F.max_by(
+                F.struct(
+                    "alcohol",
+                    "alcohol_snomed_code",
+                    "alcohol_snomed_term"
+                ),
+                F.when(F.col("alcohol").isNotNull(), F.col("condition_date"))
+            ).alias("alcohol_rec"),
+
+            F.max_by(
+                F.struct(
+                    "drug",
+                    "drug_snomed_code",
+                    "drug_snomed_term"
+                ),
+                F.when(F.col("drug").isNotNull(), F.col("condition_date"))
+            ).alias("drug_rec")
         )
-        # Fill missing values with "9 Unknown" only where there is no data
+        .select(
+            "PERSON_ID",
+
+            F.col("smoke.smoking").alias("smoking"),
+            F.col("smoke.smoke_snomed_code").alias("smoke_snomed_code"),
+            F.col("smoke.smoke_snomed_term").alias("smoke_snomed_term"),
+
+            F.col("vape_rec.vape").alias("vape"),
+            F.col("vape_rec.vape_snomed_code").alias("vape_snomed_code"),
+            F.col("vape_rec.vape_snomed_term").alias("vape_snomed_term"),
+
+            F.col("alcohol_rec.alcohol").alias("alcohol"),
+            F.col("alcohol_rec.alcohol_snomed_code").alias("alcohol_snomed_code"),
+            F.col("alcohol_rec.alcohol_snomed_term").alias("alcohol_snomed_term"),
+
+            F.col("drug_rec.drug").alias("drug"),
+            F.col("drug_rec.drug_snomed_code").alias("drug_snomed_code"),
+            F.col("drug_rec.drug_snomed_term").alias("drug_snomed_term"),
+        )
         .fillna({
             "smoking": "G09 Unknown",
             "vape": "G09 Unknown",
@@ -1609,7 +1851,6 @@ def create_medical_history_incr():
             "drug": "G09 Unknown"
         })
     )
-
     # MENOPAUSE ----------------
 
     pre_menop = ["Before menopause", "Premenopausal state", "Excessive bleeding in the premenopausal period"]
@@ -1651,13 +1892,52 @@ def create_medical_history_incr():
         .filter(col("condition_date") <= col("brc_diag_date"))
         .withColumn(
             "menopausal_status_flag",
-            when(col("sex") == "M", "G04 - Not applicable")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(pre_menop_lower), "001 - Pre-menopausal")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(peri_menop_lower), "002 - Peri-menopausal")
-            .when(lower(trim(col("SOURCE_STRING"))).isin(post_menop_lower), "003 - Post-menopausal")
+            when(
+                lower(trim(col("SOURCE_STRING"))).isin(pre_menop_lower),
+                "001 - Pre-menopausal"
+            )
+            .when(
+                lower(trim(col("SOURCE_STRING"))).isin(peri_menop_lower),
+                "002 - Peri-menopausal"
+            )
+            .when(
+                lower(trim(col("SOURCE_STRING"))).isin(post_menop_lower),
+                "003 - Post-menopausal"
+            )
         )
-        .groupBy(col("b.PERSON_ID"))
-        .agg(max("menopausal_status_flag").alias("menopausal_status"))
+        .withColumn(
+            "menopausal_snomed_code",
+            when(
+                col("menopausal_status_flag").isNotNull(),
+                col("SNOMED_CODE")
+            )
+        )
+        .withColumn(
+            "menopausal_snomed_term",
+            when(
+                col("menopausal_status_flag").isNotNull(),
+                col("SNOMED_TERM")
+            )
+        )
+        .dropDuplicates()
+        .filter(col("menopausal_status_flag").isNotNull())
+        .groupBy(col("b.PERSON_ID").alias("PERSON_ID"))
+        .agg(
+            max_by(
+                struct(
+                    "menopausal_status_flag",
+                    "menopausal_snomed_code",
+                    "menopausal_snomed_term"
+                ),
+                col("condition_date")
+            ).alias("menopausal_status")
+        )
+        .select(
+            "PERSON_ID",
+            col("menopausal_status.menopausal_status_flag").alias("menopausal_status"),
+            col("menopausal_status.menopausal_snomed_code").alias("menopausal_snomed_code"),
+            col("menopausal_status.menopausal_snomed_term").alias("menopausal_snomed_term")
+        )
     )
 
     processed_numeric_events = (
@@ -1843,6 +2123,8 @@ def create_medical_history_incr():
             lit(None).cast(StringType()).alias("rad51d"),
             lit(None).cast(StringType()).alias("genetic_testing_details"),
             col("menopausal_status").cast(StringType()),
+            col("menopausal_snomed_code").cast(IntegerType()),
+            col("menopausal_snomed_term").cast(StringType()),
             lit(None).cast(IntegerType()).alias("menopause_age"),
             lit(None).cast(StringType()).alias("inferred_menopausal_status"),
             lit(None).cast(StringType()).alias("hrt"),
@@ -1855,10 +2137,16 @@ def create_medical_history_incr():
             col("bmi").cast(FloatType()).alias("bmi_diagnosis"),
             col("smoking").cast(StringType()),
             col("smoking_no").cast(FloatType()),
+            col("smoke_snomed_code").cast(IntegerType()),
+            col("smoke_snomed_term").cast(StringType()),
             lit(None).cast(IntegerType()).alias("smoking_years"),
             col("vape").cast(StringType()),
+            col("vape_snomed_code").cast(IntegerType()),
+            col("vape_snomed_term").cast(StringType()),
             col("alcohol").cast(StringType()),
             col("alcohol_no").cast(FloatType()),
+            col("alcohol_snomed_code").cast(IntegerType()),
+            col("alcohol_snomed_term").cast(StringType()),
             col("drug").cast(StringType()),
             lit(None).cast(StringType()).alias("drug_details"),
             lit(None).cast(StringType()).alias("performance_diagnosis"),
@@ -1920,6 +2208,18 @@ schema_pharos_fh = StructType([
         metadata={"comment": "Type of cancer in family member."}
     ),
     StructField(
+        name="cancer_type_snomed_code",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code for the type of family cancer history."}
+    ),
+    StructField(
+        name="cancer_type_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term for the type of family cancer history."}
+    ),
+    StructField(
         name="relation_degree",
         dataType=StringType(),
         nullable=True,
@@ -1930,6 +2230,12 @@ schema_pharos_fh = StructType([
         dataType=StringType(),
         nullable=True,
         metadata={"comment": "Specific relation (e.g. Mother, Sister, Aunt)."}
+    ),
+    StructField(
+        name="ADC_UPDT",
+        dataType=TimestampType(),
+        nullable=True,
+        metadata={"comment": "Max source ADC_UPDT for incremental watermarking."}
     ),
     StructField(
         name="date_checked",
@@ -1984,11 +2290,12 @@ def create_fh_incr():
 
     comb_prob_diag = (
     map_problem
-    .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
+    .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "SNOMED_TERM", "ICD10_CODE", col("ONSET_DT_TM").alias("condition_date"))
     .unionByName(
         map_diagnosis
-        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
+        .select("PERSON_ID", "SOURCE_STRING", "SOURCE_IDENTIFIER", "OMOP_CONCEPT_ID", "SNOMED_CODE", "SNOMED_TERM", "ICD10_CODE", col("DIAG_DT_TM").alias("condition_date")))
     .dropDuplicates())
+
     # Get data from map_family_history
 
     cancer_type = (
@@ -2071,7 +2378,21 @@ def create_fh_incr():
             .otherwise("G09 - Unknown")
         )
         .withColumn("cancer_type", cancer_type)
-        .select("PERSON_ID", "relation_degree", col("RELATION_DESC").alias("relation_detail"),"cancer_type", "_src_adc_updt")
+        .withColumn(
+            "cancer_type_snomed_code",
+            when(
+                col("cancer_type").isNotNull(),
+                col("SNOMED_CODE")
+            )
+        )
+        .withColumn(
+            "cancer_type_snomed_term",
+            when(
+                col("cancer_type").isNotNull(),
+                col("SNOMED_TERM")
+            )
+        )
+        .select("PERSON_ID", "relation_degree", col("RELATION_DESC").alias("relation_detail"),"cancer_type", "cancer_type_snomed_code", "cancer_type_snomed_term","_src_adc_updt")
     )
 
 
@@ -2194,13 +2515,27 @@ def create_fh_incr():
         )
         .filter(col("cancer_type").isNotNull())
         .withColumn(
+            "cancer_type_snomed_code",
+            when(
+                col("cancer_type").isNotNull(),
+                col("SNOMED_CODE")
+            )
+        )
+        .withColumn(
+            "cancer_type_snomed_term",
+            when(
+                col("cancer_type").isNotNull(),
+                col("SNOMED_TERM")
+            )
+        )
+        .withColumn(
             "relation_degree",
             when(col("OMOP_CONCEPT_ID").isin(3078338013, 46270135, 4328583, 37117109), "001 - 1st degree")
             .when(col("OMOP_CONCEPT_ID").isin(35624517, 46270130, 37109210), "002 - 2nd degree")
             .otherwise("G09 - Unknown")
         )
         .withColumn("relation_detail", F.lit(None))
-        .select("PERSON_ID", "relation_degree", "relation_detail","cancer_type","_src_adc_updt")
+        .select("PERSON_ID", "relation_degree", "relation_detail","cancer_type","cancer_type_snomed_code","cancer_type_snomed_term","_src_adc_updt")
     )
     # Combine the two data source together
     combined_family_history = (
@@ -2241,6 +2576,8 @@ def create_fh_incr():
             lit(None).alias("clinical_record_id"),
             col("PERSON_ID").alias("person_id"),
             col("cancer_type"),
+            col("cancer_type_snomed_code"),
+            col("cancer_type_snomed_term"),
             col("relation_degree"),
             col("relation_detail"),
             col("_src_adc_updt").alias("ADC_UPDT"),
@@ -2575,6 +2912,18 @@ schema_pharos_imaging = StructType([
         {"comment": "Type of diagnostic imaging"}
     ),
     StructField(
+        "imaging_type_snomed_code",
+        IntegerType(),
+        True,
+        {"comment": "SNOMED CT code for the diagnostic imaging"}
+    ),
+    StructField(
+        "imaging_type_snomed_term",
+        StringType(),
+        True,
+        {"comment": "SNOMED CT term for the diagnostic imaging"}
+    ),
+    StructField(
         "image_status",
         StringType(),
         True,
@@ -2730,19 +3079,24 @@ def create_pharos_imaging_incr():
             .when(lower(col("ExaminationModality")).rlike("nm"), "007 - Nuclear medicine (NM)")
             .otherwise("G09 - Unknown")
         )
-        .select(col("PERSON_ID").alias("person_id"), col("MillEventDate").alias("image_date"), "days_diagnosis_imaging", "imaging_type", col("ExaminationBodyPart").alias("image_site"), col("_src_adc_updt"))
+        .join(imaging_type_lookup, "imaging_type", "left")
+        .select(col("PERSON_ID").alias("person_id"), col("MillEventDate").alias("image_date"), "days_diagnosis_imaging", "imaging_type", "imaging_type_snomed_code", "imaging_type_snomed_term", col("ExaminationBodyPart").alias("image_site"), col("_src_adc_updt"))
         .dropDuplicates()
     )
 
     final_df = (
         imaging
         .select(
+            lit(None).alias("imaging_id").cast(LongType()),
             col("person_id").cast(LongType()),
             col("image_date").cast(DateType()),
+            lit(None).alias("imaging_session_id").cast(StringType()),
             lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
             col("days_diagnosis_imaging").cast(IntegerType()),
             col("imaging_type").cast(StringType()),
+            col("imaging_type_snomed_code").cast(IntegerType()),
+            col("imaging_type_snomed_term").cast(StringType()),
             lit(None).alias("image_status").cast(StringType()),
             col("image_site").cast(StringType()),
             lit(None).alias("image_contrast").cast(StringType()),
@@ -2751,7 +3105,7 @@ def create_pharos_imaging_incr():
             lit(None).alias("breast_density").cast(StringType()),
             lit(None).alias("acr_score").cast(StringType()),
             lit(None).alias("rcr_score").cast(StringType()),
-            lit(None).alias("index_lesion_size").cast(StringType()),
+            lit(None).alias("index_lesion_size").cast(IntegerType()),
             lit(None).alias("index_lesion_quadrant").cast(StringType()),
             lit(None).alias("index_lesion_distance").cast(FloatType()),
             lit(None).alias("index_lesion_laterality").cast(StringType()),
@@ -3014,6 +3368,18 @@ schema_pharos_pathology = StructType([
         metadata={"comment": "Type: Mastectomy, WLE, Excision, Biopsy, etc.)"}
     ),
     StructField(
+        "breast_procedure_snomed_code",
+        LongType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code for the breast procedure."}
+    ),
+    StructField(
+        "breast_procedure_snomed_term",
+        StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term for the breast procedure."}
+    ),
+    StructField(
         "somatic_mutations",
         StringType(),
         nullable=True,
@@ -3222,10 +3588,12 @@ def create_pharos_pathology_incr():
                         "B329"   # Unspecified biopsy of breast
                         ), "015 - Biopsy Other")
         )
+        .withColumn("breast_procedure_snomed_code", when(col("breast_procedure").isNotNull(), col("SNOMED_CODE")))
+        .withColumn("breast_procedure_snomed_term", when(col("breast_procedure").isNotNull(), col("SNOMED_TERM")))
         .withColumn("days_diagnosis_surgery", datediff(col("PROC_DT_TM"), col("brc_diag_date")))
         .withColumn("age_at_surgery",year(col("PROC_DT_TM")) - col("birth_year"))
         # .filter(col("breast_procedure").isNotNull())
-        .select(col("PERSON_ID").alias("person_id"), col("PROC_DT_TM").alias("surgery_date"),"age_at_surgery","days_diagnosis_surgery","breast_procedure", "_src_adc_updt")
+        .select(col("PERSON_ID").alias("person_id"), col("PROC_DT_TM").alias("surgery_date"),"age_at_surgery","days_diagnosis_surgery","breast_procedure","breast_procedure_snomed_code","breast_procedure_snomed_term", "_src_adc_updt")
         .dropDuplicates()
     )
 
@@ -3243,6 +3611,8 @@ def create_pharos_pathology_incr():
             col("age_at_surgery").cast(IntegerType()),
             col("days_diagnosis_surgery").cast(IntegerType()),
             col("breast_procedure").cast(StringType()),
+            col("breast_procedure_snomed_code").cast(LongType()),
+            col("breast_procedure_snomed_term").cast(StringType()),
             lit(None).cast(StringType()).alias("somatic_mutations"),
             lit(None).cast(StringType()).alias("somatic_mutations_how_detected"),
             lit(None).cast(StringType()).alias("nodal_procedure"),
@@ -3557,6 +3927,18 @@ schema_pharos_treatment = StructType([
         metadata={"comment": "Type of treatment given"}
     ),
     StructField(
+        "treatment_type_snomed_code", 
+        LongType(), 
+        nullable=True, 
+        metadata={"comment": "SNOMED CT code for the type of treatment given"}
+    ),
+    StructField(
+        "treatment_type_snomed_term", 
+        StringType(), 
+        nullable=True, 
+        metadata={"comment": "SNOMED CT term for the type of treatment given"}
+    ),
+    StructField(
         "treatment_regimen", 
         StringType(), 
         nullable=True, 
@@ -3567,6 +3949,18 @@ schema_pharos_treatment = StructType([
         StringType(), 
         nullable=True, 
         metadata={"comment": "Name of drug or treatment given"}
+    ),
+    StructField(
+        "treatment_name_snomed_code", 
+        LongType(), 
+        nullable=True, 
+        metadata={"comment": "SNOMED CT code for the name of treatment drug"}
+    ),
+    StructField(
+        "treatment_name_snomed_term", 
+        StringType(), 
+        nullable=True, 
+        metadata={"comment": "SNOMED CT term for the name of treatment drug"}
     ),
     StructField(
         "treatment_name_other", 
@@ -3746,6 +4140,8 @@ def create_pharos_treatment_incr():
         chemotherapy
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
         .withColumn("treatment_type", lit("chemotherapy"))
+        .withColumn("treatment_type_snomed_code", lit(367336001))
+        .withColumn("treatment_type_snomed_term", lit("Chemotherapy (procedure)"))
         .withColumn("treatment_cycles", 
                     when(
                         (col("PlannedCycles") > col("CycleCancelledFrom")) & (col("CourseFinished") == "true"), 
@@ -3755,6 +4151,8 @@ def create_pharos_treatment_incr():
         .select(
             col("PERSON_ID"),
             col("treatment_type"),
+            col("treatment_type_snomed_code"),
+            col("treatment_type_snomed_term"),
             col("SactName").alias("treatment_regimen"),
             col("Name").alias("treatment_name"),
             col("StartDate").alias("treatment_start_date"),
@@ -3845,11 +4243,25 @@ def create_pharos_treatment_incr():
             #.when(col("RXNORM_CUI").isin(other_drugs), "Other")
             .otherwise(lit(None))
         )
+        .withColumn(
+            "treatment_type_snomed_code",
+            when(col("treatment_type") == "001 - Endocrine", 169413002)
+            .when(col("treatment_type") == "002 - Chemotherapy", 367336001)
+            .when(col("treatment_type") == "003 - Antibody", 76334006)
+        )
+        .withColumn(
+            "treatment_type_snomed_term",
+            when(col("treatment_type") == "001 - Endocrine", "Hormone therapy (procedure)")
+            .when(col("treatment_type") == "002 - Chemotherapy", "Chemotherapy (procedure)")
+            .when(col("treatment_type") == "003 - Antibody", "Immunotherapy (procedure)")
+        )
         .filter(col("treatment_type").isNotNull())
         .select(
             "PERSON_ID", 
             "treatment_type", 
-            col("RXNORM_STR").alias("treatment_name"), 
+            col("RXNORM_STR").alias("treatment_name"),
+            col("SNOMED_CODE").alias("treatment_name_snomed_code"),
+            col("SNOMED_STR").alias("treatment_name_snomed_term"),
             # WARNING: ADMIN_START/END dates represent single-day drug administrations, not the full therapy course. 
             # A freetext audit is required to validate clinical 'Treatment Start/End' dates.
             col("ADMIN_START_DT_TM").alias("treatment_start_date"), 
@@ -3861,7 +4273,7 @@ def create_pharos_treatment_incr():
             col("_src_adc_updt")
         )
     )
-    
+
     # Radiotherapy
     snomed_radiotherapy_codes = [
 
@@ -3955,8 +4367,9 @@ def create_pharos_treatment_incr():
                 *[str(x) for x in snomed_radiotherapy_codes]
             )
         )
-        .select("PERSON_ID", col("SOURCE_IDENTIFIER").alias("radiotherapy_cd"),col("SOURCE_STRING").alias("radiotherapy_desc"), col("PROC_DT_TM"))
+        .select("PERSON_ID", col("SOURCE_IDENTIFIER").alias("radiotherapy_cd"),col("SOURCE_STRING").alias("radiotherapy_desc"), col("PROC_DT_TM"), col("SNOMED_CODE").alias("treatment_type_snomed_code"),col("SNOMED_TERM").alias("treatment_type_snomed_term"))
     )
+
     treatment_radio = (
         radiotherapy
         .join(breast_cancer_cohort, "PERSON_ID", "inner")
@@ -3964,6 +4377,8 @@ def create_pharos_treatment_incr():
         .select(
             "PERSON_ID", 
             "treatment_type", 
+            "treatment_type_snomed_code",
+            "treatment_type_snomed_term",
             lit(None).alias("treatment_name"), 
             "radiotherapy_cd",
             "radiotherapy_desc",
@@ -3994,6 +4409,7 @@ def create_pharos_treatment_incr():
         .dropDuplicates()
         )
 
+
     final_df = (
         treatment
         .select(
@@ -4003,8 +4419,12 @@ def create_pharos_treatment_incr():
             lit(None).alias("clinical_record_id").cast(LongType()),
             lit(None).alias("tumour_id").cast(LongType()),
             col("treatment_type").cast(StringType()),
+            col("treatment_type_snomed_code").cast(LongType()),
+            col("treatment_type_snomed_term").cast(StringType()),
             col("treatment_regimen").cast(StringType()),
             col("treatment_name").cast(StringType()),
+            col("treatment_name_snomed_code").cast(LongType()),
+            col("treatment_name_snomed_term").cast(StringType()),
             lit(None).alias("treatment_name_other").cast(StringType()),
             lit(None).alias("treatment_intent").cast(StringType()),
             col("treatment_start_date").cast(TimestampType()),
@@ -4518,6 +4938,18 @@ schema_pharos_comorbidities = StructType([
         {"comment": "ICD code for each condition (from ICD-10)"}
     ),
     StructField(
+        "snomed_code", 
+        LongType(), 
+        True, 
+        {"comment": "SNOMED CT code for each condition"}
+    ),
+    StructField(
+        "snomed_term", 
+        StringType(), 
+        True, 
+        {"comment": "SNOMED CT term for each condition"}
+    ),
+    StructField(
         "comorbidity_name", 
         StringType(), 
         True, 
@@ -4604,7 +5036,7 @@ def create_pharos_comorbidity_incr():
         .filter(col("PERSON_ID").isNotNull())
         .groupBy("PERSON_ID")
         .agg(
-            min("earliest_diagnosis_date").alias("earliest_diagnosis_date"),
+            min("earliest_diagnosis_date").alias("brc_diag_date"),
             F.max("ADC_UPDT").alias("_src_adc_updt")
         )
     )
@@ -4704,6 +5136,8 @@ def create_pharos_comorbidity_incr():
             col("comorbidities").cast(StringType()),
             col("ICD10_CODE").alias("icd_code").cast(StringType()),
             col("ICD10_TERM").alias("comorbidity_name").cast(StringType()),
+            col("SNOMED_CODE").alias("snomed_code").cast(LongType()),
+            col("SNOMED_TERM").alias("snomed_term").cast(StringType()),
             col("comorbidity_temporality").cast(StringType()),
             col("diabetes").cast(StringType()),
             col("diabetes_temporality").cast(StringType()),
@@ -4720,19 +5154,6 @@ def create_pharos_comorbidity_incr():
 
 updated_df = create_pharos_comorbidity_incr()
 update_table(updated_df, get_target_table("pharos_comorbidities"),["person_id", "icd_code"], schema_pharos_comorbidities, pharos_comorbidities_comment)
-
-
-# COMMAND ----------
-
-med =spark.table("8_dev.bronze.map_med_admin")
-
-
-med1 = med.filter(
-    lower(col("RXNORM_STR")).rlike(
-        "(?i)(ambrisentan|bosentan|clopidogrel|dornase alfa|enoxaparin|enoximone|eplerenone|epoprostenol|flecainide acetate|furosemide|glibenclamide|heparin|iloprost|lisinopril|macitentan|mannitol|milrinone|nintedanib|pirfenidone|pravastatin|riociguat|salbutamol|selexipag|sildenafil|tadalafil|treprostinil)"
-    )
-)
-med1.select("RXNORM_STR","RXNORM_CUI").distinct().display()
 
 
 # COMMAND ----------
@@ -4763,6 +5184,18 @@ schema_pharos_meds = StructType([
         StringType(), 
         True, 
         {"comment": "Name of the non-cancer medication the patient was taking at the time of cancer diagnosis, one medication per row, only one patient"}
+    ),
+    StructField(
+        "medication_name_snomed_code", 
+        LongType(), 
+        True, 
+        {"comment": "SNOMED CT code for medication name"}
+    ),
+    StructField(
+        "medication_name_snomed_term", 
+        StringType(), 
+        True, 
+        {"comment": "SNOMED CT term for medication name"}
     ),
     StructField(
         "medication_category", 
@@ -4903,6 +5336,8 @@ def create_pharos_med_incr():
         .select(
             col("PERSON_ID").alias("person_id"),
             col("RXNORM_STR").alias("medication_name"),
+            col("SNOMED_CODE").alias("medication_name_snomed_code"),
+            col("SNOMED_STR").alias("medication_name_snomed_term"),
             col("medication_category"),
             col("_src_adc_updt")
         )  
@@ -4917,6 +5352,8 @@ def create_pharos_med_incr():
             lit(None).alias("pharosid").cast(StringType()),
             lit(None).alias("clinical_record_id").cast(LongType()),
             col("medication_name").cast(StringType()),
+            col("medication_name_snomed_code").cast(LongType()),
+            col("medication_name_snomed_term").cast(StringType()),
             col("medication_category").cast(StringType()),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("date_checked").cast(TimestampType()),
@@ -4976,6 +5413,18 @@ schema_pharos_ph = StructType([
         StringType(), 
         True, 
         {"comment": "Free-text detail if not in reference list"}
+    ),
+    StructField(
+        "cancer_type_snomed_code", 
+        LongType(), 
+        True, 
+        {"comment": "SNOMED_CT code for the personal cancer history."}
+    ),
+    StructField(
+        "cancer_type_snomed_term", 
+        StringType(), 
+        True, 
+        {"comment": "SNOMED_CT term for the personal cancer history."}
     ),
     StructField(
         "date_checked", 
@@ -5129,12 +5578,15 @@ def create_pharos_ph_incr():
         person_history
         .filter(col("cancer_type_code").isNotNull())
         .select(
+            lit(None).alias("history_id"),
             col("person_id"),
             lit(None).alias("pharosid"),
             lit(None).alias("clinical_record_id"),
             col("cancer_type_code"),
             col("code").alias("Source_cd"),
             col("SOURCE_STRING").alias("cancer_type_detail"),
+            col("SNOMED_CODE").alias("cancer_type_snomed_code"),
+            col("SNOMED_TERM").alias("cancer_type_snomed_term"),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("date_checked"),
             current_timestamp().alias("created_at"),
