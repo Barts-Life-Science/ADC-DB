@@ -526,7 +526,7 @@ def update_table(source_df, target_table: str, index_columns,
 
 # COMMAND ----------
 
-
+### Create SNOMED lookup tables for code mapping. ###
 # Sex lookup
 sex = [
     (362.0, "001 - Female", "248152002", "Female (finding)"),
@@ -581,6 +581,8 @@ ethnicity_lookup = spark.createDataFrame(
         "ethnic_group_snomed_term"
     ]
 )
+
+# Imaging type lookup
 imaging_type = [
     ("000 - Mammogram", 71651007, "Mammography (procedure)"),
     ("001 - Ultrasound", 16310003, "Ultrasonography (procedure)"),
@@ -599,6 +601,179 @@ imaging_type_lookup = spark.createDataFrame(
     "imaging_type",
     "imaging_type_snomed_code",
     "imaging_type_snomed_term"
+    ]
+)
+
+# Relationship degree lookup
+relation_degree = [
+    ("000 - None", None, None),
+    ("001 - 1st degree", 125677006, "First degree blood relative (person)"),
+    ("002 - 2nd degree", 699110007, "Second degree blood relative (person)"),
+    ("003 - 3rd degree", 699111006, "Third degree blood relative (person)"),
+    ("G09 - Unknown", None, None)
+]
+
+relation_degree_lookup = spark.createDataFrame(
+    relation_degree,
+    [
+        "relation_degree",
+        "relation_degree_snomed_code",
+        "relation_degree_snomed_term"
+    ]
+)
+
+# Metastasis lookup
+metastasis_site = [
+    # For the A25, not sure whether this is accurate, need to verify with clinicians
+    ("A25 - Distant lymph node", 59441001, "Structure of lymph node (body structure)"),
+    ("A02 - Lung", 39607008, "Lung structure (body structure)"),
+    ("A10 - Liver", 10200004, "Liver structure (body structure)"),
+    ("A16 - Renal", 64033007, "Kidney structure (body structure)"),
+    ("A06 - Bone", 272673000, "Bone structure (body structure)"),
+    ("A07 - Brain", 12738006, "Brain structure (body structure)"),
+    ("A19 - Leptomeningeal", 362507002, "Leptomeninx structure (body structure)"),
+    ("A20 - Viscera", 113257007, "Structure of visceral organ (body structure)"),
+    ("A12 - Ovary", 15497006, "Ovary structure (body structure)"),
+    ("A15 - Pleura", 3120008, "Pleural structure (body structure)"),
+    ("A14 - Peritoneum", 15425007, "Peritoneal structure (body structure)"),
+    ("A18 - Mediastinum", 72410000, "Mediastinal structure (body structure)"),
+    ("A21 - Abdominal/gastrointestinal", 113345001, "Structure of gastrointestinal tract (body structure)"),
+    ("A17 - Skin", 39937001, "Skin structure (body structure)"),
+    ("G03 - Other metastasis", None, None),
+    ("G09 - Unknown", None, None)
+]
+
+metastasis_site_lookup = spark.createDataFrame(
+    metastasis_site,
+    [
+        "metastasis_site",
+        "metastasis_site_snomed_code",
+        "metastasis_site_snomed_term"
+    ]
+)
+
+# vital_status
+
+vital_status = [
+    ("000 - Alive", 438949, "Alive"),
+    ("001 - Deceased", 4216643, "Death"),
+    ("G09 - Unknown", None, None)
+]
+
+vital_status_lookup = spark.createDataFrame(
+    vital_status,
+    [
+        "vital_status",
+        "vital_status_snomed_code",
+        "vital_status_snomed_term"
+    ]
+)
+
+# imaging site
+
+imaging_site = [
+    ("A05 - Abdomen", 818983003, "Structure of abdomen (body structure)"),
+    ("A22 - Axilla", 91470000, "Axilla structure (body structure)"),
+    ("A06 - Bone", 272673000, "Bone structure (body structure)"),
+    ("A07 - Brain", 12738006, "Brain structure (body structure)"),
+    ("A01 - Breast", 76752008, "Breast structure (body structure)"),
+    ("A09 - Chest / Thorax", 51185008, "Thoracic structure (body structure)"),
+    ("A10 - Liver", 10200004, "Liver structure (body structure)"),
+    ("A11 - Neck", 45048000, "Neck structure (body structure)"),
+    ("A13 - Pelvis", 12921003, "Pelvic structure (body structure)"),
+    ("A26 - Sentinel node", 59441001, "Structure of lymph node (body structure)"),
+    ("G03 - Other", None, None),
+    ("G09 - Unknown", None, None)
+]
+
+imaging_site_lookup = spark.createDataFrame(
+    imaging_site,
+    [
+        "imaging_site",
+        "imaging_site_snomed_code",
+        "imaging_site_snomed_term"
+    ]
+)
+
+# path_atypical
+path_atypical = [
+    ("000 - Atypical Ductal Hyperplasia (ADH)", 427785007, "Atypical ductal hyperplasia of breast (disorder)"),
+    ("001 - Atypical Lobular Hyperplasia (ALH)", 129718006, "Atypical lobular hyperplasia of breast (disorder)"),
+    ("002 - Atypical Intraduct Epithelial Proliferation (AIDEP)", None, None),
+    ("003 - Columnar Cell Change with Atypia", None, None),
+    ("004 - Columnar Cell Hyperplasia With Atypia", None, None),
+    ("005 - Flat Epithelial Atypia (FEA)", 713609000, "Flat epithelial atypia of breast (disorder)"),
+    ("006 - Lobular Neoplasia", 109889007, "Lobular neoplasia of breast (disorder)"),
+    ("007 - Pagets Disease", 278053004, "Paget disease of nipple (disorder)"),
+    ("008 - Papilloma / Papillary Lesion / Sclerosing Papillary Lesion", 254838004, "Intraductal papilloma of breast (disorder)"),
+    ("009 - Radial Scar or Complex Sclerosing Lesion", 449837001, "Radial scar of breast (disorder)"),
+    ("010 - None recorded", None, None),
+    ("G09 - Unknown", None, None)
+]
+
+path_atypical_lookup = spark.createDataFrame(
+    path_atypical,
+    [
+        "path_atypical",
+        "path_atypical_snomed_code",
+        "path_atypical_snomed_term"
+    ]
+)
+
+path_benign = [
+    ("000 - Apocrine Metaplasia", None, None),
+    ("001 - Benign", None, None),
+    ("002 - Chemotherapy Effect (CHEM)", None, None),
+    ("003 - Columnar Cell Change", None, None),
+    ("004 - Columnar Cell Hyperplasia", None, None),
+    ("005 - Cystic Change", 367643001, "Cystic change (morphologic abnormality)"),
+    ("006 - Epithelial Hyperplasia of Usual Type", 446226005, "Usual ductal hyperplasia of breast (disorder)"),
+    ("007 - Fibroadenoma (FAD)", 254845004, "Fibroadenoma of breast (disorder)"),
+    ("008 - Fibroadenomatoid Change", None, None),
+    ("009 - Fibrocystic Change", 27431007, "Fibrocystic disease of breast (disorder)"),
+    ("010 - Fibrosis", 4386001, "Fibrosis (disorder)"),
+    ("011 - Microcystic Change", None, None),
+    ("012 - Microglandular Adenosis", None, None),
+    ("013 - Pseudoangiomatous Stromal Hyperplasia (PASH)", None, None),
+    ("014 - Sclerosing Adenosis", 29070004, "Sclerosing adenosis of breast (disorder)"),
+    ("G03 - Other", None, None),
+    ("016 - Not recorded", None, None),
+    ("G09 - Unknown", None, None)
+]
+
+path_benign_lookup = spark.createDataFrame(
+    path_benign,
+    [
+        "path_benign",
+        "path_benign_snomed_code",
+        "path_benign_snomed_term"
+    ]
+)
+
+# tissue_site:
+
+tissue_site = [
+    ("A01 - Breast", 76752008, "Breast structure (body structure)"),
+    ("A23 - Axillary lymph node", 81105003, "Axillary lymph node structure (body structure)"),
+    ("A08 - Chest wall", 312535008, "Structure of chest wall (body structure)"),
+    ("A10 - Liver", 10200004, "Liver structure (body structure)"),
+    ("A07 - Brain", 12738006, "Brain structure (body structure)"),
+    ("A02 - Lung", 39607008, "Lung structure (body structure)"),
+    ("A06 - Bone", 272673000, "Bone structure (body structure)"),
+    ("A27 - Other locoregional lymph node", 59441001, "Structure of lymph node (body structure)"),
+    ("A24 - SCF node", 122495006, "Supraclavicular lymph node structure (body structure)"),
+    ("A25 - Distant lymph node", 59441001, "Structure of lymph node (body structure)"),
+    ("A28 - Lymph node - unknown region", 59441001, "Structure of lymph node (body structure)"),
+    ("008 - Other", None, None),
+    ("009 - Unknown", None, None)
+]
+
+tissue_site_lookup = spark.createDataFrame(
+    tissue_site,
+    [
+        "tissue_site",
+        "tissue_site_snomed_code",
+        "tissue_site_snomed_term"
     ]
 )
 
@@ -2226,6 +2401,18 @@ schema_pharos_fh = StructType([
         metadata={"comment": "Highest degree relation."}
     ),
     StructField(
+        name="relation_degree_snomed_code",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code mapped to relation_degree."}
+    ),
+    StructField(
+        name="relation_degree_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term mapped to relation_degree."}
+    ),
+    StructField(
         name="relation_detail",
         dataType=StringType(),
         nullable=True,
@@ -2565,6 +2752,7 @@ def create_fh_incr():
         .withColumn("rn", F.row_number().over(w))
         .filter(F.col("rn") == 1)
         .drop("rn", "relation_rank")
+        .join(relation_degree_lookup, "relation_degree","left")
     )
 
 
@@ -2579,6 +2767,8 @@ def create_fh_incr():
             col("cancer_type_snomed_code"),
             col("cancer_type_snomed_term"),
             col("relation_degree"),
+            col("relation_degree_snomed_code"),
+            col("relation_degree_snomed_term"),
             col("relation_detail"),
             col("_src_adc_updt").alias("ADC_UPDT"),
             current_timestamp().alias("created_at"),
@@ -4502,6 +4692,18 @@ schema_pharos_followup= StructType([
         metadata={"comment": "Whether patient is alive at date of last follow-up"}
     ),
     StructField(
+        name="vital_status_snomed_code",
+        dataType=LongType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT code mapped to vital_status."}
+    ),
+    StructField(
+        name="vital_status_snomed_term",
+        dataType=StringType(),
+        nullable=True,
+        metadata={"comment": "SNOMED CT term mapped to the vital_status."}
+    ),
+    StructField(
         "date_of_death",
         TimestampType(),
         metadata={"comment": "Date of death recorded in the medical record (DD-MM-YYYY)"}
@@ -4618,9 +4820,12 @@ def create_pharos_followup_incr():
                 datediff(col("DECEASED_DT_TM"), col("earliest_diagnosis_date")).cast(DoubleType()) / 365)
             .otherwise(lit(None))
         )
+        .join(vital_status_lookup, "vital_status", "left")
         .select(
             "PERSON_ID",
             "vital_status",
+            "vital_status_snomed_code",
+            "vital_status_snomed_term",
             col("DECEASED_DT_TM").alias("date_of_death"),
             "years_diagnosistodeath",
             "earliest_diagnosis_date",
@@ -4648,6 +4853,8 @@ def create_pharos_followup_incr():
             lit(None).cast(StringType()).alias("distant_metastasis"),
             lit(None).cast(StringType()).alias("denovo_metastasis"),
             col("vital_status").cast(StringType()),
+            col("vital_status_snomed_code").cast(LongType()),
+            col("vital_status_snomed_term").cast(StringType()),
             col("date_of_death").cast(TimestampType()),
             col("years_diagnosistodeath").cast(IntegerType()),
             lit(None).cast(StringType()).alias("cause_of_death"),
@@ -5066,35 +5273,35 @@ def create_pharos_comorbidity_incr():
         # COMORBIDITIES --------------- 
         .withColumn(
             "comorbidities",
-            when(col("ICD10_CODE").isNotNull(), lit("1 Yes"))
-            .otherwise(lit("9 Unknown"))
+            when(col("ICD10_CODE").isNotNull(), lit("G01 Yes"))
+            .otherwise(lit("G09 Unknown"))
         )
         .withColumn(
             "comorbidity_temporality",
-            when(col("ICD10_CODE").isNull(), lit("9 Unknown temporality"))
-            .when(col("earliest_diagnosis_date") < col("brc_diag_date"), lit("0 Pre-diagnosis"))
+            when(col("ICD10_CODE").isNull(), lit("G09 Unknown temporality"))
+            .when(col("earliest_diagnosis_date") < col("brc_diag_date"), lit("001 Pre-diagnosis"))
             .when(
                 (col("earliest_diagnosis_date") >= col("brc_diag_date")) & 
-                (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("1 Post-diagnosis"))
+                (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("001 Post-diagnosis"))
             .when(
                 (col("earliest_diagnosis_date") >= col("treatment_start_date")) & 
-                (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("2 During treatment"))
-            .when(col("earliest_diagnosis_date") > col("treatment_end_date"), lit("1 Post-diagnosis"))
+                (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("002 During treatment"))
+            .when(col("earliest_diagnosis_date") > col("treatment_end_date"), lit("001 Post-diagnosis"))
         )
 
         # DIABETES ----------------
         .withColumn(
             "diabetes",
-            when(col("ICD10_CODE").like("E10%"), "1 Type I diabetes")
+            when(col("ICD10_CODE").like("E10%"), "001 Type I diabetes")
             .when(
                 (col("ICD10_CODE").like("E11%")) |
                 (col("OMOP_CONCEPT_ID") == 45757508),
-                "2 Type II diabetes"
+                "002 Type II diabetes"
             )
             .when(
                 (col("ICD10_CODE").like("R73%")) |
                 (col("OMOP_CONCEPT_ID").isin(44808385, 37018196)),
-                "3 Pre-diabetic/borderline"
+                "003 Pre-diabetic/borderline"
             )
             # Probably this other type of diabetes can be included in the comorbidities (check)
             # .when(
@@ -5103,24 +5310,24 @@ def create_pharos_comorbidity_incr():
             #     (col("ICD10_CODE").like("E12%")) | # Malnutrition-related diabetes mellitus,
             #     "4 Other diabetes types"
             # )
-            .otherwise(lit("9 Unknown"))
+            .otherwise(lit("G09 Unknown"))
         )
         .withColumn(
             "diabetes_temporality",
             when(
-                (col("diabetes")!= "9 Unknown") & (col("earliest_diagnosis_date") < col("brc_diag_date")), "0 Pre-diagnosis")
+                (col("diabetes")!= "G09 Unknown") & (col("earliest_diagnosis_date") < col("brc_diag_date")), "000 Pre-diagnosis")
             .when(
-                (col("diabetes")!= "9 Unknown") &
+                (col("diabetes")!= "G09 Unknown") &
                 (col("earliest_diagnosis_date") >= col("brc_diag_date")) & 
-                (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("1 Post-diagnosis"))
+                (col("earliest_diagnosis_date") <= col("treatment_start_date")), lit("001 Post-diagnosis"))
             .when(
-                (col("diabetes")!= "9 Unknown") &
+                (col("diabetes")!= "G09 Unknown") &
                 (col("earliest_diagnosis_date") >= col("treatment_start_date")) & 
-                (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("2 During treatment"))
+                (col("earliest_diagnosis_date") <= col("treatment_end_date")), lit("002 During treatment"))
             .when(
-                (col("diabetes")!= "9 Unknown") &
-                (col("earliest_diagnosis_date") > col("treatment_end_date")), lit("1 Post-diagnosis"))
-            .otherwise(lit("9 Unknown"))
+                (col("diabetes")!= "G09 Unknown") &
+                (col("earliest_diagnosis_date") > col("treatment_end_date")), lit("001 Post-diagnosis"))
+            .otherwise(lit("G09 Unknown"))
         )
         .withColumn("days_diagnosis_comor", datediff(col("earliest_diagnosis_date"), col("brc_diag_date")))
     )
