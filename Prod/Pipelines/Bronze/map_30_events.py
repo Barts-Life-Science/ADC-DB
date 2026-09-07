@@ -430,7 +430,7 @@ def _mne_build_enriched_numeric_events(config: MapNumericEventsConfig, string_ro
     resolved_maps = _mne_resolved_manual_maps(config, source_versions=source_versions)
     base = _mne_attach_omop_mappings(base, resolved_maps)
     base = base.withColumn('ADC_UPDT', F.greatest(F.col('STRING_RESULT_EFFECTIVE_UPDT_DT_TM'), F.col('CLINICAL_EVENT_ADC_UPDT'), F.col('CLINICAL_EVENT_UPDT_DT_TM'), F.col('PARENT_ADC_UPDT'), F.col('PARENT_UPDT_DT_TM'), F.col('LOOKUP_ADC_UPDT'), F.col('OMOP_MAPPING_ADC_UPDT'))).withColumn('STRING_RESULT_SOURCE_VERSION', F.lit(source_versions[config.string_result_table]).cast('long')).withColumn('CLINICAL_EVENT_SOURCE_VERSION', F.lit(source_versions[config.clinical_event_table]).cast('long')).withColumn('CODE_VALUE_SOURCE_VERSION', F.lit(source_versions[config.code_value_table]).cast('long')).withColumn('ORDER_CATALOG_SOURCE_VERSION', F.lit(source_versions[config.order_catalog_table]).cast('long')).withColumn('MANUAL_MAP_SOURCE_VERSION', F.lit(source_versions[config.manual_map_table]).cast('long')).withColumn('CONCEPT_SOURCE_VERSION', F.lit(source_versions[config.concept_table]).cast('long'))
-    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'STRING_RESULT_CDF_COMMIT_VERSION', 'STRING_RESULT_CDF_COMMIT_TIMESTAMP', 'STRING_RESULT_CDF_CHANGE_TYPE'}
+    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'STRING_RESULT_CDF_COMMIT_VERSION', 'STRING_RESULT_CDF_COMMIT_TIMESTAMP', 'STRING_RESULT_CDF_CHANGE_TYPE', 'STRING_RESULT_SOURCE_VERSION', 'CLINICAL_EVENT_SOURCE_VERSION', 'CODE_VALUE_SOURCE_VERSION', 'ORDER_CATALOG_SOURCE_VERSION', 'MANUAL_MAP_SOURCE_VERSION', 'CONCEPT_SOURCE_VERSION'}
     hash_columns = [F.col(field.name) for field in schema_map_numeric_events.fields if field.name not in hash_exclusions and field.name in base.columns]
     base = base.withColumn('ROW_HASH', _mne_stable_hash_columns(hash_columns)).withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_UPDT_DT_TM', F.lit(run_timestamp))
     return _mne_align_to_schema(base, schema_map_numeric_events)
@@ -451,6 +451,51 @@ def _mne_simple_cdf_keys(table_name: str, key_column: str, previous_version: int
         return spark.createDataFrame([], 'CHANGE_KEY long')
     key = _mne_checked_double_id(F.col(key_column), f'{table_name}.{key_column}') if key_is_double else F.col(key_column).cast('long')
     return cdf.select(key.alias('CHANGE_KEY')).where(F.col('CHANGE_KEY').isNotNull()).dropDuplicates()
+
+
+def _mne_semantic_snapshot_keys(
+    table_name: str,
+    key_column: str,
+    previous_version: int,
+    current_version: int,
+    key_is_double: bool,
+    semantic_columns: Sequence[str],
+) -> DataFrame:
+    """Return only lookup keys whose effective payload changed between snapshots.
+
+    Lookup publishers replace whole Delta tables, so CDF can report every key as
+    delete+insert even when the lookup values are identical. Comparing the pinned
+    before/after snapshots prevents that maintenance churn from invalidating the
+    entire event target.
+    """
+    if int(previous_version) == int(current_version):
+        return spark.createDataFrame([], 'CHANGE_KEY long')
+
+    def prepared(version: int, payload_name: str) -> DataFrame:
+        frame = _mne_read_snapshot(table_name, version)
+        available = [column for column in semantic_columns if column in frame.columns]
+        if not available:
+            raise RuntimeError(f'No semantic comparison columns found for {table_name}')
+        key = (
+            _mne_checked_double_id(F.col(key_column), f'{table_name}.{key_column}')
+            if key_is_double else F.col(key_column).cast('long')
+        )
+        row_hash = F.xxhash64(*[F.col(column) for column in available])
+        return (
+            frame.select(key.alias('CHANGE_KEY'), row_hash.alias('_ROW_PAYLOAD_HASH'))
+            .where(F.col('CHANGE_KEY').isNotNull())
+            .groupBy('CHANGE_KEY')
+            .agg(F.sort_array(F.collect_set('_ROW_PAYLOAD_HASH')).alias(payload_name))
+        )
+
+    before = prepared(int(previous_version), '_BEFORE_PAYLOAD').alias('b')
+    after = prepared(int(current_version), '_AFTER_PAYLOAD').alias('a')
+    return (
+        before.join(after, F.col('b.CHANGE_KEY').eqNullSafe(F.col('a.CHANGE_KEY')), 'full')
+        .where(~F.col('b._BEFORE_PAYLOAD').eqNullSafe(F.col('a._AFTER_PAYLOAD')))
+        .select(F.coalesce(F.col('b.CHANGE_KEY'), F.col('a.CHANGE_KEY')).alias('CHANGE_KEY'))
+        .dropDuplicates()
+    )
 
 def _mne_target_events_for_changed_codes(target: DataFrame, changed_codes: DataFrame) -> DataFrame:
     candidate_columns = [column for column in ('UNIT_OF_MEASURE_CD', 'STRING_RESULT_FORMAT_CD', 'EVENT_CLASS_CD', 'EVENT_CD', 'CATALOG_TYPE_CD', 'CONTRIBUTOR_SYSTEM_CD', 'NORMALCY_CD', 'NORMALCY_METHOD_CD', 'ENTRY_MODE_CD', 'RESULT_UNITS_CD', 'RESULT_TIME_UNITS_CD', 'TASK_ASSAY_CD', 'RESULT_STATUS_CD', 'RECORD_STATUS_CD', 'QC_REVIEW_CD', 'EVENT_RELTN_CD', 'SOURCE_CD', 'PARENT_EVENT_CLASS_CD', 'PARENT_EVENT_CD', 'PARENT_CATALOG_TYPE_CD', 'PARENT_RESULT_STATUS_CD') if column in target.columns]
@@ -581,9 +626,9 @@ def _mne_build_changed_event_keys(config: MapNumericEventsConfig, previous_versi
     direct_ce = ce_ids.select(F.col('CHANGE_KEY').alias('EVENT_ID')).withColumn('TRIGGER_SOURCE', F.lit('CLINICAL_EVENT'))
     parent_ce = target.select('EVENT_ID', 'PARENT_EVENT_ID').join(ce_ids, F.col('PARENT_EVENT_ID') == F.col('CHANGE_KEY'), 'inner').select('EVENT_ID').withColumn('TRIGGER_SOURCE', F.lit('PARENT_CLINICAL_EVENT'))
     trigger_frames.extend([direct_ce, parent_ce])
-    code_ids = _mne_simple_cdf_keys(config.code_value_table, 'CODE_VALUE', previous_versions[config.code_value_table], current_versions[config.code_value_table], key_is_double=True)
+    code_ids = _mne_semantic_snapshot_keys(config.code_value_table, 'CODE_VALUE', previous_versions[config.code_value_table], current_versions[config.code_value_table], key_is_double=True, semantic_columns=('CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'))
     trigger_frames.append(_mne_target_events_for_changed_codes(target, code_ids).withColumn('TRIGGER_SOURCE', F.lit('CODE_VALUE')))
-    catalog_ids = _mne_simple_cdf_keys(config.order_catalog_table, 'CATALOG_CD', previous_versions[config.order_catalog_table], current_versions[config.order_catalog_table], key_is_double=True)
+    catalog_ids = _mne_semantic_snapshot_keys(config.order_catalog_table, 'CATALOG_CD', previous_versions[config.order_catalog_table], current_versions[config.order_catalog_table], key_is_double=True, semantic_columns=('CATALOG_TYPE_CD', 'DESCRIPTION', 'PRIMARY_MNEMONIC', 'DEPT_DISPLAY_NAME', 'ACTIVE_IND', 'EVENT_CD', 'CONCEPT_CKI'))
     trigger_frames.append(_mne_target_events_for_changed_catalogs(target, catalog_ids).withColumn('TRIGGER_SOURCE', F.lit('ORDER_CATALOG')))
     event_map_values, unit_map_values = _mne_manual_map_changed_values(config, previous_versions[config.manual_map_table], current_versions[config.manual_map_table])
     trigger_frames.append(_mne_target_events_for_changed_manual_maps(target, event_map_values, unit_map_values).withColumn('TRIGGER_SOURCE', F.lit('MANUAL_MAP')))
@@ -669,16 +714,11 @@ def _mne_merge_active_updates(config: MapNumericEventsConfig, updates: DataFrame
         column_name: F.col(f's.{column_name}')
         for column_name in updates.columns
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-        for column_name in updates.columns
-        if column_name != 'EVENT_ID'
-    )
     DeltaTable.forName(spark, config.target_table).alias('t').merge(
         updates.alias('s'),
         't.EVENT_ID <=> s.EVENT_ID',
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.ROW_HASH <=> s.ROW_HASH) OR coalesce(t.SOURCE_DELETED_IND, false)',
         set=assignments,
     ).whenNotMatchedInsert(values=assignments).execute()
     return {'active_source_rows': int(source_rows)}
@@ -1838,6 +1878,13 @@ def _mte_finalize_text_events(
         "STRING_RESULT_CDF_COMMIT_VERSION",
         "STRING_RESULT_CDF_COMMIT_TIMESTAMP",
         "STRING_RESULT_CDF_CHANGE_TYPE",
+        "STRING_RESULT_SOURCE_VERSION",
+        "CLINICAL_EVENT_SOURCE_VERSION",
+        "CODE_VALUE_SOURCE_VERSION",
+        "ORDER_CATALOG_SOURCE_VERSION",
+        "MANUAL_MAP_SOURCE_VERSION",
+        "CONCEPT_SOURCE_VERSION",
+        "LONG_TEXT_SOURCE_VERSION",
     }
     hash_columns = [
         F.col(field.name)
@@ -3000,7 +3047,7 @@ def _build_enriched_date_events(config: MapDateEventsConfig, date_rows: DataFram
     encounter_match = F.when(F.col('DATE_RESULT_ENCNTR_ID').isNull() | F.col('CE_ENCNTR_ID').isNull(), F.lit(None).cast('boolean')).otherwise(F.col('DATE_RESULT_ENCNTR_ID') == F.col('CE_ENCNTR_ID'))
     source_current = F.when(F.col('DATE_RESULT_VALID_UNTIL_DT_TM').isNull(), F.lit(None).cast('boolean')).otherwise(F.col('DATE_RESULT_VALID_UNTIL_DT_TM') > F.lit(run_timestamp))
     selected = base.select(F.col('EVENT_ID'), F.coalesce(F.col('CE_ENCNTR_ID'), F.col('DATE_RESULT_ENCNTR_ID')).cast('long').alias('ENCNTR_ID'), F.col('CE_PERSON_ID').cast('long').alias('PERSON_ID'), F.col('CE_ORDER_ID').cast('long').alias('ORDER_ID'), _checked_int(F.col('CE_EVENT_CLASS_CD'), 'CLINICAL_EVENT.EVENT_CLASS_CD').alias('EVENT_CLASS_CD'), F.col('CE_PERFORMED_PRSNL_ID').cast('long').alias('PERFORMED_PRSNL_ID'), F.col('RESULT_DT_TM'), F.col('CE_EVENT_TITLE_TEXT').alias('EVENT_TITLE_TEXT'), _checked_int(F.col('CE_EVENT_CD'), 'CLINICAL_EVENT.EVENT_CD').alias('EVENT_CD'), event_display.alias('EVENT_CD_DISPLAY'), _checked_int(F.col('CE_CATALOG_CD'), 'CLINICAL_EVENT.CATALOG_CD').alias('CATALOG_CD'), catalog_display.alias('CATALOG_DISPLAY'), F.col('OC_CATALOG_TYPE_CD').alias('CATALOG_TYPE_CD'), catalog_type_display.alias('CATALOG_TYPE_DISPLAY'), _checked_int(F.col('CE_CONTRIBUTOR_SYSTEM_CD'), 'CLINICAL_EVENT.CONTRIBUTOR_SYSTEM_CD').alias('CONTRIBUTOR_SYSTEM_CD'), contributor_display.alias('CONTRIBUTOR_SYSTEM_DISPLAY'), F.col('CE_REFERENCE_NBR').alias('REFERENCE_NBR'), F.col('CE_PARENT_EVENT_ID').cast('long').alias('PARENT_EVENT_ID'), _checked_int(F.col('CE_NORMALCY_CD'), 'CLINICAL_EVENT.NORMALCY_CD').alias('NORMALCY_CD'), normalcy_display.alias('NORMALCY_DISPLAY'), _checked_int(F.col('CE_ENTRY_MODE_CD'), 'CLINICAL_EVENT.ENTRY_MODE_CD').alias('ENTRY_MODE_CD'), entry_display.alias('ENTRY_MODE_DISPLAY'), F.col('CE_PERFORMED_DT_TM').alias('PERFORMED_DT_TM'), F.col('CE_CLINSIG_UPDT_DT_TM').alias('CLINSIG_UPDT_DT_TM'), F.col('PARENT_EVENT_TITLE_TEXT').alias('PARENT_EVENT_TITLE_TEXT'), _checked_int(F.col('PARENT_EVENT_CD'), 'PARENT_CLINICAL_EVENT.EVENT_CD').alias('PARENT_EVENT_CD'), parent_event_display.alias('PARENT_EVENT_CD_DISPLAY'), _checked_int(F.col('PARENT_CATALOG_CD'), 'PARENT_CLINICAL_EVENT.CATALOG_CD').alias('PARENT_CATALOG_CD'), parent_catalog_display.alias('PARENT_CATALOG_DISPLAY'), F.col('POC_CATALOG_TYPE_CD').alias('PARENT_CATALOG_TYPE_CD'), parent_catalog_type_display.alias('PARENT_CATALOG_TYPE_DISPLAY'), F.col('PARENT_REFERENCE_NBR').alias('PARENT_REFERENCE_NBR'), adc_updt.alias('ADC_UPDT'), event_label.alias('EVENT_LABEL'), F.col('DATE_TYPE_FLAG'), F.col('RESULT_TZ'), F.col('DATE_RESULT_VALID_FROM_DT_TM'), F.col('DATE_RESULT_VALID_UNTIL_DT_TM'), F.col('DATE_RESULT_UPDT_DT_TM'), F.col('DATE_RESULT_UPDT_CNT'), F.col('DATE_RESULT_ADC_UPDT'), F.col('DATE_RESULT_EFFECTIVE_UPDT_DT_TM'), F.col('DATE_RESULT_ENCNTR_ID'), F.col('DATE_RESULT_ORGANIZATION_ID'), F.col('TRUST'), F.col('CE_CLINICAL_EVENT_ID').cast('long').alias('CLINICAL_EVENT_ID'), F.col('CE_ENCNTR_ID').cast('long').alias('CLINICAL_EVENT_ENCNTR_ID'), F.col('CE_ORGANIZATION_ID').cast('long').alias('CLINICAL_EVENT_ORGANIZATION_ID'), F.col('CE_Trust').alias('CLINICAL_EVENT_TRUST'), F.coalesce(F.col('CE_ORGANIZATION_ID'), F.col('DATE_RESULT_ORGANIZATION_ID')).cast('long').alias('ORGANIZATION_ID'), F.col('CE_VALID_FROM_DT_TM').alias('CLINICAL_EVENT_VALID_FROM_DT_TM'), F.col('CE_VALID_UNTIL_DT_TM').alias('CLINICAL_EVENT_VALID_UNTIL_DT_TM'), F.col('CE_UPDT_DT_TM').alias('CLINICAL_EVENT_UPDT_DT_TM'), F.col('CE_UPDT_CNT').cast('long').alias('CLINICAL_EVENT_UPDT_CNT'), F.col('CE_ADC_UPDT').alias('CLINICAL_EVENT_ADC_UPDT'), F.col('CE_EVENT_START_DT_TM').alias('EVENT_START_DT_TM'), F.col('CE_EVENT_END_DT_TM').alias('EVENT_END_DT_TM'), F.col('CE_RESULT_STATUS_CD').cast('long').alias('RESULT_STATUS_CD'), F.col('CE_RECORD_STATUS_CD').cast('long').alias('RECORD_STATUS_CD'), F.col('CE_AUTHENTIC_FLAG').cast('long').alias('AUTHENTIC_FLAG'), F.col('CE_PUBLISH_FLAG').cast('long').alias('PUBLISH_FLAG'), F.col('CE_EVENT_RELTN_CD').cast('long').alias('EVENT_RELTN_CD'), F.col('CE_EVENT_TAG').alias('EVENT_TAG'), F.col('CE_SOURCE_CD').cast('long').alias('SOURCE_CD'), F.col('CE_VERIFIED_DT_TM').alias('VERIFIED_DT_TM'), F.col('CE_VERIFIED_PRSNL_ID').cast('long').alias('VERIFIED_PRSNL_ID'), F.col('PARENT_CLINICAL_EVENT_ID').cast('long').alias('PARENT_CLINICAL_EVENT_ID'), F.col('PARENT_VALID_FROM_DT_TM').alias('PARENT_VALID_FROM_DT_TM'), F.col('PARENT_VALID_UNTIL_DT_TM').alias('PARENT_VALID_UNTIL_DT_TM'), F.col('PARENT_UPDT_DT_TM').alias('PARENT_UPDT_DT_TM'), F.col('PARENT_UPDT_CNT').cast('long').alias('PARENT_UPDT_CNT'), F.col('PARENT_ADC_UPDT').alias('PARENT_ADC_UPDT'), F.col('PARENT_RESULT_STATUS_CD').cast('long').alias('PARENT_RESULT_STATUS_CD'), F.col('OC_PRIMARY_MNEMONIC').alias('CATALOG_PRIMARY_MNEMONIC'), F.col('OC_DEPT_DISPLAY_NAME').alias('CATALOG_DEPT_DISPLAY_NAME'), F.col('OC_ACTIVE_IND').alias('CATALOG_ACTIVE_IND'), F.col('POC_PRIMARY_MNEMONIC').alias('PARENT_CATALOG_PRIMARY_MNEMONIC'), F.col('POC_DEPT_DISPLAY_NAME').alias('PARENT_CATALOG_DEPT_DISPLAY_NAME'), F.col('POC_ACTIVE_IND').alias('PARENT_CATALOG_ACTIVE_IND'), lookup_adc_updt.alias('LOOKUP_ADC_UPDT'), F.col('CE_CLINICAL_EVENT_ID').isNotNull().alias('CLINICAL_EVENT_FOUND_IND'), F.col('PARENT_CLINICAL_EVENT_ID').isNotNull().alias('PARENT_EVENT_FOUND_IND'), F.col('OC_CATALOG_CD').isNotNull().alias('ORDER_CATALOG_FOUND_IND'), F.col('POC_CATALOG_CD').isNotNull().alias('PARENT_ORDER_CATALOG_FOUND_IND'), encounter_match.alias('ENCOUNTER_ID_MATCH_IND'), source_current.alias('SOURCE_CURRENT_IND'), F.lit(False).alias('SOURCE_DELETED_IND'), F.col('DATE_RESULT_CDF_COMMIT_VERSION'), F.col('DATE_RESULT_CDF_COMMIT_TIMESTAMP'), F.col('DATE_RESULT_CDF_CHANGE_TYPE'), F.col('TRIGGER_SOURCES'), F.lit(source_versions[config.date_result_table]).cast('long').alias('DATE_RESULT_SOURCE_VERSION'), F.lit(source_versions[config.clinical_event_table]).cast('long').alias('CLINICAL_EVENT_SOURCE_VERSION'), F.lit(source_versions[config.code_value_table]).cast('long').alias('CODE_VALUE_SOURCE_VERSION'), F.lit(source_versions[config.order_catalog_table]).cast('long').alias('ORDER_CATALOG_SOURCE_VERSION'))
-    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'DATE_RESULT_CDF_COMMIT_VERSION', 'DATE_RESULT_CDF_COMMIT_TIMESTAMP', 'DATE_RESULT_CDF_CHANGE_TYPE'}
+    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'DATE_RESULT_CDF_COMMIT_VERSION', 'DATE_RESULT_CDF_COMMIT_TIMESTAMP', 'DATE_RESULT_CDF_CHANGE_TYPE', 'DATE_RESULT_SOURCE_VERSION', 'CLINICAL_EVENT_SOURCE_VERSION', 'CODE_VALUE_SOURCE_VERSION', 'ORDER_CATALOG_SOURCE_VERSION'}
     hash_columns = [F.col(field.name) for field in schema_map_date_events.fields if field.name not in hash_exclusions]
     final_df = selected.withColumn('ROW_HASH', _stable_hash_columns(hash_columns)).withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_UPDT_DT_TM', F.lit(run_timestamp))
     return _align_to_schema(final_df, schema_map_date_events)
@@ -3107,30 +3154,25 @@ def _full_rebuild(config: MapDateEventsConfig, source_versions: Dict[str, int], 
     return {'mode': 'FULL_REBUILD', **metrics}
 
 def _merge_active_updates(config: MapDateEventsConfig, updates: DataFrame) -> Dict[str, int]:
-    cached = bronze_project_contract(updates, config.target_table)
+    cached = _mp30_persist_stage(bronze_project_contract(updates, config.target_table))
     try:
         source_rows = cached.count()
         if source_rows == 0:
             return {'active_source_rows': 0}
-        assignments = {
-            column_name: F.col(f's.{column_name}')
-            for column_name in cached.columns
-        }
+        assignments = {column_name: F.col(f's.{column_name}') for column_name in cached.columns}
         comparisons = ' OR '.join(
             f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
             for column_name in cached.columns
             if column_name != 'EVENT_ID'
         )
         DeltaTable.forName(spark, config.target_table).alias('t').merge(
-            cached.alias('s'),
-            't.EVENT_ID <=> s.EVENT_ID',
+            cached.alias('s'), 't.EVENT_ID <=> s.EVENT_ID'
         ).whenMatchedUpdate(
-            condition=comparisons or 'false',
-            set=assignments,
+            condition=comparisons or 'false', set=assignments
         ).whenNotMatchedInsert(values=assignments).execute()
         return {'active_source_rows': int(source_rows)}
     finally:
-        None
+        _mp30_persist_stage_drop(cached)
 
 def _mark_deleted_keys(config: MapDateEventsConfig, deleted_keys: DataFrame, source_versions: Dict[str, int], run_id: str, run_timestamp: datetime) -> Dict[str, int]:
     prepared = deleted_keys.withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_UPDT_DT_TM', F.lit(run_timestamp)).withColumn('DATE_RESULT_SOURCE_VERSION', F.lit(source_versions[config.date_result_table]).cast('long')).withColumn('CLINICAL_EVENT_SOURCE_VERSION', F.lit(source_versions[config.clinical_event_table]).cast('long')).withColumn('CODE_VALUE_SOURCE_VERSION', F.lit(source_versions[config.code_value_table]).cast('long')).withColumn('ORDER_CATALOG_SOURCE_VERSION', F.lit(source_versions[config.order_catalog_table]).cast('long'))
@@ -3168,24 +3210,36 @@ def _mark_deleted_keys(config: MapDateEventsConfig, deleted_keys: DataFrame, sou
 
 def _incremental_update(config: MapDateEventsConfig, previous_versions: Dict[str, int], source_versions: Dict[str, int], run_id: str, run_timestamp: datetime) -> Dict[str, object]:
     _ensure_target_schema(config)
-    changed_keys = _build_changed_event_keys(config, previous_versions, source_versions)
+    changed_keys = _mp30_persist_stage(
+        _build_changed_event_keys(config, previous_versions, source_versions)
+    )
+    date_rows = None
     try:
         changed_count = changed_keys.count()
         if changed_count == 0:
             return {'mode': 'INCREMENTAL', 'changed_event_ids': 0, 'active_source_rows': 0, 'deleted_source_keys': 0}
-        date_rows = _latest_date_results(config, source_versions[config.date_result_table], event_keys=changed_keys)
+        date_rows = _mp30_persist_stage(
+            _latest_date_results(
+                config, source_versions[config.date_result_table], event_keys=changed_keys
+            )
+        )
         active_date_rows = date_rows.join(changed_keys, 'EVENT_ID', 'inner')
         deleted_keys = changed_keys.join(date_rows.select('EVENT_ID'), 'EVENT_ID', 'left_anti')
-        updates = _build_enriched_date_events(config, active_date_rows, source_versions, run_id, run_timestamp)
+        updates = _build_enriched_date_events(
+            config, active_date_rows, source_versions, run_id, run_timestamp
+        )
         metrics = {'mode': 'INCREMENTAL', 'changed_event_ids': int(changed_count)}
         metrics.update(_merge_active_updates(config, updates))
         metrics.update(_mark_deleted_keys(config, deleted_keys, source_versions, run_id, run_timestamp))
-        missing_active = active_date_rows.select('EVENT_ID').dropDuplicates().join(spark.table(config.target_table).select('EVENT_ID'), 'EVENT_ID', 'left_anti').limit(1).count()
+        missing_active = active_date_rows.select('EVENT_ID').dropDuplicates().join(
+            spark.table(config.target_table).select('EVENT_ID'), 'EVENT_ID', 'left_anti'
+        ).limit(1).count()
         if missing_active:
             raise RuntimeError('At least one active changed EVENT_ID was not present after the merge')
         return metrics
     finally:
-        None
+        _mp30_persist_stage_drop(date_rows)
+        _mp30_persist_stage_drop(changed_keys)
 
 def process_date_events_incremental(force_full_rebuild: bool=False, bootstrap_if_state_missing: bool=True, safe_rebuild: bool=True, config: MapDateEventsConfig=MAP_DATE_EVENTS_CONFIG) -> Dict[str, object]:
     """
@@ -3570,7 +3624,33 @@ def _join_nomenclature(df: DataFrame, versions: Dict[str, int]) -> DataFrame:
 def _legacy_and_foundation_columns(df: DataFrame, run_id: str) -> DataFrame:
     result = df.withColumn('ENCNTR_ID', F.col('CE_ENCNTR_ID')).withColumn('PERSON_ID', F.col('CE_PERSON_ID')).withColumn('ORDER_ID', F.col('CE_ORDER_ID')).withColumn('PERFORMED_PRSNL_ID', F.col('CE_PERFORMED_PRSNL_ID')).withColumn('EVENT_TITLE_TEXT', F.col('CE_EVENT_TITLE_TEXT')).withColumn('EVENT_CD', F.col('CE_EVENT_CD')).withColumn('CATALOG_CD', F.col('CE_CATALOG_CD')).withColumn('CATALOG_TYPE_CD', F.col('OC_CATALOG_TYPE_CD')).withColumn('CATALOG_DISPLAY', F.col('OC_DESCRIPTION')).withColumn('EVENT_CLASS_CD', F.col('CE_EVENT_CLASS_CD')).withColumn('CONTRIBUTOR_SYSTEM_CD', F.col('CE_CONTRIBUTOR_SYSTEM_CD')).withColumn('REFERENCE_NBR', F.col('CE_REFERENCE_NBR')).withColumn('PARENT_EVENT_ID', F.col('CE_PARENT_EVENT_ID')).withColumn('NORMALCY_CD', F.col('CE_NORMALCY_CD')).withColumn('ENTRY_MODE_CD', F.col('CE_ENTRY_MODE_CD')).withColumn('PERFORMED_DT_TM', F.col('CE_PERFORMED_DT_TM')).withColumn('CLINSIG_UPDT_DT_TM', F.col('CE_CLINSIG_UPDT_DT_TM')).withColumn('PARENT_EVENT_TITLE_TEXT', F.col('PE_EVENT_TITLE_TEXT')).withColumn('PARENT_EVENT_CD', F.col('PE_EVENT_CD')).withColumn('PARENT_CATALOG_CD', F.col('PE_CATALOG_CD')).withColumn('PARENT_CATALOG_TYPE_CD', F.col('POC_CATALOG_TYPE_CD')).withColumn('PARENT_CATALOG_DISPLAY', F.col('POC_DESCRIPTION')).withColumn('PARENT_REFERENCE_NBR', F.col('PE_REFERENCE_NBR')).withColumn('SOURCE_VOCABULARY_DESC', F.col('SOURCE_VOCABULARY_DESCRIPTION')).withColumn('VOCAB_AXIS_DESC', F.col('VOCAB_AXIS_DESCRIPTION')).withColumn('EVENT_START_DT_TM', F.col('CE_EVENT_START_DT_TM')).withColumn('EVENT_END_DT_TM', F.col('CE_EVENT_END_DT_TM')).withColumn('EVENT_TAG', F.col('CE_EVENT_TAG')).withColumn('ACCESSION_NBR', F.col('CE_ACCESSION_NBR')).withColumn('RESULT_STATUS_CD', F.col('CE_RESULT_STATUS_CD')).withColumn('RECORD_STATUS_CD', F.col('CE_RECORD_STATUS_CD')).withColumn('AUTHENTIC_FLAG', F.col('CE_AUTHENTIC_FLAG')).withColumn('PUBLISH_FLAG', F.col('CE_PUBLISH_FLAG')).withColumn('VERIFIED_DT_TM', F.col('CE_VERIFIED_DT_TM')).withColumn('VERIFIED_PRSNL_ID', F.col('CE_VERIFIED_PRSNL_ID')).withColumn('EVENT_RELTN_CD', F.col('CE_EVENT_RELTN_CD')).withColumn('SOURCE_CD', F.col('CE_SOURCE_CD')).withColumn('CLINICAL_EVENT_ID', F.col('CE_CLINICAL_EVENT_ID')).withColumn('CE_VALID_FROM_DT_TM', F.col('CE_VALID_FROM_DT_TM')).withColumn('CE_VALID_UNTIL_DT_TM', F.col('CE_VALID_UNTIL_DT_TM')).withColumn('CE_ADC_UPDT', F.col('CE_ADC_UPDT')).withColumn('PARENT_CE_ADC_UPDT', F.col('PE_ADC_UPDT')).withColumn('CATALOG_NAME', F.coalesce(F.nullif(F.trim(F.col('OC_DEPT_DISPLAY_NAME')), F.lit('')), F.nullif(F.trim(F.col('OC_DESCRIPTION')), F.lit('')), F.nullif(F.trim(F.col('OC_PRIMARY_MNEMONIC')), F.lit('')))).withColumn('PARENT_CATALOG_NAME', F.coalesce(F.nullif(F.trim(F.col('POC_DEPT_DISPLAY_NAME')), F.lit('')), F.nullif(F.trim(F.col('POC_DESCRIPTION')), F.lit('')), F.nullif(F.trim(F.col('POC_PRIMARY_MNEMONIC')), F.lit('')))).withColumn('CLINICAL_EVENT_DT_TM', F.coalesce(F.col('EVENT_END_DT_TM'), F.col('PERFORMED_DT_TM'), F.col('EVENT_START_DT_TM'), F.col('CR_VALID_FROM_DT_TM'))).withColumn('EVENT_NAME', F.coalesce(F.nullif(F.trim(F.col('EVENT_TITLE_TEXT')), F.lit('')), F.nullif(F.trim(F.col('EVENT_CD_DISPLAY')), F.lit('')), F.nullif(F.trim(F.col('CATALOG_NAME')), F.lit('')))).withColumn('NOMENCLATURE_CODE', F.coalesce(F.nullif(F.trim(F.col('SOURCE_IDENTIFIER')), F.lit('')), F.nullif(F.trim(F.col('CONCEPT_CKI')), F.lit('')), F.col('NOMENCLATURE_ID').cast('string'))).withColumn('RESOLVED_OMOP_CONCEPT_ID', F.coalesce(F.col('OMOP_MANUAL_CONCEPT_ID'), F.col('OMOP_CONCEPT_ID'))).withColumn('RESOLVED_OMOP_CONCEPT_NAME', F.coalesce(F.col('OMOP_MANUAL_CONCEPT_NAME'), F.col('OMOP_CONCEPT_NAME'))).withColumn('RESOLVED_OMOP_STANDARD_CONCEPT', F.coalesce(F.col('OMOP_MANUAL_STANDARD_CONCEPT'), F.col('OMOP_STANDARD_CONCEPT'))).withColumn('RESOLVED_OMOP_CONCEPT_DOMAIN', F.coalesce(F.col('OMOP_MANUAL_CONCEPT_DOMAIN'), F.col('OMOP_CONCEPT_DOMAIN'))).withColumn('RESOLVED_OMOP_CONCEPT_CLASS', F.coalesce(F.col('OMOP_MANUAL_CONCEPT_CLASS'), F.col('OMOP_CONCEPT_CLASS'))).withColumn('OMOP_MAPPING_SOURCE', F.when(F.col('OMOP_MANUAL_CONCEPT_ID').isNotNull(), F.lit('manual_rule')).when(F.col('OMOP_CONCEPT_ID').isNotNull(), F.lit('nomenclature'))).withColumn('RESOLVED_OMOP_VALUE_CONCEPT_ID', F.col('OMOP_MANUAL_VALUE_CONCEPT_ID')).withColumn('RESOLVED_OMOP_VALUE_CONCEPT_NAME', F.col('OMOP_MANUAL_VALUE_CONCEPT_NAME')).withColumn('OMOP_VALUE_MAPPING_SOURCE', F.when(F.col('OMOP_MANUAL_VALUE_CONCEPT_ID').isNotNull(), F.lit('manual_rule'))).withColumn('SOURCE_DELETED_IND', F.lit(False)).withColumn('SOURCE_CHANGE_TYPE', F.lit('snapshot_upsert'))
     result = result.withColumn('CODE_LOOKUP_ADC_UPDT', _greatest_existing(result, [f'{stem}_LOOKUP_ADC_UPDT' for stem in ('EVENT_CD', 'PARENT_EVENT_CD', 'NORMALCY', 'CONTRIBUTOR_SYSTEM', 'ENTRY_MODE', 'CATALOG_TYPE', 'PARENT_CATALOG_TYPE', 'SOURCE_VOCABULARY', 'VOCAB_AXIS', 'RESULT_STATUS', 'RECORD_STATUS', 'EVENT_RELTN', 'SOURCE')])).withColumn('ADC_UPDT', _greatest_existing(result, ['CR_ADC_UPDT', 'CE_ADC_UPDT', 'PARENT_CE_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'OC_ADC_UPDT', 'POC_ADC_UPDT', 'CODE_LOOKUP_ADC_UPDT', 'OMOP_MANUAL_MAP_ADC_UPDT', 'OMOP_MANUAL_VALUE_MAP_ADC_UPDT']))
-    return result.withColumn('_ROW_HASH_PAYLOAD', F.to_json(F.struct('*'))).withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_PROCESSED_TS', F.current_timestamp()).withColumn('ROW_HASH', F.sha2(F.col('_ROW_HASH_PAYLOAD'), 256)).drop('_ROW_HASH_PAYLOAD')
+    technical_hash_columns = {
+        'ADC_UPDT', 'PIPELINE_RUN_ID', 'PIPELINE_PROCESSED_TS',
+        'SOURCE_CHANGE_TS',
+    }
+    semantic_hash_columns = [
+        F.col(name).alias(name)
+        for name in sorted(result.columns)
+        if name not in technical_hash_columns
+        and not name.upper().endswith('_ADC_UPDT')
+        and not name.upper().endswith('_SOURCE_VERSION')
+        and not name.upper().endswith('_CDF_COMMIT_VERSION')
+        and not name.upper().endswith('_CDF_COMMIT_TIMESTAMP')
+    ]
+    return (
+        result
+        .withColumn(
+            '_ROW_HASH_PAYLOAD',
+            F.to_json(
+                F.struct(*semantic_hash_columns),
+                {'ignoreNullFields': 'false'},
+            ),
+        )
+        .withColumn('PIPELINE_RUN_ID', F.lit(run_id))
+        .withColumn('PIPELINE_PROCESSED_TS', F.current_timestamp())
+        .withColumn('ROW_HASH', F.sha2(F.col('_ROW_HASH_PAYLOAD'), 256))
+        .drop('_ROW_HASH_PAYLOAD')
+    )
 
 def build_map_nomen_events(versions: Dict[str, int], event_ids: Optional[DataFrame]=None, trust: str=DEFAULT_TRUST, run_id: Optional[str]=None) -> DataFrame:
     run_id = run_id or str(uuid.uuid4())
@@ -3612,17 +3692,39 @@ def collect_affected_event_ids(batches: Dict[str, ChangeBatch], versions: Dict[s
         frames.append(reduce(lambda left, right: left.unionByName(right), [target.alias('t').join(F.broadcast(changed_ce_ids).alias('c'), F.col('t.' + column) == F.col('c.CHANGED_EVENT_ID'), 'left_semi').select('EVENT_ID') for column in ('EVENT_ID', 'PARENT_EVENT_ID')]))
     nomen_changes = batches[SRC_NOMENCLATURE].changes
     if nomen_changes is not None:
-        changed_nomen = nomen_changes.select(F.col('NOMENCLATURE_ID').cast('long').alias('NOMENCLATURE_ID')).filter(F.col('NOMENCLATURE_ID').isNotNull()).distinct()
+        changed_nomen = _mne_semantic_snapshot_keys(
+            SRC_NOMENCLATURE,
+            'NOMENCLATURE_ID',
+            batches[SRC_NOMENCLATURE].start_version - 1,
+            batches[SRC_NOMENCLATURE].end_version,
+            key_is_double=True,
+            semantic_columns=(
+                'SOURCE_IDENTIFIER', 'SOURCE_STRING', 'SOURCE_VOCABULARY_CD',
+                'VOCAB_AXIS_CD', 'IS_STANDARD_OMOP_CONCEPT', 'CONCEPT_DOMAIN',
+                'CONCEPT_CLASS', 'FOUND_CUI', 'CONCEPT_CKI', 'SNOMED_CODE',
+                'SNOMED_TYPE', 'SNOMED_MATCH_COUNT', 'SNOMED_TERM', 'ICD10_CODE',
+                'ICD10_CODE_TYPE', 'ICD10_CODE_MATCH_COUNT', 'ICD10_TERM',
+                'OPCS4_CODE', 'OPCS4_CODE_TYPE', 'OPCS4_CODE_MATCH_COUNT',
+                'OPCS4_TERM', 'OMOP_CONCEPT_ID', 'OMOP_CONCEPT_NAME',
+                'NUMBER_OF_OMOP_MATCHES', 'SNOMED_SIMILARITY',
+                'ICD10_SIMILARITY', 'OPCS4_SIMILARITY', 'OMOP_SIMILARITY',
+                'IS_ACTIVE', 'SIMILARITY_SOURCE_SNOMED',
+                'SIMILARITY_SOURCE_ICD10', 'SIMILARITY_SOURCE_OPCS4',
+                'SIMILARITY_SOURCE_OMOP', 'SIMILARITY_SNOMED_ICD10',
+                'SIMILARITY_SNOMED_OPCS4', 'SIMILARITY_SNOMED_OMOP',
+                'SIMILARITY_ICD10_OMOP', 'SIMILARITY_OPCS4_OMOP',
+            ),
+        ).select(F.col('CHANGE_KEY').alias('NOMENCLATURE_ID'))
         frames.append(_snapshot_table(SRC_CODED_RESULT, versions).filter(F.col('Trust') == DEFAULT_TRUST).alias('cr').join(F.broadcast(changed_nomen).alias('n'), 'NOMENCLATURE_ID', 'inner').select(F.col('cr.EVENT_ID').cast('long').alias('EVENT_ID')))
     code_changes = batches[SRC_CODE_VALUE].changes
     if code_changes is not None:
-        changed_codes = code_changes.select(F.col('CODE_VALUE').cast('long').alias('CHANGED_CODE')).filter(F.col('CHANGED_CODE').isNotNull()).distinct()
+        changed_codes = _mne_semantic_snapshot_keys(SRC_CODE_VALUE, 'CODE_VALUE', batches[SRC_CODE_VALUE].start_version - 1, batches[SRC_CODE_VALUE].end_version, key_is_double=True, semantic_columns=('CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND')).select(F.col('CHANGE_KEY').alias('CHANGED_CODE'))
         code_columns = [c for c in ['EVENT_CD', 'PARENT_EVENT_CD', 'NORMALCY_CD', 'CONTRIBUTOR_SYSTEM_CD', 'ENTRY_MODE_CD', 'CATALOG_TYPE_CD', 'PARENT_CATALOG_TYPE_CD', 'SOURCE_VOCABULARY_CD', 'VOCAB_AXIS_CD', 'RESULT_STATUS_CD', 'RECORD_STATUS_CD', 'EVENT_RELTN_CD', 'SOURCE_CD'] if c in target.columns]
         if code_columns:
             frames.append(reduce(lambda left, right: left.unionByName(right), [target.alias('t').join(F.broadcast(changed_codes).alias('v'), F.col('t.' + c).cast('long') == F.col('v.CHANGED_CODE'), 'left_semi').select('EVENT_ID') for c in code_columns]))
     catalog_changes = batches[SRC_ORDER_CATALOG].changes
     if catalog_changes is not None:
-        changed_catalogs = catalog_changes.select(F.col('CATALOG_CD').cast('long').alias('CHANGED_CATALOG_CD')).filter(F.col('CHANGED_CATALOG_CD').isNotNull()).distinct()
+        changed_catalogs = _mne_semantic_snapshot_keys(SRC_ORDER_CATALOG, 'CATALOG_CD', batches[SRC_ORDER_CATALOG].start_version - 1, batches[SRC_ORDER_CATALOG].end_version, key_is_double=True, semantic_columns=('CATALOG_TYPE_CD', 'DESCRIPTION', 'PRIMARY_MNEMONIC', 'DEPT_DISPLAY_NAME', 'ACTIVE_IND', 'EVENT_CD', 'CONCEPT_CKI')).select(F.col('CHANGE_KEY').alias('CHANGED_CATALOG_CD'))
         frames.append(reduce(lambda left, right: left.unionByName(right), [target.alias('t').join(F.broadcast(changed_catalogs).alias('c'), F.col('t.' + column) == F.col('c.CHANGED_CATALOG_CD'), 'left_semi').select('EVENT_ID') for column in ('CATALOG_CD', 'PARENT_CATALOG_CD')]))
     manual_changes = batches[SRC_MANUAL_MAP].changes
     if manual_changes is not None:
@@ -3726,15 +3828,10 @@ def _merge_rebuilt_rows(rebuilt: DataFrame) -> None:
         column_name: F.col(f's.{column_name}')
         for column_name in rebuilt.columns
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-        for column_name in rebuilt.columns
-        if column_name not in MAP_NOMEN_KEY
-    )
     target.alias('t').merge(
         rebuilt.alias('s'), condition
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.ROW_HASH <=> s.ROW_HASH) OR coalesce(t.SOURCE_DELETED_IND, false)',
         set=assignments,
     ).whenNotMatchedInsert(values=assignments).execute()
 
@@ -4276,11 +4373,11 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
         child_event_ids = spark.table(config.target_table).join(F.broadcast(changed_parents), F.col('PARENT_EVENT_ID') == F.col('_CHANGED_PARENT_EVENT_ID'), 'left_semi').select('EVENT_ID')
     changed_code_events = None
     if code_changed is not None:
-        changed_codes = code_changed.select(F.col('CODE_VALUE').cast('long').alias('CODE_VALUE')).where(F.col('CODE_VALUE').isNotNull()).distinct()
+        changed_codes = _mne_semantic_snapshot_keys(config.code_value_source, 'CODE_VALUE', checkpoints[config.code_value_source], current_versions[config.code_value_source], key_is_double=True, semantic_columns=('CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND')).select(F.col('CHANGE_KEY').alias('CODE_VALUE'))
         changed_code_events = _changed_codes_to_events(changed_codes, config)
     changed_catalog_events = None
     if catalog_changed is not None:
-        changed_catalogs = catalog_changed.select(F.col('CATALOG_CD').cast('long').alias('CATALOG_CD')).where(F.col('CATALOG_CD').isNotNull()).distinct()
+        changed_catalogs = _mne_semantic_snapshot_keys(config.order_catalog_source, 'CATALOG_CD', checkpoints[config.order_catalog_source], current_versions[config.order_catalog_source], key_is_double=True, semantic_columns=('CATALOG_TYPE_CD', 'DESCRIPTION', 'PRIMARY_MNEMONIC', 'DEPT_DISPLAY_NAME', 'ACTIVE_IND', 'EVENT_CD', 'CONCEPT_CKI')).select(F.col('CHANGE_KEY').alias('CATALOG_CD'))
         changed_catalog_events = _changed_catalogs_to_events(changed_catalogs, config)
     affected_event_ids = _union_distinct([coded_event_ids, clinical_event_ids, child_event_ids, changed_code_events, changed_catalog_events])
     refreshed_rows = 0
@@ -4291,14 +4388,15 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
     affected_event_count = 0
     try:
         if affected_event_ids is not None:
-            affected_event_ids = affected_event_ids
+            affected_event_ids = _mp30_persist_stage(affected_event_ids)
             affected_event_count = affected_event_ids.count()
         if affected_event_count > 0:
             use_broadcast = affected_event_count <= config.broadcast_event_id_limit
             base, caches = build_coded_events_base(affected_event_ids, config, source_versions=current_versions, broadcast_event_ids=use_broadcast)
+            base = _mp30_persist_stage(base)
             bridge, summary = build_omop_mapping_outputs(base, config, source_versions=current_versions)
-            final = attach_omop_mapping_summary(base, summary)
-            bridge = bridge
+            final = _mp30_persist_stage(attach_omop_mapping_summary(base, summary))
+            bridge = _mp30_persist_stage(bridge)
             stats = validate_coded_events_dataframe(final, 'incremental coded events')
             bridge_stats = validate_omop_bridge_dataframe(bridge, 'incremental OMOP bridge')
             refreshed_rows = stats['row_count']
@@ -4312,14 +4410,12 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
         write_map_checkpoints(current_versions, run_id, config)
         return {'status': 'SUCCESS', 'run_id': run_id, 'changed_ranges': changed_ranges, 'affected_event_count': affected_event_count, 'refreshed_target_rows': refreshed_rows, 'refreshed_bridge_rows': refreshed_bridge_rows, 'full_mapping_refresh': bool(maps_changed or concepts_changed), 'checkpoint_versions': current_versions}
     finally:
-        if final is not None:
-            None
-        if bridge is not None:
-            None
-        if affected_event_ids is not None:
-            None
+        _mp30_persist_stage_drop(final)
+        _mp30_persist_stage_drop(bridge)
+        _mp30_persist_stage_drop(locals().get('base'))
+        _mp30_persist_stage_drop(affected_event_ids)
         for cached in caches:
-            None
+            _mp30_persist_stage_drop(cached)
 
 def process_coded_events_incremental(config: MapCodedEventsConfig=DEFAULT_CODED_EVENTS_CONFIG) -> Dict[str, object]:
     """Drop-in entry point that intentionally overrides the original Map Pipeline function."""
@@ -4348,4 +4444,79 @@ finally:
         has_cdf_enabled = _pipeline_shared_has_cdf_enabled
     if _pipeline_shared_get_incremental is not None:
         get_incremental_data_with_cdf = _pipeline_shared_get_incremental
+
+# ANON_TEXT_STATE_REATTACH_V3_2
+import json as _anon_json
+from pyspark.sql import functions as _anon_F
+
+_ANON_REATTACH_SPECS = _anon_json.loads('[{"feed": "text_event", "keys": ["EVENT_ID"], "outputs": ["anon_text_result"], "state_table": "6_mgmt.anon.state_text_event", "table": "4_prod.bronze.map_text_events"}]')
+_ANON_STATE_TYPES = {'anon_status': 'STRING', 'anon_redactor_version': 'STRING', 'anon_source_text_sha': 'STRING', 'anon_identity_fingerprint': 'STRING', 'anon_redaction_count': 'BIGINT', 'anon_processed_at': 'TIMESTAMP'}
+
+def _anon_qtable(name):
+    return ".".join(f"`{part}`" for part in name.replace("`", "").split("."))
+
+for _anon_spec in _ANON_REATTACH_SPECS:
+    _anon_target = _anon_spec["table"]
+    _anon_state = _anon_spec["state_table"]
+    _anon_columns = {field.name: field.dataType.simpleString()
+                     for field in spark.table(_anon_target).schema.fields}
+    for _anon_name in _anon_spec["outputs"]:
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` STRING)")
+    for _anon_name, _anon_type in _ANON_STATE_TYPES.items():
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` {_anon_type})")
+    for _anon_name in _anon_spec["outputs"]:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='3','ig_severity'='2')"
+        )
+    for _anon_name in _ANON_STATE_TYPES:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='1','ig_severity'='1')"
+        )
+    if spark.catalog.tableExists(_anon_state):
+        _anon_target_df = spark.table(_anon_target).alias("t")
+        _anon_state_df = spark.table(_anon_state).alias("s")
+        _anon_condition = None
+        for _anon_key in _anon_spec["keys"]:
+            _anon_term = _anon_F.col(f"t.`{_anon_key}`").eqNullSafe(
+                _anon_F.col(f"s.`{_anon_key}`")
+            )
+            _anon_condition = _anon_term if _anon_condition is None else _anon_condition & _anon_term
+        _anon_expected = _anon_target_df.join(
+            _anon_state_df, _anon_condition, "inner"
+        ).count()
+        _anon_join_sql = " AND ".join(
+            f"t.`{column}` <=> s.`{column}`" for column in _anon_spec["keys"]
+        )
+        spark.sql(
+            f"MERGE INTO {_anon_qtable(_anon_target)} t USING {_anon_qtable(_anon_state)} s "
+            f"ON {_anon_join_sql} WHEN MATCHED THEN UPDATE SET "
+            + ", ".join(
+                f"t.`{column}` = s.`{column}`"
+                for column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES)
+            )
+        )
+        _anon_post = spark.table(_anon_target).alias("t").join(
+            spark.table(_anon_state).alias("s"), _anon_condition, "inner"
+        )
+        _anon_mismatch = _anon_F.lit(False)
+        for _anon_column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES):
+            _anon_mismatch = _anon_mismatch | ~_anon_F.col(
+                f"t.`{_anon_column}`"
+            ).eqNullSafe(_anon_F.col(f"s.`{_anon_column}`"))
+        _anon_metrics = _anon_post.agg(
+            _anon_F.count("*").alias("matched_rows"),
+            _anon_F.sum(_anon_F.when(_anon_mismatch, 1).otherwise(0)).alias("mismatches"),
+        ).first()
+        if (int(_anon_metrics.matched_rows) != int(_anon_expected)
+                or int(_anon_metrics.mismatches or 0) != 0):
+            raise AssertionError(
+                f"anonymous-state reattach failed for {_anon_target}: "
+                f"expected={_anon_expected}, matched={_anon_metrics.matched_rows}, "
+                f"mismatches={_anon_metrics.mismatches}"
+            )
+# END_ANON_TEXT_STATE_REATTACH_V3_2
 

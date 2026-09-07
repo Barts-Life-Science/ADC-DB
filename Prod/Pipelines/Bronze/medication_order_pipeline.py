@@ -32,6 +32,7 @@ for _name, _default in {
     "bootstrap_mode": "false",
     "bootstrap_min_order_id": "",
     "bootstrap_max_order_id": "",
+    "recovery_control_table": "8_dev.bronze.medication_order_recovery_control",
 }.items():
     try:
         dbutils.widgets.get(_name)
@@ -54,6 +55,28 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+# S4-C1a BEGIN
+# S4/C1a drop-in contract: ADC_UPDT remains the bronze BUILD clock and
+# SOURCE_ADC_UPDT remains the raw source clock. This enrichment must not alter
+# source watermarks or checkpoint semantics.
+S4_MED_LOOKUP_TABLE = "3_lookup.mill.map_med_lookup"
+S4_OMOP_CONCEPT_TABLE = "4_prod.omop.concept"
+S4_OMOP_CONCEPT_RELATIONSHIP_TABLE = "4_prod.omop.concept_relationship"
+S4_MED_CONCEPT_COLUMNS = [
+    "SNOMED_CODE",
+    "MULTUM_CODE",
+    "RXNORM_CODE",
+    "OMOP_CONCEPT_ID",
+    "OMOP_CONCEPT_NAME",
+    "OMOP_MAPPING_METHOD",
+    "OMOP_MAPPING_CONFIDENCE",
+    "OMOP_STANDARD_CONCEPT_ID",
+    "OMOP_STANDARD_CONCEPT_NAME",
+    "OMOP_STANDARD_CANDIDATE_COUNT",
+    "OMOP_STANDARD_MAPPING_METHOD",
+    "LOOKUP_SOURCE_ROW_HASH",
+]
+# S4-C1a END
 TARGET_SCHEMA = bronze_value("target_schema", "8_dev.bronze")
 ALLOW_PRODUCTION_WRITE = bronze_bool("allow_production_write", False)
 FORCE_FULL_REFRESH = bronze_bool("force_full_refresh", False)
@@ -62,7 +85,11 @@ BOOTSTRAP_MODE = bronze_bool("bootstrap_mode", False)
 BOOTSTRAP_MIN_ORDER_ID = bronze_value("bootstrap_min_order_id", "")
 BOOTSTRAP_MAX_ORDER_ID = bronze_value("bootstrap_max_order_id", "")
 RUN_ID = bronze_run_id()
-PIPELINE_LOGIC_VERSION = "2026.08.v2.0"
+RECOVERY_CONTROL_TABLE = bronze_value(
+    "recovery_control_table",
+    "8_dev.bronze.medication_order_recovery_control",
+)
+PIPELINE_LOGIC_VERSION = "2026.08.s4s3a11.recovery-finalize-v2"
 LOGIC_VERSION_INT = 2026080801
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 RUN_FUTURE_HORIZON = None
@@ -394,6 +421,62 @@ def merge_target(
     }
 
 
+def replace_target_full(df: DataFrame, target: str, keys: list[str]) -> dict:
+    """Atomically replace one full target without a many-billion-row MERGE."""
+    assert bronze_table_exists(target), f"Recovery replacement requires existing target {target}"
+    replacement = (
+        with_row_hash(df)
+        .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID))
+        .withColumn("SOURCE_PRESENT_IND", F.lit(True))
+        .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
+        .withColumn("ADC_UPDT", F.current_timestamp())
+    )
+    target_columns = spark.table(target).columns
+    missing = sorted(set(target_columns) - set(replacement.columns))
+    extra = sorted(set(replacement.columns) - set(target_columns))
+    assert not missing and not extra, {
+        "target": target,
+        "missing_columns": missing,
+        "extra_columns": extra,
+    }
+    view_name = "__medication_detail_full_replace"
+    replacement.select(*target_columns).createOrReplaceTempView(view_name)
+    try:
+        spark.sql(
+            f"INSERT OVERWRITE TABLE {qname(target)} "
+            f"SELECT * FROM {qident(view_name)}"
+        )
+    finally:
+        spark.catalog.dropTempView(view_name)
+
+    ensure_table_features(target)
+    if target in CLUSTER_KEYS:
+        cluster_columns = ", ".join(qident(column) for column in CLUSTER_KEYS[target])
+        spark.sql(f"ALTER TABLE {qname(target)} CLUSTER BY ({cluster_columns})")
+
+    null_condition = reduce(
+        lambda left, right: left | right,
+        [F.col(key).isNull() for key in keys],
+    )
+    assert spark.table(target).where(null_condition).limit(1).count() == 0, (
+        f"{target}: NULL key detected after full replacement"
+    )
+    history = _run_overwrite_history(target, RUN_ID)
+    assert history is not None, {
+        "target": target,
+        "message": "No successful overwrite from this pipeline run was found",
+        "run_id": RUN_ID,
+    }
+    return {
+        "operation": "INSERT_OVERWRITE",
+        "staged_rows": int(history["output_rows"]),
+        "tombstones_staged": 0,
+        "target_version": int(history["version"]),
+        "output_rows": int(history["output_rows"]),
+        "write_timestamp": history["timestamp"],
+    }
+
+
 def add_decode(
     df: DataFrame,
     code_column: str,
@@ -410,6 +493,178 @@ def add_decode(
     return df.join(lookup, F.col(code_column).cast("long") == F.col(key), "left").drop(key)
 
 
+# S4-C1a BEGIN
+def add_s4_medication_concepts(df: DataFrame, target_keys: list[str]) -> DataFrame:
+    """Add the S4 medication concept stack at the target increment's key grain."""
+    missing = [column for column in [*target_keys, "SYNONYM_ID"] if column not in df.columns]
+    assert not missing, f"S4 medication enrichment: missing target columns {missing}"
+
+    lookup = spark.table(S4_MED_LOOKUP_TABLE).select(
+        F.col("SYNONYM_ID").cast("long").alias("__S4_LOOKUP_SYNONYM_ID"),
+        F.col("SNOMED_CODE").cast("string").alias("SNOMED_CODE"),
+        F.col("MULTUM_CODE").cast("string").alias("MULTUM_CODE"),
+        F.col("RXNORM_CODE").cast("string").alias("RXNORM_CODE"),
+        F.col("MAPPED_OMOP_CONCEPT_ID").cast("long").alias("MAPPED_OMOP_CONCEPT_ID"),
+        F.col("MAPPED_OMOP_CONCEPT_TERM").cast("string").alias("MAPPED_OMOP_CONCEPT_TERM"),
+        F.col("STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID").cast("long").alias(
+            "STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID"
+        ),
+        F.col("STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM").cast("string").alias(
+            "STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM"
+        ),
+        F.col("SIMILARITY_OMOP_CONCEPT_ID").cast("long").alias("SIMILARITY_OMOP_CONCEPT_ID"),
+        F.col("SIMILARITY_OMOP_CONCEPT_TERM").cast("string").alias("SIMILARITY_OMOP_CONCEPT_TERM"),
+        F.col("RAW_SIMILARITY_SCORE").cast("double").alias("RAW_SIMILARITY_SCORE"),
+        F.col("SIMILARITY_SCORE").cast("double").alias("SIMILARITY_SCORE"),
+        F.col("SOURCE_ROW_HASH").cast("string").alias("LOOKUP_SOURCE_ROW_HASH"),
+    )
+
+    # Binding S4 enrich-frame contract: the increment at its target-key grain is
+    # the LEFT side. Missing/removed lookup rows therefore emit NULL enrichment.
+    enriched = (
+        df.alias("target_keys")
+        .join(
+            F.broadcast(lookup).alias("lookup"),
+            F.col("target_keys.SYNONYM_ID").cast("long") == F.col("lookup.__S4_LOOKUP_SYNONYM_ID"),
+            "left",
+        )
+        .select(
+            "target_keys.*",
+            F.col("lookup.SNOMED_CODE").alias("SNOMED_CODE"),
+            F.col("lookup.MULTUM_CODE").alias("MULTUM_CODE"),
+            F.col("lookup.RXNORM_CODE").alias("RXNORM_CODE"),
+            F.coalesce(
+                F.col("lookup.MAPPED_OMOP_CONCEPT_ID"),
+                F.col("lookup.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID"),
+                F.col("lookup.SIMILARITY_OMOP_CONCEPT_ID"),
+            ).cast("long").alias("OMOP_CONCEPT_ID"),
+            F.coalesce(
+                F.col("lookup.MAPPED_OMOP_CONCEPT_TERM"),
+                F.col("lookup.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM"),
+                F.col("lookup.SIMILARITY_OMOP_CONCEPT_TERM"),
+            ).alias("OMOP_CONCEPT_NAME"),
+            F.when(
+                F.col("lookup.MAPPED_OMOP_CONCEPT_ID").isNotNull(),
+                F.lit("LOOKUP_MAPPED"),
+            ).when(
+                F.col("lookup.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID").isNotNull(),
+                F.lit("LOOKUP_SIMILARITY_STANDARDIZED"),
+            ).when(
+                F.col("lookup.SIMILARITY_OMOP_CONCEPT_ID").isNotNull(),
+                F.lit("LOOKUP_SIMILARITY"),
+            ).alias("OMOP_MAPPING_METHOD"),
+            F.when(
+                F.col("lookup.MAPPED_OMOP_CONCEPT_ID").isNotNull(),
+                F.lit(None).cast("double"),
+            ).when(
+                F.col("lookup.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID").isNotNull(),
+                F.col("lookup.RAW_SIMILARITY_SCORE"),
+            ).otherwise(F.col("lookup.SIMILARITY_SCORE")).alias("OMOP_MAPPING_CONFIDENCE"),
+            F.col("lookup.LOOKUP_SOURCE_ROW_HASH").alias("LOOKUP_SOURCE_ROW_HASH"),
+        )
+    )
+
+    source_ids = (
+        enriched.select(F.col("OMOP_CONCEPT_ID").cast("long").alias("concept_id"))
+        .where(F.col("concept_id").isNotNull())
+        .distinct()
+    )
+    concepts = spark.table(S4_OMOP_CONCEPT_TABLE).select(
+        F.col("concept_id").cast("long").alias("concept_id"),
+        F.col("concept_name").cast("string").alias("concept_name"),
+        F.col("standard_concept").cast("string").alias("standard_concept"),
+    )
+    classified = (
+        source_ids.alias("source")
+        .join(
+            concepts.alias("source_concept"),
+            F.col("source.concept_id") == F.col("source_concept.concept_id"),
+            "left",
+        )
+        .select(
+            F.col("source.concept_id").alias("concept_id"),
+            F.col("source_concept.standard_concept").alias("source_standard_concept"),
+        )
+    )
+    valid_standard = concepts.where(F.col("standard_concept") == F.lit("S")).select(
+        F.col("concept_id").alias("standard_concept_id"),
+        F.col("concept_name").alias("standard_concept_name"),
+    )
+    maps_to = (
+        spark.table(S4_OMOP_CONCEPT_RELATIONSHIP_TABLE)
+        .where(
+            (F.col("relationship_id") == F.lit("Maps to"))
+            & F.col("invalid_reason").isNull()
+        )
+        .select(
+            F.col("concept_id_1").cast("long").alias("concept_id"),
+            F.col("concept_id_2").cast("long").alias("standard_concept_id"),
+        )
+        .join(source_ids, "concept_id", "inner")
+        .join(valid_standard.select("standard_concept_id"), "standard_concept_id", "inner")
+        .dropDuplicates(["concept_id", "standard_concept_id"])
+    )
+    maps_to_agg = maps_to.groupBy("concept_id").agg(
+        F.countDistinct("standard_concept_id").cast("long").alias("maps_to_count"),
+        F.min("standard_concept_id").cast("long").alias("only_standard_concept_id"),
+    )
+    resolved = classified.join(maps_to_agg, "concept_id", "left")
+    maps_to_count = F.coalesce(F.col("maps_to_count"), F.lit(0).cast("long"))
+    already_standard = F.col("source_standard_concept") == F.lit("S")
+    resolved = resolved.select(
+        F.col("concept_id"),
+        F.when(already_standard, F.col("concept_id"))
+        .when(maps_to_count == 1, F.col("only_standard_concept_id"))
+        .cast("long")
+        .alias("OMOP_STANDARD_CONCEPT_ID"),
+        F.when(already_standard, F.lit(1).cast("long"))
+        .otherwise(maps_to_count)
+        .cast("long")
+        .alias("OMOP_STANDARD_CANDIDATE_COUNT"),
+        F.when(already_standard, F.lit("ALREADY_STANDARD"))
+        .when(maps_to_count == 1, F.lit("MAPS_TO_EXACT"))
+        .when(maps_to_count > 1, F.lit("MAPS_TO_MULTI"))
+        .otherwise(F.lit("NO_STANDARD_MAP"))
+        .alias("OMOP_STANDARD_MAPPING_METHOD"),
+    )
+    resolved = (
+        resolved.alias("resolution")
+        .join(
+            valid_standard.alias("standard_concept"),
+            F.col("resolution.OMOP_STANDARD_CONCEPT_ID")
+            == F.col("standard_concept.standard_concept_id"),
+            "left",
+        )
+        .select(
+            "resolution.*",
+            F.col("standard_concept.standard_concept_name").alias("OMOP_STANDARD_CONCEPT_NAME"),
+        )
+    )
+
+    return (
+        enriched.alias("target_keys")
+        .join(
+            F.broadcast(resolved).alias("standard_resolution"),
+            F.col("target_keys.OMOP_CONCEPT_ID") == F.col("standard_resolution.concept_id"),
+            "left",
+        )
+        .select(
+            "target_keys.*",
+            F.col("standard_resolution.OMOP_STANDARD_CONCEPT_ID").cast("long").alias(
+                "OMOP_STANDARD_CONCEPT_ID"
+            ),
+            F.col("standard_resolution.OMOP_STANDARD_CONCEPT_NAME").alias(
+                "OMOP_STANDARD_CONCEPT_NAME"
+            ),
+            F.col("standard_resolution.OMOP_STANDARD_CANDIDATE_COUNT").cast("long").alias(
+                "OMOP_STANDARD_CANDIDATE_COUNT"
+            ),
+            F.col("standard_resolution.OMOP_STANDARD_MAPPING_METHOD").alias(
+                "OMOP_STANDARD_MAPPING_METHOD"
+            ),
+        )
+    )
+# S4-C1a END
 def apply_order_id_slice(df: DataFrame) -> DataFrame:
     if not BOOTSTRAP_MODE:
         return df
@@ -655,6 +910,9 @@ def build_order(order_ids: DataFrame | None, decode_lookup: DataFrame) -> DataFr
         "SOFT_STOP_DT_TM", "SUSPEND_EFFECTIVE_DT_TM", "RESUME_EFFECTIVE_DT_TM",
         "DISCONTINUE_EFFECTIVE_DT_TM", "MODIFIED_START_DT_TM", "VALID_DOSE_DT_TM",
         F.col("LAST_UPDATE_PROVIDER_ID").cast("long").alias("LAST_UPDATE_PROVIDER_ID"),
+        # S3-A11 BEGIN: retain source update counter for prod-twin provenance parity.
+        F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
+        # S3-A11 END
         F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"),
     )
     for code, description in [
@@ -666,6 +924,11 @@ def build_order(order_ids: DataFrame | None, decode_lookup: DataFrame) -> DataFr
         result = add_decode(result, code, description, decode_lookup)
     for column in ["ORIG_ORDER_DT_TM", "STATUS_DT_TM", "CURRENT_START_DT_TM", "PROJECTED_STOP_DT_TM", "SOFT_STOP_DT_TM", "DISCONTINUE_EFFECTIVE_DT_TM", "VALID_DOSE_DT_TM"]:
         result = add_timestamp_quality(result, column, scheduled_future_ok=column in {"CURRENT_START_DT_TM", "PROJECTED_STOP_DT_TM", "SOFT_STOP_DT_TM", "VALID_DOSE_DT_TM"})
+    # S4-C1a BEGIN
+    # materialize_stage/merge_target write every returned column, so this extends
+    # both the staged write and MERGE update/insert paths for the 12 S4 columns.
+    result = add_s4_medication_concepts(result, ["ORDER_ID"])
+    # S4-C1a END
     return result
 
 
@@ -698,6 +961,10 @@ def build_action(affected_orders: DataFrame | None, decode_lookup: DataFrame) ->
         "ORDER_DT_TM", "ACTION_DT_TM", "EFFECTIVE_DT_TM", "ACTION_INITIATED_DT_TM",
         "PROJECTED_STOP_DT_TM", "NEXT_DOSE_DT_TM", "VALID_DOSE_DT_TM", "CURRENT_START_DT_TM",
         F.lit(True).alias("HISTORICAL_FEED_IND"),
+        # S3-A11 BEGIN: child and parent source provenance fill forward.
+        F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
+        F.col("ORDER_SOURCE_ADC_UPDT").alias("ORDER_SOURCE_ADC_UPDT"),
+        # S3-A11 END
         F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"),
     )
     for code, description in [
@@ -746,6 +1013,10 @@ def build_ingredient(affected_orders: DataFrame | None, decode_lookup: DataFrame
         F.col("INGREDIENT_TYPE_FLAG").cast("long").alias("INGREDIENT_TYPE_FLAG"),
         F.col("CLINICALLY_SIGNIFICANT_FLAG").cast("long").alias("CLINICALLY_SIGNIFICANT_FLAG"),
         F.col("INCLUDE_IN_TOTAL_VOLUME_FLAG").cast("long").alias("INCLUDE_IN_TOTAL_VOLUME_FLAG"),
+        # S3-A11 BEGIN: child and parent source provenance fill forward.
+        F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
+        F.col("ORDER_SOURCE_ADC_UPDT").alias("ORDER_SOURCE_ADC_UPDT"),
+        # S3-A11 END
         F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"),
     )
     for code, description in [
@@ -756,6 +1027,14 @@ def build_ingredient(affected_orders: DataFrame | None, decode_lookup: DataFrame
         ("CONCENTRATION_UNIT_CD", "CONCENTRATION_UNIT_DESCRIPTION"),
     ]:
         result = add_decode(result, code, description, decode_lookup)
+    # S4-C1a BEGIN
+    # The ingredient increment is already unique at these target keys; retain it
+    # as the LEFT side so a missing lookup row yields explicit NULL enrichment.
+    result = add_s4_medication_concepts(
+        result,
+        ["ORDER_ID", "ACTION_SEQUENCE", "COMP_SEQUENCE"],
+    )
+    # S4-C1a END
     return result
 
 
@@ -783,6 +1062,10 @@ def build_detail(affected_orders: DataFrame | None = None) -> DataFrame:
         F.col("PARENT_ACTION_SEQUENCE").cast("long").alias("PARENT_ACTION_SEQUENCE"),
         "LAST_ACTION_SEQUENCE",
         F.lit("LATEST_ACTION_LONG_FORMAT").alias("DETAIL_HISTORY_CONTRACT"),
+        # S3-A11 BEGIN: child and parent source provenance fill forward.
+        F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
+        F.col("ORDER_SOURCE_ADC_UPDT").alias("ORDER_SOURCE_ADC_UPDT"),
+        # S3-A11 END
         F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"),
     )
 
@@ -802,11 +1085,164 @@ TARGET_KEYS = {
 }
 SOURCE_HEALTH: dict[str, dict] = {}
 FULL_MODES = {"FULL", "FULL_LOOKUP_CHANGE"}
+RECOVERY_CONFIG = None
+
+
+def _history_has_run_merge(target: str, run_id: str) -> bool:
+    history = spark.sql(f"DESCRIBE HISTORY {qname(target)}")
+    return (
+        history.where(
+            (F.col("operation") == F.lit("MERGE"))
+            & (F.col("job.jobRunId").cast("string") == F.lit(str(run_id)))
+        )
+        .limit(1)
+        .count()
+        == 1
+    )
+
+
+def _run_overwrite_history(
+    target: str,
+    run_id: str,
+    expected_version: int | None = None,
+) -> dict | None:
+    history = spark.sql(f"DESCRIBE HISTORY {qname(target)}")
+    matching = history.where(
+        (F.col("operation") == F.lit("WRITE"))
+        & (F.col("job.jobRunId").cast("string") == F.lit(str(run_id)))
+        & (
+            F.lower(
+                F.element_at(F.col("operationParameters"), F.lit("mode"))
+            ) == F.lit("overwrite")
+        )
+    )
+    if expected_version is not None:
+        matching = matching.where(F.col("version") == F.lit(int(expected_version)))
+    row = matching.orderBy(F.col("version").desc()).limit(1).collect()
+    if not row:
+        return None
+    item = row[0].asDict(recursive=True)
+    latest_write = (
+        history.where(F.col("operation") == F.lit("WRITE"))
+        .orderBy(F.col("version").desc())
+        .limit(1)
+        .collect()[0]
+        .asDict(recursive=True)
+    )
+    assert int(latest_write["version"]) == int(item["version"]), {
+        "message": "A later WRITE exists; refusing to finalize an older recovery overwrite",
+        "expected_recovery_write": item,
+        "latest_write": latest_write,
+    }
+    metrics = item.get("operationMetrics") or {}
+    output_rows = int(
+        metrics.get("numOutputRows")
+        or metrics.get("numTargetRowsInserted")
+        or 0
+    )
+    assert output_rows > 0, {"target": target, "history": item}
+    return {
+        "operation": "RECOVERY_FINALIZE_EXISTING_OVERWRITE",
+        "version": int(item["version"]),
+        "timestamp": str(item["timestamp"]),
+        "output_rows": output_rows,
+        "job_run_id": str((item.get("job") or {}).get("jobRunId") or ""),
+        "task_run_id": str((item.get("job") or {}).get("runId") or ""),
+    }
+
+
+def load_recovery_config() -> dict | None:
+    if not RECOVERY_CONTROL_TABLE or not bronze_table_exists(RECOVERY_CONTROL_TABLE):
+        return None
+    rows = (
+        spark.table(RECOVERY_CONTROL_TABLE)
+        .where(
+            (F.col("pipeline_run_id") == F.lit(RUN_ID))
+            & (F.col("status") == F.lit("ACTIVE"))
+        )
+        .orderBy(F.col("created_at").desc())
+        .limit(1)
+        .collect()
+    )
+    if not rows:
+        return None
+    config = rows[0].asDict(recursive=True)
+    selected = set(json.loads(config["selected_targets_json"]))
+    expected_successful = set(json.loads(config["expected_successful_targets_json"]))
+    assert selected == {DETAIL}, selected
+    assert expected_successful == {ORDER, ACTION, INGREDIENT}, expected_successful
+    missing_success = sorted(
+        target for target in expected_successful
+        if not _history_has_run_merge(target, RUN_ID)
+    )
+    assert not missing_success, {
+        "message": "Recovery would skip targets without a successful MERGE from this run",
+        "run_id": RUN_ID,
+        "missing_success": missing_success,
+    }
+    details = json.loads(config.get("details_json") or "{}")
+    expected_write_version = details.get("expected_detail_write_version")
+    existing_detail_overwrite = None
+    if expected_write_version is not None:
+        existing_detail_overwrite = _run_overwrite_history(
+            DETAIL,
+            RUN_ID,
+            int(expected_write_version),
+        )
+        assert existing_detail_overwrite is not None, {
+            "message": "Expected completed medication-detail overwrite was not found",
+            "run_id": RUN_ID,
+            "expected_version": expected_write_version,
+        }
+        expected_output_rows = details.get("expected_detail_output_rows")
+        if expected_output_rows is not None:
+            assert int(existing_detail_overwrite["output_rows"]) == int(expected_output_rows), {
+                "expected_output_rows": int(expected_output_rows),
+                "actual": existing_detail_overwrite,
+            }
+    config["selected_targets"] = selected
+    config["expected_successful_targets"] = expected_successful
+    config["details"] = details
+    config["existing_detail_overwrite"] = existing_detail_overwrite
+    return config
+
+
+def apply_recovery_scope(modes: dict[str, str]) -> dict[str, str]:
+    global RECOVERY_CONFIG
+    RECOVERY_CONFIG = load_recovery_config()
+    if RECOVERY_CONFIG is None:
+        return modes
+    adjusted = {target: "UNCHANGED_SKIP" for target in TARGET_SOURCES}
+    if RECOVERY_CONFIG.get("existing_detail_overwrite") is not None:
+        adjusted[DETAIL] = "RECOVERY_FINALIZE"
+        print(
+            "[MEDICATION_ORDER][RECOVERY] existing detail overwrite verified; "
+            "finalizing checkpoints without rebuilding 2.83B rows"
+        )
+    else:
+        adjusted[DETAIL] = "FULL_REPLACE"
+        print(
+            "[MEDICATION_ORDER][RECOVERY] detail-only full replacement; "
+            "order/action/ingredient verified and skipped"
+        )
+    return adjusted
+
+
+def mark_recovery_control(status: str, details: dict) -> None:
+    if RECOVERY_CONFIG is None:
+        return
+    payload = sql_escape(json.dumps(details, sort_keys=True, default=str))
+    spark.sql(
+        f"UPDATE {qname(RECOVERY_CONTROL_TABLE)} "
+        f"SET status='{sql_escape(status)}', completed_at=current_timestamp(), "
+        f"details_json='{payload}' "
+        f"WHERE pipeline_run_id='{sql_escape(RUN_ID)}' AND status='ACTIVE'"
+    )
 
 
 def source_mode(source: str, modes: dict[str, str]) -> str:
     consuming_modes = [mode for target, mode in modes.items() if source in TARGET_SOURCES[target]]
-    if any(mode in FULL_MODES or mode == "BOOTSTRAP" for mode in consuming_modes):
+    if any(mode in FULL_MODES or mode in {"BOOTSTRAP", "FULL_REPLACE"} for mode in consuming_modes):
         return "FULL"
     if any(mode == "INCREMENTAL" for mode in consuming_modes):
         return "INCREMENTAL"
@@ -885,77 +1321,116 @@ def run_incremental_suite(modes: dict[str, str], metrics: dict[str, dict]) -> di
     return result
 
 
-def run_full_parity_suite() -> dict:
-    raw_pharmacy_orders = spark.table(SRC_ORDER).where(
-        F.col("ACTIVITY_TYPE_CD").cast("long") == PHARMACY_ACTIVITY_TYPE_CD
-    ).count()
-    present_orders = spark.table(ORDER).where("SOURCE_PRESENT_IND").count()
-    assert present_orders == raw_pharmacy_orders, f"order parity: {present_orders} != {raw_pharmacy_orders}"
+def run_full_parity_suite(modes: dict[str, str]) -> dict:
+    result = {"level": "FULL_PARITY", "targets": {}}
+    child_targets = (ACTION, INGREDIENT, DETAIL)
+    needs_parent_ids = any(modes[target] in FULL_MODES for target in child_targets)
 
-    parent_ids = (
-        spark.table(SRC_ORDER)
-        .where(F.col("ACTIVITY_TYPE_CD").cast("long") == PHARMACY_ACTIVITY_TYPE_CD)
-        .select(
-            F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
-            F.col("LAST_ACTION_SEQUENCE").cast("long").alias("LAST_ACTION_SEQUENCE"),
+    parent_ids = None
+    if needs_parent_ids:
+        parent_ids = (
+            spark.table(SRC_ORDER)
+            .where(F.col("ACTIVITY_TYPE_CD").cast("long") == PHARMACY_ACTIVITY_TYPE_CD)
+            .select(
+                F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
+                F.col("LAST_ACTION_SEQUENCE").cast("long").alias(
+                    "LAST_ACTION_SEQUENCE"
+                ),
+            )
         )
-    )
-    expected_action = (
-        spark.table(SRC_ACTION).select(F.col("ORDER_ID").cast("long").alias("ORDER_ID"))
-        .join(parent_ids.select("ORDER_ID"), "ORDER_ID", "inner").count()
-    )
-    expected_ingredient = (
-        spark.table(SRC_INGREDIENT)
-        .select(
-            F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
-            F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
-            F.col("COMP_SEQUENCE").cast("long").alias("COMP_SEQUENCE"),
-        )
-        .join(parent_ids.select("ORDER_ID"), "ORDER_ID", "inner")
-        .dropDuplicates(["ORDER_ID", "ACTION_SEQUENCE", "COMP_SEQUENCE"])
-        .count()
-    )
-    expected_detail = (
-        spark.table(SRC_DETAIL)
-        .select(
-            F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
-            F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
-            F.col("DETAIL_SEQUENCE").cast("long").alias("DETAIL_SEQUENCE"),
-        )
-        .join(parent_ids, "ORDER_ID", "inner")
-        .where(F.col("ACTION_SEQUENCE") == F.col("LAST_ACTION_SEQUENCE"))
-        .select("ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE")
-        .dropDuplicates(["ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE"])
-        .count()
-    )
-    present_action = spark.table(ACTION).where("SOURCE_PRESENT_IND").count()
-    present_ingredient = spark.table(INGREDIENT).where("SOURCE_PRESENT_IND").count()
-    present_detail = spark.table(DETAIL).where("SOURCE_PRESENT_IND").count()
-    assert present_action == expected_action
-    assert present_ingredient == expected_ingredient
-    assert present_detail == expected_detail
 
-    max_action_source = spark.table(ACTION).agg(F.max("SOURCE_ADC_UPDT").alias("watermark")).collect()[0]["watermark"]
-    assert max_action_source.replace(tzinfo=None) <= _action_ceiling
-    encounter_rate = spark.table(ORDER).where("SOURCE_PRESENT_IND").agg(
-        F.avg(F.col("ENCNTR_ID").isNotNull().cast("double")).alias("rate")
-    ).collect()[0]["rate"]
-    return {
-        "level": "FULL_PARITY",
-        "pharmacy_orders": int(present_orders),
-        "pharmacy_actions": int(present_action),
-        "pharmacy_ingredients": int(present_ingredient),
-        "pharmacy_latest_action_detail": int(present_detail),
-        "order_encounter_rate": encounter_rate,
-        "action_history_ceiling": str(max_action_source),
-        "detail_history_contract": "LATEST_ACTION_LONG_FORMAT",
-    }
+    if modes[ORDER] in FULL_MODES:
+        expected_orders = spark.table(SRC_ORDER).where(
+            F.col("ACTIVITY_TYPE_CD").cast("long") == PHARMACY_ACTIVITY_TYPE_CD
+        ).count()
+        present_orders = spark.table(ORDER).where("SOURCE_PRESENT_IND").count()
+        assert present_orders == expected_orders, (
+            f"order parity: {present_orders} != {expected_orders}"
+        )
+        encounter_rate = spark.table(ORDER).where("SOURCE_PRESENT_IND").agg(
+            F.avg(F.col("ENCNTR_ID").isNotNull().cast("double")).alias("rate")
+        ).collect()[0]["rate"]
+        result["targets"][ORDER] = {
+            "present_rows": int(present_orders),
+            "expected_rows": int(expected_orders),
+            "order_encounter_rate": encounter_rate,
+        }
+
+    if modes[ACTION] in FULL_MODES:
+        expected_action = (
+            spark.table(SRC_ACTION)
+            .select(F.col("ORDER_ID").cast("long").alias("ORDER_ID"))
+            .join(parent_ids.select("ORDER_ID"), "ORDER_ID", "inner")
+            .count()
+        )
+        present_action = spark.table(ACTION).where("SOURCE_PRESENT_IND").count()
+        assert present_action == expected_action, (
+            f"action parity: {present_action} != {expected_action}"
+        )
+        max_action_source = spark.table(ACTION).agg(
+            F.max("SOURCE_ADC_UPDT").alias("watermark")
+        ).collect()[0]["watermark"]
+        assert max_action_source.replace(tzinfo=None) <= _action_ceiling
+        result["targets"][ACTION] = {
+            "present_rows": int(present_action),
+            "expected_rows": int(expected_action),
+            "action_history_ceiling": str(max_action_source),
+        }
+
+    if modes[INGREDIENT] in FULL_MODES:
+        expected_ingredient = (
+            spark.table(SRC_INGREDIENT)
+            .select(
+                F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
+                F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
+                F.col("COMP_SEQUENCE").cast("long").alias("COMP_SEQUENCE"),
+            )
+            .join(parent_ids.select("ORDER_ID"), "ORDER_ID", "inner")
+            .dropDuplicates(["ORDER_ID", "ACTION_SEQUENCE", "COMP_SEQUENCE"])
+            .count()
+        )
+        present_ingredient = (
+            spark.table(INGREDIENT).where("SOURCE_PRESENT_IND").count()
+        )
+        assert present_ingredient == expected_ingredient, (
+            f"ingredient parity: {present_ingredient} != {expected_ingredient}"
+        )
+        result["targets"][INGREDIENT] = {
+            "present_rows": int(present_ingredient),
+            "expected_rows": int(expected_ingredient),
+        }
+
+    if modes[DETAIL] in FULL_MODES:
+        expected_detail = (
+            spark.table(SRC_DETAIL)
+            .select(
+                F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
+                F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
+                F.col("DETAIL_SEQUENCE").cast("long").alias("DETAIL_SEQUENCE"),
+            )
+            .join(parent_ids, "ORDER_ID", "inner")
+            .where(F.col("ACTION_SEQUENCE") == F.col("LAST_ACTION_SEQUENCE"))
+            .select("ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE")
+            .dropDuplicates(["ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE"])
+            .count()
+        )
+        present_detail = spark.table(DETAIL).where("SOURCE_PRESENT_IND").count()
+        assert present_detail == expected_detail, (
+            f"detail parity: {present_detail} != {expected_detail}"
+        )
+        result["targets"][DETAIL] = {
+            "present_rows": int(present_detail),
+            "expected_rows": int(expected_detail),
+            "detail_history_contract": "LATEST_ACTION_LONG_FORMAT",
+        }
+
+    return result
 
 
 def apply_output_comments() -> None:
     apply_comments(
         ORDER,
-        "S10 medication_order feeder: one decoded Millennium Pharmacy order. Measured lifecycle sequences/dates and all three non-duplicate display lines stay; source counters are cut.",
+        "S10 medication_order feeder: one decoded Millennium Pharmacy order. S4 concept enrichment is retained and S3-A11 publishes the source update counter.",
         {
             "ORDER_ID": "S10 medication_order key and liquid-clustering key.",
             "ORDER_DOMAIN": "S10 source classification: PHARMACY; Pharmacy Consults excluded.",
@@ -970,7 +1445,7 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         ACTION,
-        "S10 medication_order state-history feeder. The source is historical and hard-capped at 2024-09-17; parent-order contributor stamps and source counters are cut.",
+        "S10 medication_order state-history feeder. The source is historical and hard-capped at 2024-09-17; S3-A11 retains parent-order contributor stamps and source counters.",
         {
             "HISTORICAL_FEED_IND": "S10 provenance flag; true while mill_order_action remains frozen.",
             "SOURCE_ADC_UPDT": "S10 action-history source timestamp; must not exceed the declared ceiling.",
@@ -979,13 +1454,13 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         INGREDIENT,
-        "S10 medication_order ingredient feeder at ORDER_ID + ACTION_SEQUENCE + COMP_SEQUENCE. Natural-key duplicates are deterministically collapsed; parent stamps and counters are cut.",
+        "S10 medication_order ingredient feeder at ORDER_ID + ACTION_SEQUENCE + COMP_SEQUENCE. Natural-key duplicates are deterministically collapsed; S3-A11 retains parent stamps and counters.",
         {"FREETEXT_DOSE": "S10 dosage input; source text with no re-landed person attributes."},
         "S10 medication_order medication/dosage",
     )
     apply_comments(
         DETAIL,
-        "S10 latest-action order-detail feeder in long form. Natural-key duplicates are collapsed; historical detail and parent stamps/counters are declared exclusions.",
+        "S10 latest-action order-detail feeder in long form. Natural-key duplicates are collapsed; historical detail remains excluded while S3-A11 retains parent stamps/counters.",
         {"DETAIL_HISTORY_CONTRACT": "S10 contract: LATEST_ACTION_LONG_FORMAT; historical detail requires a separate bronze product."},
         "S10 medication_order dosage and route detail",
     )
@@ -999,11 +1474,14 @@ def run_pipeline() -> dict:
         {source: source_version(source) for source in [*SOURCE_SLA.keys(), LOGIC_SOURCE]}
     )
     modes = {target: choose_mode(target, sources) for target, sources in TARGET_SOURCES.items()}
+    modes = apply_recovery_scope(modes)
     SOURCE_HEALTH = {
         source: source_health_for_mode(source, source_mode(source, modes), health_checkpoint(source))
         for source in [*SOURCE_SLA.keys(), LOGIC_SOURCE]
     }
     for table, (sla_days, freshness_mode) in SOURCE_SLA.items():
+        if RECOVERY_CONFIG is not None and SOURCE_HEALTH[table]["scan"] == "REUSED":
+            continue
         stale = SOURCE_HEALTH[table]["source_staleness_days"]
         assert stale is not None, f"{table}: source watermark is NULL"
         if stale > sla_days:
@@ -1019,15 +1497,21 @@ def run_pipeline() -> dict:
         health["watermark"] for health in SOURCE_HEALTH.values() if health["watermark"] is not None
     ) + timedelta(days=2)
 
-    decode_lookup = spark.table(CODE_VALUE).select(
-        F.col("CODE_VALUE").cast("long").alias("__CODE_VALUE"),
-        F.coalesce(F.col("DESCRIPTION"), F.col("DISPLAY")).alias("__CODE_DESCRIPTION"),
+    needs_decode_lookup = any(
+        modes[target] != "UNCHANGED_SKIP"
+        for target in (ORDER, ACTION, INGREDIENT)
     )
-    pharmacy_decode = (
-        decode_lookup.where(F.col("__CODE_VALUE") == PHARMACY_ACTIVITY_TYPE_CD)
-        .select(F.col("__CODE_DESCRIPTION").alias("description")).collect()
-    )
-    assert len(pharmacy_decode) == 1 and pharmacy_decode[0]["description"] == "Pharmacy", pharmacy_decode
+    decode_lookup = None
+    if needs_decode_lookup:
+        decode_lookup = spark.table(CODE_VALUE).select(
+            F.col("CODE_VALUE").cast("long").alias("__CODE_VALUE"),
+            F.coalesce(F.col("DESCRIPTION"), F.col("DISPLAY")).alias("__CODE_DESCRIPTION"),
+        )
+        pharmacy_decode = (
+            decode_lookup.where(F.col("__CODE_VALUE") == PHARMACY_ACTIVITY_TYPE_CD)
+            .select(F.col("__CODE_DESCRIPTION").alias("description")).collect()
+        )
+        assert len(pharmacy_decode) == 1 and pharmacy_decode[0]["description"] == "Pharmacy", pharmacy_decode
 
     print(
         f"[MEDICATION_ORDER] target={TARGET_SCHEMA}, run_id={RUN_ID}, logic={PIPELINE_LOGIC_VERSION}, "
@@ -1063,27 +1547,69 @@ def run_pipeline() -> dict:
         checkpoints[INGREDIENT] = TARGET_SOURCES[INGREDIENT]
 
     if modes[DETAIL] != "UNCHANGED_SKIP":
-        affected = union_order_ids([changed_rows(SRC_DETAIL, DETAIL), changed_rows(SRC_ORDER, DETAIL)]) if modes[DETAIL] == "INCREMENTAL" else None
-        staged = materialize_stage(build_detail(affected), DETAIL, TARGET_KEYS[DETAIL])
-        tombstones = existing_tombstones(DETAIL, affected, staged, TARGET_KEYS[DETAIL])
-        metrics[DETAIL] = merge_target(staged, DETAIL, TARGET_KEYS[DETAIL], modes[DETAIL] in FULL_MODES, tombstones)
+        if modes[DETAIL] == "RECOVERY_FINALIZE":
+            metrics[DETAIL] = dict(RECOVERY_CONFIG["existing_detail_overwrite"])
+        elif modes[DETAIL] == "FULL_REPLACE":
+            metrics[DETAIL] = replace_target_full(
+                build_detail(None),
+                DETAIL,
+                TARGET_KEYS[DETAIL],
+            )
+        else:
+            affected = union_order_ids([changed_rows(SRC_DETAIL, DETAIL), changed_rows(SRC_ORDER, DETAIL)]) if modes[DETAIL] == "INCREMENTAL" else None
+            staged = materialize_stage(build_detail(affected), DETAIL, TARGET_KEYS[DETAIL])
+            tombstones = existing_tombstones(DETAIL, affected, staged, TARGET_KEYS[DETAIL])
+            metrics[DETAIL] = merge_target(staged, DETAIL, TARGET_KEYS[DETAIL], modes[DETAIL] in FULL_MODES, tombstones)
         checkpoints[DETAIL] = TARGET_SOURCES[DETAIL]
 
     if BOOTSTRAP_MODE:
         validation = {"level": "BOOTSTRAP_DEFERRED"}
         print("[MEDICATION_ORDER] bootstrap slice complete; checkpoints and reconciliation deferred")
     else:
-        ran_full = any(mode in FULL_MODES for mode in modes.values())
-        validate_features(check_target_uniqueness=ran_full)
-        if all(mode == "UNCHANGED_SKIP" for mode in modes.values()):
-            validation = {"level": "SKIPPED_ALL_UNCHANGED"}
-        elif ran_full:
-            validation = run_full_parity_suite()
-        else:
-            validation = run_incremental_suite(modes, metrics)
-        if any(mode != "UNCHANGED_SKIP" for mode in modes.values()):
+        if RECOVERY_CONFIG is not None:
+            validate_features(check_target_uniqueness=False)
+            validation = {
+                "level": (
+                    "DETAIL_EXISTING_OVERWRITE_FINALIZED"
+                    if modes[DETAIL] == "RECOVERY_FINALIZE"
+                    else "DETAIL_ONLY_FULL_REPLACE"
+                ),
+                "targets": {DETAIL: metrics[DETAIL]},
+                "skipped_verified_targets": sorted(
+                    RECOVERY_CONFIG["expected_successful_targets"]
+                ),
+            }
             apply_output_comments()
-        commit_checkpoints(checkpoints)
+            commit_checkpoints(checkpoints)
+            mark_recovery_control("COMPLETE", validation)
+        else:
+            ran_full = any(mode in FULL_MODES for mode in modes.values())
+            ran_incremental = any(mode == "INCREMENTAL" for mode in modes.values())
+            validate_features(check_target_uniqueness=ran_full)
+            if all(mode == "UNCHANGED_SKIP" for mode in modes.values()):
+                validation = {"level": "SKIPPED_ALL_UNCHANGED"}
+            else:
+                full_validation = (
+                    run_full_parity_suite(modes) if ran_full else None
+                )
+                incremental_validation = (
+                    run_incremental_suite(modes, metrics)
+                    if ran_incremental
+                    else None
+                )
+                if full_validation is not None and incremental_validation is not None:
+                    validation = {
+                        "level": "MIXED_FULL_AND_INCREMENTAL",
+                        "full": full_validation,
+                        "incremental": incremental_validation,
+                    }
+                elif full_validation is not None:
+                    validation = full_validation
+                else:
+                    validation = incremental_validation
+            if any(mode != "UNCHANGED_SKIP" for mode in modes.values()):
+                apply_output_comments()
+            commit_checkpoints(checkpoints)
 
     return {
         "status": "SUCCESS",
@@ -1106,10 +1632,17 @@ def run_pipeline() -> dict:
 acquire_run_lock()
 try:
     SUMMARY = run_pipeline()
+except Exception as exc:
+    mark_recovery_control(
+        "FAILED",
+        {"error_type": type(exc).__name__, "error": str(exc)},
+    )
+    raise
 finally:
     cleanup_stages()
     release_run_lock()
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
+
 

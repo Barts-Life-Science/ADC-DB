@@ -32,6 +32,44 @@ def _read_changes(spark, table_name: str, start_version: int, end_version: int):
     )
 
 
+def _semantic_map_parent_changes(changes):
+    """Discard map_pathology updates that changed only operational provenance."""
+    if changes is None:
+        return None
+    _, F = _imports()
+    ignored = {
+        '_change_type', '_commit_version', '_commit_timestamp',
+        'ADC_UPDT', 'source_adc_updt', 'mapping_updated_at', 'loaded_at',
+        'source_payload_hash',
+    }
+    semantic_columns = [column for column in changes.columns if column not in ignored]
+    payload = F.xxhash64(*[F.col(column) for column in semantic_columns])
+    prepared = changes.select(
+        'source_record_key', 'source_table', 'source_parent_key',
+        F.col('_commit_version').alias('_commit_version'),
+        F.col('_change_type').alias('_change_type'),
+        payload.alias('_SEMANTIC_PAYLOAD'),
+    )
+    direct = prepared.filter(F.col('_change_type').isin('insert', 'delete')).select(
+        'source_table', 'source_parent_key'
+    )
+    before = prepared.filter(F.col('_change_type') == 'update_preimage').alias('b')
+    after = prepared.filter(F.col('_change_type') == 'update_postimage').alias('a')
+    updates = (
+        before.join(
+            after,
+            F.col('b.source_record_key').eqNullSafe(F.col('a.source_record_key'))
+            & (F.col('b._commit_version') == F.col('a._commit_version')),
+            'full',
+        )
+        .where(~F.col('b._SEMANTIC_PAYLOAD').eqNullSafe(F.col('a._SEMANTIC_PAYLOAD')))
+        .select(
+            F.coalesce(F.col('a.source_table'), F.col('b.source_table')).alias('source_table'),
+            F.coalesce(F.col('a.source_parent_key'), F.col('b.source_parent_key')).alias('source_parent_key'),
+        )
+    )
+    return direct.unionByName(updates).filter(F.col('source_parent_key').isNotNull()).dropDuplicates()
+
 def changed_parent_keys(spark, config: PipelineConfig):
     """Return touched source parents and pending source versions.
 
@@ -55,15 +93,14 @@ def changed_parent_keys(spark, config: PipelineConfig):
         spark, config.map_pathology_table, map_start, versions["map_pathology"]
     )
     if map_changes is not None:
+        semantic_map_changes = _semantic_map_parent_changes(map_changes)
         frames.append(
-            map_changes.filter(F.col("_change_type") != "update_preimage")
-            .select(
+            semantic_map_changes.select(
                 F.when(F.col("source_table") == "raw", "TFC_LIMS")
                 .otherwise("CERNER")
                 .alias("source_system"),
                 "source_parent_key",
             )
-            .filter(F.col("source_parent_key").isNotNull())
         )
 
     sample_start = int(state["path_patient_samplelevel"]["last_delta_version"]) + 1

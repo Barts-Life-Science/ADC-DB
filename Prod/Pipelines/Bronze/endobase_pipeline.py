@@ -42,6 +42,7 @@ for _widget_name, _widget_default in {
     # Dev validation overrides. Production defaults remain the landed raw tables.
     "source_patient": "4_prod.raw.endobase3_dbo_patient_tbl",
     "source_term": "4_prod.raw.endobase3_dbo_dgvs_exam_term_tbl",
+    "exam_link_source": "4_prod.bronze.map_endobase_exam",
 }.items():
     _widget_text(_widget_name, _widget_default)
 
@@ -58,6 +59,9 @@ SRC_TERM = bronze_value(
 )
 SRC_PATIENT = bronze_value(
     "source_patient", "4_prod.raw.endobase3_dbo_patient_tbl"
+)
+EXAM_LINK_SOURCE = bronze_value(
+    "exam_link_source", "4_prod.bronze.map_endobase_exam"
 )
 DEFAULT_SRC_TERM = "4_prod.raw.endobase3_dbo_dgvs_exam_term_tbl"
 DEFAULT_SRC_PATIENT = "4_prod.raw.endobase3_dbo_patient_tbl"
@@ -416,6 +420,32 @@ def last_committed_version(target: str, source: str):
 def needs_run(target: str, sources: list) -> bool:
     if FORCE_FULL_REFRESH or not bronze_table_exists(target):
         return True
+    if target == TGT_TERM:
+        # A term may carry a person only when the canonical exam bridge agrees.
+        # This retains the ban on EXAM_P -> PATIENT_TBL.PRIMARY_NO while allowing
+        # the legitimate EXAM_P -> map_endobase_exam -> PERSON_ID route.
+        doctrine_violation = (
+            spark.table(target).alias("t")
+            .where(F.col("t.SOURCE_PRESENT_IND") == F.lit(True))
+            .where(F.col("t.PERSON_ID").isNotNull())
+            .join(
+                spark.table(EXAM_LINK_SOURCE)
+                .where(F.col("SOURCE_PRESENT_IND") == F.lit(True))
+                .select("ENDOBASE_EXAM_ID", "PERSON_ID")
+                .alias("e"),
+                (F.col("t.ENDOBASE_EXAM_ID") == F.col("e.ENDOBASE_EXAM_ID"))
+                & (F.col("t.PERSON_ID") == F.col("e.PERSON_ID")),
+                "left_anti",
+            )
+            .limit(1)
+            .count()
+        )
+        if doctrine_violation:
+            print(
+                "[ENDOBASE] map_endobase_exam_term carries person linkage that "
+                "map_endobase_exam does not corroborate; forcing self-healing rebuild"
+            )
+            return True
     recorded_sources = {
         row["source_table"]
         for row in spark.table(STATE_TABLE)
@@ -547,15 +577,18 @@ def endobase_update_table(
         insert_values = {
             column: f"s.{qident(column)}" for column in staged.columns
         }
+        matched_update_condition = (
+            "NOT (t.ROW_HASH <=> s.ROW_HASH) "
+            "OR t.SOURCE_PRESENT_IND = false"
+        )
+        # PERSON_ID and PERSON_LINK_STATUS are pipeline-managed and participate in
+        # ROW_HASH, so the standard hash comparison handles linkage changes.
         (
             DeltaTable.forName(spark, target)
             .alias("t")
             .merge(staged.alias("s"), condition)
             .whenMatchedUpdate(
-                condition=(
-                    "t.ROW_HASH <> s.ROW_HASH "
-                    "OR t.SOURCE_PRESENT_IND = false"
-                ),
+                condition=matched_update_condition,
                 set=update_values,
             )
             .whenNotMatchedInsert(values=insert_values)
@@ -1162,11 +1195,9 @@ def nullif_zero(column):
 
 def build_exam_terms() -> DataFrame:
     normalised = normalised_term_text(F.col("TEXT_ASCII"))
-    src = spark.table(SRC_TERM).select(
+    raw_terms = spark.table(SRC_TERM).select(
         F.col("PRIMARY_NO").alias("ENDOBASE_EXAM_TERM_ID"),
         F.col("EXAM_P").alias("ENDOBASE_EXAM_ID"),
-        F.lit(None).cast("long").alias("PERSON_ID"),
-        F.lit("EXAM_TABLE_NOT_LANDED").alias("PERSON_LINK_STATUS"),
         nullif_zero(F.col("TERM_P")).cast("long").alias("DGVS_TERM_ID"),
         (F.col("TERM_P") == 0).alias("FREE_TEXT_IND"),
         F.rtrim(F.col("TEXT_ASCII")).alias("TERM_TEXT"),
@@ -1181,6 +1212,28 @@ def build_exam_terms() -> DataFrame:
         F.col("GUID").alias("SOURCE_ROW_GUID"),
         F.col("CREATED").alias("CREATED_TS"),
         F.col("TEXT_CHANGED_FLG").alias("_changed_raw"),
+    )
+    exam_linkage = (
+        spark.table(EXAM_LINK_SOURCE)
+        .where(F.col("SOURCE_PRESENT_IND") == F.lit(True))
+        .select(
+            F.col("ENDOBASE_EXAM_ID").alias("_LINK_EXAM_ID"),
+            F.col("PERSON_ID").alias("_LINK_PERSON_ID"),
+            F.col("PERSON_LINK_STATUS").alias("_LINK_STATUS"),
+        )
+    )
+    src = (
+        raw_terms.join(
+            exam_linkage,
+            F.col("ENDOBASE_EXAM_ID") == F.col("_LINK_EXAM_ID"),
+            "left",
+        )
+        .withColumn("PERSON_ID", F.col("_LINK_PERSON_ID"))
+        .withColumn(
+            "PERSON_LINK_STATUS",
+            F.coalesce(F.col("_LINK_STATUS"), F.lit("EXAM_NOT_FOUND")),
+        )
+        .drop("_LINK_EXAM_ID", "_LINK_PERSON_ID", "_LINK_STATUS")
     )
     assert_unique_non_null(src, ["ENDOBASE_EXAM_TERM_ID"], SRC_TERM)
     approved = (
@@ -1251,9 +1304,9 @@ def build_exam_terms() -> DataFrame:
 
 TERM_COMMENTS = {
     "ENDOBASE_EXAM_TERM_ID": "DGVS_EXAM_TERM_TBL.PRIMARY_NO; target grain key, one row per source report term.",
-    "ENDOBASE_EXAM_ID": "Foreign key EXAM_P to the un-landed EXAM_TBL.PRIMARY_NO. Do NOT join to map_endobase_patient.ENDOBASE_PATIENT_ID; dense-integer overlap is spurious.",
-    "PERSON_ID": "NULL while EXAM_TBL is not landed. Future linkage must follow EXAM_P to EXAM_TBL.PATIENT_P and then the EndoBase patient crosswalk.",
-    "PERSON_LINK_STATUS": "EXAM_TABLE_NOT_LANDED in this release; explicitly records the person-linkage feature gate.",
+    "ENDOBASE_EXAM_ID": "Foreign key EXAM_P resolved only through map_endobase_exam. Do NOT join directly to map_endobase_patient.ENDOBASE_PATIENT_ID; dense-integer overlap is spurious.",
+    "PERSON_ID": "Resolved person identifier inherited from map_endobase_exam; NULL only when the exam bridge cannot safely resolve one.",
+    "PERSON_LINK_STATUS": "Person-linkage outcome inherited from map_endobase_exam, or EXAM_NOT_FOUND when the exam row is absent.",
     "DGVS_TERM_ID": "Local DGVS TERM_P identifier; NULL for TERM_P=0 free-text rows. It is not a stable value key without normalised text.",
     "FREE_TEXT_IND": "True when TERM_P=0 and the row is clinician-authored narrative rather than a DGVS template term.",
     "TERM_TEXT": "Right-trimmed TEXT_ASCII clinical report text. This is clinical free text and may contain patient identifiers; handle under the same controls as other bronze clinical text.",
@@ -1275,7 +1328,7 @@ TERM_COMMENTS = {
     "ADC_UPDT": "Timestamp this row was last inserted or changed by endobase_pipeline.",
 }
 
-_term_sources = [SRC_TERM, TGT_TERM_MAP]
+_term_sources = [SRC_TERM, TGT_TERM_MAP, EXAM_LINK_SOURCE]
 assert SRC_PATIENT not in _term_sources, (
     "Term builder must never depend on or join directly to the EndoBase patient table"
 )
@@ -1296,7 +1349,7 @@ else:
 _term_comment_changes = apply_comments(
     TGT_TERM,
     TERM_COMMENTS,
-    "EndoBase DGVS report terms at one row per DGVS_EXAM_TERM_TBL.PRIMARY_NO. All free-text, edited, unconfirmed and dependent rows are retained. TERM_TEXT is clinical free text. ENDOBASE_EXAM_ID points to un-landed EXAM_TBL and must never be joined directly to map_endobase_patient.ENDOBASE_PATIENT_ID.",
+    "EndoBase DGVS report terms at one row per DGVS_EXAM_TERM_TBL.PRIMARY_NO. All free-text, edited, unconfirmed and dependent rows are retained. TERM_TEXT is clinical free text. Person linkage follows ENDOBASE_EXAM_ID through map_endobase_exam and never directly to map_endobase_patient.",
 )
 
 # COMMAND ----------
@@ -1465,10 +1518,21 @@ _term_validation = (
             "person_populated_rows"
         ),
         F.sum(
+            F.when(F.col("PERSON_LINK_STATUS") == "EXAM_TABLE_NOT_LANDED", 1).otherwise(0)
+        ).alias("exam_table_not_landed_rows"),
+        F.sum(
             F.when(
-                F.col("PERSON_LINK_STATUS") != "EXAM_TABLE_NOT_LANDED", 1
+                F.col("PERSON_ID").isNull()
+                & ~F.col("PERSON_LINK_STATUS").isin(
+                    "EXAM_NOT_FOUND",
+                    "UNMATCHED",
+                    "CONFLICT_PATIENT_VS_ORDER",
+                    "ORDER_AMBIGUOUS",
+                    "MERGE_TARGET_AMBIGUOUS",
+                ),
+                1,
             ).otherwise(0)
-        ).alias("unexpected_person_status_rows"),
+        ).alias("invalid_null_person_status_rows"),
     )
     .collect()[0]
     .asDict()
@@ -1485,8 +1549,29 @@ assert _term_validation["free_text_rows"] == int(
 )
 assert _term_validation["mapping_leak_rows"] == 0
 assert _term_validation["unsafe_approved_rows"] == 0
-assert _term_validation["person_populated_rows"] == 0
-assert _term_validation["unexpected_person_status_rows"] == 0
+assert _term_validation["person_populated_rows"] > 0, "term linkage did not populate"
+assert _term_validation["exam_table_not_landed_rows"] == 0, (
+    "map_endobase_exam has landed; no term row should still say EXAM_TABLE_NOT_LANDED"
+)
+assert _term_validation["invalid_null_person_status_rows"] == 0, (
+    "NULL PERSON_ID appeared outside an explicit withholding status"
+)
+_uncorroborated = (
+    _term_present.alias("t")
+    .where(F.col("t.PERSON_ID").isNotNull())
+    .join(
+        spark.table(EXAM_LINK_SOURCE)
+        .where(F.col("SOURCE_PRESENT_IND") == F.lit(True))
+        .select("ENDOBASE_EXAM_ID", "PERSON_ID")
+        .alias("e"),
+        (F.col("t.ENDOBASE_EXAM_ID") == F.col("e.ENDOBASE_EXAM_ID"))
+        & (F.col("t.PERSON_ID") == F.col("e.PERSON_ID")),
+        "left_anti",
+    )
+    .limit(1)
+    .count()
+)
+assert _uncorroborated == 0, f"{_uncorroborated} term rows carry uncorroborated linkage"
 
 _term_mapping_status_counts = {
     row["TERM_MAPPING_STATUS"]: int(row["count"])

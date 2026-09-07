@@ -352,14 +352,24 @@ def merge_contract(
                 + ", ".join(str(row.asDict()) for row in duplicate)
             )
 
+    # Production tables can carry additive serve-time columns (for example
+    # anon_report_text) that are deliberately outside the pathology contract.  An
+    # updateAll/insertAll merge incorrectly requires those columns in the source
+    # frame.  Write only contract-owned columns so additive columns are retained on
+    # update and receive their target defaults/nulls on insert.
+    contract_values = {
+        column.name: f"s.`{column.name}`"
+        for column in item.columns
+    }
     builder = (
         DeltaTable.forName(spark, table_name)
         .alias("t")
         .merge(frame.alias("s"), _merge_condition(item.keys))
-        .whenMatchedUpdateAll(
-            condition="NOT (t.source_payload_hash <=> s.source_payload_hash)"
+        .whenMatchedUpdate(
+            condition="NOT (t.source_payload_hash <=> s.source_payload_hash)",
+            set=contract_values,
         )
-        .whenNotMatchedInsertAll()
+        .whenNotMatchedInsert(values=contract_values)
     )
     if delete_not_matched:
         builder = builder.whenNotMatchedBySourceDelete()
@@ -1265,86 +1275,186 @@ def run_core(
     touched_parent_keys=None,
     validate_stage_keys: bool = True,
 ) -> dict[str, dict[str, int]]:
-    """Build accession, request, report, and equivalence sidecars in the selected dev schemas."""
+    """Build pathology sidecars using Delta scratch stages on serverless compute."""
 
-    from pyspark import StorageLevel
+    from uuid import uuid4
 
     config = config or PipelineConfig()
-    ensure_contracts(spark, config)
-    source_stage = build_source_stage(spark, config)
-    scoped_match_groups = None
-    if touched_parent_keys is not None:
-        _, _, F, _ = _imports()
-        touched = touched_parent_keys.select("source_system", "source_parent_key").dropDuplicates()
-        new_groups = source_stage.join(
-            touched, ["source_system", "source_parent_key"], "inner"
-        ).select("match_group_key")
-        previous_groups = (
-            spark.table(f"{config.bronze_schema}.map_pathology_accession_source")
-            .join(touched, ["source_system", "source_parent_key"], "inner")
-            .select("match_group_key")
+    scratch_suffix = uuid4().hex
+    scratch_tables: list[str] = []
+
+    def materialize(frame, label: str):
+        table_name = (
+            f"{config.bronze_schema}."
+            f"_pathology_expansion_{label}_{scratch_suffix}"
         )
-        scoped_match_groups = new_groups.unionByName(previous_groups).dropDuplicates()
-        source_stage = source_stage.join(scoped_match_groups, "match_group_key", "inner")
-        full_reconcile = False
-    identity_stage = source_stage.persist(StorageLevel.DISK_ONLY)
-    identity_stage.count()
-    candidates, merge_map = build_link_candidates(spark, identity_stage, config)
-    source_stage, aliases = apply_merge_map(identity_stage, merge_map)
-    source_stage = source_stage.persist(StorageLevel.DISK_ONLY)
-    source_stage.count()
-    identity_stage.unpersist()
+        scratch_tables.append(table_name)
+        (
+            frame.write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(table_name)
+        )
+        return spark.table(table_name)
 
-    outputs = {
-        "map_pathology_accession_source": build_accession_source_rows(source_stage),
-        "map_pathology_accession_link_candidate": _candidate_contract_rows(candidates),
-        "map_pathology_accession_alias": aliases,
-        "map_pathology_accession": build_accession_rows(spark, source_stage, config),
-    }
-    outputs["map_pathology_requested_test"] = build_requested_test_rows(spark, source_stage, config)
-    reports = build_report_rows(spark, source_stage, config).persist(StorageLevel.DISK_ONLY)
-    reports.count()
-    outputs["map_pathology_report"] = reports
-    outputs["map_pathology_result_equivalence"] = build_result_equivalence_rows(spark, source_stage, reports, config)
-
-    metrics: dict[str, dict[str, int]] = {}
-    registry_tables = {"map_pathology_accession", "map_pathology_accession_alias"}
-    for name, frame in outputs.items():
-        item = contract(name)
-        stale_update = None
-        delete_not_matched = full_reconcile and name not in registry_tables and name != "map_pathology_accession_source"
-        if full_reconcile and name == "map_pathology_accession_source":
+    try:
+        ensure_contracts(spark, config)
+        source_stage = build_source_stage(spark, config)
+        scoped_match_groups = None
+        if touched_parent_keys is not None:
             _, _, F, _ = _imports()
-            stale_update = {"is_current": F.lit(False), "ADC_UPDT": F.current_timestamp()}
-        metrics[name] = merge_contract(
+            touched = touched_parent_keys.select(
+                "source_system", "source_parent_key"
+            ).dropDuplicates()
+            new_groups = source_stage.join(
+                touched,
+                ["source_system", "source_parent_key"],
+                "inner",
+            ).select("match_group_key")
+            previous_groups = (
+                spark.table(
+                    f"{config.bronze_schema}.map_pathology_accession_source"
+                )
+                .join(
+                    touched,
+                    ["source_system", "source_parent_key"],
+                    "inner",
+                )
+                .select("match_group_key")
+            )
+            scoped_match_groups = (
+                new_groups.unionByName(previous_groups).dropDuplicates()
+            )
+            source_stage = source_stage.join(
+                scoped_match_groups,
+                "match_group_key",
+                "inner",
+            )
+            full_reconcile = False
+
+        identity_stage = materialize(source_stage, "identity")
+        candidates, merge_map = build_link_candidates(
             spark,
-            f"{config.bronze_schema}.{name}",
-            frame,
-            item,
-            delete_not_matched=delete_not_matched,
-            stale_update=stale_update,
-            validate_stage_keys=validate_stage_keys,
+            identity_stage,
+            config,
         )
-    if scoped_match_groups is not None:
-        scoped_accessions = source_stage.select("pathology_accession_id").dropDuplicates()
-        scope_by_table = {
-            "map_pathology_accession_source": (scoped_match_groups, "match_group_key", True),
-            "map_pathology_accession_link_candidate": (scoped_match_groups, "match_group_key", False),
-            "map_pathology_requested_test": (scoped_accessions, "pathology_accession_id", False),
-            "map_pathology_report": (scoped_accessions, "pathology_accession_id", False),
-            "map_pathology_result_equivalence": (scoped_accessions, "pathology_accession_id", False),
+        source_stage, aliases = apply_merge_map(identity_stage, merge_map)
+        source_stage = materialize(source_stage, "source")
+
+        outputs = {
+            "map_pathology_accession_source": build_accession_source_rows(
+                source_stage
+            ),
+            "map_pathology_accession_link_candidate": _candidate_contract_rows(
+                candidates
+            ),
+            "map_pathology_accession_alias": aliases,
+            "map_pathology_accession": build_accession_rows(
+                spark,
+                source_stage,
+                config,
+            ),
         }
-        for name, (scope, scope_column, mark_inactive) in scope_by_table.items():
-            stale = reconcile_scoped_stale(
+        outputs["map_pathology_requested_test"] = build_requested_test_rows(
+            spark,
+            source_stage,
+            config,
+        )
+        reports = materialize(
+            build_report_rows(spark, source_stage, config),
+            "report",
+        )
+        outputs["map_pathology_report"] = reports
+        outputs["map_pathology_result_equivalence"] = (
+            build_result_equivalence_rows(
+                spark,
+                source_stage,
+                reports,
+                config,
+            )
+        )
+
+        metrics: dict[str, dict[str, int]] = {}
+        registry_tables = {
+            "map_pathology_accession",
+            "map_pathology_accession_alias",
+        }
+        for name, frame in outputs.items():
+            item = contract(name)
+            stale_update = None
+            delete_not_matched = (
+                full_reconcile
+                and name not in registry_tables
+                and name != "map_pathology_accession_source"
+            )
+            if full_reconcile and name == "map_pathology_accession_source":
+                _, _, F, _ = _imports()
+                stale_update = {
+                    "is_current": F.lit(False),
+                    "ADC_UPDT": F.current_timestamp(),
+                }
+            metrics[name] = merge_contract(
                 spark,
                 f"{config.bronze_schema}.{name}",
-                outputs[name],
-                contract(name),
-                scope,
-                scope_column,
-                mark_inactive=mark_inactive,
+                frame,
+                item,
+                delete_not_matched=delete_not_matched,
+                stale_update=stale_update,
+                validate_stage_keys=validate_stage_keys,
             )
-            metrics[name]["stale_reconciled"] = stale
-    reports.unpersist()
-    source_stage.unpersist()
-    return metrics
+
+        if scoped_match_groups is not None:
+            scoped_accessions = source_stage.select(
+                "pathology_accession_id"
+            ).dropDuplicates()
+            scope_by_table = {
+                "map_pathology_accession_source": (
+                    scoped_match_groups,
+                    "match_group_key",
+                    True,
+                ),
+                "map_pathology_accession_link_candidate": (
+                    scoped_match_groups,
+                    "match_group_key",
+                    False,
+                ),
+                "map_pathology_requested_test": (
+                    scoped_accessions,
+                    "pathology_accession_id",
+                    False,
+                ),
+                "map_pathology_report": (
+                    scoped_accessions,
+                    "pathology_accession_id",
+                    False,
+                ),
+                "map_pathology_result_equivalence": (
+                    scoped_accessions,
+                    "pathology_accession_id",
+                    False,
+                ),
+            }
+            for name, (scope, scope_column, mark_inactive) in (
+                scope_by_table.items()
+            ):
+                stale = reconcile_scoped_stale(
+                    spark,
+                    f"{config.bronze_schema}.{name}",
+                    outputs[name],
+                    contract(name),
+                    scope,
+                    scope_column,
+                    mark_inactive=mark_inactive,
+                )
+                metrics[name]["stale_reconciled"] = stale
+
+        return metrics
+    finally:
+        for table_name in reversed(scratch_tables):
+            try:
+                spark.sql(f"DROP TABLE IF EXISTS {qn(table_name)}")
+            except Exception as cleanup_error:
+                print(
+                    f"[PATHOLOGY][WARN] scratch cleanup failed for "
+                    f"{table_name}: {cleanup_error}"
+                )

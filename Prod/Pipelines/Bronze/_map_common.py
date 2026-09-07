@@ -5458,6 +5458,13 @@ def _pipeline_assert_contract(
     expected = _pipeline_expected_signature(target_table)
     if actual == expected:
         return
+    # The anonymisation publisher owns additive anon_* columns. Base producers must
+    # neither reject nor overwrite them, while every non-anon contract difference
+    # remains a hard failure.
+    actual_base = tuple(field for field in actual if not field[0].lower().startswith("anon_"))
+    additive = tuple(field for field in actual if field[0].lower().startswith("anon_"))
+    if actual_base == expected and additive:
+        return
 
     limit = _pipeline_builtins.max(
         len(actual),
@@ -5774,7 +5781,6 @@ def _pipeline_rebuild_recovery_reason(exc: Exception):
         "missing source-version checkpoint",
         "missing source checkpoints",
         "missing tables",
-        "schema mismatch",
         "target and bridge must be initialized",
         "cdf is unavailable",
         "cdf could not be read",
@@ -7442,7 +7448,7 @@ except Exception as exc:
 
 # COMMAND ----------
 
-# MAGIC # pathology_embed_increment is folded into map_50_pathology, the only component that calls it
+# pathology_embed_increment is folded into map_50_pathology, the only component that calls it
 
 # COMMAND ----------
 
@@ -7572,6 +7578,5 @@ def finalize_map_pipeline_run():
     )
     print(result_json)
     return result_json
-
 
 

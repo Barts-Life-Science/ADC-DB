@@ -63,7 +63,7 @@ BOOTSTRAP_MODE = bronze_bool("bootstrap_mode", False)
 BOOTSTRAP_START_YEAR = bronze_value("bootstrap_start_year", "")
 BOOTSTRAP_END_YEAR = bronze_value("bootstrap_end_year", "")
 RUN_ID = bronze_run_id()
-PIPELINE_LOGIC_VERSION = "2026.08.v2.0"
+PIPELINE_LOGIC_VERSION = "2026.08.s3a11"
 LOGIC_VERSION_INT = 2026080801
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 
@@ -105,12 +105,12 @@ SOURCE_SLA = {
 LOOKUP_SOURCES = {CODE_VALUE}
 
 EXPECTED_COLUMNS = {
-    SRC_EVENT: {"SCH_EVENT_ID", "APPT_TYPE_CD", "SCH_STATE_CD", "SCH_MEANING", "ENCNTR_ID", "ADC_UPDT"},
+    SRC_EVENT: {"SCH_EVENT_ID", "APPT_TYPE_CD", "SCH_STATE_CD", "SCH_MEANING", "ENCNTR_ID", "REFER_DT_TM", "UPDT_CNT", "ADC_UPDT"},
     SRC_PATIENT: {"SCH_EVENT_ID", "PERSON_ID", "ENCNTR_ID", "VERSION_DT_TM", "UPDT_CNT", "ADC_UPDT"},
-    SRC_SCHEDULE: {"SCHEDULE_ID", "SCH_EVENT_ID", "SCHEDULE_SEQ", "SCH_STATE_CD", "BEG_EFFECTIVE_DT_TM", "ADC_UPDT"},
+    SRC_SCHEDULE: {"SCHEDULE_ID", "SCH_EVENT_ID", "SCHEDULE_SEQ", "SCH_STATE_CD", "BEG_EFFECTIVE_DT_TM", "INDIRECT_BOOK_IND", "UNCONFIRM_COUNT", "OVERRIDE_DURATION_MINUTE_NBR", "ADDITIONAL_MINUTE_NBR", "ADC_UPDT"},
     SRC_LOCATION: {"SCHEDULE_ID", "LOCATION_TYPE_CD", "LOCATION_CD", "LOCATION_FREETEXT", "SCH_CLINIC_ID", "ADC_UPDT"},
-    SRC_APPT: {"SCH_APPT_ID", "SCH_EVENT_ID", "SCHEDULE_ID", "ROLE_MEANING", "BEG_DT_TM", "END_DT_TM", "ADC_UPDT"},
-    SRC_ALIAS: {"SCH_EVENT_ID", "ALIAS", "EVENT_ALIAS_TYPE_CD", "ALIAS_POOL_CD", "ADC_UPDT"},
+    SRC_APPT: {"SCH_APPT_ID", "SCH_EVENT_ID", "SCHEDULE_ID", "ROLE_MEANING", "BEG_DT_TM", "END_DT_TM", "VIS_BEG_DT_TM", "VIS_END_DT_TM", "END_EFFECTIVE_DT_TM", "UPDT_CNT", "ADC_UPDT"},
+    SRC_ALIAS: {"SCH_EVENT_ID", "SCH_EVENT_ALIAS_ID", "ALIAS", "EVENT_ALIAS_TYPE_CD", "ALIAS_POOL_CD", "ADC_UPDT"},
     CODE_VALUE: {"CODE_VALUE", "DISPLAY", "DESCRIPTION", "ADC_UPDT"},
 }
 
@@ -604,7 +604,11 @@ def current_event_patient(event_ids: DataFrame | None = None) -> DataFrame:
             F.col("SCH_EVENT_ID").cast("long").alias("SCH_EVENT_ID"),
             F.when(F.col("PERSON_ID").cast("long") != 0, F.col("PERSON_ID").cast("long")).alias("PERSON_ID"),
             F.when(F.col("ENCNTR_ID").cast("long") != 0, F.col("ENCNTR_ID").cast("long")).alias("PATIENT_ENCNTR_ID"),
+            # S3-A11 BEGIN: retain source provenance needed by the prod-twin contract.
+            F.col("VERSION_DT_TM").alias("PATIENT_VERSION_DT_TM"),
+            F.col("UPDT_CNT").cast("long").alias("PATIENT_UPDT_CNT"),
             F.col("ADC_UPDT").alias("PATIENT_SOURCE_ADC_UPDT"),
+            # S3-A11 END
         )
     )
 
@@ -631,6 +635,15 @@ def build_appointment(event_ids: DataFrame | None, decode_lookup: DataFrame) -> 
         "ORIG_REQ_START_DT_TM",
         "ORIG_REQ_END_DT_TM",
         "FIRST_BKD_ASI_DT_TM",
+        # S3-A11 BEGIN: retain sparse referral facts and source provenance.
+        (
+            F.col("REFERRAL_IDENT")
+            if "REFERRAL_IDENT" in event.columns
+            else F.lit(None).cast("string")
+        ).alias("REFERRAL_IDENT"),
+        "REFER_DT_TM",
+        F.col("UPDT_CNT").cast("long").alias("EVENT_UPDT_CNT"),
+        # S3-A11 END
         F.when(F.col("ENCNTR_ID").cast("long") != 0, F.col("ENCNTR_ID").cast("long")).alias("EVENT_ENCNTR_ID"),
         F.col("ORGANIZATION_ID").cast("long").alias("ORGANIZATION_ID"),
         F.col("ADC_UPDT").alias("EVENT_SOURCE_ADC_UPDT"),
@@ -640,6 +653,9 @@ def build_appointment(event_ids: DataFrame | None, decode_lookup: DataFrame) -> 
     alias = scope_by_ids(spark.table(SRC_ALIAS), scoped_ids, "SCH_EVENT_ID")
     alias = alias.select(
         F.col("SCH_EVENT_ID").cast("long").alias("SCH_EVENT_ID"),
+        # S3-A11 BEGIN
+        F.col("SCH_EVENT_ALIAS_ID").cast("long").alias("SCH_EVENT_ALIAS_ID"),
+        # S3-A11 END
         F.col("ALIAS").alias("EXTERNAL_EVENT_ALIAS"),
         F.col("EVENT_ALIAS_TYPE_CD").cast("long").alias("EVENT_ALIAS_TYPE_CD"),
         F.col("EVENT_ALIAS_SUB_TYPE_CD").cast("long").alias("EVENT_ALIAS_SUB_TYPE_CD"),
@@ -672,14 +688,9 @@ def build_appointment(event_ids: DataFrame | None, decode_lookup: DataFrame) -> 
             "SOURCE_ADC_UPDT",
             F.greatest("EVENT_SOURCE_ADC_UPDT", "PATIENT_SOURCE_ADC_UPDT", "ALIAS_SOURCE_ADC_UPDT"),
         )
-        .drop(
-            "SCH_EVENT_ID_RAW",
-            "PATIENT_ENCNTR_ID",
-            "EVENT_ENCNTR_ID",
-            "EVENT_SOURCE_ADC_UPDT",
-            "PATIENT_SOURCE_ADC_UPDT",
-            "ALIAS_SOURCE_ADC_UPDT",
-        )
+        # S3-A11 BEGIN: contributor timestamps are published, not discarded.
+        .drop("SCH_EVENT_ID_RAW", "PATIENT_ENCNTR_ID", "EVENT_ENCNTR_ID")
+        # S3-A11 END
     )
 
 
@@ -699,7 +710,13 @@ def build_schedule(schedule_ids: DataFrame | None, decode_lookup: DataFrame) -> 
         F.col("ACTIVE_STATUS_CD").cast("long").alias("ACTIVE_STATUS_CD"),
         F.col("RES_LIST_ID").cast("long").alias("RESOURCE_LIST_ID"),
         F.col("GRPSESSION_ID").cast("long").alias("GROUP_SESSION_ID"),
+        # S3-A11 BEGIN: retain schedule machinery for schema parity and provenance.
+        F.col("INDIRECT_BOOK_IND").cast("long").alias("INDIRECT_BOOK_IND"),
+        F.col("UNCONFIRM_COUNT").cast("long").alias("UNCONFIRM_COUNT"),
+        F.col("OVERRIDE_DURATION_MINUTE_NBR").cast("long").alias("OVERRIDE_DURATION_MINUTES"),
+        F.col("ADDITIONAL_MINUTE_NBR").cast("long").alias("ADDITIONAL_MINUTES"),
         F.col("ADC_UPDT").alias("SCHEDULE_SOURCE_ADC_UPDT"),
+        # S3-A11 END
     )
     scoped_ids = schedule.select("SCHEDULE_ID_RAW", "SCHEDULE_ID")
     location = scope_by_ids(spark.table(SRC_LOCATION), scoped_ids, "SCHEDULE_ID")
@@ -724,7 +741,9 @@ def build_schedule(schedule_ids: DataFrame | None, decode_lookup: DataFrame) -> 
         result.withColumn(
             "SOURCE_ADC_UPDT", F.greatest("SCHEDULE_SOURCE_ADC_UPDT", "LOCATION_SOURCE_ADC_UPDT")
         )
-        .drop("SCHEDULE_ID_RAW", "SCHEDULE_SOURCE_ADC_UPDT", "LOCATION_SOURCE_ADC_UPDT")
+        # S3-A11 BEGIN: contributor timestamps are published, not discarded.
+        .drop("SCHEDULE_ID_RAW")
+        # S3-A11 END
     )
 
 
@@ -761,6 +780,10 @@ def build_resource(resource_ids: DataFrame | None, decode_lookup: DataFrame) -> 
         "ORIG_BEG_DT_TM",
         "ORIG_END_DT_TM",
         "BEG_EFFECTIVE_DT_TM",
+        # S3-A11 BEGIN: retain resource lifecycle/provenance fields.
+        "VIS_BEG_DT_TM", "VIS_END_DT_TM", "END_EFFECTIVE_DT_TM",
+        F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
+        # S3-A11 END
         F.col("APPT_LOCATION_CD").cast("long").alias("APPT_LOCATION_CD"),
         F.col("REFERRING_ORG_ID").cast("long").alias("REFERRING_ORGANIZATION_ID"),
         F.col("ALLOCATED_PRSNL_ID").cast("long").alias("ALLOCATED_PERSONNEL_ID"),
@@ -919,7 +942,7 @@ def run_full_parity_suite() -> dict:
 def apply_output_comments() -> None:
     apply_comments(
         APPOINTMENT,
-        "S14 appointment feeder: one Millennium scheduling request. Curation cuts referral-ident/date, version counters, alias surrogate and contributor stamps; UBRN alias evidence remains.",
+        "S14 appointment feeder: one Millennium scheduling request. S3-A11 retains referral facts, version counters, alias surrogate and per-source contributor stamps.",
         {
             "SCH_EVENT_ID": "S14 appointment key; Millennium scheduling id, never a clinical EVENT_ID.",
             "EXTERNAL_EVENT_ALIAS": "S14 referral/request-thread linkage evidence via the UBRN alias lane.",
@@ -932,7 +955,7 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         SCHEDULE,
-        "S14 appointment booking-history feeder: one booking/reschedule iteration with its 1:1 location. Curation cuts null/constant and consumer-less booking machinery plus contributor stamps.",
+        "S14 appointment booking-history feeder: one booking/reschedule iteration with its 1:1 location. S3-A11 retains booking machinery and contributor stamps for prod-twin parity.",
         {
             "SCHEDULE_ID": "S14 appointment ordered booking-iteration key.",
             "SCH_EVENT_ID": "S14 appointment parent request identifier.",
@@ -944,7 +967,7 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         RESOURCE,
-        "S14 appointment participation/slot feeder: one nonblank role assignment. Constant sentinel VIS/END_EFFECTIVE timestamps and source counters are cut; NUL/blank capacity rows are excluded.",
+        "S14 appointment participation/slot feeder: one nonblank role assignment. S3-A11 retains VIS/END_EFFECTIVE timestamps and source counters; NUL/blank capacity rows remain excluded.",
         {
             "SCH_APPT_ID": "S14 appointment slot/participation key and liquid-clustering key.",
             "BEG_DT_TM": "S14 booked-slot start; never an observed arrival.",
@@ -1099,4 +1122,5 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
+
 

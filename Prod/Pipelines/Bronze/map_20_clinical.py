@@ -47,6 +47,16 @@ map_diagnosis_comment = 'One row per source diagnosis for the configured trust. 
 def _sf(name, data_type, comment):
     return StructField(name, data_type, True, metadata={'comment': comment})
 schema_map_diagnosis_v2 = StructType([_sf('DIAGNOSIS_ID', LongType(), 'Primary key from the source diagnosis table.'), _sf('PERSON_ID', LongType(), 'Source person identifier.'), _sf('ENCNTR_ID', LongType(), 'Source encounter identifier.'), _sf('DIAG_DT_TM', TimestampType(), 'Compatibility diagnosis datetime derived from raw diagnosis datetime, encounter arrival, then row effective datetime.'), _sf('DIAG_DT_TM_RAW', TimestampType(), 'Unmodified DIAG_DT_TM from the diagnosis source.'), _sf('ARRIVE_DT_TM', TimestampType(), 'Current encounter arrival datetime used as the second date fallback.'), _sf('BEG_EFFECTIVE_DT_TM', TimestampType(), 'Source diagnosis row beginning effective datetime.'), _sf('END_EFFECTIVE_DT_TM', TimestampType(), 'Source diagnosis row ending effective datetime.'), _sf('DIAG_DT_TM_SOURCE', StringType(), 'Source selected for DIAG_DT_TM: DIAG_DT_TM, ENCOUNTER_ARRIVE_DT_TM, BEG_EFFECTIVE_DT_TM, or NULL.'), _sf('DIAG_DT_TM_BEFORE_1950_IND', BooleanType(), 'True when the derived diagnosis datetime precedes 1950-01-01; no row is filtered.'), _sf('DIAG_DT_TM_FUTURE_AT_MAP_IND', BooleanType(), 'True when the derived diagnosis datetime was in the future when mapped; no row is filtered.'), _sf('earliest_diagnosis_date', TimestampType(), 'Earliest derived diagnosis datetime across the complete current PERSON_ID and NOMENCLATURE_ID group.'), _sf('DIAG_TYPE_CD', LongType(), 'Source diagnosis type code.'), _sf('diag_type_desc', StringType(), 'Code-value display, description, or CDF meaning for DIAG_TYPE_CD.'), _sf('DIAG_PRIORITY', LongType(), 'Source diagnosis priority.'), _sf('RANKING_CD', LongType(), 'Source diagnosis ranking code.'), _sf('DIAG_PRSNL_ID', LongType(), 'Personnel identifier that added the diagnosis.'), _sf('CLINICAL_SERVICE_CD', LongType(), 'Source clinical service code.'), _sf('clinical_service_desc', StringType(), 'Code-value display, description, or CDF meaning for CLINICAL_SERVICE_CD.'), _sf('CONFIRMATION_STATUS_CD', LongType(), 'Source confirmation status code.'), _sf('confirmation_status_desc', StringType(), 'Code-value display, description, or CDF meaning for CONFIRMATION_STATUS_CD.'), _sf('CLASSIFICATION_CD', LongType(), 'Source diagnosis classification code.'), _sf('classification_desc', StringType(), 'Code-value display, description, or CDF meaning for CLASSIFICATION_CD.'), _sf('ACTIVE_IND', LongType(), 'Source active indicator; inactive rows are retained.'), _sf('ACTIVE_STATUS_CD', LongType(), 'Source row active-status code.'), _sf('ACTIVE_STATUS_DT_TM', TimestampType(), 'Datetime the source active status was set.'), _sf('CONTRIBUTOR_SYSTEM_CD', LongType(), 'Source contributor-system code.'), _sf('ORGANIZATION_ID', LongType(), 'Source organization identifier.'), _sf('TRUST', StringType(), 'Source Trust value retained for provenance.'), _sf('UPDT_CNT', LongType(), 'Source update counter.'), _sf('UPDT_DT_TM', TimestampType(), 'Source application update datetime.'), _sf('LAST_UTC_TS', TimestampType(), 'Source last UTC timestamp.'), _sf('DIAGNOSIS_DISPLAY', StringType(), 'Clinician-facing diagnosis display from the diagnosis source.'), _sf('DIAG_FTDESC', StringType(), 'Source free-text diagnosis description.'), _sf('DIAGNOSIS_TEXT', StringType(), 'First nonblank value from nomenclature source string, diagnosis display, and diagnosis free text.'), _sf('DIAGNOSIS_TEXT_SOURCE', StringType(), 'Column used to populate DIAGNOSIS_TEXT.'), _sf('DIAGNOSIS_GROUP', LongType(), 'Source diagnosis-group identifier.'), _sf('ORIGINATING_NOMENCLATURE_ID', LongType(), 'Source originating nomenclature identifier.'), _sf('CLINICAL_DIAG_PRIORITY', LongType(), 'Source clinical diagnosis priority.'), _sf('LATERALITY_CD', LongType(), 'Source laterality code.'), _sf('CONDITIONAL_QUAL_CD', LongType(), 'Source conditional qualifier code.'), _sf('PROBABILITY', DoubleType(), 'Source numeric diagnosis probability.'), _sf('SEVERITY_CLASS_CD', LongType(), 'Source severity classification code.'), _sf('SEVERITY_CD', LongType(), 'Source severity code.'), _sf('SEVERITY_FTDESC', StringType(), 'Source free-text severity.'), _sf('ASSERTED_DT_TM', TimestampType(), 'Source diagnosis asserted datetime.'), _sf('LIFE_CYCLE_STATUS_CD', LongType(), 'Source diagnosis lifecycle status code.'), _sf('LIFE_CYCLE_DT_TM', TimestampType(), 'Source diagnosis lifecycle datetime.'), _sf('NOMENCLATURE_ID', LongType(), 'Source diagnosis nomenclature identifier.'), _sf('SOURCE_IDENTIFIER', StringType(), 'Current nomenclature source-vocabulary identifier.'), _sf('SOURCE_STRING', StringType(), 'Current nomenclature source string.'), _sf('SOURCE_VOCABULARY_CD', LongType(), 'Current nomenclature source-vocabulary code.'), _sf('source_vocabulary_desc', StringType(), 'Code-value display, description, or CDF meaning for SOURCE_VOCABULARY_CD.'), _sf('VOCAB_AXIS_CD', LongType(), 'Current nomenclature vocabulary-axis code.'), _sf('vocab_axis_desc', StringType(), 'Code-value display, description, or CDF meaning for VOCAB_AXIS_CD.'), _sf('CONCEPT_CKI', StringType(), 'Complete, unmodified nomenclature concept CKI.'), _sf('CONCEPT_CKI_SOURCE', StringType(), 'Source component before the first exclamation mark in CONCEPT_CKI.'), _sf('CONCEPT_CKI_IDENTIFIER', StringType(), 'Identifier component after the final exclamation mark in CONCEPT_CKI.'), _sf('NOMENCLATURE_IS_ACTIVE', BooleanType(), 'Current nomenclature active indicator; inactive mappings are retained.'), _sf('NOMENCLATURE_SOURCE_CHANGE_TS', TimestampType(), 'True source-change timestamp carried by the nomenclature table.'), _sf('NOMENCLATURE_MAPPING_HASH', StringType(), 'Stable hash of current nomenclature mapping content, excluding load timestamps.'), _sf('FOUND_CUI', StringType(), 'CUI found during nomenclature mapping.'), _sf('OMOP_CONCEPT_ID', LongType(), 'Current mapped OMOP concept identifier.'), _sf('OMOP_CONCEPT_NAME', StringType(), 'Current mapped OMOP concept name.'), _sf('OMOP_STANDARD_CONCEPT', StringType(), 'Current OMOP standard-concept flag.'), _sf('OMOP_MATCH_NUMBER', LongType(), 'Number of OMOP mapping matches.'), _sf('OMOP_SIMILARITY', DoubleType(), 'Source-to-OMOP similarity score.'), _sf('OMOP_CONCEPT_DOMAIN', StringType(), 'Current OMOP concept domain.'), _sf('OMOP_CONCEPT_CLASS', StringType(), 'Current OMOP concept class.'), _sf('SNOMED_CODE', LongType(), 'Current mapped SNOMED code.'), _sf('SNOMED_TYPE', StringType(), 'Current SNOMED mapping method.'), _sf('SNOMED_MATCH_NUMBER', LongType(), 'Number of SNOMED mapping matches.'), _sf('SNOMED_SIMILARITY', DoubleType(), 'Source-to-SNOMED similarity score.'), _sf('SNOMED_TERM', StringType(), 'Current mapped SNOMED term.'), _sf('ICD10_CODE', StringType(), 'Current mapped ICD-10 code.'), _sf('ICD10_TYPE', StringType(), 'Current ICD-10 mapping method.'), _sf('ICD10_MATCH_NUMBER', LongType(), 'Number of ICD-10 mapping matches.'), _sf('ICD10_SIMILARITY', DoubleType(), 'Source-to-ICD-10 similarity score.'), _sf('ICD10_TERM', StringType(), 'Current mapped ICD-10 term.'), _sf('CODE_VALUE_LOOKUP_HASH', StringType(), 'Stable hash of the six code-value descriptions used by this row.'), _sf('DIAGNOSIS_ADC_UPDT', TimestampType(), 'ADC_UPDT from the diagnosis source only.'), _sf('NOMENCLATURE_ADC_UPDT', TimestampType(), 'ADC_UPDT from the nomenclature source only.'), _sf('ENCOUNTER_ADC_UPDT', TimestampType(), 'ADC_UPDT from the encounter source only.'), _sf('CODE_VALUE_ADC_UPDT', TimestampType(), 'Greatest ADC_UPDT among code-value rows used for descriptions.'), _sf('MAP_REFRESH_DT_TM', TimestampType(), 'Datetime this mapped row last materially changed.'), _sf('MAP_ROW_HASH', StringType(), 'Stable hash used to avoid rewriting unchanged mapped rows.'), _sf('ADC_UPDT', TimestampType(), 'Compatibility composite update timestamp. Never use this column as a source-system incremental checkpoint.')])
+# S4-C1b BEGIN
+schema_map_diagnosis_v2 = StructType(list(schema_map_diagnosis_v2.fields) + [
+    _sf('OMOP_STANDARD_CONCEPT_ID', LongType(), 'Standard OMOP concept via exactly-one Maps-to, or the source concept when already standard.'),
+    _sf('OMOP_STANDARD_CONCEPT_NAME', StringType(), 'Name of OMOP_STANDARD_CONCEPT_ID.'),
+    _sf('OMOP_STANDARD_CANDIDATE_COUNT', LongType(), 'Distinct valid standard Maps-to targets; values greater than one are deliberately unresolved.'),
+    _sf('OMOP_STANDARD_MAPPING_METHOD', StringType(), 'ALREADY_STANDARD | MAPS_TO_EXACT | MAPS_TO_MULTI | NO_STANDARD_MAP; NULL when OMOP_CONCEPT_ID is NULL.'),
+    _sf('DIAG_NOTE', StringType(), 'raw.mill_diagnosis passthrough — 3 filled rows in 46.3M at 2026-08-12 (semantically empty; carried for RDE parity).'),
+    _sf('PRESENT_ON_ADMIT_CD', LongType(), 'raw.mill_diagnosis passthrough — always 0 at 2026-08-12.'),
+])
+# S4-C1b END
 schema_map_diagnosis = schema_map_diagnosis_v2
 
 def _sql_name(table_name: str) -> str:
@@ -238,6 +248,71 @@ def _m20_hardening_validate_cdf(changes):
     changes.limit(1).collect()
     return changes
 
+def _m20_semantic_snapshot_keys(
+    table_name: str,
+    previous_version: int,
+    current_version: int,
+    key_columns: List[str],
+    semantic_columns: Optional[List[str]]=None,
+) -> DataFrame:
+    """Return keys whose effective payload changed, ignoring publisher metadata churn."""
+    current = _m20_hardening_read_pinned_snapshot(table_name, int(current_version))
+    if int(current_version) <= int(previous_version):
+        return current.select(*[F.col(name) for name in key_columns]).limit(0)
+    previous = _m20_hardening_read_pinned_snapshot(table_name, int(previous_version))
+    technical = {
+        'ADC_UPDT', 'LOAD_DT_TM', 'LOADED_AT', 'INGESTED_AT', 'UPDATED_AT',
+        'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'SOURCE_VERSION',
+        '_CHANGE_TYPE', '_COMMIT_VERSION', '_COMMIT_TIMESTAMP',
+        'UPDT_DT_TM', 'UPDT_CNT', 'UPDT_ID', 'UPDT_TASK', 'UPDT_APPLCTX',
+        'LAST_UTC_TS', 'INST_ID', 'TXN_ID_TEXT', 'ROW_HASH',
+    }
+
+    def prepared(frame: DataFrame, payload_name: str) -> DataFrame:
+        requested = list(semantic_columns) if semantic_columns is not None else list(frame.columns)
+        available = [
+            name for name in requested
+            if name in frame.columns
+            and name not in key_columns
+            and name.upper() not in technical
+            and not name.upper().startswith('PIPELINE_')
+            and not name.upper().startswith('LOAD_')
+            and not name.upper().startswith('INGEST')
+            and not name.upper().endswith('_ADC_UPDT')
+            and not name.upper().endswith('_SOURCE_VERSION')
+            and not name.upper().endswith('_COMMIT_VERSION')
+            and not name.upper().endswith('_COMMIT_TIMESTAMP')
+        ]
+        if not available:
+            raise RuntimeError(f'No semantic columns available for {table_name}')
+        payload = F.sha2(
+            F.to_json(F.struct(*[F.col(name).alias(name) for name in available]), {'ignoreNullFields': 'false'}),
+            256,
+        )
+        return (
+            frame.select(*[F.col(name) for name in key_columns], payload.alias('_PAYLOAD'))
+            .where(reduce(lambda left, right: left & right, [F.col(name).isNotNull() for name in key_columns]))
+            .groupBy(*key_columns)
+            .agg(F.sort_array(F.collect_set('_PAYLOAD')).alias(payload_name))
+        )
+
+    before = prepared(previous, '_BEFORE').alias('b')
+    after = prepared(current, '_AFTER').alias('a')
+    condition = reduce(
+        lambda left, right: left & right,
+        [F.col(f'b.{name}').eqNullSafe(F.col(f'a.{name}')) for name in key_columns],
+    )
+    return (
+        before.join(after, condition, 'full')
+        .where(~F.col('b._BEFORE').eqNullSafe(F.col('a._AFTER')))
+        .select(*[
+            F.coalesce(F.col(f'b.{name}'), F.col(f'a.{name}')).alias(name)
+            for name in key_columns
+        ])
+        .dropDuplicates(list(key_columns))
+    )
+
+
 def _cdf_changed_keys(table_name: str, key_column: str, start_version: int, end_version: int) -> DataFrame:
     if start_version > end_version:
         return _empty_key_df(table_name, key_column)
@@ -257,8 +332,10 @@ def _read_source_snapshot(table_name: str) -> DataFrame:
         return spark.table(table_name)
     return _m20_hardening_read_pinned_snapshot(table_name, int(version))
 
+# S4-C1b BEGIN
 def _current_diagnosis_snapshot() -> DataFrame:
-    return _read_source_snapshot(MAP_DIAGNOSIS_SOURCE).filter(F.col('Trust') == F.lit(MAP_DIAGNOSIS_TRUST)).select('DIAGNOSIS_ID', 'PERSON_ID', 'ENCNTR_ID', 'NOMENCLATURE_ID', 'DIAG_DT_TM', 'BEG_EFFECTIVE_DT_TM', 'END_EFFECTIVE_DT_TM', 'DIAG_TYPE_CD', 'DIAG_PRIORITY', 'RANKING_CD', 'DIAG_PRSNL_ID', 'CLINICAL_SERVICE_CD', 'CONFIRMATION_STATUS_CD', 'CLASSIFICATION_CD', 'ACTIVE_IND', 'ACTIVE_STATUS_CD', 'ACTIVE_STATUS_DT_TM', 'CONTRIBUTOR_SYSTEM_CD', 'ORGANIZATION_ID', F.col('Trust').alias('TRUST'), 'UPDT_CNT', 'UPDT_DT_TM', 'LAST_UTC_TS', 'DIAGNOSIS_DISPLAY', 'DIAG_FTDESC', 'DIAGNOSIS_GROUP', 'ORIGINATING_NOMENCLATURE_ID', 'CLINICAL_DIAG_PRIORITY', 'LATERALITY_CD', 'CONDITIONAL_QUAL_CD', 'PROBABILITY', 'SEVERITY_CLASS_CD', 'SEVERITY_CD', 'SEVERITY_FTDESC', 'ASSERTED_DT_TM', 'LIFE_CYCLE_STATUS_CD', 'LIFE_CYCLE_DT_TM', 'ADC_UPDT')
+    return _read_source_snapshot(MAP_DIAGNOSIS_SOURCE).filter(F.col('Trust') == F.lit(MAP_DIAGNOSIS_TRUST)).select('DIAGNOSIS_ID', 'PERSON_ID', 'ENCNTR_ID', 'NOMENCLATURE_ID', 'DIAG_DT_TM', 'BEG_EFFECTIVE_DT_TM', 'END_EFFECTIVE_DT_TM', 'DIAG_TYPE_CD', 'DIAG_PRIORITY', 'RANKING_CD', 'DIAG_PRSNL_ID', 'CLINICAL_SERVICE_CD', 'CONFIRMATION_STATUS_CD', 'CLASSIFICATION_CD', 'ACTIVE_IND', 'ACTIVE_STATUS_CD', 'ACTIVE_STATUS_DT_TM', 'CONTRIBUTOR_SYSTEM_CD', 'ORGANIZATION_ID', F.col('Trust').alias('TRUST'), 'UPDT_CNT', 'UPDT_DT_TM', 'LAST_UTC_TS', 'DIAGNOSIS_DISPLAY', 'DIAG_FTDESC', 'DIAGNOSIS_GROUP', 'ORIGINATING_NOMENCLATURE_ID', 'CLINICAL_DIAG_PRIORITY', 'LATERALITY_CD', 'CONDITIONAL_QUAL_CD', 'PROBABILITY', 'SEVERITY_CLASS_CD', 'SEVERITY_CD', 'SEVERITY_FTDESC', 'ASSERTED_DT_TM', 'LIFE_CYCLE_STATUS_CD', 'LIFE_CYCLE_DT_TM', F.col('DIAG_NOTE').cast('string').alias('DIAG_NOTE'), F.col('PRESENT_ON_ADMIT_CD').cast('long').alias('PRESENT_ON_ADMIT_CD'), 'ADC_UPDT')
+# S4-C1b END
 NOMENCLATURE_HASH_COLUMNS = ['SOURCE_IDENTIFIER', 'SOURCE_STRING', 'SOURCE_VOCABULARY_CD', 'VOCAB_AXIS_CD', 'CONCEPT_CKI', 'IS_STANDARD_OMOP_CONCEPT', 'CONCEPT_DOMAIN', 'CONCEPT_CLASS', 'FOUND_CUI', 'OMOP_CONCEPT_ID', 'OMOP_CONCEPT_NAME', 'NUMBER_OF_OMOP_MATCHES', 'OMOP_SIMILARITY', 'SNOMED_CODE', 'SNOMED_TYPE', 'SNOMED_MATCH_COUNT', 'SNOMED_SIMILARITY', 'SNOMED_TERM', 'ICD10_CODE', 'ICD10_CODE_TYPE', 'ICD10_CODE_MATCH_COUNT', 'ICD10_SIMILARITY', 'ICD10_TERM', 'SOURCE_CHANGE_TS', 'IS_ACTIVE']
 
 def _current_nomenclature_projection() -> DataFrame:
@@ -276,6 +353,79 @@ def _current_code_value_projection() -> DataFrame:
     selection = Window.partitionBy('CODE_VALUE').orderBy(F.col('LOOKUP_ADC_UPDT').desc_nulls_last(), F.col('LOOKUP_DESC').desc_nulls_last())
     return lookup.withColumn('_CODE_VALUE_RN', F.row_number().over(selection)).where(F.col('_CODE_VALUE_RN') == 1).drop('_CODE_VALUE_RN')
 CODE_LOOKUPS = [('DIAG_TYPE_CD', 'diag_type_desc', 'diag_type'), ('CLINICAL_SERVICE_CD', 'clinical_service_desc', 'clinical_service'), ('CONFIRMATION_STATUS_CD', 'confirmation_status_desc', 'confirmation_status'), ('CLASSIFICATION_CD', 'classification_desc', 'classification'), ('SOURCE_VOCABULARY_CD', 'source_vocabulary_desc', 'source_vocabulary'), ('VOCAB_AXIS_CD', 'vocab_axis_desc', 'vocab_axis')]
+# S4-C1b BEGIN
+def _s4_c1b_diagnosis_standard_resolution(frame: DataFrame) -> DataFrame:
+    source_ids = frame.select(F.col('OMOP_CONCEPT_ID').cast('long').alias('concept_id')).where(F.col('concept_id').isNotNull()).distinct()
+    concepts = spark.table('4_prod.omop.concept').select(
+        F.col('concept_id').cast('long').alias('_s4_concept_id'),
+        F.col('concept_name').cast('string').alias('_s4_concept_name'),
+        F.col('standard_concept').cast('string').alias('_s4_standard_concept'),
+    )
+    source_class = source_ids.alias('s').join(
+        concepts.alias('c'),
+        F.col('s.concept_id') == F.col('c._s4_concept_id'),
+        'left',
+    ).select(F.col('s.concept_id'), F.col('c._s4_standard_concept'))
+    relationships = spark.table('4_prod.omop.concept_relationship').where(
+        (F.col('relationship_id') == F.lit('Maps to')) & F.col('invalid_reason').isNull()
+    ).select(
+        F.col('concept_id_1').cast('long').alias('_s4_source_id'),
+        F.col('concept_id_2').cast('long').alias('_s4_target_id'),
+    )
+    standard_targets = concepts.where(F.col('_s4_standard_concept') == F.lit('S')).select(
+        F.col('_s4_concept_id').alias('_s4_valid_target_id')
+    )
+    maps_to = relationships.join(
+        F.broadcast(source_ids.select(F.col('concept_id').alias('_s4_requested_source_id'))),
+        F.col('_s4_source_id') == F.col('_s4_requested_source_id'),
+        'inner',
+    ).join(
+        standard_targets,
+        F.col('_s4_target_id') == F.col('_s4_valid_target_id'),
+        'inner',
+    )
+    aggregate = maps_to.groupBy('_s4_source_id').agg(
+        F.countDistinct('_s4_target_id').cast('long').alias('_s4_candidate_count'),
+        F.min('_s4_target_id').cast('long').alias('_s4_only_target'),
+    )
+    resolution = source_class.join(
+        aggregate,
+        F.col('concept_id') == F.col('_s4_source_id'),
+        'left',
+    ).select(
+        'concept_id',
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.col('concept_id'))
+         .when(F.col('_s4_candidate_count') == F.lit(1), F.col('_s4_only_target'))
+         .cast('long').alias('OMOP_STANDARD_CONCEPT_ID'),
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.lit(1).cast('long'))
+         .otherwise(F.coalesce(F.col('_s4_candidate_count'), F.lit(0).cast('long')))
+         .alias('OMOP_STANDARD_CANDIDATE_COUNT'),
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.lit('ALREADY_STANDARD'))
+         .when(F.col('_s4_candidate_count') == F.lit(1), F.lit('MAPS_TO_EXACT'))
+         .when(F.col('_s4_candidate_count') > F.lit(1), F.lit('MAPS_TO_MULTI'))
+         .otherwise(F.lit('NO_STANDARD_MAP')).alias('OMOP_STANDARD_MAPPING_METHOD'),
+    )
+    standard_names = concepts.select(
+        F.col('_s4_concept_id').alias('_s4_standard_id'),
+        F.col('_s4_concept_name').alias('OMOP_STANDARD_CONCEPT_NAME'),
+    )
+    resolution = resolution.join(
+        standard_names,
+        F.col('OMOP_STANDARD_CONCEPT_ID') == F.col('_s4_standard_id'),
+        'left',
+    ).drop('_s4_standard_id')
+    return frame.alias('r').join(
+        F.broadcast(resolution).alias('s'),
+        F.col('r.OMOP_CONCEPT_ID') == F.col('s.concept_id'),
+        'left',
+    ).select(
+        'r.*',
+        F.col('s.OMOP_STANDARD_CONCEPT_ID'),
+        F.col('s.OMOP_STANDARD_CONCEPT_NAME'),
+        F.col('s.OMOP_STANDARD_CANDIDATE_COUNT'),
+        F.col('s.OMOP_STANDARD_MAPPING_METHOD'),
+    )
+# S4-C1b END
 
 def _derive_diagnosis_date(df: DataFrame) -> DataFrame:
     derived = F.coalesce(F.col('DIAG_DT_TM_RAW'), F.col('ARRIVE_DT_TM'), F.col('BEG_EFFECTIVE_DT_TM'))
@@ -290,7 +440,9 @@ def _build_map_diagnosis_rows(diagnosis_rows: DataFrame, full_refresh: bool, ear
     d = diagnosis_rows.alias('d')
     e = _current_encounter_projection().alias('e')
     n = _current_nomenclature_projection().alias('n')
-    base = d.join(e, F.col('d.ENCNTR_ID') == F.col('e.ENCNTR_ID'), 'left').join(n, F.col('d.NOMENCLATURE_ID').cast(DecimalType(38, 18)) == F.col('n.NOMENCLATURE_ID'), 'left').select(F.col('d.DIAGNOSIS_ID'), F.col('d.PERSON_ID'), F.col('d.ENCNTR_ID'), F.col('d.DIAG_DT_TM').alias('DIAG_DT_TM_RAW'), F.col('e.ARRIVE_DT_TM'), F.col('d.BEG_EFFECTIVE_DT_TM'), F.col('d.END_EFFECTIVE_DT_TM'), F.col('d.DIAG_TYPE_CD'), F.col('d.DIAG_PRIORITY'), F.col('d.RANKING_CD'), F.col('d.DIAG_PRSNL_ID'), F.col('d.CLINICAL_SERVICE_CD'), F.col('d.CONFIRMATION_STATUS_CD'), F.col('d.CLASSIFICATION_CD'), F.col('d.ACTIVE_IND'), F.col('d.ACTIVE_STATUS_CD'), F.col('d.ACTIVE_STATUS_DT_TM'), F.col('d.CONTRIBUTOR_SYSTEM_CD'), F.col('d.ORGANIZATION_ID'), F.col('d.TRUST'), F.col('d.UPDT_CNT'), F.col('d.UPDT_DT_TM'), F.col('d.LAST_UTC_TS'), F.col('d.DIAGNOSIS_DISPLAY'), F.col('d.DIAG_FTDESC'), F.col('d.DIAGNOSIS_GROUP'), F.col('d.ORIGINATING_NOMENCLATURE_ID'), F.col('d.CLINICAL_DIAG_PRIORITY'), F.col('d.LATERALITY_CD'), F.col('d.CONDITIONAL_QUAL_CD'), F.col('d.PROBABILITY'), F.col('d.SEVERITY_CLASS_CD'), F.col('d.SEVERITY_CD'), F.col('d.SEVERITY_FTDESC'), F.col('d.ASSERTED_DT_TM'), F.col('d.LIFE_CYCLE_STATUS_CD'), F.col('d.LIFE_CYCLE_DT_TM'), F.col('d.NOMENCLATURE_ID').alias('NOMENCLATURE_ID'), F.col('n.SOURCE_IDENTIFIER'), F.col('n.SOURCE_STRING'), F.col('n.SOURCE_VOCABULARY_CD'), F.col('n.VOCAB_AXIS_CD'), F.col('n.CONCEPT_CKI'), F.col('n.IS_ACTIVE').alias('NOMENCLATURE_IS_ACTIVE'), F.col('n.SOURCE_CHANGE_TS').alias('NOMENCLATURE_SOURCE_CHANGE_TS'), F.col('n.NOMENCLATURE_MAPPING_HASH'), F.col('n.FOUND_CUI'), F.col('n.OMOP_CONCEPT_ID'), F.col('n.OMOP_CONCEPT_NAME'), F.col('n.IS_STANDARD_OMOP_CONCEPT').alias('OMOP_STANDARD_CONCEPT'), F.col('n.NUMBER_OF_OMOP_MATCHES').alias('OMOP_MATCH_NUMBER'), F.col('n.OMOP_SIMILARITY'), F.col('n.CONCEPT_DOMAIN').alias('OMOP_CONCEPT_DOMAIN'), F.col('n.CONCEPT_CLASS').alias('OMOP_CONCEPT_CLASS'), F.col('n.SNOMED_CODE'), F.col('n.SNOMED_TYPE'), F.col('n.SNOMED_MATCH_COUNT').alias('SNOMED_MATCH_NUMBER'), F.col('n.SNOMED_SIMILARITY'), F.col('n.SNOMED_TERM'), F.col('n.ICD10_CODE'), F.col('n.ICD10_CODE_TYPE').alias('ICD10_TYPE'), F.col('n.ICD10_CODE_MATCH_COUNT').alias('ICD10_MATCH_NUMBER'), F.col('n.ICD10_SIMILARITY'), F.col('n.ICD10_TERM'), F.col('d.ADC_UPDT').alias('DIAGNOSIS_ADC_UPDT'), F.col('n.ADC_UPDT').alias('NOMENCLATURE_ADC_UPDT'), F.col('e.ENCOUNTER_ADC_UPDT'))
+    # S4-C1b BEGIN
+    base = d.join(e, F.col('d.ENCNTR_ID') == F.col('e.ENCNTR_ID'), 'left').join(n, F.col('d.NOMENCLATURE_ID').cast(DecimalType(38, 18)) == F.col('n.NOMENCLATURE_ID'), 'left').select(F.col('d.DIAGNOSIS_ID'), F.col('d.PERSON_ID'), F.col('d.ENCNTR_ID'), F.col('d.DIAG_DT_TM').alias('DIAG_DT_TM_RAW'), F.col('e.ARRIVE_DT_TM'), F.col('d.BEG_EFFECTIVE_DT_TM'), F.col('d.END_EFFECTIVE_DT_TM'), F.col('d.DIAG_TYPE_CD'), F.col('d.DIAG_PRIORITY'), F.col('d.RANKING_CD'), F.col('d.DIAG_PRSNL_ID'), F.col('d.CLINICAL_SERVICE_CD'), F.col('d.CONFIRMATION_STATUS_CD'), F.col('d.CLASSIFICATION_CD'), F.col('d.ACTIVE_IND'), F.col('d.ACTIVE_STATUS_CD'), F.col('d.ACTIVE_STATUS_DT_TM'), F.col('d.CONTRIBUTOR_SYSTEM_CD'), F.col('d.ORGANIZATION_ID'), F.col('d.TRUST'), F.col('d.UPDT_CNT'), F.col('d.UPDT_DT_TM'), F.col('d.LAST_UTC_TS'), F.col('d.DIAGNOSIS_DISPLAY'), F.col('d.DIAG_FTDESC'), F.col('d.DIAG_NOTE'), F.col('d.PRESENT_ON_ADMIT_CD'), F.col('d.DIAGNOSIS_GROUP'), F.col('d.ORIGINATING_NOMENCLATURE_ID'), F.col('d.CLINICAL_DIAG_PRIORITY'), F.col('d.LATERALITY_CD'), F.col('d.CONDITIONAL_QUAL_CD'), F.col('d.PROBABILITY'), F.col('d.SEVERITY_CLASS_CD'), F.col('d.SEVERITY_CD'), F.col('d.SEVERITY_FTDESC'), F.col('d.ASSERTED_DT_TM'), F.col('d.LIFE_CYCLE_STATUS_CD'), F.col('d.LIFE_CYCLE_DT_TM'), F.col('d.NOMENCLATURE_ID').alias('NOMENCLATURE_ID'), F.col('n.SOURCE_IDENTIFIER'), F.col('n.SOURCE_STRING'), F.col('n.SOURCE_VOCABULARY_CD'), F.col('n.VOCAB_AXIS_CD'), F.col('n.CONCEPT_CKI'), F.col('n.IS_ACTIVE').alias('NOMENCLATURE_IS_ACTIVE'), F.col('n.SOURCE_CHANGE_TS').alias('NOMENCLATURE_SOURCE_CHANGE_TS'), F.col('n.NOMENCLATURE_MAPPING_HASH'), F.col('n.FOUND_CUI'), F.col('n.OMOP_CONCEPT_ID'), F.col('n.OMOP_CONCEPT_NAME'), F.col('n.IS_STANDARD_OMOP_CONCEPT').alias('OMOP_STANDARD_CONCEPT'), F.col('n.NUMBER_OF_OMOP_MATCHES').alias('OMOP_MATCH_NUMBER'), F.col('n.OMOP_SIMILARITY'), F.col('n.CONCEPT_DOMAIN').alias('OMOP_CONCEPT_DOMAIN'), F.col('n.CONCEPT_CLASS').alias('OMOP_CONCEPT_CLASS'), F.col('n.SNOMED_CODE'), F.col('n.SNOMED_TYPE'), F.col('n.SNOMED_MATCH_COUNT').alias('SNOMED_MATCH_NUMBER'), F.col('n.SNOMED_SIMILARITY'), F.col('n.SNOMED_TERM'), F.col('n.ICD10_CODE'), F.col('n.ICD10_CODE_TYPE').alias('ICD10_TYPE'), F.col('n.ICD10_CODE_MATCH_COUNT').alias('ICD10_MATCH_NUMBER'), F.col('n.ICD10_SIMILARITY'), F.col('n.ICD10_TERM'), F.col('d.ADC_UPDT').alias('DIAGNOSIS_ADC_UPDT'), F.col('n.ADC_UPDT').alias('NOMENCLATURE_ADC_UPDT'), F.col('e.ENCOUNTER_ADC_UPDT'))
+    # S4-C1b END
     base = _derive_diagnosis_date(base)
     if full_refresh:
         complete_group = Window.partitionBy('PERSON_ID', 'NOMENCLATURE_ID')
@@ -314,6 +466,9 @@ def _build_map_diagnosis_rows(diagnosis_rows: DataFrame, full_refresh: bool, ear
         description_columns.append(description_column)
     result = result.withColumn('CODE_VALUE_ADC_UPDT', F.greatest(*[F.col(name) for name in code_adc_columns])).withColumn('CODE_VALUE_LOOKUP_HASH', _stable_hash(description_columns)).withColumn('ADC_UPDT', F.greatest(F.col('DIAGNOSIS_ADC_UPDT'), F.col('NOMENCLATURE_ADC_UPDT'), F.col('ENCOUNTER_ADC_UPDT'), F.col('CODE_VALUE_ADC_UPDT')))
     result = result.drop(*code_adc_columns)
+    # S4-C1b BEGIN
+    result = _s4_c1b_diagnosis_standard_resolution(result)
+    # S4-C1b END
     row_hash_exclusions = {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'DIAGNOSIS_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'ENCOUNTER_ADC_UPDT', 'CODE_VALUE_ADC_UPDT'}
     row_hash_columns = [field.name for field in schema_map_diagnosis_v2.fields if field.name not in row_hash_exclusions]
     result = result.withColumn('MAP_ROW_HASH', _stable_hash(row_hash_columns)).withColumn('MAP_REFRESH_DT_TM', F.current_timestamp())
@@ -390,7 +545,24 @@ def _prepare_incremental_refresh(checkpoints: Dict[str, int], end_versions: Dict
     changed = {}
     key_columns = {'diagnosis': 'DIAGNOSIS_ID', 'nomenclature': 'NOMENCLATURE_ID', 'encounter': 'ENCNTR_ID', 'code_value': 'CODE_VALUE'}
     for source_name, table_name in MAP_DIAGNOSIS_SOURCES.items():
-        changed[source_name] = _cdf_changed_keys(table_name, key_columns[source_name], checkpoints[table_name] + 1, end_versions[source_name])
+        if source_name == 'code_value':
+            changed[source_name] = _m20_semantic_snapshot_keys(
+                table_name,
+                checkpoints[table_name],
+                end_versions[source_name],
+                [key_columns[source_name]],
+                ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'],
+            )
+        elif source_name == 'nomenclature':
+            changed[source_name] = _m20_semantic_snapshot_keys(
+                table_name,
+                checkpoints[table_name],
+                end_versions[source_name],
+                [key_columns[source_name]],
+                NOMENCLATURE_HASH_COLUMNS,
+            )
+        else:
+            changed[source_name] = _cdf_changed_keys(table_name, key_columns[source_name], checkpoints[table_name] + 1, end_versions[source_name])
     diagnosis_ids = changed['diagnosis'].select('DIAGNOSIS_ID')
     changed_nom_ids = _changed_nomenclature_ids(changed['nomenclature'])
     nomenclature_diagnosis_ids = _target_ids_for_nomenclature_ids(changed_nom_ids) if not _is_empty(changed_nom_ids) else _empty_key_df(MAP_DIAGNOSIS_SOURCE, 'DIAGNOSIS_ID')
@@ -460,16 +632,11 @@ def _merge_map_diagnosis_rows(rows: DataFrame, full_refresh: bool) -> None:
         for name in target_columns
         if name != 'DIAGNOSIS_ID'
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{name}` <=> s.`{name}`)'
-        for name in target_columns
-        if name != 'DIAGNOSIS_ID'
-    )
     merge = DeltaTable.forName(spark, MAP_DIAGNOSIS_TARGET).alias('t').merge(
         rows.alias('s'),
         't.DIAGNOSIS_ID <=> s.DIAGNOSIS_ID',
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.MAP_ROW_HASH <=> s.MAP_ROW_HASH)',
         set=update_values,
     ).whenNotMatchedInsert(values=insert_values)
     if full_refresh:
@@ -609,6 +776,16 @@ _PROBLEM_SCHEMA_FIELDS = [_sf('PROBLEM_ID', T.LongType(), 'Compatibility primary
 schema_map_problem_v3 = T.StructType(_PROBLEM_SCHEMA_FIELDS)
 schema_map_problem = schema_map_problem_v3
 schema_map_problem_history_v3 = T.StructType(_PROBLEM_SCHEMA_FIELDS + [_sf('SOURCE_DELETED_IND', T.BooleanType(), 'True when the source revision was physically deleted after being observed.'), _sf('SOURCE_DELETE_COMMIT_VERSION', T.LongType(), 'Source Delta commit version that deleted the revision.'), _sf('SOURCE_DELETE_COMMIT_TIMESTAMP', T.TimestampType(), 'Datetime the source delete was applied to history.')])
+# S4-C1b BEGIN
+schema_map_problem_v3 = T.StructType(list(schema_map_problem_v3.fields) + [
+    _sf('OMOP_STANDARD_CONCEPT_ID', T.LongType(), 'Standard OMOP concept via exactly-one Maps-to, or the source concept when already standard.'),
+    _sf('OMOP_STANDARD_CONCEPT_NAME', T.StringType(), 'Name of OMOP_STANDARD_CONCEPT_ID.'),
+    _sf('OMOP_STANDARD_CANDIDATE_COUNT', T.LongType(), 'Distinct valid standard Maps-to targets; values greater than one are deliberately unresolved.'),
+    _sf('OMOP_STANDARD_MAPPING_METHOD', T.StringType(), 'ALREADY_STANDARD | MAPS_TO_EXACT | MAPS_TO_MULTI | NO_STANDARD_MAP; NULL when OMOP_CONCEPT_ID is NULL.'),
+    _sf('ABSENCE_ASSERTION_IND', T.BooleanType(), "True when CONCEPT_CKI_IDENTIFIER = 'NKP' (the No Known Problems marker); false otherwise."),
+])
+schema_map_problem = schema_map_problem_v3
+# S4-C1b END
 LONG_SOURCE_COLUMNS = ['PROBLEM_INSTANCE_ID', 'PROBLEM_ID', 'NOMENCLATURE_ID', 'PERSON_ID', 'CLASSIFICATION_CD', 'PERSISTENCE_CD', 'CONFIRMATION_STATUS_CD', 'LIFE_CYCLE_STATUS_CD', 'ONSET_DT_CD', 'RANKING_CD', 'CERTAINTY_CD', 'PERSON_AWARE_CD', 'PROGNOSIS_CD', 'PERSON_AWARE_PROGNOSIS_CD', 'FAMILY_AWARE_CD', 'ACTIVE_IND', 'ACTIVE_STATUS_CD', 'ACTIVE_STATUS_PRSNL_ID', 'CONTRIBUTOR_SYSTEM_CD', 'DATA_STATUS_CD', 'DATA_STATUS_PRSNL_ID', 'UPDT_APPLCTX', 'UPDT_CNT', 'UPDT_ID', 'UPDT_TASK', 'COURSE_CD', 'CANCEL_REASON_CD', 'ONSET_DT_FLAG', 'STATUS_UPDT_PRECISION_CD', 'STATUS_UPDT_FLAG', 'QUALIFIER_CD', 'SEVERITY_CLASS_CD', 'SEVERITY_CD', 'ONSET_TZ', 'BEG_EFFECTIVE_TZ', 'LIFE_CYCLE_TZ', 'DEL_IND', 'COND_TYPE_FLAG', 'LIFE_CYCLE_DT_CD', 'LIFE_CYCLE_DT_FLAG', 'ORGANIZATION_ID', 'PROBLEM_TYPE_FLAG', 'SHOW_IN_PM_HISTORY_IND', 'LATERALITY_CD', 'ORIGINATING_NOMENCLATURE_ID', 'INST_ID', 'UPDATE_ENCNTR_ID', 'ORIGINATING_ENCNTR_ID', 'ENCNTR_ID', 'ASSERTED_DT_FLAG', 'ASSERTED_DT_CD', 'ASSERTED_TZ', 'IMPAIRMENT_TYPE_CD']
 STRING_SOURCE_COLUMNS = ['PROBLEM_FTDESC', 'ANNOTATED_DISPLAY', 'PROBLEM_INSTANCE_UUID', 'PROBLEM_UUID', 'TXN_ID_TEXT', 'OTHER_IMPAIRMENT_TEXT', 'Trust']
 TIMESTAMP_SOURCE_COLUMNS = ['ESTIMATED_RESOLUTION_DT_TM', 'ACTUAL_RESOLUTION_DT_TM', 'LIFE_CYCLE_DT_TM', 'ONSET_DT_TM', 'ACTIVE_STATUS_DT_TM', 'BEG_EFFECTIVE_DT_TM', 'END_EFFECTIVE_DT_TM', 'DATA_STATUS_DT_TM', 'UPDT_DT_TM', 'STATUS_UPDT_DT_TM', 'LAST_UTC_TS', 'ADC_UPDT', 'ASSERTED_DT_TM']
@@ -930,7 +1107,7 @@ def _attach_encounter_associations(problems: DataFrame) -> DataFrame:
 
 def _finalize_problem_rows(problems: DataFrame) -> DataFrame:
     result = problems.withColumn('ADC_UPDT', F.greatest(F.col('PROBLEM_ADC_UPDT'), F.col('NOMENCLATURE_ADC_UPDT'), F.col('CODE_VALUE_ADC_UPDT'), F.col('CALC_ENCNTR_ADC_UPDT')))
-    hash_columns = sorted((column_name for column_name in result.columns if column_name not in {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM'} and (not column_name.startswith('_'))))
+    hash_columns = sorted((column_name for column_name in result.columns if column_name not in {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'PROBLEM_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'CODE_VALUE_ADC_UPDT', 'CALC_ENCNTR_ADC_UPDT'} and (not column_name.startswith('_'))))
     return result.withColumn('MAP_ROW_HASH', _stable_hash(hash_columns)).withColumn('MAP_REFRESH_DT_TM', F.current_timestamp())
 
 def _build_enriched_problem_rows(source_rows: DataFrame, complete_problem_snapshot: DataFrame, nomenclature: DataFrame, code_maps: DataFrame, earliest_dates: Optional[DataFrame]=None) -> DataFrame:
@@ -944,6 +1121,99 @@ def _history_and_current_rows(source_rows: DataFrame, complete_problem_snapshot:
     history = _align_to_schema(enriched.withColumn('SOURCE_DELETED_IND', F.lit(False)).withColumn('SOURCE_DELETE_COMMIT_VERSION', F.lit(None).cast('long')).withColumn('SOURCE_DELETE_COMMIT_TIMESTAMP', F.lit(None).cast('timestamp')), schema_map_problem_history_v3)
     current = _align_to_schema(history.filter(F.col('IS_CURRENT_PROBLEM_REVISION')), schema_map_problem_v3)
     return (history, current)
+# S4-C1b BEGIN
+def _s4_c1b_problem_standard_resolution(frame: DataFrame) -> DataFrame:
+    source_ids = frame.select(F.col('OMOP_CONCEPT_ID').cast('long').alias('concept_id')).where(F.col('concept_id').isNotNull()).distinct()
+    concepts = spark.table('4_prod.omop.concept').select(
+        F.col('concept_id').cast('long').alias('_s4_concept_id'),
+        F.col('concept_name').cast('string').alias('_s4_concept_name'),
+        F.col('standard_concept').cast('string').alias('_s4_standard_concept'),
+    )
+    source_class = source_ids.alias('s').join(
+        concepts.alias('c'),
+        F.col('s.concept_id') == F.col('c._s4_concept_id'),
+        'left',
+    ).select(F.col('s.concept_id'), F.col('c._s4_standard_concept'))
+    relationships = spark.table('4_prod.omop.concept_relationship').where(
+        (F.col('relationship_id') == F.lit('Maps to')) & F.col('invalid_reason').isNull()
+    ).select(
+        F.col('concept_id_1').cast('long').alias('_s4_source_id'),
+        F.col('concept_id_2').cast('long').alias('_s4_target_id'),
+    )
+    standard_targets = concepts.where(F.col('_s4_standard_concept') == F.lit('S')).select(
+        F.col('_s4_concept_id').alias('_s4_valid_target_id')
+    )
+    maps_to = relationships.join(
+        F.broadcast(source_ids.select(F.col('concept_id').alias('_s4_requested_source_id'))),
+        F.col('_s4_source_id') == F.col('_s4_requested_source_id'),
+        'inner',
+    ).join(
+        standard_targets,
+        F.col('_s4_target_id') == F.col('_s4_valid_target_id'),
+        'inner',
+    )
+    aggregate = maps_to.groupBy('_s4_source_id').agg(
+        F.countDistinct('_s4_target_id').cast('long').alias('_s4_candidate_count'),
+        F.min('_s4_target_id').cast('long').alias('_s4_only_target'),
+    )
+    resolution = source_class.join(
+        aggregate,
+        F.col('concept_id') == F.col('_s4_source_id'),
+        'left',
+    ).select(
+        'concept_id',
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.col('concept_id'))
+         .when(F.col('_s4_candidate_count') == F.lit(1), F.col('_s4_only_target'))
+         .cast('long').alias('OMOP_STANDARD_CONCEPT_ID'),
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.lit(1).cast('long'))
+         .otherwise(F.coalesce(F.col('_s4_candidate_count'), F.lit(0).cast('long')))
+         .alias('OMOP_STANDARD_CANDIDATE_COUNT'),
+        F.when(F.col('_s4_standard_concept') == F.lit('S'), F.lit('ALREADY_STANDARD'))
+         .when(F.col('_s4_candidate_count') == F.lit(1), F.lit('MAPS_TO_EXACT'))
+         .when(F.col('_s4_candidate_count') > F.lit(1), F.lit('MAPS_TO_MULTI'))
+         .otherwise(F.lit('NO_STANDARD_MAP')).alias('OMOP_STANDARD_MAPPING_METHOD'),
+    )
+    standard_names = concepts.select(
+        F.col('_s4_concept_id').alias('_s4_standard_id'),
+        F.col('_s4_concept_name').alias('OMOP_STANDARD_CONCEPT_NAME'),
+    )
+    resolution = resolution.join(
+        standard_names,
+        F.col('OMOP_STANDARD_CONCEPT_ID') == F.col('_s4_standard_id'),
+        'left',
+    ).drop('_s4_standard_id')
+    return frame.alias('r').join(
+        F.broadcast(resolution).alias('s'),
+        F.col('r.OMOP_CONCEPT_ID') == F.col('s.concept_id'),
+        'left',
+    ).select(
+        'r.*',
+        F.col('s.OMOP_STANDARD_CONCEPT_ID'),
+        F.col('s.OMOP_STANDARD_CONCEPT_NAME'),
+        F.col('s.OMOP_STANDARD_CANDIDATE_COUNT'),
+        F.col('s.OMOP_STANDARD_MAPPING_METHOD'),
+    )
+
+def _s4_c1b_problem_current_rows(frame: DataFrame) -> DataFrame:
+    enriched = _s4_c1b_problem_standard_resolution(frame).withColumn(
+        'ABSENCE_ASSERTION_IND',
+        F.coalesce(F.col('CONCEPT_CKI_IDENTIFIER') == F.lit('NKP'), F.lit(False)),
+    )
+    hash_columns = sorted(
+        column_name for column_name in enriched.columns
+        if column_name not in {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'PROBLEM_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'CODE_VALUE_ADC_UPDT', 'CALC_ENCNTR_ADC_UPDT'} and not column_name.startswith('_')
+    )
+    return enriched.withColumn('MAP_ROW_HASH', _stable_hash(hash_columns))
+
+def _history_and_current_rows(source_rows: DataFrame, complete_problem_snapshot: DataFrame, nomenclature: DataFrame, code_maps: DataFrame, earliest_dates: Optional[DataFrame]=None) -> Tuple[DataFrame, DataFrame]:
+    enriched = _build_enriched_problem_rows(source_rows, complete_problem_snapshot, nomenclature, code_maps, earliest_dates=earliest_dates)
+    history = _align_to_schema(enriched.withColumn('SOURCE_DELETED_IND', F.lit(False)).withColumn('SOURCE_DELETE_COMMIT_VERSION', F.lit(None).cast('long')).withColumn('SOURCE_DELETE_COMMIT_TIMESTAMP', F.lit(None).cast('timestamp')), schema_map_problem_history_v3)
+    current = _align_to_schema(
+        _s4_c1b_problem_current_rows(enriched.filter(F.col('IS_CURRENT_PROBLEM_REVISION'))),
+        schema_map_problem_v3,
+    )
+    return (history, current)
+# S4-C1b END
 
 def _cdf_changed_keys(source_name: str, key_column: str, checkpoints: Dict[str, int], end_versions: Dict[str, int]) -> DataFrame:
     table_name = MAP_PROBLEM_SOURCES[source_name]
@@ -1017,9 +1287,9 @@ def _prepare_incremental_refresh(checkpoints: Dict[str, int], end_versions: Dict
     code_maps = _prepare_code_maps()
     persisted: List[DataFrame] = [problem_snapshot, nomenclature, code_maps]
     changed_problem_ids, changed_instance_ids, cdf_groups = _problem_cdf_context(checkpoints, end_versions)
-    changed_nomenclature_ids = _cdf_changed_keys('nomenclature', 'NOMENCLATURE_ID', checkpoints, end_versions)
+    changed_nomenclature_ids = _m20_semantic_snapshot_keys(MAP_PROBLEM_NOMENCLATURE, checkpoints[MAP_PROBLEM_NOMENCLATURE], end_versions['nomenclature'], ['NOMENCLATURE_ID'])
     changed_people = _read_cdf(MAP_PROBLEM_ENCOUNTER, checkpoints[MAP_PROBLEM_ENCOUNTER] + 1, end_versions['encounter']).select(_checked_long(F.col('PERSON_ID'), 'ENCOUNTER_CDF.PERSON_ID').alias('PERSON_ID')).where(F.col('PERSON_ID').isNotNull()).dropDuplicates(['PERSON_ID'])
-    changed_code_values = _cdf_changed_keys('code_value', 'CODE_VALUE', checkpoints, end_versions)
+    changed_code_values = _m20_semantic_snapshot_keys(MAP_PROBLEM_CODE_VALUE, checkpoints[MAP_PROBLEM_CODE_VALUE], end_versions['code_value'], ['CODE_VALUE'], ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'])
     nomenclature_problem_ids = _problem_ids_for_nomenclature_ids(problem_snapshot, changed_nomenclature_ids)
     encounter_problem_ids = _problem_ids_for_people(problem_snapshot, changed_people)
     code_problem_ids = _problem_ids_for_code_values(problem_snapshot, nomenclature, changed_code_values)
@@ -1079,10 +1349,9 @@ def _overwrite_map_problem_tables(history_rows: DataFrame, current_rows: DataFra
         _align_to_schema(history_rows, schema_map_problem_history_v3).write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
         staged_history = spark.table(stage_table)
         _assert_unique_rows(staged_history, 'PROBLEM_INSTANCE_ID', 'history refresh')
-        staged_current = bronze_project_contract(
-            staged_history.filter(F.col('IS_CURRENT_PROBLEM_REVISION')),
-            MAP_PROBLEM_TARGET,
-        )
+        # S4-C1b BEGIN
+        staged_current = bronze_project_contract(current_rows, MAP_PROBLEM_TARGET)
+        # S4-C1b END
         _assert_unique_rows(staged_current, 'PROBLEM_ID', 'current refresh')
         staged_history.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').option('delta.enableChangeDataFeed', 'true').option('delta.enableDeletionVectors', 'true').option('delta.enableRowTracking', 'true').saveAsTable(MAP_PROBLEM_HISTORY)
         staged_current.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').option('delta.enableChangeDataFeed', 'true').option('delta.enableDeletionVectors', 'true').option('delta.enableRowTracking', 'true').saveAsTable(MAP_PROBLEM_TARGET)
@@ -1274,15 +1543,47 @@ class MapMedAdminConfig:
     def tracked_tables(self) -> Tuple[str, ...]:
         return (self.clinical_event_table, self.med_admin_event_table, self.med_result_table, self.orders_table, self.order_ingredient_table, self.order_synonym_table, self.medication_lookup_table, self.code_value_table, self.rxnconso_table, self.concept_table, self.concept_relationship_table)
 MAP_MED_ADMIN_CONFIG = MapMedAdminConfig()
-map_med_admin_comment = 'Medication-administration foundation at one row per logical EVENT_ID. No source rows are excluded because of result status, validity, event type, Trust or encounter availability. Raw source values, source identifiers, mapping provenance, mapping ambiguity, unit-parsing status and pipeline provenance are retained. All order-ingredient actions/components are preserved in map_med_admin_ingredient.'
+# S3-A11 BEGIN: measured parity-detail disposition
+map_med_admin_comment = 'Medication-administration foundation at one row per logical EVENT_ID. No source rows are excluded because of result status, validity, event type, Trust or encounter availability. Raw source values, source identifiers, mapping provenance, mapping ambiguity, unit-parsing status and pipeline provenance are retained. All order-ingredient actions/components are preserved in map_med_admin_ingredient. A11 parity detail baseline 2026-08-12: raw CE_MED_RESULT versions contain 17,151,881 nonzero DILUENT_TYPE_CD rows and 9,182 nonzero MEDICATION_FORM_CD rows, but the deterministic map/RDE EVENT_ID grain has zero populated rows for every requested parity-detail field; columns are deliberately published as measured-empty and ready to fill if the selected source grain changes.'
+# S3-A11 END: measured parity-detail disposition
 map_med_admin_ingredient_comment = 'Lossless medication-order ingredient actions/components associated with map_med_admin events. Rows retain actual/template match path, action/component sequence and source provenance.'
 _PENDING_MED_ADMIN_PLAN: Dict[str, object] = {}
 _PENDING_MED_ADMIN_CACHES: List[str] = []
 
 def _ma_field(name: str, data_type: T.DataType, comment: str, nullable: bool=True) -> T.StructField:
     return T.StructField(name, data_type, nullable, metadata={'comment': comment})
-schema_map_med_admin = T.StructType([_ma_field('PERSON_ID', T.LongType(), 'Best available source person identifier.'), _ma_field('ENCNTR_ID', T.LongType(), 'Best available source encounter identifier.'), _ma_field('EVENT_ID', T.LongType(), 'Logical clinical event identifier and target key.', nullable=False), _ma_field('ORDER_ID', T.LongType(), 'Best available source medication order identifier.'), _ma_field('EVENT_TYPE_CD', T.LongType(), 'Unfiltered medication-administration event type code.'), _ma_field('EVENT_TYPE_DISPLAY', T.StringType(), 'Best available display for EVENT_TYPE_CD.'), _ma_field('RESULT_STATUS_CD', T.LongType(), 'Unfiltered clinical-event result status code.'), _ma_field('RESULT_STATUS_DISPLAY', T.StringType(), 'Best available display for RESULT_STATUS_CD.'), _ma_field('ADMIN_START_DT_TM', T.TimestampType(), 'Convenience administration start timestamp.'), _ma_field('ADMIN_END_DT_TM', T.TimestampType(), 'Convenience administration end timestamp.'), _ma_field('ADMIN_START_DT_TM_SOURCE', T.StringType(), 'Source field supplying ADMIN_START_DT_TM.'), _ma_field('ADMIN_END_DT_TM_SOURCE', T.StringType(), 'Source field supplying ADMIN_END_DT_TM.'), _ma_field('ORDER_SYNONYM_ID', T.LongType(), 'Medication order synonym identifier.'), _ma_field('ORDER_CKI', T.StringType(), 'Actual order CKI from ORDERS.CKI or ORDER_CATALOG_SYNONYM.CKI.'), _ma_field('MULTUM', T.StringType(), 'Multum code from the medication mapping lookup.'), _ma_field('RXNORM_CUI', T.StringType(), 'RxNorm concept identifier from the medication mapping lookup.'), _ma_field('RXNORM_STR', T.StringType(), 'Deterministically selected preferred RxNorm description.'), _ma_field('SNOMED_CODE', T.StringType(), 'Legacy semantics: medication-lookup SNOMED code, else the legacy ORDER_MNEMONIC term-match lanes; see SNOMED_VALIDATED_CODE for the standard-validated variant.'), _ma_field('SNOMED_STR', T.StringType(), 'Legacy semantics: description of the medication-lookup SNOMED code only; null whenever the code came from a legacy term-match lane.'), _ma_field('ORDER_MNEMONIC', T.StringType(), 'Best available order mnemonic without replacing source-specific fields.'), _ma_field('ORDER_DETAIL', T.StringType(), 'Best available order/ingredient detail display text.'), _ma_field('ORDER_STRENGTH', T.DoubleType(), 'Representative ingredient strength.'), _ma_field('ORDER_STRENGTH_UNIT_CD', T.LongType(), 'Representative ingredient strength unit code.'), _ma_field('ORDER_STRENGTH_UNIT_DISPLAY', T.StringType(), 'Display for representative strength unit.'), _ma_field('ORDER_VOLUME', T.DoubleType(), 'Representative ingredient volume.'), _ma_field('ORDER_VOLUME_UNIT_CD', T.LongType(), 'Representative ingredient volume unit code.'), _ma_field('ORDER_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for representative volume unit.'), _ma_field('ADMIN_ROUTE_CD', T.LongType(), 'Source administration route code.'), _ma_field('ADMIN_ROUTE_DISPLAY', T.StringType(), 'Display for administration route.'), _ma_field('INITIAL_DOSAGE', T.DoubleType(), 'Source initial dosage value.'), _ma_field('INITIAL_DOSAGE_UNIT_CD', T.LongType(), 'Source initial dosage unit code.'), _ma_field('INITIAL_DOSAGE_UNIT_DISPLAY', T.StringType(), 'Display for initial dosage unit.'), _ma_field('ADMIN_DOSAGE', T.DoubleType(), 'Source administered dosage value.'), _ma_field('ADMIN_DOSAGE_UNIT_CD', T.LongType(), 'Source administered dosage unit code.'), _ma_field('ADMIN_DOSAGE_UNIT_DISPLAY', T.StringType(), 'Display for administered dosage unit.'), _ma_field('INITIAL_VOLUME', T.DoubleType(), 'Source initial volume; never substituted for a mass dose.'), _ma_field('INFUSED_VOLUME', T.DoubleType(), 'Source infused volume.'), _ma_field('INFUSED_VOLUME_UNIT_CD', T.LongType(), 'Source infused-volume unit code.'), _ma_field('INFUSED_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for infused-volume unit.'), _ma_field('INFUSION_RATE', T.DoubleType(), 'Source infusion rate.'), _ma_field('INFUSION_UNIT_CD', T.LongType(), 'Source infusion-rate unit code.'), _ma_field('INFUSION_UNIT_DISPLAY', T.StringType(), 'Display for infusion-rate unit.'), _ma_field('NURSE_UNIT_CD', T.LongType(), 'Source documenting nurse-unit code.'), _ma_field('NURSE_UNIT_DISPLAY', T.StringType(), 'Display for documenting nurse unit.'), _ma_field('POSITION_CD', T.LongType(), 'Source documenting personnel position code.'), _ma_field('POSITION_DISPLAY', T.StringType(), 'Display for documenting position.'), _ma_field('PRSNL_ID', T.LongType(), 'Personnel identifier documenting the medication event.'), _ma_field('ADC_UPDT', T.TimestampType(), 'Greatest row-level source ADC timestamp; not used as a pipeline checkpoint.'), _ma_field('DOSE_IN_MG', T.DoubleType(), 'Absolute administered mass in mg only for exact absolute mass units.'), _ma_field('DOSE_IN_ML', T.DoubleType(), 'Absolute administered volume in mL only for exact absolute volume units.'), _ma_field('DOSE_UNIT_CATEGORY', T.StringType(), 'ABSOLUTE_MASS, ABSOLUTE_VOLUME, UNITS, DISCRETE, RATIO_OR_RATE, OTHER or MISSING.'), _ma_field('SNOMED_SOURCE', T.StringType(), 'Legacy semantics: ORIGINAL, SNOMED_SCT, OMOP_FORWARD, OMOP_BACKWARD, SNOMED_SCT_SIMPLIFIED, OMOP_FORWARD_SIMPLIFIED, OMOP_BACKWARD_SIMPLIFIED, OMOP or NOT_FOUND; see SNOMED_VALIDATED_SOURCE.'), _ma_field('OMOP_CONCEPT_ID', T.LongType(), 'Legacy semantics: first OMOP concept found across the Multum, RxNorm, RxNorm Extension, SNOMED, exact-name then simplified-name lanes; combination products are preserved and the concept is not Standard-validated. See OMOP_STANDARD_CONCEPT_ID.'), _ma_field('OMOP_CONCEPT_NAME', T.StringType(), 'Legacy semantics: name of the legacy OMOP_CONCEPT_ID; see OMOP_STANDARD_CONCEPT_NAME.'), _ma_field('OMOP_STANDARD_CONCEPT', T.StringType(), 'Legacy semantics: standard_concept flag carried straight from the legacy concept row, so null for non-standard concepts; see OMOP_STANDARD_CONCEPT_FLAG.'), _ma_field('OMOP_TYPE', T.StringType(), 'Legacy semantics: MULTUM, RXNORM, RXNORMEXT, SNOMED, NAME_MATCH_<vocabulary_id> or SIMPLIFIED_MATCH_<vocabulary_id>, else null; see OMOP_MAPPING_METHOD for the standard-validated label.'), _ma_field('CLINICAL_EVENT_ID', T.LongType(), 'Unique source CLINICAL_EVENT row identifier.'), _ma_field('MED_ADMIN_EVENT_ID', T.LongType(), 'Unique source MED_ADMIN_EVENT row identifier.'), _ma_field('MAE_ORDER_ID', T.LongType(), 'Order identifier recorded on MED_ADMIN_EVENT.'), _ma_field('MR_SYNONYM_ID', T.LongType(), 'Synonym identifier recorded on CE_MED_RESULT.'), _ma_field('TEMPLATE_ORDER_ID', T.LongType(), 'Template order identifier used for ingredient linkage.'), _ma_field('CE_VALID_FROM_DT_TM', T.TimestampType(), 'Source clinical-event validity start.'), _ma_field('CE_VALID_UNTIL_DT_TM', T.TimestampType(), 'Source clinical-event validity end.'), _ma_field('CE_IS_CURRENT_IND', T.BooleanType(), 'True when selected clinical-event row is currently valid.'), _ma_field('CE_VERSION_COUNT', T.LongType(), 'Number of source clinical-event rows for EVENT_ID.'), _ma_field('CE_CURRENT_VERSION_COUNT', T.LongType(), 'Number of currently valid clinical-event rows for EVENT_ID.'), _ma_field('MAE_ROW_COUNT', T.LongType(), 'Number of MED_ADMIN_EVENT rows for EVENT_ID.'), _ma_field('MR_ROW_COUNT', T.LongType(), 'Number of CE_MED_RESULT rows for EVENT_ID.'), _ma_field('MR_CURRENT_ROW_COUNT', T.LongType(), 'Number of currently valid CE_MED_RESULT rows for EVENT_ID.'), _ma_field('EVENT_CLASS_CD', T.LongType(), 'Source clinical-event class code.'), _ma_field('EVENT_CD', T.LongType(), 'Source clinical-event code.'), _ma_field('EVENT_TAG', T.StringType(), 'Source clinical-event display tag.'), _ma_field('EVENT_TITLE_TEXT', T.StringType(), 'Source clinical-event title text.'), _ma_field('PARENT_EVENT_ID', T.LongType(), 'Source parent event identifier.'), _ma_field('EVENT_RELTN_CD', T.LongType(), 'Source event relationship code.'), _ma_field('RECORD_STATUS_CD', T.LongType(), 'Source clinical-event record status code.'), _ma_field('AUTHENTIC_FLAG', T.LongType(), 'Source clinical-event authentication flag.'), _ma_field('PUBLISH_FLAG', T.LongType(), 'Source clinical-event publish flag.'), _ma_field('PERFORMED_DT_TM', T.TimestampType(), 'Source clinical-event performed timestamp.'), _ma_field('PERFORMED_PRSNL_ID', T.LongType(), 'Source performing personnel identifier.'), _ma_field('VERIFIED_DT_TM', T.TimestampType(), 'Source clinical-event verified timestamp.'), _ma_field('CE_VERIFIED_PRSNL_ID', T.LongType(), 'Source clinical-event verifying personnel identifier.'), _ma_field('ENTRY_MODE_CD', T.LongType(), 'Source clinical-event entry mode code.'), _ma_field('CE_SOURCE_CD', T.LongType(), 'Source clinical-event source code.'), _ma_field('CONTRIBUTOR_SYSTEM_CD', T.LongType(), 'Source clinical-event contributor-system code.'), _ma_field('DEVICE_FREE_TXT', T.StringType(), 'Source device free text.'), _ma_field('ORDER_ACTION_SEQUENCE', T.LongType(), 'Source clinical-event order action sequence.'), _ma_field('DOCUMENTATION_ACTION_SEQUENCE', T.LongType(), 'Source medication documentation action sequence.'), _ma_field('POSITIVE_PATIENT_IDENT_IND', T.LongType(), 'Positive patient identification indicator.'), _ma_field('POSITIVE_MED_IDENT_IND', T.LongType(), 'Positive medication identification indicator.'), _ma_field('ORDER_RESULT_VARIANCE_IND', T.LongType(), 'Indicator that documented administration differed from order details.'), _ma_field('CLINICAL_WARNING_CNT', T.LongType(), 'Number of clinical warnings presented.'), _ma_field('EVENT_CNT', T.LongType(), 'Source count of administration events in the event range.'), _ma_field('SOURCE_APPLICATION_FLAG', T.LongType(), 'Source application used to chart the event.'), _ma_field('MAE_VERIFIED_PRSNL_ID', T.LongType(), 'Personnel identifier verifying the administration.'), _ma_field('NEEDS_VERIFY_FLAG', T.LongType(), 'Source verification-state flag.'), _ma_field('VERIFICATION_DT_TM', T.TimestampType(), 'Administration verification timestamp.'), _ma_field('SCHEDULED_DT_TM', T.TimestampType(), 'Scheduled administration timestamp.'), _ma_field('CAREAWARE_USED_IND', T.LongType(), 'CareAware-used indicator.'), _ma_field('CRITICAL_DRUG_IND', T.LongType(), 'Critical-drug indicator.'), _ma_field('MR_VALID_FROM_DT_TM', T.TimestampType(), 'CE_MED_RESULT validity start.'), _ma_field('MR_VALID_UNTIL_DT_TM', T.TimestampType(), 'CE_MED_RESULT validity end.'), _ma_field('MR_IS_CURRENT_IND', T.BooleanType(), 'True when selected CE_MED_RESULT row is currently valid.'), _ma_field('ADMIN_NOTE', T.StringType(), 'Source administration note.'), _ma_field('ADMIN_PROV_ID', T.LongType(), 'Source administering provider identifier.'), _ma_field('ADMIN_SITE_CD', T.LongType(), 'Source administration body-site code.'), _ma_field('ADMIN_SITE_DISPLAY', T.StringType(), 'Display for administration site.'), _ma_field('ADMIN_METHOD_CD', T.LongType(), 'Source administration method code.'), _ma_field('ADMIN_METHOD_DISPLAY', T.StringType(), 'Display for administration method.'), _ma_field('ADMIN_PT_LOC_CD', T.LongType(), 'Source patient-location code at administration.'), _ma_field('TOTAL_INTAKE_VOLUME', T.DoubleType(), 'Unchanged source total-intake volume.'), _ma_field('DILUENT_TYPE_CD', T.LongType(), 'Source diluent type code.'), _ma_field('DILUENT_TYPE_DISPLAY', T.StringType(), 'Display for diluent type.'), _ma_field('PH_DISPENSE_ID', T.LongType(), 'Source pharmacy dispense identifier.'), _ma_field('INFUSION_TIME_CD', T.LongType(), 'Source infusion-time unit/code.'), _ma_field('MEDICATION_FORM_CD', T.LongType(), 'Source medication form code.'), _ma_field('MEDICATION_FORM_DISPLAY', T.StringType(), 'Display for medication form.'), _ma_field('ADMIN_STRENGTH', T.DoubleType(), 'Unchanged source administered strength.'), _ma_field('ADMIN_STRENGTH_UNIT_CD', T.LongType(), 'Source administered-strength unit code.'), _ma_field('ADMIN_STRENGTH_UNIT_DISPLAY', T.StringType(), 'Display for administered-strength unit.'), _ma_field('SUBSTANCE_LOT_NUMBER', T.StringType(), 'Unchanged source substance lot/sequence text.'), _ma_field('SUBSTANCE_EXP_DT_TM', T.TimestampType(), 'Source substance expiration timestamp.'), _ma_field('SUBSTANCE_EXP_DT_TXT', T.StringType(), 'Source substance expiration text.'), _ma_field('SUBSTANCE_MANUFACTURER_CD', T.LongType(), 'Source substance manufacturer code.'), _ma_field('SUBSTANCE_MANUFACTURER_DISPLAY', T.StringType(), 'Display for substance manufacturer.'), _ma_field('REFUSAL_CD', T.LongType(), 'Source refusal reason code.'), _ma_field('REFUSAL_DISPLAY', T.StringType(), 'Display for refusal reason.'), _ma_field('SYSTEM_ENTRY_DT_TM', T.TimestampType(), 'Source system-entry timestamp.'), _ma_field('IV_EVENT_CD', T.LongType(), 'Source IV event code.'), _ma_field('IV_EVENT_DISPLAY', T.StringType(), 'Display for IV event code.'), _ma_field('REMAINING_VOLUME', T.DoubleType(), 'Source remaining volume.'), _ma_field('REMAINING_VOLUME_UNIT_CD', T.LongType(), 'Source remaining-volume unit code.'), _ma_field('REMAINING_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for remaining-volume unit.'), _ma_field('WEIGHT_VALUE', T.DoubleType(), 'Source dosing weight value.'), _ma_field('WEIGHT_UNIT_CD', T.LongType(), 'Source dosing weight unit code.'), _ma_field('WEIGHT_UNIT_DISPLAY', T.StringType(), 'Display for dosing weight unit.'), _ma_field('BOLUS_TYPE_CD', T.LongType(), 'Source bolus type code.'), _ma_field('BOLUS_TYPE_DISPLAY', T.StringType(), 'Display for bolus type.'), _ma_field('ORDER_STATUS_CD', T.LongType(), 'Source order status code.'), _ma_field('ORDER_STATUS_DISPLAY', T.StringType(), 'Display for order status.'), _ma_field('ORIG_ORDER_DT_TM', T.TimestampType(), 'Source original order timestamp.'), _ma_field('CURRENT_START_DT_TM', T.TimestampType(), 'Source current order start timestamp.'), _ma_field('PROJECTED_STOP_DT_TM', T.TimestampType(), 'Source projected order stop timestamp.'), _ma_field('ORDER_STATUS_DT_TM', T.TimestampType(), 'Source order status timestamp.'), _ma_field('DISCONTINUE_IND', T.LongType(), 'Source order discontinue indicator.'), _ma_field('DISCONTINUE_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order discontinue timestamp.'), _ma_field('SUSPEND_IND', T.LongType(), 'Source order suspend indicator.'), _ma_field('SUSPEND_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order suspend timestamp.'), _ma_field('RESUME_IND', T.LongType(), 'Source order resume indicator.'), _ma_field('RESUME_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order resume timestamp.'), _ma_field('PRN_IND', T.LongType(), 'Source PRN indicator.'), _ma_field('IV_IND', T.LongType(), 'Source IV indicator.'), _ma_field('FREQUENCY_ID', T.LongType(), 'Source order frequency identifier.'), _ma_field('ORDER_DETAIL_DISPLAY_LINE', T.StringType(), 'Source order detail display line.'), _ma_field('CLINICAL_DISPLAY_LINE', T.StringType(), 'Source clinical display line.'), _ma_field('HNA_ORDER_MNEMONIC', T.StringType(), 'Source HNA order mnemonic.'), _ma_field('ORDERED_AS_MNEMONIC', T.StringType(), 'Source ordered-as mnemonic.'), _ma_field('ORDERS_CKI', T.StringType(), 'CKI stored on the source order.'), _ma_field('SYNONYM_CKI', T.StringType(), 'CKI stored on the order catalogue synonym.'), _ma_field('CONCEPT_CKI', T.StringType(), 'Concept CKI stored on the order catalogue synonym.'), _ma_field('PRODUCT_ID', T.LongType(), 'Source product identifier.'), _ma_field('MED_ORDER_TYPE_CD', T.LongType(), 'Source medication order type code.'), _ma_field('MED_ORDER_TYPE_DISPLAY', T.StringType(), 'Display for medication order type.'), _ma_field('INGREDIENT_MATCH_PATH', T.StringType(), 'TEMPLATE_SYNONYM or ACTUAL_SYNONYM for representative ingredient.'), _ma_field('INGREDIENT_ORDER_ID', T.LongType(), 'ORDER_INGREDIENT order identifier for representative row.'), _ma_field('INGREDIENT_ACTION_SEQUENCE', T.LongType(), 'Latest representative ingredient action sequence.'), _ma_field('INGREDIENT_COMP_SEQUENCE', T.LongType(), 'Representative ingredient component sequence.'), _ma_field('INGREDIENT_SYNONYM_ID', T.LongType(), 'Representative ingredient synonym identifier.'), _ma_field('INGREDIENT_TYPE_FLAG', T.LongType(), 'Representative ingredient type flag.'), _ma_field('CLINICALLY_SIGNIFICANT_FLAG', T.LongType(), 'Representative clinically-significant flag.'), _ma_field('INCLUDE_IN_TOTAL_VOLUME_FLAG', T.LongType(), 'Representative include-in-total-volume flag.'), _ma_field('ORDERED_DOSE', T.DoubleType(), 'Representative ordered dose.'), _ma_field('ORDERED_DOSE_UNIT_CD', T.LongType(), 'Representative ordered-dose unit code.'), _ma_field('ORDERED_DOSE_UNIT_DISPLAY', T.StringType(), 'Display for representative ordered-dose unit.'), _ma_field('DOSE_QUANTITY', T.DoubleType(), 'Representative ingredient dose quantity.'), _ma_field('DOSE_QUANTITY_UNIT_CD', T.LongType(), 'Representative dose-quantity unit code.'), _ma_field('DOSE_QUANTITY_UNIT_DISPLAY', T.StringType(), 'Display for dose-quantity unit.'), _ma_field('FREETEXT_DOSE', T.StringType(), 'Representative source free-text dose.'), _ma_field('NORMALIZED_RATE', T.DoubleType(), 'Representative normalized ingredient rate.'), _ma_field('NORMALIZED_RATE_UNIT_CD', T.LongType(), 'Representative normalized-rate unit code.'), _ma_field('NORMALIZED_RATE_UNIT_DISPLAY', T.StringType(), 'Display for normalized-rate unit.'), _ma_field('CONCENTRATION', T.DoubleType(), 'Representative ingredient concentration.'), _ma_field('CONCENTRATION_UNIT_CD', T.LongType(), 'Representative concentration unit code.'), _ma_field('CONCENTRATION_UNIT_DISPLAY', T.StringType(), 'Display for concentration unit.'), _ma_field('INGREDIENT_ROW_COUNT', T.LongType(), 'Number of matching ingredient rows for EVENT_ID.'), _ma_field('INGREDIENT_ACTION_COUNT', T.LongType(), 'Distinct ingredient action sequences for EVENT_ID.'), _ma_field('INGREDIENT_COMPONENT_COUNT', T.LongType(), 'Distinct ingredient components for EVENT_ID.'), _ma_field('INGREDIENT_MULTI_ACTION_IND', T.BooleanType(), 'True when multiple ingredient actions exist.'), _ma_field('INGREDIENT_MULTI_COMPONENT_IND', T.BooleanType(), 'True when multiple ingredient components exist.'), _ma_field('DOSE_VALUE_EFFECTIVE', T.DoubleType(), 'ADMIN_DOSAGE then INITIAL_DOSAGE; volume is never substituted.'), _ma_field('DOSE_VALUE_SOURCE', T.StringType(), 'ADMIN_DOSAGE, INITIAL_DOSAGE or null.'), _ma_field('DOSE_UNIT_NORMALIZED', T.StringType(), 'Normalized exact source dosage unit.'), _ma_field('DOSE_NUMERATOR_UNIT', T.StringType(), 'Normalized numerator for compound units.'), _ma_field('DOSE_DENOMINATOR_UNIT', T.StringType(), 'Normalized denominator for compound units.'), _ma_field('DOSE_IN_UNITS', T.DoubleType(), 'Absolute administered amount in base international units.'), _ma_field('DOSE_STANDARDIZATION_STATUS', T.StringType(), 'EXACT_CONVERSION, COMPOUND_UNIT_NOT_ABSOLUTE, UNSUPPORTED_UNIT, MISSING_VALUE or MISSING_UNIT.'), _ma_field('DOSE_COMPOUND_UNIT_IND', T.BooleanType(), 'True when source unit is a ratio or rate.'), _ma_field('DOSE_NEGATIVE_IND', T.BooleanType(), 'True when source effective dosage is negative.'), _ma_field('DOSE_NUMERIC_EXTREME_IND', T.BooleanType(), 'Broad non-filtering flag for extreme source/standardized dosage values.'), _ma_field('LOOKUP_OMOP_CONCEPT_ID', T.LongType(), 'OMOP concept supplied by medication lookup after its own threshold rule.'), _ma_field('LOOKUP_OMOP_CONCEPT_TERM', T.StringType(), 'Term supplied for LOOKUP_OMOP_CONCEPT_ID.'), _ma_field('LOOKUP_OMOP_METHOD', T.StringType(), 'STANDARD_MAP or VECTOR_SIMILARITY from medication lookup.'), _ma_field('LOOKUP_SIMILARITY_SCORE', T.DoubleType(), 'Medication lookup similarity score.'), _ma_field('LOOKUP_SIMILARITY_THRESHOLD', T.DoubleType(), 'Threshold applied to the lookup similarity candidate.'), _ma_field('LOOKUP_SIMILARITY_STATUS', T.StringType(), 'Similarity status supplied by medication lookup.'), _ma_field('LOOKUP_EMBEDDING_MODEL_VERSION', T.StringType(), 'Embedding model version supplied by medication lookup.'), _ma_field('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_ID', T.LongType(), 'Raw similarity candidate identifier.'), _ma_field('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_TERM', T.StringType(), 'Raw similarity candidate term.'), _ma_field('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID', T.LongType(), 'Standardized similarity candidate identifier.'), _ma_field('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM', T.StringType(), 'Standardized similarity candidate term.'), _ma_field('LOOKUP_SNOMED_CODE', T.StringType(), 'Direct SNOMED code supplied by medication lookup.'), _ma_field('LOOKUP_SNOMED_FROM_OMOP', T.StringType(), 'SNOMED code supplied by lookup OMOP reverse mapping.'), _ma_field('LOOKUP_SOURCE_CHANGE_TS', T.TimestampType(), 'Medication lookup source-change timestamp.'), _ma_field('LOOKUP_SOURCE_ROW_HASH', T.StringType(), 'Medication lookup source row hash.'), _ma_field('OMOP_SOURCE_CONCEPT_ID', T.LongType(), 'Best exact source concept before Standard mapping.'), _ma_field('OMOP_SOURCE_CONCEPT_NAME', T.StringType(), 'Name of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_VOCABULARY_ID', T.StringType(), 'Vocabulary of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_CONCEPT_CODE', T.StringType(), 'Code of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_STANDARD_CONCEPT', T.StringType(), 'Source concept standard flag.'), _ma_field('OMOP_SOURCE_CONCEPT_VALID_IND', T.BooleanType(), 'True when source concept exists and is not invalid.'), _ma_field('OMOP_MAPPING_METHOD', T.StringType(), 'Evidence method used to select OMOP source/standard concepts.'), _ma_field('OMOP_MAPPING_CONFIDENCE', T.DoubleType(), 'Evidence confidence, not a calibrated clinical probability.'), _ma_field('OMOP_SOURCE_MATCH_CANDIDATE_COUNT', T.LongType(), 'Number of exact concepts for selected source evidence key.'), _ma_field('OMOP_STANDARD_CANDIDATE_COUNT', T.LongType(), 'Number of valid Standard Maps-to candidates.'), _ma_field('OMOP_STANDARD_CONCEPT_ID', T.LongType(), 'Validated Standard OMOP Drug/Ingredient concept identifier; standard-validated replacement for the legacy-semantics OMOP_CONCEPT_ID.'), _ma_field('OMOP_STANDARD_CONCEPT_NAME', T.StringType(), 'Name of the validated Standard OMOP concept in OMOP_STANDARD_CONCEPT_ID.'), _ma_field('OMOP_STANDARD_CONCEPT_FLAG', T.StringType(), 'S only when OMOP_STANDARD_CONCEPT_ID is a valid Standard Drug/Ingredient concept.'), _ma_field('OMOP_MAPPING_AMBIGUOUS_IND', T.BooleanType(), 'True when source or Standard mapping is ambiguous.'), _ma_field('SNOMED_VALIDATED_CODE', T.StringType(), 'SNOMED code retained with explicit validation and provenance; standard-validated replacement for the legacy-semantics SNOMED_CODE.'), _ma_field('SNOMED_VALIDATED_STR', T.StringType(), 'Deterministically selected description of SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_VALIDATED_SOURCE', T.StringType(), 'LOOKUP_DIRECT, LOOKUP_FROM_OMOP, OMOP_MAPPED_FROM or UNMAPPED provenance for SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_CONCEPT_ID', T.LongType(), 'OMOP concept identifier for SNOMED_VALIDATED_CODE when present.'), _ma_field('SNOMED_VALID_DRUG_DOMAIN_IND', T.BooleanType(), 'True when SNOMED_VALIDATED_CODE is a valid Drug/Ingredient-domain concept.'), _ma_field('SNOMED_CANDIDATE_COUNT', T.LongType(), 'Number of valid SNOMED reverse-map candidates for SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_MAPPING_AMBIGUOUS_IND', T.BooleanType(), 'True when multiple SNOMED candidates exist for SNOMED_VALIDATED_CODE.'), _ma_field('ORGANIZATION_ID', T.LongType(), 'Best available source organization identifier.'), _ma_field('TRUST', T.StringType(), 'Best available source Trust value; no filtering is applied.'), _ma_field('SOURCE_ID_CONFLICT_IND', T.BooleanType(), 'True when populated source person/encounter/order identifiers disagree.'), _ma_field('SOURCE_ORGANIZATION_CONFLICT_IND', T.BooleanType(), 'True when populated source organization identifiers disagree.'), _ma_field('SOURCE_TRUST_CONFLICT_IND', T.BooleanType(), 'True when populated source Trust values disagree.'), _ma_field('CE_ADC_UPDT', T.TimestampType(), 'Selected CLINICAL_EVENT ADC timestamp.'), _ma_field('MAE_ADC_UPDT', T.TimestampType(), 'Selected MED_ADMIN_EVENT ADC timestamp.'), _ma_field('MR_ADC_UPDT', T.TimestampType(), 'Selected CE_MED_RESULT ADC timestamp.'), _ma_field('ORDERS_ADC_UPDT', T.TimestampType(), 'Selected ORDERS ADC timestamp.'), _ma_field('OI_ADC_UPDT', T.TimestampType(), 'Selected ORDER_INGREDIENT ADC timestamp.'), _ma_field('SYNONYM_ADC_UPDT', T.TimestampType(), 'ORDER_CATALOG_SYNONYM ADC timestamp.'), _ma_field('LOOKUP_ADC_UPDT', T.TimestampType(), 'Medication mapping lookup ADC timestamp.'), _ma_field('CODE_LOOKUP_ADC_UPDT', T.TimestampType(), 'Greatest code-value ADC timestamp used by the row.'), _ma_field('TRIGGER_SOURCES', T.StringType(), 'Comma-separated sources causing the event rebuild.'), _ma_field('SOURCE_VERSIONS_JSON', T.StringType(), 'Captured Delta versions used to build the row.'), _ma_field('MAPPING_SCHEMA_VERSION', T.StringType(), 'Medication mapping implementation version.'), _ma_field('UNIT_RULES_VERSION', T.StringType(), 'Dose-unit parsing rule version.'), _ma_field('ROW_HASH', T.LongType(), 'Stable source-derived row hash used to avoid unchanged rewrites.'), _ma_field('PIPELINE_RUN_ID', T.StringType(), 'Pipeline run that last materially changed the row.'), _ma_field('PIPELINE_UPDT_DT_TM', T.TimestampType(), 'Timestamp at which the target row last materially changed.')])
+schema_map_med_admin = T.StructType([_ma_field('PERSON_ID', T.LongType(), 'Best available source person identifier.'), _ma_field('ENCNTR_ID', T.LongType(), 'Best available source encounter identifier.'), _ma_field('EVENT_ID', T.LongType(), 'Logical clinical event identifier and target key.', nullable=False), _ma_field('ORDER_ID', T.LongType(), 'Best available source medication order identifier.'), _ma_field('EVENT_TYPE_CD', T.LongType(), 'Unfiltered medication-administration event type code.'), _ma_field('EVENT_TYPE_DISPLAY', T.StringType(), 'Best available display for EVENT_TYPE_CD.'), _ma_field('RESULT_STATUS_CD', T.LongType(), 'Unfiltered clinical-event result status code.'), _ma_field('RESULT_STATUS_DISPLAY', T.StringType(), 'Best available display for RESULT_STATUS_CD.'), _ma_field('ADMIN_START_DT_TM', T.TimestampType(), 'Convenience administration start timestamp.'), _ma_field('ADMIN_END_DT_TM', T.TimestampType(), 'Convenience administration end timestamp.'), _ma_field('ADMIN_START_DT_TM_SOURCE', T.StringType(), 'Source field supplying ADMIN_START_DT_TM.'), _ma_field('ADMIN_END_DT_TM_SOURCE', T.StringType(), 'Source field supplying ADMIN_END_DT_TM.'), _ma_field('ORDER_SYNONYM_ID', T.LongType(), 'Medication order synonym identifier.'), _ma_field('ORDER_CKI', T.StringType(), 'Actual order CKI from ORDERS.CKI or ORDER_CATALOG_SYNONYM.CKI.'), _ma_field('MULTUM', T.StringType(), 'Multum code from the medication mapping lookup.'), _ma_field('RXNORM_CUI', T.StringType(), 'RxNorm concept identifier from the medication mapping lookup.'), _ma_field('RXNORM_STR', T.StringType(), 'Deterministically selected preferred RxNorm description.'), _ma_field('SNOMED_CODE', T.StringType(), 'Legacy semantics: medication-lookup SNOMED code, else the legacy ORDER_MNEMONIC term-match lanes; see SNOMED_VALIDATED_CODE for the standard-validated variant.'), _ma_field('SNOMED_STR', T.StringType(), 'Legacy semantics: description of the medication-lookup SNOMED code only; null whenever the code came from a legacy term-match lane.'), _ma_field('ORDER_MNEMONIC', T.StringType(), 'Best available order mnemonic without replacing source-specific fields.'), _ma_field('ORDER_DETAIL', T.StringType(), 'Best available order/ingredient detail display text.'), _ma_field('ORDER_STRENGTH', T.DoubleType(), 'Representative ingredient strength.'), _ma_field('ORDER_STRENGTH_UNIT_CD', T.LongType(), 'Representative ingredient strength unit code.'), _ma_field('ORDER_STRENGTH_UNIT_DISPLAY', T.StringType(), 'Display for representative strength unit.'), _ma_field('ORDER_VOLUME', T.DoubleType(), 'Representative ingredient volume.'), _ma_field('ORDER_VOLUME_UNIT_CD', T.LongType(), 'Representative ingredient volume unit code.'), _ma_field('ORDER_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for representative volume unit.'), _ma_field('ADMIN_ROUTE_CD', T.LongType(), 'Source administration route code.'), _ma_field('ADMIN_ROUTE_DISPLAY', T.StringType(), 'Display for administration route.'), _ma_field('INITIAL_DOSAGE', T.DoubleType(), 'Source initial dosage value.'), _ma_field('INITIAL_DOSAGE_UNIT_CD', T.LongType(), 'Source initial dosage unit code.'), _ma_field('INITIAL_DOSAGE_UNIT_DISPLAY', T.StringType(), 'Display for initial dosage unit.'), _ma_field('ADMIN_DOSAGE', T.DoubleType(), 'Source administered dosage value.'), _ma_field('ADMIN_DOSAGE_UNIT_CD', T.LongType(), 'Source administered dosage unit code.'), _ma_field('ADMIN_DOSAGE_UNIT_DISPLAY', T.StringType(), 'Display for administered dosage unit.'), _ma_field('INITIAL_VOLUME', T.DoubleType(), 'Source initial volume; never substituted for a mass dose.'), _ma_field('INFUSED_VOLUME', T.DoubleType(), 'Source infused volume.'), _ma_field('INFUSED_VOLUME_UNIT_CD', T.LongType(), 'Source infused-volume unit code.'), _ma_field('INFUSED_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for infused-volume unit.'), _ma_field('INFUSION_RATE', T.DoubleType(), 'Source infusion rate.'), _ma_field('INFUSION_UNIT_CD', T.LongType(), 'Source infusion-rate unit code.'), _ma_field('INFUSION_UNIT_DISPLAY', T.StringType(), 'Display for infusion-rate unit.'), _ma_field('NURSE_UNIT_CD', T.LongType(), 'Source documenting nurse-unit code.'), _ma_field('NURSE_UNIT_DISPLAY', T.StringType(), 'Display for documenting nurse unit.'), _ma_field('POSITION_CD', T.LongType(), 'Source documenting personnel position code.'), _ma_field('POSITION_DISPLAY', T.StringType(), 'Display for documenting position.'), _ma_field('PRSNL_ID', T.LongType(), 'Personnel identifier documenting the medication event.'), _ma_field('ADC_UPDT', T.TimestampType(), 'Greatest row-level source ADC timestamp; not used as a pipeline checkpoint.'), _ma_field('DOSE_IN_MG', T.DoubleType(), 'Absolute administered mass in mg only for exact absolute mass units.'), _ma_field('DOSE_IN_ML', T.DoubleType(), 'Absolute administered volume in mL only for exact absolute volume units.'), _ma_field('DOSE_UNIT_CATEGORY', T.StringType(), 'ABSOLUTE_MASS, ABSOLUTE_VOLUME, UNITS, DISCRETE, RATIO_OR_RATE, OTHER or MISSING.'), _ma_field('SNOMED_SOURCE', T.StringType(), 'Legacy semantics: ORIGINAL, SNOMED_SCT, OMOP_FORWARD, OMOP_BACKWARD, SNOMED_SCT_SIMPLIFIED, OMOP_FORWARD_SIMPLIFIED, OMOP_BACKWARD_SIMPLIFIED, OMOP or NOT_FOUND; see SNOMED_VALIDATED_SOURCE.'), _ma_field('OMOP_CONCEPT_ID', T.LongType(), 'Legacy semantics: first OMOP concept found across the Multum, RxNorm, RxNorm Extension, SNOMED, exact-name then simplified-name lanes; combination products are preserved and the concept is not Standard-validated. See OMOP_STANDARD_CONCEPT_ID.'), _ma_field('OMOP_CONCEPT_NAME', T.StringType(), 'Legacy semantics: name of the legacy OMOP_CONCEPT_ID; see OMOP_STANDARD_CONCEPT_NAME.'), _ma_field('OMOP_STANDARD_CONCEPT', T.StringType(), 'Legacy semantics: standard_concept flag carried straight from the legacy concept row, so null for non-standard concepts; see OMOP_STANDARD_CONCEPT_FLAG.'), _ma_field('OMOP_TYPE', T.StringType(), 'Legacy semantics: MULTUM, RXNORM, RXNORMEXT, SNOMED, NAME_MATCH_<vocabulary_id> or SIMPLIFIED_MATCH_<vocabulary_id>, else null; see OMOP_MAPPING_METHOD for the standard-validated label.'), _ma_field('CLINICAL_EVENT_ID', T.LongType(), 'Unique source CLINICAL_EVENT row identifier.'), _ma_field('MED_ADMIN_EVENT_ID', T.LongType(), 'Unique source MED_ADMIN_EVENT row identifier.'), _ma_field('MAE_ORDER_ID', T.LongType(), 'Order identifier recorded on MED_ADMIN_EVENT.'), _ma_field('MR_SYNONYM_ID', T.LongType(), 'Synonym identifier recorded on CE_MED_RESULT.'), _ma_field('TEMPLATE_ORDER_ID', T.LongType(), 'Template order identifier used for ingredient linkage.'), _ma_field('CE_VALID_FROM_DT_TM', T.TimestampType(), 'Source clinical-event validity start.'), _ma_field('CE_VALID_UNTIL_DT_TM', T.TimestampType(), 'Source clinical-event validity end.'), _ma_field('CE_IS_CURRENT_IND', T.BooleanType(), 'True when selected clinical-event row is currently valid.'), _ma_field('CE_VERSION_COUNT', T.LongType(), 'Number of source clinical-event rows for EVENT_ID.'), _ma_field('CE_CURRENT_VERSION_COUNT', T.LongType(), 'Number of currently valid clinical-event rows for EVENT_ID.'), _ma_field('MAE_ROW_COUNT', T.LongType(), 'Number of MED_ADMIN_EVENT rows for EVENT_ID.'), _ma_field('MR_ROW_COUNT', T.LongType(), 'Number of CE_MED_RESULT rows for EVENT_ID.'), _ma_field('MR_CURRENT_ROW_COUNT', T.LongType(), 'Number of currently valid CE_MED_RESULT rows for EVENT_ID.'), _ma_field('EVENT_CLASS_CD', T.LongType(), 'Source clinical-event class code.'), _ma_field('EVENT_CD', T.LongType(), 'Source clinical-event code.'), _ma_field('EVENT_TAG', T.StringType(), 'Source clinical-event display tag.'), _ma_field('EVENT_TITLE_TEXT', T.StringType(), 'Source clinical-event title text.'), _ma_field('PARENT_EVENT_ID', T.LongType(), 'Source parent event identifier.'), _ma_field('EVENT_RELTN_CD', T.LongType(), 'Source event relationship code.'), _ma_field('RECORD_STATUS_CD', T.LongType(), 'Source clinical-event record status code.'), _ma_field('AUTHENTIC_FLAG', T.LongType(), 'Source clinical-event authentication flag.'), _ma_field('PUBLISH_FLAG', T.LongType(), 'Source clinical-event publish flag.'), _ma_field('PERFORMED_DT_TM', T.TimestampType(), 'Source clinical-event performed timestamp.'), _ma_field('PERFORMED_PRSNL_ID', T.LongType(), 'Source performing personnel identifier.'), _ma_field('VERIFIED_DT_TM', T.TimestampType(), 'Source clinical-event verified timestamp.'), _ma_field('CE_VERIFIED_PRSNL_ID', T.LongType(), 'Source clinical-event verifying personnel identifier.'), _ma_field('ENTRY_MODE_CD', T.LongType(), 'Source clinical-event entry mode code.'), _ma_field('CE_SOURCE_CD', T.LongType(), 'Source clinical-event source code.'), _ma_field('CONTRIBUTOR_SYSTEM_CD', T.LongType(), 'Source clinical-event contributor-system code.'), _ma_field('DEVICE_FREE_TXT', T.StringType(), 'Source device free text.'), _ma_field('ORDER_ACTION_SEQUENCE', T.LongType(), 'Source clinical-event order action sequence.'), _ma_field('DOCUMENTATION_ACTION_SEQUENCE', T.LongType(), 'Source medication documentation action sequence.'), _ma_field('POSITIVE_PATIENT_IDENT_IND', T.LongType(), 'Positive patient identification indicator.'), _ma_field('POSITIVE_MED_IDENT_IND', T.LongType(), 'Positive medication identification indicator.'), _ma_field('ORDER_RESULT_VARIANCE_IND', T.LongType(), 'Indicator that documented administration differed from order details.'), _ma_field('CLINICAL_WARNING_CNT', T.LongType(), 'Number of clinical warnings presented.'), _ma_field('EVENT_CNT', T.LongType(), 'Source count of administration events in the event range.'), _ma_field('SOURCE_APPLICATION_FLAG', T.LongType(), 'Source application used to chart the event.'), _ma_field('MAE_VERIFIED_PRSNL_ID', T.LongType(), 'Personnel identifier verifying the administration.'), _ma_field('NEEDS_VERIFY_FLAG', T.LongType(), 'Source verification-state flag.'), _ma_field('VERIFICATION_DT_TM', T.TimestampType(), 'Administration verification timestamp.'), _ma_field('SCHEDULED_DT_TM', T.TimestampType(), 'Scheduled administration timestamp.'), _ma_field('CAREAWARE_USED_IND', T.LongType(), 'CareAware-used indicator.'), _ma_field('CRITICAL_DRUG_IND', T.LongType(), 'Critical-drug indicator.'), _ma_field('MR_VALID_FROM_DT_TM', T.TimestampType(), 'CE_MED_RESULT validity start.'), _ma_field('MR_VALID_UNTIL_DT_TM', T.TimestampType(), 'CE_MED_RESULT validity end.'), _ma_field('MR_IS_CURRENT_IND', T.BooleanType(), 'True when selected CE_MED_RESULT row is currently valid.'), _ma_field('ADMIN_NOTE', T.StringType(), 'Source administration note.'), _ma_field('ADMIN_PROV_ID', T.LongType(), 'Source administering provider identifier.'), _ma_field('ADMIN_SITE_CD', T.LongType(), 'Source administration body-site code.'), _ma_field('ADMIN_SITE_DISPLAY', T.StringType(), 'Display for administration site.'), _ma_field('ADMIN_METHOD_CD', T.LongType(), 'Source administration method code.'), _ma_field('ADMIN_METHOD_DISPLAY', T.StringType(), 'Display for administration method.'), _ma_field('ADMIN_PT_LOC_CD', T.LongType(), 'Source patient-location code at administration.'), _ma_field('TOTAL_INTAKE_VOLUME', T.DoubleType(), 'Unchanged source total-intake volume.'), _ma_field('DILUENT_TYPE_CD', T.LongType(), 'Source diluent type code.'), _ma_field('DILUENT_TYPE_DISPLAY', T.StringType(), 'Display for diluent type.'),
+# S3-A11 BEGIN: RDE-facing DESC alias
+_ma_field('DILUENT_TYPE_DESC', T.StringType(), 'RDE-facing alias of DILUENT_TYPE_DISPLAY; raw source versions are nonzero, while the deterministic map/RDE EVENT_ID grain is measured empty on 2026-08-12.'),
+# S3-A11 END: RDE-facing DESC alias
+_ma_field('PH_DISPENSE_ID', T.LongType(), 'Source pharmacy dispense identifier.'), _ma_field('INFUSION_TIME_CD', T.LongType(), 'Source infusion-time unit/code.'), _ma_field('MEDICATION_FORM_CD', T.LongType(), 'Source medication form code.'), _ma_field('MEDICATION_FORM_DISPLAY', T.StringType(), 'Display for medication form.'),
+# S3-A11 BEGIN: RDE-facing DESC alias
+_ma_field('MEDICATION_FORM_DESC', T.StringType(), 'RDE-facing alias of MEDICATION_FORM_DISPLAY; raw source versions include 9,182 nonzero rows, while the deterministic map/RDE EVENT_ID grain is measured empty on 2026-08-12.'),
+# S3-A11 END: RDE-facing DESC alias
+_ma_field('ADMIN_STRENGTH', T.DoubleType(), 'Unchanged source administered strength.'), _ma_field('ADMIN_STRENGTH_UNIT_CD', T.LongType(), 'Source administered-strength unit code.'), _ma_field('ADMIN_STRENGTH_UNIT_DISPLAY', T.StringType(), 'Display for administered-strength unit.'), _ma_field('SUBSTANCE_LOT_NUMBER', T.StringType(), 'Unchanged source substance lot/sequence text.'), _ma_field('SUBSTANCE_EXP_DT_TM', T.TimestampType(), 'Source substance expiration timestamp.'), _ma_field('SUBSTANCE_EXP_DT_TXT', T.StringType(), 'Source substance expiration text.'), _ma_field('SUBSTANCE_MANUFACTURER_CD', T.LongType(), 'Source substance manufacturer code.'), _ma_field('SUBSTANCE_MANUFACTURER_DISPLAY', T.StringType(), 'Display for substance manufacturer.'), _ma_field('REFUSAL_CD', T.LongType(), 'Source refusal reason code.'), _ma_field('REFUSAL_DISPLAY', T.StringType(), 'Display for refusal reason.'),
+# S3-A11 BEGIN: immunization parity group (measured all-zero at source)
+_ma_field('IMMUNIZATION_TYPE_CD', T.LongType(), 'Source immunization type code; all-zero across 80,018,812 baseline source rows.'),
+_ma_field('IMMUNIZATION_TYPE_DISPLAY', T.StringType(), 'Display for immunization type when a future nonzero source value arrives.'),
+_ma_field('IMMUNIZATION_TYPE_DESC', T.StringType(), 'RDE-facing alias of IMMUNIZATION_TYPE_DISPLAY.'),
+# S3-A11 END: immunization parity group
+_ma_field('SYSTEM_ENTRY_DT_TM', T.TimestampType(), 'Source system-entry timestamp.'), _ma_field('IV_EVENT_CD', T.LongType(), 'Source IV event code.'), _ma_field('IV_EVENT_DISPLAY', T.StringType(), 'Display for IV event code.'), _ma_field('REMAINING_VOLUME', T.DoubleType(), 'Source remaining volume.'), _ma_field('REMAINING_VOLUME_UNIT_CD', T.LongType(), 'Source remaining-volume unit code.'), _ma_field('REMAINING_VOLUME_UNIT_DISPLAY', T.StringType(), 'Display for remaining-volume unit.'), _ma_field('WEIGHT_VALUE', T.DoubleType(), 'Source dosing weight value.'), _ma_field('WEIGHT_UNIT_CD', T.LongType(), 'Source dosing weight unit code.'), _ma_field('WEIGHT_UNIT_DISPLAY', T.StringType(), 'Display for dosing weight unit.'), _ma_field('BOLUS_TYPE_CD', T.LongType(), 'Source bolus type code.'), _ma_field('BOLUS_TYPE_DISPLAY', T.StringType(), 'Display for bolus type.'), _ma_field('ORDER_STATUS_CD', T.LongType(), 'Source order status code.'), _ma_field('ORDER_STATUS_DISPLAY', T.StringType(), 'Display for order status.'), _ma_field('ORIG_ORDER_DT_TM', T.TimestampType(), 'Source original order timestamp.'), _ma_field('CURRENT_START_DT_TM', T.TimestampType(), 'Source current order start timestamp.'), _ma_field('PROJECTED_STOP_DT_TM', T.TimestampType(), 'Source projected order stop timestamp.'), _ma_field('ORDER_STATUS_DT_TM', T.TimestampType(), 'Source order status timestamp.'), _ma_field('DISCONTINUE_IND', T.LongType(), 'Source order discontinue indicator.'), _ma_field('DISCONTINUE_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order discontinue timestamp.'), _ma_field('SUSPEND_IND', T.LongType(), 'Source order suspend indicator.'), _ma_field('SUSPEND_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order suspend timestamp.'), _ma_field('RESUME_IND', T.LongType(), 'Source order resume indicator.'), _ma_field('RESUME_EFFECTIVE_DT_TM', T.TimestampType(), 'Source order resume timestamp.'), _ma_field('PRN_IND', T.LongType(), 'Source PRN indicator.'), _ma_field('IV_IND', T.LongType(), 'Source IV indicator.'), _ma_field('FREQUENCY_ID', T.LongType(), 'Source order frequency identifier.'), _ma_field('ORDER_DETAIL_DISPLAY_LINE', T.StringType(), 'Source order detail display line.'), _ma_field('CLINICAL_DISPLAY_LINE', T.StringType(), 'Source clinical display line.'), _ma_field('HNA_ORDER_MNEMONIC', T.StringType(), 'Source HNA order mnemonic.'), _ma_field('ORDERED_AS_MNEMONIC', T.StringType(), 'Source ordered-as mnemonic.'), _ma_field('ORDERS_CKI', T.StringType(), 'CKI stored on the source order.'), _ma_field('SYNONYM_CKI', T.StringType(), 'CKI stored on the order catalogue synonym.'), _ma_field('CONCEPT_CKI', T.StringType(), 'Concept CKI stored on the order catalogue synonym.'), _ma_field('PRODUCT_ID', T.LongType(), 'Source product identifier.'), _ma_field('MED_ORDER_TYPE_CD', T.LongType(), 'Source medication order type code.'), _ma_field('MED_ORDER_TYPE_DISPLAY', T.StringType(), 'Display for medication order type.'), _ma_field('INGREDIENT_MATCH_PATH', T.StringType(), 'TEMPLATE_SYNONYM or ACTUAL_SYNONYM for representative ingredient.'), _ma_field('INGREDIENT_ORDER_ID', T.LongType(), 'ORDER_INGREDIENT order identifier for representative row.'), _ma_field('INGREDIENT_ACTION_SEQUENCE', T.LongType(), 'Latest representative ingredient action sequence.'), _ma_field('INGREDIENT_COMP_SEQUENCE', T.LongType(), 'Representative ingredient component sequence.'), _ma_field('INGREDIENT_SYNONYM_ID', T.LongType(), 'Representative ingredient synonym identifier.'), _ma_field('INGREDIENT_TYPE_FLAG', T.LongType(), 'Representative ingredient type flag.'), _ma_field('CLINICALLY_SIGNIFICANT_FLAG', T.LongType(), 'Representative clinically-significant flag.'), _ma_field('INCLUDE_IN_TOTAL_VOLUME_FLAG', T.LongType(), 'Representative include-in-total-volume flag.'), _ma_field('ORDERED_DOSE', T.DoubleType(), 'Representative ordered dose.'), _ma_field('ORDERED_DOSE_UNIT_CD', T.LongType(), 'Representative ordered-dose unit code.'), _ma_field('ORDERED_DOSE_UNIT_DISPLAY', T.StringType(), 'Display for representative ordered-dose unit.'), _ma_field('DOSE_QUANTITY', T.DoubleType(), 'Representative ingredient dose quantity.'), _ma_field('DOSE_QUANTITY_UNIT_CD', T.LongType(), 'Representative dose-quantity unit code.'), _ma_field('DOSE_QUANTITY_UNIT_DISPLAY', T.StringType(), 'Display for dose-quantity unit.'), _ma_field('FREETEXT_DOSE', T.StringType(), 'Representative source free-text dose.'), _ma_field('NORMALIZED_RATE', T.DoubleType(), 'Representative normalized ingredient rate.'), _ma_field('NORMALIZED_RATE_UNIT_CD', T.LongType(), 'Representative normalized-rate unit code.'), _ma_field('NORMALIZED_RATE_UNIT_DISPLAY', T.StringType(), 'Display for normalized-rate unit.'), _ma_field('CONCENTRATION', T.DoubleType(), 'Representative ingredient concentration.'), _ma_field('CONCENTRATION_UNIT_CD', T.LongType(), 'Representative concentration unit code.'), _ma_field('CONCENTRATION_UNIT_DISPLAY', T.StringType(), 'Display for concentration unit.'), _ma_field('INGREDIENT_ROW_COUNT', T.LongType(), 'Number of matching ingredient rows for EVENT_ID.'), _ma_field('INGREDIENT_ACTION_COUNT', T.LongType(), 'Distinct ingredient action sequences for EVENT_ID.'), _ma_field('INGREDIENT_COMPONENT_COUNT', T.LongType(), 'Distinct ingredient components for EVENT_ID.'), _ma_field('INGREDIENT_MULTI_ACTION_IND', T.BooleanType(), 'True when multiple ingredient actions exist.'), _ma_field('INGREDIENT_MULTI_COMPONENT_IND', T.BooleanType(), 'True when multiple ingredient components exist.'), _ma_field('DOSE_VALUE_EFFECTIVE', T.DoubleType(), 'ADMIN_DOSAGE then INITIAL_DOSAGE; volume is never substituted.'), _ma_field('DOSE_VALUE_SOURCE', T.StringType(), 'ADMIN_DOSAGE, INITIAL_DOSAGE or null.'), _ma_field('DOSE_UNIT_NORMALIZED', T.StringType(), 'Normalized exact source dosage unit.'), _ma_field('DOSE_NUMERATOR_UNIT', T.StringType(), 'Normalized numerator for compound units.'), _ma_field('DOSE_DENOMINATOR_UNIT', T.StringType(), 'Normalized denominator for compound units.'), _ma_field('DOSE_IN_UNITS', T.DoubleType(), 'Absolute administered amount in base international units.'), _ma_field('DOSE_STANDARDIZATION_STATUS', T.StringType(), 'EXACT_CONVERSION, COMPOUND_UNIT_NOT_ABSOLUTE, UNSUPPORTED_UNIT, MISSING_VALUE or MISSING_UNIT.'), _ma_field('DOSE_COMPOUND_UNIT_IND', T.BooleanType(), 'True when source unit is a ratio or rate.'), _ma_field('DOSE_NEGATIVE_IND', T.BooleanType(), 'True when source effective dosage is negative.'), _ma_field('DOSE_NUMERIC_EXTREME_IND', T.BooleanType(), 'Broad non-filtering flag for extreme source/standardized dosage values.'), _ma_field('LOOKUP_OMOP_CONCEPT_ID', T.LongType(), 'OMOP concept supplied by medication lookup after its own threshold rule.'), _ma_field('LOOKUP_OMOP_CONCEPT_TERM', T.StringType(), 'Term supplied for LOOKUP_OMOP_CONCEPT_ID.'), _ma_field('LOOKUP_OMOP_METHOD', T.StringType(), 'STANDARD_MAP or VECTOR_SIMILARITY from medication lookup.'), _ma_field('LOOKUP_SIMILARITY_SCORE', T.DoubleType(), 'Medication lookup similarity score.'), _ma_field('LOOKUP_SIMILARITY_THRESHOLD', T.DoubleType(), 'Threshold applied to the lookup similarity candidate.'), _ma_field('LOOKUP_SIMILARITY_STATUS', T.StringType(), 'Similarity status supplied by medication lookup.'), _ma_field('LOOKUP_EMBEDDING_MODEL_VERSION', T.StringType(), 'Embedding model version supplied by medication lookup.'), _ma_field('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_ID', T.LongType(), 'Raw similarity candidate identifier.'), _ma_field('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_TERM', T.StringType(), 'Raw similarity candidate term.'), _ma_field('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID', T.LongType(), 'Standardized similarity candidate identifier.'), _ma_field('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM', T.StringType(), 'Standardized similarity candidate term.'), _ma_field('LOOKUP_SNOMED_CODE', T.StringType(), 'Direct SNOMED code supplied by medication lookup.'), _ma_field('LOOKUP_SNOMED_FROM_OMOP', T.StringType(), 'SNOMED code supplied by lookup OMOP reverse mapping.'), _ma_field('LOOKUP_SOURCE_CHANGE_TS', T.TimestampType(), 'Medication lookup source-change timestamp.'), _ma_field('LOOKUP_SOURCE_ROW_HASH', T.StringType(), 'Medication lookup source row hash.'), _ma_field('OMOP_SOURCE_CONCEPT_ID', T.LongType(), 'Best exact source concept before Standard mapping.'), _ma_field('OMOP_SOURCE_CONCEPT_NAME', T.StringType(), 'Name of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_VOCABULARY_ID', T.StringType(), 'Vocabulary of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_CONCEPT_CODE', T.StringType(), 'Code of OMOP_SOURCE_CONCEPT_ID.'), _ma_field('OMOP_SOURCE_STANDARD_CONCEPT', T.StringType(), 'Source concept standard flag.'), _ma_field('OMOP_SOURCE_CONCEPT_VALID_IND', T.BooleanType(), 'True when source concept exists and is not invalid.'), _ma_field('OMOP_MAPPING_METHOD', T.StringType(), 'Evidence method used to select OMOP source/standard concepts.'), _ma_field('OMOP_MAPPING_CONFIDENCE', T.DoubleType(), 'Evidence confidence, not a calibrated clinical probability.'), _ma_field('OMOP_SOURCE_MATCH_CANDIDATE_COUNT', T.LongType(), 'Number of exact concepts for selected source evidence key.'), _ma_field('OMOP_STANDARD_CANDIDATE_COUNT', T.LongType(), 'Number of valid Standard Maps-to candidates.'), _ma_field('OMOP_STANDARD_CONCEPT_ID', T.LongType(), 'Validated Standard OMOP Drug/Ingredient concept identifier; standard-validated replacement for the legacy-semantics OMOP_CONCEPT_ID.'), _ma_field('OMOP_STANDARD_CONCEPT_NAME', T.StringType(), 'Name of the validated Standard OMOP concept in OMOP_STANDARD_CONCEPT_ID.'), _ma_field('OMOP_STANDARD_CONCEPT_FLAG', T.StringType(), 'S only when OMOP_STANDARD_CONCEPT_ID is a valid Standard Drug/Ingredient concept.'), _ma_field('OMOP_MAPPING_AMBIGUOUS_IND', T.BooleanType(), 'True when source or Standard mapping is ambiguous.'), _ma_field('SNOMED_VALIDATED_CODE', T.StringType(), 'SNOMED code retained with explicit validation and provenance; standard-validated replacement for the legacy-semantics SNOMED_CODE.'), _ma_field('SNOMED_VALIDATED_STR', T.StringType(), 'Deterministically selected description of SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_VALIDATED_SOURCE', T.StringType(), 'LOOKUP_DIRECT, LOOKUP_FROM_OMOP, OMOP_MAPPED_FROM or UNMAPPED provenance for SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_CONCEPT_ID', T.LongType(), 'OMOP concept identifier for SNOMED_VALIDATED_CODE when present.'), _ma_field('SNOMED_VALID_DRUG_DOMAIN_IND', T.BooleanType(), 'True when SNOMED_VALIDATED_CODE is a valid Drug/Ingredient-domain concept.'), _ma_field('SNOMED_CANDIDATE_COUNT', T.LongType(), 'Number of valid SNOMED reverse-map candidates for SNOMED_VALIDATED_CODE.'), _ma_field('SNOMED_MAPPING_AMBIGUOUS_IND', T.BooleanType(), 'True when multiple SNOMED candidates exist for SNOMED_VALIDATED_CODE.'), _ma_field('ORGANIZATION_ID', T.LongType(), 'Best available source organization identifier.'), _ma_field('TRUST', T.StringType(), 'Best available source Trust value; no filtering is applied.'), _ma_field('SOURCE_ID_CONFLICT_IND', T.BooleanType(), 'True when populated source person/encounter/order identifiers disagree.'), _ma_field('SOURCE_ORGANIZATION_CONFLICT_IND', T.BooleanType(), 'True when populated source organization identifiers disagree.'), _ma_field('SOURCE_TRUST_CONFLICT_IND', T.BooleanType(), 'True when populated source Trust values disagree.'), _ma_field('CE_ADC_UPDT', T.TimestampType(), 'Selected CLINICAL_EVENT ADC timestamp.'), _ma_field('MAE_ADC_UPDT', T.TimestampType(), 'Selected MED_ADMIN_EVENT ADC timestamp.'), _ma_field('MR_ADC_UPDT', T.TimestampType(), 'Selected CE_MED_RESULT ADC timestamp.'), _ma_field('ORDERS_ADC_UPDT', T.TimestampType(), 'Selected ORDERS ADC timestamp.'), _ma_field('OI_ADC_UPDT', T.TimestampType(), 'Selected ORDER_INGREDIENT ADC timestamp.'), _ma_field('SYNONYM_ADC_UPDT', T.TimestampType(), 'ORDER_CATALOG_SYNONYM ADC timestamp.'), _ma_field('LOOKUP_ADC_UPDT', T.TimestampType(), 'Medication mapping lookup ADC timestamp.'), _ma_field('CODE_LOOKUP_ADC_UPDT', T.TimestampType(), 'Greatest code-value ADC timestamp used by the row.'), _ma_field('TRIGGER_SOURCES', T.StringType(), 'Comma-separated sources causing the event rebuild.'), _ma_field('SOURCE_VERSIONS_JSON', T.StringType(), 'Captured Delta versions used to build the row.'), _ma_field('MAPPING_SCHEMA_VERSION', T.StringType(), 'Medication mapping implementation version.'), _ma_field('UNIT_RULES_VERSION', T.StringType(), 'Dose-unit parsing rule version.'), _ma_field('ROW_HASH', T.LongType(), 'Stable source-derived row hash used to avoid unchanged rewrites.'), _ma_field('PIPELINE_RUN_ID', T.StringType(), 'Pipeline run that last materially changed the row.'), _ma_field('PIPELINE_UPDT_DT_TM', T.TimestampType(), 'Timestamp at which the target row last materially changed.')])
 schema_map_med_admin_ingredient = T.StructType([_ma_field('EVENT_ID', T.LongType(), 'Parent medication administration EVENT_ID.', nullable=False), _ma_field('ORDER_ID', T.LongType(), 'Event order identifier.'), _ma_field('TEMPLATE_ORDER_ID', T.LongType(), 'Event template order identifier.'), _ma_field('INGREDIENT_MATCH_PATH', T.StringType(), 'TEMPLATE or ACTUAL order linkage.', nullable=False), _ma_field('INGREDIENT_ORDER_ID', T.LongType(), 'Source ORDER_INGREDIENT order identifier.', nullable=False), _ma_field('ACTION_SEQUENCE', T.LongType(), 'Source ingredient action sequence.'), _ma_field('COMP_SEQUENCE', T.LongType(), 'Source ingredient component sequence.'), _ma_field('CATALOG_TYPE_CD', T.LongType(), 'Source ingredient catalog type code.'), _ma_field('CATALOG_CD', T.LongType(), 'Source ingredient catalog code.'), _ma_field('SYNONYM_ID', T.LongType(), 'Source ingredient synonym identifier.'), _ma_field('ORDER_MNEMONIC', T.StringType(), 'Source ingredient mnemonic.'), _ma_field('ORDER_DETAIL_DISPLAY_LINE', T.StringType(), 'Source ingredient detail display line.'), _ma_field('STRENGTH', T.DoubleType(), 'Source ingredient strength.'), _ma_field('STRENGTH_UNIT_CD', T.LongType(), 'Source strength unit code.'), _ma_field('VOLUME', T.DoubleType(), 'Source ingredient volume.'), _ma_field('VOLUME_UNIT_CD', T.LongType(), 'Source volume unit code.'), _ma_field('FREETEXT_DOSE', T.StringType(), 'Source free-text dose.'), _ma_field('FREQ_CD', T.LongType(), 'Source ingredient frequency code.'), _ma_field('IV_SEQ', T.LongType(), 'Source IV sequence.'), _ma_field('DOSE_QUANTITY', T.DoubleType(), 'Source dose quantity.'), _ma_field('DOSE_QUANTITY_UNIT_CD', T.LongType(), 'Source dose-quantity unit code.'), _ma_field('ORDERED_AS_MNEMONIC', T.StringType(), 'Source ordered-as mnemonic.'), _ma_field('SUPPLIED_AS_MNEMONIC', T.StringType(), 'Source supplied-as mnemonic.'), _ma_field('HNA_ORDER_MNEMONIC', T.StringType(), 'Source HNA ingredient mnemonic.'), _ma_field('INGREDIENT_TYPE_FLAG', T.LongType(), 'Source ingredient type flag.'), _ma_field('CLINICALLY_SIGNIFICANT_FLAG', T.LongType(), 'Source clinically significant flag.'), _ma_field('INCLUDE_IN_TOTAL_VOLUME_FLAG', T.LongType(), 'Source include-in-total-volume flag.'), _ma_field('ORDERED_DOSE', T.DoubleType(), 'Source ordered dose.'), _ma_field('ORDERED_DOSE_UNIT_CD', T.LongType(), 'Source ordered-dose unit code.'), _ma_field('NORMALIZED_RATE', T.DoubleType(), 'Source normalized rate.'), _ma_field('NORMALIZED_RATE_UNIT_CD', T.LongType(), 'Source normalized-rate unit code.'), _ma_field('CONCENTRATION', T.DoubleType(), 'Source concentration.'), _ma_field('CONCENTRATION_UNIT_CD', T.LongType(), 'Source concentration unit code.'), _ma_field('DOSING_CAPACITY', T.DoubleType(), 'Source dosing capacity.'), _ma_field('DAYS_OF_ADMINISTRATION_DISPLAY', T.StringType(), 'Source administration-days display.'), _ma_field('DOSE_ADJUSTMENT_DISPLAY', T.StringType(), 'Source dose-adjustment display.'), _ma_field('ORDERED_AS_SYNONYM_ID', T.LongType(), 'Source ordered-as synonym identifier.'), _ma_field('UPDT_CNT', T.LongType(), 'Source ingredient update counter.'), _ma_field('UPDT_DT_TM', T.TimestampType(), 'Source application update timestamp.'), _ma_field('UPDT_ID', T.LongType(), 'Source application updater identifier.'), _ma_field('UPDT_TASK', T.LongType(), 'Source application update task.'), _ma_field('UPDT_APPLCTX', T.LongType(), 'Source application update context.'), _ma_field('LAST_UTC_TS', T.TimestampType(), 'Source last-UTC timestamp.'), _ma_field('INST_ID', T.LongType(), 'Source instance identifier.'), _ma_field('TXN_ID_TEXT', T.StringType(), 'Source transaction identifier.'), _ma_field('ADC_UPDT', T.TimestampType(), 'Source ingredient ADC timestamp.'), _ma_field('TRUST', T.StringType(), 'Source ingredient Trust value.'), _ma_field('ENCNTR_ID', T.LongType(), 'Source ingredient encounter identifier.'), _ma_field('ORGANIZATION_ID', T.LongType(), 'Source ingredient organization identifier.'), _ma_field('SOURCE_VERSIONS_JSON', T.StringType(), 'Captured Delta versions used to build the row.'), _ma_field('ROW_HASH', T.LongType(), 'Stable source-derived row hash.'), _ma_field('PIPELINE_RUN_ID', T.StringType(), 'Pipeline run that last materially changed the row.'), _ma_field('PIPELINE_UPDT_DT_TM', T.TimestampType(), 'Pipeline material-change timestamp.')])
+# S4-C1a BEGIN
+schema_map_med_admin_ingredient = T.StructType(list(schema_map_med_admin_ingredient.fields) + [
+    _ma_field('SNOMED_CODE', T.StringType(), 'map_med_lookup.SNOMED_CODE via the child SYNONYM_ID.'),
+    _ma_field('MULTUM_CODE', T.StringType(), 'map_med_lookup.MULTUM_CODE via the child SYNONYM_ID.'),
+    _ma_field('RXNORM_CODE', T.StringType(), 'map_med_lookup.RXNORM_CODE via the child SYNONYM_ID.'),
+    _ma_field('OMOP_CONCEPT_ID', T.LongType(), 'COALESCE of curated mapped, standardized-similarity, then similarity OMOP lanes.'),
+    _ma_field('OMOP_CONCEPT_NAME', T.StringType(), 'Term associated with OMOP_CONCEPT_ID in map_med_lookup.'),
+    _ma_field('OMOP_MAPPING_METHOD', T.StringType(), 'LOOKUP_MAPPED | LOOKUP_SIMILARITY_STANDARDIZED | LOOKUP_SIMILARITY; NULL when no OMOP lane resolves.'),
+    _ma_field('OMOP_MAPPING_CONFIDENCE', T.DoubleType(), 'Similarity score for similarity lanes; NULL for the curated mapped lane.'),
+    _ma_field('OMOP_STANDARD_CONCEPT_ID', T.LongType(), 'Standard OMOP concept via exactly-one Maps-to, or OMOP_CONCEPT_ID when already standard.'),
+    _ma_field('OMOP_STANDARD_CONCEPT_NAME', T.StringType(), 'Name of OMOP_STANDARD_CONCEPT_ID.'),
+    _ma_field('OMOP_STANDARD_CANDIDATE_COUNT', T.LongType(), 'Distinct valid standard Maps-to targets; values greater than one are deliberately unresolved.'),
+    _ma_field('OMOP_STANDARD_MAPPING_METHOD', T.StringType(), 'ALREADY_STANDARD | MAPS_TO_EXACT | MAPS_TO_MULTI | NO_STANDARD_MAP; NULL when OMOP_CONCEPT_ID is NULL.'),
+    _ma_field('LOOKUP_SOURCE_ROW_HASH', T.StringType(), 'map_med_lookup.SOURCE_ROW_HASH applied to this child row.'),
+])
+# S4-C1a END
 
 def _ma_sql_identifier(name: str) -> str:
     tick = chr(96)
@@ -1377,6 +1678,13 @@ def _ma_empty_change_set() -> DataFrame:
 
 def _ma_hash_columns(df: DataFrame, schema: T.StructType, excluded: Sequence[str]) -> DataFrame:
     excluded_set = set(excluded)
+    excluded_set.update({
+        field.name for field in schema.fields
+        if field.name.upper() == 'ADC_UPDT'
+        or field.name.upper().endswith('_ADC_UPDT')
+        or field.name.upper().endswith('_SOURCE_VERSION')
+        or field.name.upper() in {'SOURCE_VERSIONS_JSON', 'LAST_UTC_TS'}
+    })
     columns = [field.name for field in schema.fields if field.name not in excluded_set and field.name in df.columns]
     values = [F.coalesce(F.col(column).cast('string'), F.lit('<NULL>')) for column in columns]
     return df.withColumn('ROW_HASH', F.xxhash64(*values))
@@ -1542,7 +1850,11 @@ def _ma_prepare_med_admin_event(raw: DataFrame, event_keys: Optional[DataFrame])
     return latest.join(stats, 'EVENT_ID', 'left')
 
 def _ma_prepare_med_result(raw: DataFrame, event_keys: Optional[DataFrame], run_timestamp: datetime) -> DataFrame:
-    selected = _ma_filter_event_keys(raw, 'EVENT_ID', event_keys).select(_ma_checked_long(F.col('EVENT_ID'), 'CE_MED_RESULT.EVENT_ID', True).alias('EVENT_ID'), F.col('VALID_FROM_DT_TM').cast('timestamp').alias('MR_VALID_FROM_DT_TM'), F.col('VALID_UNTIL_DT_TM').cast('timestamp').alias('MR_VALID_UNTIL_DT_TM'), F.col('ADMIN_START_DT_TM').cast('timestamp').alias('MR_ADMIN_START_DT_TM'), F.col('ADMIN_END_DT_TM').cast('timestamp').alias('MR_ADMIN_END_DT_TM'), F.col('ADMIN_NOTE').cast('string').alias('ADMIN_NOTE'), _ma_checked_long(F.col('ADMIN_PROV_ID'), 'CE_MED_RESULT.ADMIN_PROV_ID').alias('ADMIN_PROV_ID'), _ma_checked_long(F.col('ADMIN_ROUTE_CD'), 'CE_MED_RESULT.ADMIN_ROUTE_CD').alias('ADMIN_ROUTE_CD'), _ma_checked_long(F.col('ADMIN_SITE_CD'), 'CE_MED_RESULT.ADMIN_SITE_CD').alias('ADMIN_SITE_CD'), _ma_checked_long(F.col('ADMIN_METHOD_CD'), 'CE_MED_RESULT.ADMIN_METHOD_CD').alias('ADMIN_METHOD_CD'), _ma_checked_long(F.col('ADMIN_PT_LOC_CD'), 'CE_MED_RESULT.ADMIN_PT_LOC_CD').alias('ADMIN_PT_LOC_CD'), F.col('INITIAL_DOSAGE').cast('double').alias('INITIAL_DOSAGE'), F.col('ADMIN_DOSAGE').cast('double').alias('ADMIN_DOSAGE'), _ma_checked_long(F.col('DOSAGE_UNIT_CD'), 'CE_MED_RESULT.DOSAGE_UNIT_CD').alias('ADMIN_DOSAGE_UNIT_CD'), F.col('INITIAL_VOLUME').cast('double').alias('INITIAL_VOLUME'), F.col('TOTAL_INTAKE_VOLUME').cast('double').alias('TOTAL_INTAKE_VOLUME'), _ma_checked_long(F.col('DILUENT_TYPE_CD'), 'CE_MED_RESULT.DILUENT_TYPE_CD').alias('DILUENT_TYPE_CD'), _ma_checked_long(F.col('PH_DISPENSE_ID'), 'CE_MED_RESULT.PH_DISPENSE_ID').alias('PH_DISPENSE_ID'), F.col('INFUSION_RATE').cast('double').alias('INFUSION_RATE'), _ma_checked_long(F.col('INFUSION_UNIT_CD'), 'CE_MED_RESULT.INFUSION_UNIT_CD').alias('INFUSION_UNIT_CD'), _ma_checked_long(F.col('INFUSION_TIME_CD'), 'CE_MED_RESULT.INFUSION_TIME_CD').alias('INFUSION_TIME_CD'), _ma_checked_long(F.col('MEDICATION_FORM_CD'), 'CE_MED_RESULT.MEDICATION_FORM_CD').alias('MEDICATION_FORM_CD'), F.col('ADMIN_STRENGTH').cast('double').alias('ADMIN_STRENGTH'), _ma_checked_long(F.col('ADMIN_STRENGTH_UNIT_CD'), 'CE_MED_RESULT.ADMIN_STRENGTH_UNIT_CD').alias('ADMIN_STRENGTH_UNIT_CD'), F.col('SUBSTANCE_LOT_NUMBER').cast('string').alias('SUBSTANCE_LOT_NUMBER'), F.col('SUBSTANCE_EXP_DT_TM').cast('timestamp').alias('SUBSTANCE_EXP_DT_TM'), F.col('SUBSTANCE_EXP_DT_TXT').cast('string').alias('SUBSTANCE_EXP_DT_TXT'), _ma_checked_long(F.col('SUBSTANCE_MANUFACTURER_CD'), 'CE_MED_RESULT.SUBSTANCE_MANUFACTURER_CD').alias('SUBSTANCE_MANUFACTURER_CD'), _ma_checked_long(F.col('REFUSAL_CD'), 'CE_MED_RESULT.REFUSAL_CD').alias('REFUSAL_CD'), F.col('SYSTEM_ENTRY_DT_TM').cast('timestamp').alias('SYSTEM_ENTRY_DT_TM'), _ma_checked_long(F.col('IV_EVENT_CD'), 'CE_MED_RESULT.IV_EVENT_CD').alias('IV_EVENT_CD'), F.col('INFUSED_VOLUME').cast('double').alias('INFUSED_VOLUME'), _ma_checked_long(F.col('INFUSED_VOLUME_UNIT_CD'), 'CE_MED_RESULT.INFUSED_VOLUME_UNIT_CD').alias('INFUSED_VOLUME_UNIT_CD'), F.col('REMAINING_VOLUME').cast('double').alias('REMAINING_VOLUME'), _ma_checked_long(F.col('REMAINING_VOLUME_UNIT_CD'), 'CE_MED_RESULT.REMAINING_VOLUME_UNIT_CD').alias('REMAINING_VOLUME_UNIT_CD'), _ma_checked_long(F.col('SYNONYM_ID'), 'CE_MED_RESULT.SYNONYM_ID').alias('MR_SYNONYM_ID'), F.col('WEIGHT_VALUE').cast('double').alias('WEIGHT_VALUE'), _ma_checked_long(F.col('WEIGHT_UNIT_CD'), 'CE_MED_RESULT.WEIGHT_UNIT_CD').alias('WEIGHT_UNIT_CD'), _ma_checked_long(F.col('BOLUS_TYPE_CD'), 'CE_MED_RESULT.BOLUS_TYPE_CD').alias('BOLUS_TYPE_CD'), F.col('UPDT_DT_TM').cast('timestamp').alias('MR_UPDT_DT_TM'), F.col('ADC_UPDT').cast('timestamp').alias('MR_ADC_UPDT'), _ma_checked_long(F.col('ENCNTR_ID'), 'CE_MED_RESULT.ENCNTR_ID').alias('MR_ENCNTR_ID'), _ma_checked_long(F.col('ORGANIZATION_ID'), 'CE_MED_RESULT.ORGANIZATION_ID').alias('MR_ORGANIZATION_ID'), F.col('Trust').cast('string').alias('MR_TRUST'))
+    selected = _ma_filter_event_keys(raw, 'EVENT_ID', event_keys).select(_ma_checked_long(F.col('EVENT_ID'), 'CE_MED_RESULT.EVENT_ID', True).alias('EVENT_ID'), F.col('VALID_FROM_DT_TM').cast('timestamp').alias('MR_VALID_FROM_DT_TM'), F.col('VALID_UNTIL_DT_TM').cast('timestamp').alias('MR_VALID_UNTIL_DT_TM'), F.col('ADMIN_START_DT_TM').cast('timestamp').alias('MR_ADMIN_START_DT_TM'), F.col('ADMIN_END_DT_TM').cast('timestamp').alias('MR_ADMIN_END_DT_TM'), F.col('ADMIN_NOTE').cast('string').alias('ADMIN_NOTE'), _ma_checked_long(F.col('ADMIN_PROV_ID'), 'CE_MED_RESULT.ADMIN_PROV_ID').alias('ADMIN_PROV_ID'), _ma_checked_long(F.col('ADMIN_ROUTE_CD'), 'CE_MED_RESULT.ADMIN_ROUTE_CD').alias('ADMIN_ROUTE_CD'), _ma_checked_long(F.col('ADMIN_SITE_CD'), 'CE_MED_RESULT.ADMIN_SITE_CD').alias('ADMIN_SITE_CD'), _ma_checked_long(F.col('ADMIN_METHOD_CD'), 'CE_MED_RESULT.ADMIN_METHOD_CD').alias('ADMIN_METHOD_CD'), _ma_checked_long(F.col('ADMIN_PT_LOC_CD'), 'CE_MED_RESULT.ADMIN_PT_LOC_CD').alias('ADMIN_PT_LOC_CD'), F.col('INITIAL_DOSAGE').cast('double').alias('INITIAL_DOSAGE'), F.col('ADMIN_DOSAGE').cast('double').alias('ADMIN_DOSAGE'), _ma_checked_long(F.col('DOSAGE_UNIT_CD'), 'CE_MED_RESULT.DOSAGE_UNIT_CD').alias('ADMIN_DOSAGE_UNIT_CD'), F.col('INITIAL_VOLUME').cast('double').alias('INITIAL_VOLUME'), F.col('TOTAL_INTAKE_VOLUME').cast('double').alias('TOTAL_INTAKE_VOLUME'), _ma_checked_long(F.col('DILUENT_TYPE_CD'), 'CE_MED_RESULT.DILUENT_TYPE_CD').alias('DILUENT_TYPE_CD'), _ma_checked_long(F.col('PH_DISPENSE_ID'), 'CE_MED_RESULT.PH_DISPENSE_ID').alias('PH_DISPENSE_ID'), F.col('INFUSION_RATE').cast('double').alias('INFUSION_RATE'), _ma_checked_long(F.col('INFUSION_UNIT_CD'), 'CE_MED_RESULT.INFUSION_UNIT_CD').alias('INFUSION_UNIT_CD'), _ma_checked_long(F.col('INFUSION_TIME_CD'), 'CE_MED_RESULT.INFUSION_TIME_CD').alias('INFUSION_TIME_CD'), _ma_checked_long(F.col('MEDICATION_FORM_CD'), 'CE_MED_RESULT.MEDICATION_FORM_CD').alias('MEDICATION_FORM_CD'), F.col('ADMIN_STRENGTH').cast('double').alias('ADMIN_STRENGTH'), _ma_checked_long(F.col('ADMIN_STRENGTH_UNIT_CD'), 'CE_MED_RESULT.ADMIN_STRENGTH_UNIT_CD').alias('ADMIN_STRENGTH_UNIT_CD'), F.col('SUBSTANCE_LOT_NUMBER').cast('string').alias('SUBSTANCE_LOT_NUMBER'), F.col('SUBSTANCE_EXP_DT_TM').cast('timestamp').alias('SUBSTANCE_EXP_DT_TM'), F.col('SUBSTANCE_EXP_DT_TXT').cast('string').alias('SUBSTANCE_EXP_DT_TXT'), _ma_checked_long(F.col('SUBSTANCE_MANUFACTURER_CD'), 'CE_MED_RESULT.SUBSTANCE_MANUFACTURER_CD').alias('SUBSTANCE_MANUFACTURER_CD'), _ma_checked_long(F.col('REFUSAL_CD'), 'CE_MED_RESULT.REFUSAL_CD').alias('REFUSAL_CD'),
+# S3-A11 BEGIN: select immunization parity source column
+_ma_checked_long(F.col('IMMUNIZATION_TYPE_CD'), 'CE_MED_RESULT.IMMUNIZATION_TYPE_CD').alias('IMMUNIZATION_TYPE_CD'),
+# S3-A11 END: select immunization parity source column
+F.col('SYSTEM_ENTRY_DT_TM').cast('timestamp').alias('SYSTEM_ENTRY_DT_TM'), _ma_checked_long(F.col('IV_EVENT_CD'), 'CE_MED_RESULT.IV_EVENT_CD').alias('IV_EVENT_CD'), F.col('INFUSED_VOLUME').cast('double').alias('INFUSED_VOLUME'), _ma_checked_long(F.col('INFUSED_VOLUME_UNIT_CD'), 'CE_MED_RESULT.INFUSED_VOLUME_UNIT_CD').alias('INFUSED_VOLUME_UNIT_CD'), F.col('REMAINING_VOLUME').cast('double').alias('REMAINING_VOLUME'), _ma_checked_long(F.col('REMAINING_VOLUME_UNIT_CD'), 'CE_MED_RESULT.REMAINING_VOLUME_UNIT_CD').alias('REMAINING_VOLUME_UNIT_CD'), _ma_checked_long(F.col('SYNONYM_ID'), 'CE_MED_RESULT.SYNONYM_ID').alias('MR_SYNONYM_ID'), F.col('WEIGHT_VALUE').cast('double').alias('WEIGHT_VALUE'), _ma_checked_long(F.col('WEIGHT_UNIT_CD'), 'CE_MED_RESULT.WEIGHT_UNIT_CD').alias('WEIGHT_UNIT_CD'), _ma_checked_long(F.col('BOLUS_TYPE_CD'), 'CE_MED_RESULT.BOLUS_TYPE_CD').alias('BOLUS_TYPE_CD'), F.col('UPDT_DT_TM').cast('timestamp').alias('MR_UPDT_DT_TM'), F.col('ADC_UPDT').cast('timestamp').alias('MR_ADC_UPDT'), _ma_checked_long(F.col('ENCNTR_ID'), 'CE_MED_RESULT.ENCNTR_ID').alias('MR_ENCNTR_ID'), _ma_checked_long(F.col('ORGANIZATION_ID'), 'CE_MED_RESULT.ORGANIZATION_ID').alias('MR_ORGANIZATION_ID'), F.col('Trust').cast('string').alias('MR_TRUST'))
     selected = selected.withColumn('MR_IS_CURRENT_IND', F.coalesce(F.col('MR_VALID_UNTIL_DT_TM') > F.lit(run_timestamp), F.lit(False)))
     stats = selected.groupBy('EVENT_ID').agg(F.count(F.lit(1)).cast('long').alias('MR_ROW_COUNT'), F.sum(F.col('MR_IS_CURRENT_IND').cast('long')).cast('long').alias('MR_CURRENT_ROW_COUNT'))
     window = Window.partitionBy('EVENT_ID').orderBy(F.col('MR_IS_CURRENT_IND').desc(), F.col('MR_VALID_FROM_DT_TM').desc_nulls_last(), F.col('MR_ADC_UPDT').desc_nulls_last(), F.col('SYSTEM_ENTRY_DT_TM').desc_nulls_last(), F.col('MR_UPDT_DT_TM').desc_nulls_last())
@@ -1564,6 +1876,66 @@ def _ma_prepare_medication_lookup(raw: DataFrame) -> DataFrame:
     selected = raw.select(_ma_checked_long(F.col('SYNONYM_ID'), 'MAP_MED_LOOKUP.SYNONYM_ID', True).alias('ORDER_SYNONYM_ID'), F.col('HNA_ORDER_MNEMONIC').cast('string').alias('LOOKUP_HNA_ORDER_MNEMONIC'), F.col('MULTUM_CODE').cast('string').alias('MULTUM'), F.col('RXNORM_CODE').cast('string').alias('RXNORM_CUI'), F.col('SNOMED_CODE').cast('string').alias('LOOKUP_SNOMED_CODE'), F.col('SNOMED_FROM_OMOP').cast('string').alias('LOOKUP_SNOMED_FROM_OMOP'), _ma_checked_long(F.col('MAPPED_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.MAPPED_OMOP_CONCEPT_ID').alias('LKP_MAPPED_OMOP_CONCEPT_ID'), F.col('MAPPED_OMOP_CONCEPT_TERM').cast('string').alias('LKP_MAPPED_OMOP_CONCEPT_TERM'), _ma_checked_long(F.col('SIMILARITY_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.SIMILARITY_OMOP_CONCEPT_ID').alias('LKP_SIMILARITY_OMOP_CONCEPT_ID'), F.col('SIMILARITY_OMOP_CONCEPT_TERM').cast('string').alias('LKP_SIMILARITY_OMOP_CONCEPT_TERM'), F.col('SIMILARITY_SCORE').cast('double').alias('LOOKUP_SIMILARITY_SCORE'), _ma_checked_long(F.col('RAW_SIMILARITY_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.RAW_SIMILARITY_OMOP_CONCEPT_ID').alias('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_ID'), F.col('RAW_SIMILARITY_OMOP_CONCEPT_TERM').cast('string').alias('LOOKUP_RAW_SIMILARITY_OMOP_CONCEPT_TERM'), _ma_checked_long(F.col('STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID').alias('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID'), F.col('STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM').cast('string').alias('LOOKUP_STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM'), F.col('SIMILARITY_STATUS').cast('string').alias('LOOKUP_SIMILARITY_STATUS'), F.col('SOURCE_CHANGE_TS').cast('timestamp').alias('LOOKUP_SOURCE_CHANGE_TS'), F.col('SOURCE_ROW_HASH').cast('string').alias('LOOKUP_SOURCE_ROW_HASH'), F.col('ADC_UPDT').cast('timestamp').alias('LOOKUP_ADC_UPDT'), F.col('EMBEDDING_MODEL_VERSION').cast('string').alias('LOOKUP_EMBEDDING_MODEL_VERSION'), F.col('SIMILARITY_THRESHOLD').cast('double').alias('LOOKUP_SIMILARITY_THRESHOLD_RAW'))
     window = Window.partitionBy('ORDER_SYNONYM_ID').orderBy(F.col('LOOKUP_ADC_UPDT').desc_nulls_last(), F.col('LOOKUP_SOURCE_CHANGE_TS').desc_nulls_last())
     return selected.withColumn('_LKP_RN', F.row_number().over(window)).where(F.col('_LKP_RN') == 1).drop('_LKP_RN')
+# S4-C1a BEGIN
+_MA_S4_INGREDIENT_CONCEPT_COLUMNS = (
+    'SNOMED_CODE', 'MULTUM_CODE', 'RXNORM_CODE', 'OMOP_CONCEPT_ID',
+    'OMOP_CONCEPT_NAME', 'OMOP_MAPPING_METHOD', 'OMOP_MAPPING_CONFIDENCE',
+    'OMOP_STANDARD_CONCEPT_ID', 'OMOP_STANDARD_CONCEPT_NAME',
+    'OMOP_STANDARD_CANDIDATE_COUNT', 'OMOP_STANDARD_MAPPING_METHOD',
+    'LOOKUP_SOURCE_ROW_HASH',
+)
+
+def _ma_s4_prepare_ingredient_lookup(raw: DataFrame) -> DataFrame:
+    selected = raw.select(
+        _ma_checked_long(F.col('SYNONYM_ID'), 'MAP_MED_LOOKUP.SYNONYM_ID', True).alias('SYNONYM_ID'),
+        F.col('SNOMED_CODE').cast('string').alias('SNOMED_CODE'),
+        F.col('MULTUM_CODE').cast('string').alias('MULTUM_CODE'),
+        F.col('RXNORM_CODE').cast('string').alias('RXNORM_CODE'),
+        _ma_checked_long(F.col('MAPPED_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.MAPPED_OMOP_CONCEPT_ID').alias('_S4_MAPPED_ID'),
+        F.col('MAPPED_OMOP_CONCEPT_TERM').cast('string').alias('_S4_MAPPED_TERM'),
+        _ma_checked_long(F.col('STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID').alias('_S4_STANDARDIZED_ID'),
+        F.col('STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM').cast('string').alias('_S4_STANDARDIZED_TERM'),
+        F.col('RAW_SIMILARITY_SCORE').cast('double').alias('_S4_STANDARDIZED_SCORE'),
+        _ma_checked_long(F.col('SIMILARITY_OMOP_CONCEPT_ID'), 'MAP_MED_LOOKUP.SIMILARITY_OMOP_CONCEPT_ID').alias('_S4_SIMILARITY_ID'),
+        F.col('SIMILARITY_OMOP_CONCEPT_TERM').cast('string').alias('_S4_SIMILARITY_TERM'),
+        F.col('SIMILARITY_SCORE').cast('double').alias('_S4_SIMILARITY_SCORE'),
+        F.col('SOURCE_ROW_HASH').cast('string').alias('LOOKUP_SOURCE_ROW_HASH'),
+        F.col('ADC_UPDT').cast('timestamp').alias('_S4_LOOKUP_ADC_UPDT'),
+        F.col('SOURCE_CHANGE_TS').cast('timestamp').alias('_S4_LOOKUP_SOURCE_CHANGE_TS'),
+    )
+    window = Window.partitionBy('SYNONYM_ID').orderBy(
+        F.col('_S4_LOOKUP_ADC_UPDT').desc_nulls_last(),
+        F.col('_S4_LOOKUP_SOURCE_CHANGE_TS').desc_nulls_last(),
+        F.col('LOOKUP_SOURCE_ROW_HASH').desc_nulls_last(),
+    )
+    selected = selected.withColumn('_S4_LOOKUP_RN', F.row_number().over(window)).where(F.col('_S4_LOOKUP_RN') == 1)
+    return selected.withColumns({
+        'OMOP_CONCEPT_ID': F.coalesce(F.col('_S4_MAPPED_ID'), F.col('_S4_STANDARDIZED_ID'), F.col('_S4_SIMILARITY_ID')).cast('long'),
+        'OMOP_CONCEPT_NAME': F.coalesce(F.col('_S4_MAPPED_TERM'), F.col('_S4_STANDARDIZED_TERM'), F.col('_S4_SIMILARITY_TERM')).cast('string'),
+        'OMOP_MAPPING_METHOD': F.when(F.col('_S4_MAPPED_ID').isNotNull(), F.lit('LOOKUP_MAPPED'))
+            .when(F.col('_S4_STANDARDIZED_ID').isNotNull(), F.lit('LOOKUP_SIMILARITY_STANDARDIZED'))
+            .when(F.col('_S4_SIMILARITY_ID').isNotNull(), F.lit('LOOKUP_SIMILARITY')),
+        'OMOP_MAPPING_CONFIDENCE': F.when(F.col('_S4_MAPPED_ID').isNotNull(), F.lit(None).cast('double'))
+            .when(F.col('_S4_STANDARDIZED_ID').isNotNull(), F.col('_S4_STANDARDIZED_SCORE'))
+            .otherwise(F.col('_S4_SIMILARITY_SCORE')).cast('double'),
+    }).select(
+        'SYNONYM_ID', 'SNOMED_CODE', 'MULTUM_CODE', 'RXNORM_CODE',
+        'OMOP_CONCEPT_ID', 'OMOP_CONCEPT_NAME', 'OMOP_MAPPING_METHOD',
+        'OMOP_MAPPING_CONFIDENCE', 'LOOKUP_SOURCE_ROW_HASH',
+    )
+
+def _ma_s4_enrich_ingredient_child(child: DataFrame, lookup_raw: DataFrame) -> DataFrame:
+    lookup = _s4_c1b_diagnosis_standard_resolution(_ma_s4_prepare_ingredient_lookup(lookup_raw))
+    base = child.drop(*[name for name in _MA_S4_INGREDIENT_CONCEPT_COLUMNS if name in child.columns])
+    return base.alias('c').join(
+        F.broadcast(lookup).alias('l'),
+        F.col('c.SYNONYM_ID') == F.col('l.SYNONYM_ID'),
+        'left',
+    ).select(
+        'c.*',
+        *[F.col('l.' + name).alias(name) for name in _MA_S4_INGREDIENT_CONCEPT_COLUMNS],
+    )
+# S4-C1a END
 
 def _ma_prepare_order_ingredient(raw: DataFrame) -> DataFrame:
     return raw.select(_ma_checked_long(F.col('ORDER_ID'), 'ORDER_INGREDIENT.ORDER_ID', True).alias('INGREDIENT_ORDER_ID'), _ma_checked_long(F.col('ACTION_SEQUENCE'), 'ORDER_INGREDIENT.ACTION_SEQUENCE').alias('ACTION_SEQUENCE'), _ma_checked_long(F.col('COMP_SEQUENCE'), 'ORDER_INGREDIENT.COMP_SEQUENCE').alias('COMP_SEQUENCE'), _ma_checked_long(F.col('CATALOG_TYPE_CD'), 'ORDER_INGREDIENT.CATALOG_TYPE_CD').alias('OI_CATALOG_TYPE_CD'), _ma_checked_long(F.col('CATALOG_CD'), 'ORDER_INGREDIENT.CATALOG_CD').alias('OI_CATALOG_CD'), _ma_checked_long(F.col('SYNONYM_ID'), 'ORDER_INGREDIENT.SYNONYM_ID').alias('INGREDIENT_SYNONYM_ID'), F.col('ORDER_MNEMONIC').cast('string').alias('OI_ORDER_MNEMONIC'), F.col('ORDER_DETAIL_DISPLAY_LINE').cast('string').alias('OI_ORDER_DETAIL_DISPLAY_LINE'), F.col('STRENGTH').cast('double').alias('OI_STRENGTH'), _ma_checked_long(F.col('STRENGTH_UNIT'), 'ORDER_INGREDIENT.STRENGTH_UNIT').alias('OI_STRENGTH_UNIT_CD'), F.col('VOLUME').cast('double').alias('OI_VOLUME'), _ma_checked_long(F.col('VOLUME_UNIT'), 'ORDER_INGREDIENT.VOLUME_UNIT').alias('OI_VOLUME_UNIT_CD'), F.col('FREETEXT_DOSE').cast('string').alias('FREETEXT_DOSE'), _ma_checked_long(F.col('FREQ_CD'), 'ORDER_INGREDIENT.FREQ_CD').alias('OI_FREQ_CD'), _ma_checked_long(F.col('IV_SEQ'), 'ORDER_INGREDIENT.IV_SEQ').alias('OI_IV_SEQ'), F.col('DOSE_QUANTITY').cast('double').alias('DOSE_QUANTITY'), _ma_checked_long(F.col('DOSE_QUANTITY_UNIT'), 'ORDER_INGREDIENT.DOSE_QUANTITY_UNIT').alias('DOSE_QUANTITY_UNIT_CD'), F.col('ORDERED_AS_MNEMONIC').cast('string').alias('OI_ORDERED_AS_MNEMONIC'), F.col('SUPPLIED_AS_MNEMONIC').cast('string').alias('OI_SUPPLIED_AS_MNEMONIC'), F.col('HNA_ORDER_MNEMONIC').cast('string').alias('OI_HNA_ORDER_MNEMONIC'), _ma_checked_long(F.col('INGREDIENT_TYPE_FLAG'), 'ORDER_INGREDIENT.INGREDIENT_TYPE_FLAG').alias('INGREDIENT_TYPE_FLAG'), _ma_checked_long(F.col('CLINICALLY_SIGNIFICANT_FLAG'), 'ORDER_INGREDIENT.CLINICALLY_SIGNIFICANT_FLAG').alias('CLINICALLY_SIGNIFICANT_FLAG'), _ma_checked_long(F.col('INCLUDE_IN_TOTAL_VOLUME_FLAG'), 'ORDER_INGREDIENT.INCLUDE_IN_TOTAL_VOLUME_FLAG').alias('INCLUDE_IN_TOTAL_VOLUME_FLAG'), F.col('ORDERED_DOSE').cast('double').alias('ORDERED_DOSE'), _ma_checked_long(F.col('ORDERED_DOSE_UNIT_CD'), 'ORDER_INGREDIENT.ORDERED_DOSE_UNIT_CD').alias('ORDERED_DOSE_UNIT_CD'), F.col('NORMALIZED_RATE').cast('double').alias('NORMALIZED_RATE'), _ma_checked_long(F.col('NORMALIZED_RATE_UNIT_CD'), 'ORDER_INGREDIENT.NORMALIZED_RATE_UNIT_CD').alias('NORMALIZED_RATE_UNIT_CD'), F.col('CONCENTRATION').cast('double').alias('CONCENTRATION'), _ma_checked_long(F.col('CONCENTRATION_UNIT_CD'), 'ORDER_INGREDIENT.CONCENTRATION_UNIT_CD').alias('CONCENTRATION_UNIT_CD'), F.col('DOSING_CAPACITY').cast('double').alias('DOSING_CAPACITY'), F.col('DAYS_OF_ADMINISTRATION_DISPLAY').cast('string').alias('DAYS_OF_ADMINISTRATION_DISPLAY'), F.col('DOSE_ADJUSTMENT_DISPLAY').cast('string').alias('DOSE_ADJUSTMENT_DISPLAY'), _ma_checked_long(F.col('ORDERED_AS_SYNONYM_ID'), 'ORDER_INGREDIENT.ORDERED_AS_SYNONYM_ID').alias('ORDERED_AS_SYNONYM_ID'), _ma_checked_long(F.col('UPDT_CNT'), 'ORDER_INGREDIENT.UPDT_CNT').alias('OI_UPDT_CNT'), F.col('UPDT_DT_TM').cast('timestamp').alias('OI_UPDT_DT_TM'), _ma_checked_long(F.col('UPDT_ID'), 'ORDER_INGREDIENT.UPDT_ID').alias('OI_UPDT_ID'), _ma_checked_long(F.col('UPDT_TASK'), 'ORDER_INGREDIENT.UPDT_TASK').alias('OI_UPDT_TASK'), _ma_checked_long(F.col('UPDT_APPLCTX'), 'ORDER_INGREDIENT.UPDT_APPLCTX').alias('OI_UPDT_APPLCTX'), F.col('LAST_UTC_TS').cast('timestamp').alias('OI_LAST_UTC_TS'), _ma_checked_long(F.col('INST_ID'), 'ORDER_INGREDIENT.INST_ID').alias('OI_INST_ID'), F.col('TXN_ID_TEXT').cast('string').alias('OI_TXN_ID_TEXT'), F.col('ADC_UPDT').cast('timestamp').alias('OI_ADC_UPDT'), F.col('Trust').cast('string').alias('OI_TRUST'), _ma_checked_long(F.col('ENCNTR_ID'), 'ORDER_INGREDIENT.ENCNTR_ID').alias('OI_ENCNTR_ID'), _ma_checked_long(F.col('ORGANIZATION_ID'), 'ORDER_INGREDIENT.ORGANIZATION_ID').alias('OI_ORGANIZATION_ID'))
@@ -1572,7 +1944,11 @@ def _ma_prepare_code_lookup(raw: DataFrame) -> DataFrame:
     selected = raw.select(_ma_checked_long(F.col('CODE_VALUE'), 'CODE_VALUE.CODE_VALUE', True).alias('CODE_VALUE'), F.coalesce(_ma_nonblank(F.col('DISPLAY')), _ma_nonblank(F.col('CDF_MEANING'))).alias('CODE_DESCRIPTION'), F.col('ADC_UPDT').cast('timestamp').alias('CODE_ADC_UPDT'))
     window = Window.partitionBy('CODE_VALUE').orderBy(F.col('CODE_ADC_UPDT').desc_nulls_last(), F.col('CODE_DESCRIPTION').asc_nulls_last())
     return selected.withColumn('_CV_RN', F.row_number().over(window)).where(F.col('_CV_RN') == 1).drop('_CV_RN')
-_MA_CODE_DISPLAY_COLUMNS: Dict[str, str] = {'EVENT_TYPE_CD': 'EVENT_TYPE_DISPLAY', 'RESULT_STATUS_CD': 'RESULT_STATUS_DISPLAY', 'ADMIN_ROUTE_CD': 'ADMIN_ROUTE_DISPLAY', 'ADMIN_SITE_CD': 'ADMIN_SITE_DISPLAY', 'ADMIN_METHOD_CD': 'ADMIN_METHOD_DISPLAY', 'INITIAL_DOSAGE_UNIT_CD': 'INITIAL_DOSAGE_UNIT_DISPLAY', 'ADMIN_DOSAGE_UNIT_CD': 'ADMIN_DOSAGE_UNIT_DISPLAY', 'INFUSED_VOLUME_UNIT_CD': 'INFUSED_VOLUME_UNIT_DISPLAY', 'INFUSION_UNIT_CD': 'INFUSION_UNIT_DISPLAY', 'NURSE_UNIT_CD': 'NURSE_UNIT_DISPLAY', 'POSITION_CD': 'POSITION_DISPLAY', 'DILUENT_TYPE_CD': 'DILUENT_TYPE_DISPLAY', 'MEDICATION_FORM_CD': 'MEDICATION_FORM_DISPLAY', 'ADMIN_STRENGTH_UNIT_CD': 'ADMIN_STRENGTH_UNIT_DISPLAY', 'SUBSTANCE_MANUFACTURER_CD': 'SUBSTANCE_MANUFACTURER_DISPLAY', 'REFUSAL_CD': 'REFUSAL_DISPLAY', 'IV_EVENT_CD': 'IV_EVENT_DISPLAY', 'REMAINING_VOLUME_UNIT_CD': 'REMAINING_VOLUME_UNIT_DISPLAY', 'WEIGHT_UNIT_CD': 'WEIGHT_UNIT_DISPLAY', 'BOLUS_TYPE_CD': 'BOLUS_TYPE_DISPLAY', 'ORDER_STATUS_CD': 'ORDER_STATUS_DISPLAY', 'MED_ORDER_TYPE_CD': 'MED_ORDER_TYPE_DISPLAY', 'ORDER_STRENGTH_UNIT_CD': 'ORDER_STRENGTH_UNIT_DISPLAY', 'ORDER_VOLUME_UNIT_CD': 'ORDER_VOLUME_UNIT_DISPLAY', 'ORDERED_DOSE_UNIT_CD': 'ORDERED_DOSE_UNIT_DISPLAY', 'DOSE_QUANTITY_UNIT_CD': 'DOSE_QUANTITY_UNIT_DISPLAY', 'NORMALIZED_RATE_UNIT_CD': 'NORMALIZED_RATE_UNIT_DISPLAY', 'CONCENTRATION_UNIT_CD': 'CONCENTRATION_UNIT_DISPLAY'}
+_MA_CODE_DISPLAY_COLUMNS: Dict[str, str] = {'EVENT_TYPE_CD': 'EVENT_TYPE_DISPLAY', 'RESULT_STATUS_CD': 'RESULT_STATUS_DISPLAY', 'ADMIN_ROUTE_CD': 'ADMIN_ROUTE_DISPLAY', 'ADMIN_SITE_CD': 'ADMIN_SITE_DISPLAY', 'ADMIN_METHOD_CD': 'ADMIN_METHOD_DISPLAY', 'INITIAL_DOSAGE_UNIT_CD': 'INITIAL_DOSAGE_UNIT_DISPLAY', 'ADMIN_DOSAGE_UNIT_CD': 'ADMIN_DOSAGE_UNIT_DISPLAY', 'INFUSED_VOLUME_UNIT_CD': 'INFUSED_VOLUME_UNIT_DISPLAY', 'INFUSION_UNIT_CD': 'INFUSION_UNIT_DISPLAY', 'NURSE_UNIT_CD': 'NURSE_UNIT_DISPLAY', 'POSITION_CD': 'POSITION_DISPLAY', 'DILUENT_TYPE_CD': 'DILUENT_TYPE_DISPLAY', 'MEDICATION_FORM_CD': 'MEDICATION_FORM_DISPLAY', 'ADMIN_STRENGTH_UNIT_CD': 'ADMIN_STRENGTH_UNIT_DISPLAY', 'SUBSTANCE_MANUFACTURER_CD': 'SUBSTANCE_MANUFACTURER_DISPLAY', 'REFUSAL_CD': 'REFUSAL_DISPLAY',
+# S3-A11 BEGIN: decode immunization parity code
+'IMMUNIZATION_TYPE_CD': 'IMMUNIZATION_TYPE_DISPLAY',
+# S3-A11 END: decode immunization parity code
+'IV_EVENT_CD': 'IV_EVENT_DISPLAY', 'REMAINING_VOLUME_UNIT_CD': 'REMAINING_VOLUME_UNIT_DISPLAY', 'WEIGHT_UNIT_CD': 'WEIGHT_UNIT_DISPLAY', 'BOLUS_TYPE_CD': 'BOLUS_TYPE_DISPLAY', 'ORDER_STATUS_CD': 'ORDER_STATUS_DISPLAY', 'MED_ORDER_TYPE_CD': 'MED_ORDER_TYPE_DISPLAY', 'ORDER_STRENGTH_UNIT_CD': 'ORDER_STRENGTH_UNIT_DISPLAY', 'ORDER_VOLUME_UNIT_CD': 'ORDER_VOLUME_UNIT_DISPLAY', 'ORDERED_DOSE_UNIT_CD': 'ORDERED_DOSE_UNIT_DISPLAY', 'DOSE_QUANTITY_UNIT_CD': 'DOSE_QUANTITY_UNIT_DISPLAY', 'NORMALIZED_RATE_UNIT_CD': 'NORMALIZED_RATE_UNIT_DISPLAY', 'CONCENTRATION_UNIT_CD': 'CONCENTRATION_UNIT_DISPLAY'}
 
 def _ma_add_code_descriptions(frame: DataFrame, lookup: DataFrame) -> DataFrame:
     result = frame.withColumn('CODE_LOOKUP_ADC_UPDT', F.lit(None).cast('timestamp'))
@@ -1632,6 +2008,11 @@ def _ma_build_joined_source_rows(snapshots: Dict[str, DataFrame], event_keys: Op
     child_base = base.select('EVENT_ID', 'ORDER_ID', 'TEMPLATE_ORDER_ID').dropDuplicates(['EVENT_ID'])
     source_versions_json = json.dumps(source_versions, sort_keys=True)
     child_rows = _ma_build_ingredient_child_rows(child_base, ingredients, source_versions_json, run_id, run_timestamp)
+    # S4-C1a BEGIN
+    child_rows = _ma_s4_enrich_ingredient_child(child_rows, snapshots[config.medication_lookup_table])
+    child_rows = _ma_hash_columns(child_rows.drop('ROW_HASH'), schema_map_med_admin_ingredient, excluded=('ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM'))
+    child_rows = _ma_schema_select(child_rows, schema_map_med_admin_ingredient)
+    # S4-C1a END
     base = _ma_attach_representative_ingredient(base, ingredients)
     return (base, child_rows)
 
@@ -1847,6 +2228,13 @@ def _ma_finalize_target_rows(base: DataFrame, snapshots: Dict[str, DataFrame], t
     frame = base.withColumns({'ADMIN_START_DT_TM': start_timestamp, 'ADMIN_END_DT_TM': end_timestamp, 'ADMIN_START_DT_TM_SOURCE': start_source, 'ADMIN_END_DT_TM_SOURCE': end_source, 'ORDER_CKI': F.coalesce(_ma_nonblank(F.col('ORDERS_CKI')), _ma_nonblank(F.col('SYNONYM_CKI'))), 'ORDER_MNEMONIC': F.coalesce(_ma_nonblank(F.col('ORD_ORDER_MNEMONIC')), _ma_nonblank(F.col('SYNONYM_MNEMONIC')), _ma_nonblank(F.col('LOOKUP_HNA_ORDER_MNEMONIC')), _ma_nonblank(F.col('OI_ORDER_MNEMONIC')), _ma_nonblank(F.col('HNA_ORDER_MNEMONIC')), _ma_nonblank(F.col('ORDERED_AS_MNEMONIC'))), 'ORDER_DETAIL': F.coalesce(_ma_nonblank(F.col('OI_ORDER_DETAIL_DISPLAY_LINE')), _ma_nonblank(F.col('ORDER_DETAIL_DISPLAY_LINE')), _ma_nonblank(F.col('CLINICAL_DISPLAY_LINE'))), 'ORDER_STRENGTH': F.col('OI_STRENGTH'), 'ORDER_STRENGTH_UNIT_CD': F.col('OI_STRENGTH_UNIT_CD'), 'ORDER_VOLUME': F.col('OI_VOLUME'), 'ORDER_VOLUME_UNIT_CD': F.col('OI_VOLUME_UNIT_CD'), 'INITIAL_DOSAGE_UNIT_CD': F.col('ADMIN_DOSAGE_UNIT_CD'), 'ORGANIZATION_ID': F.coalesce(F.col('CE_ORGANIZATION_ID'), F.col('MAE_ORGANIZATION_ID'), F.col('MR_ORGANIZATION_ID'), F.col('ORD_ORGANIZATION_ID'), F.col('OI_ORGANIZATION_ID')), 'TRUST': F.coalesce(_ma_nonblank(F.col('CE_TRUST')), _ma_nonblank(F.col('MAE_TRUST')), _ma_nonblank(F.col('MR_TRUST')), _ma_nonblank(F.col('ORD_TRUST')), _ma_nonblank(F.col('OI_TRUST'))), 'SOURCE_ID_CONFLICT_IND': source_id_conflict, 'SOURCE_ORGANIZATION_CONFLICT_IND': organization_conflict, 'SOURCE_TRUST_CONFLICT_IND': trust_conflict, 'ADC_UPDT': F.greatest(F.col('CE_ADC_UPDT'), F.col('MAE_ADC_UPDT'), F.col('MR_ADC_UPDT'), F.col('ORDERS_ADC_UPDT'), F.col('OI_ADC_UPDT'), F.col('SYNONYM_ADC_UPDT'), F.col('LOOKUP_ADC_UPDT')), 'MAPPING_SCHEMA_VERSION': F.lit(config.mapping_version), 'SOURCE_VERSIONS_JSON': F.lit(json.dumps(source_versions, sort_keys=True)), 'PIPELINE_RUN_ID': F.lit(run_id), 'PIPELINE_UPDT_DT_TM': F.lit(run_timestamp).cast('timestamp')})
     code_lookup = _ma_persist(_ma_prepare_code_lookup(snapshots[config.code_value_table]))
     frame = _ma_add_code_descriptions(frame, code_lookup)
+    # S3-A11 BEGIN: stable RDE-facing description aliases
+    frame = frame.withColumns({
+        'DILUENT_TYPE_DESC': F.col('DILUENT_TYPE_DISPLAY'),
+        'MEDICATION_FORM_DESC': F.col('MEDICATION_FORM_DISPLAY'),
+        'IMMUNIZATION_TYPE_DESC': F.col('IMMUNIZATION_TYPE_DISPLAY'),
+    })
+    # S3-A11 END: stable RDE-facing description aliases
     frame = add_standardized_columns(frame, config=config)
     rxnconso = snapshots[config.rxnconso_table]
     rxnorm_description = _ma_preferred_rxnorm_description(rxnconso)
@@ -1904,6 +2292,21 @@ def _ma_aggregate_triggers(trigger_rows: DataFrame) -> DataFrame:
     return trigger_rows.groupBy('EVENT_ID').agg(F.concat_ws(',', F.sort_array(F.collect_set('_TRIGGER_SOURCE'))).alias('TRIGGER_SOURCES'))
 
 def _ma_changed_cdf(table_name: str, state: Dict[str, int], source_versions: Dict[str, int]) -> Optional[DataFrame]:
+    semantic_reference_keys = {
+        MAP_MED_ADMIN_CONFIG.order_synonym_table: ['SYNONYM_ID'],
+        MAP_MED_ADMIN_CONFIG.medication_lookup_table: ['SYNONYM_ID'],
+        MAP_MED_ADMIN_CONFIG.code_value_table: ['CODE_VALUE'],
+        MAP_MED_ADMIN_CONFIG.rxnconso_table: ['RXCUI', 'CODE'],
+        MAP_MED_ADMIN_CONFIG.concept_table: ['concept_id'],
+        MAP_MED_ADMIN_CONFIG.concept_relationship_table: ['concept_id_1', 'concept_id_2', 'relationship_id'],
+    }
+    if table_name in semantic_reference_keys:
+        return _m20_semantic_snapshot_keys(
+            table_name,
+            int(state[table_name]),
+            int(source_versions[table_name]),
+            semantic_reference_keys[table_name],
+        )
     return _ma_read_cdf(table_name, int(state[table_name]) + 1, int(source_versions[table_name]))
 
 def _ma_events_matching_any(target_frame: DataFrame, keys: DataFrame, pairs: Sequence[Tuple[str, str]]) -> DataFrame:
@@ -2044,15 +2447,10 @@ def _ma_merge_target(changes: DataFrame, config: MapMedAdminConfig) -> None:
             column_name: F.col(f's.{column_name}')
             for column_name in upserts.columns
         }
-        comparisons = ' OR '.join(
-            f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-            for column_name in upserts.columns
-            if column_name != 'EVENT_ID'
-        )
         target.alias('t').merge(
             upserts.alias('s'), 't.EVENT_ID = s.EVENT_ID'
         ).whenMatchedUpdate(
-            condition=comparisons or 'false',
+            condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
             set=assignments,
         ).whenNotMatchedInsert(values=assignments).execute()
 
@@ -2156,11 +2554,8 @@ def run_map_med_admin_post_deployment_checks(config: MapMedAdminConfig=MAP_MED_A
             ).cast('long')
         ).cast('long').alias('incorrect_exact_mg_rows'),
         F.sum(
-            (
-                F.col('OMOP_CONCEPT_ID').isNotNull()
-                & (F.col('OMOP_STANDARD_CONCEPT') != 'S')
-            ).cast('long')
-        ).cast('long').alias('omop_not_marked_standard'),
+            F.col('OMOP_STANDARD_CONCEPT_ID').isNotNull().cast('long')
+        ).cast('long').alias('validated_standard_omop_rows'),
         F.sum(
             F.coalesce(
                 F.col('OMOP_MAPPING_METHOD').contains('SIMPLIFIED'),
@@ -2186,16 +2581,16 @@ def run_map_med_admin_post_deployment_checks(config: MapMedAdminConfig=MAP_MED_A
         ).cast('long').alias('order_cki_is_multum_without_source_support'),
     ).first()
     metrics = {name: int(metrics_row[name] or 0) for name in metrics_row.asDict()}
-    invalid_omop = (
-        target.select('OMOP_CONCEPT_ID')
-        .where(F.col('OMOP_CONCEPT_ID').isNotNull())
-        .dropDuplicates(['OMOP_CONCEPT_ID'])
+    invalid_standard_omop = (
+        target.select('OMOP_STANDARD_CONCEPT_ID')
+        .where(F.col('OMOP_STANDARD_CONCEPT_ID').isNotNull())
+        .dropDuplicates(['OMOP_STANDARD_CONCEPT_ID'])
         .join(
             spark.table(config.concept_table).select(
-                F.col('concept_id').cast('long').alias('OMOP_CONCEPT_ID'),
+                F.col('concept_id').cast('long').alias('OMOP_STANDARD_CONCEPT_ID'),
                 'standard_concept', 'domain_id', 'invalid_reason',
             ),
-            'OMOP_CONCEPT_ID',
+            'OMOP_STANDARD_CONCEPT_ID',
             'left',
         )
         .where(
@@ -2206,7 +2601,9 @@ def run_map_med_admin_post_deployment_checks(config: MapMedAdminConfig=MAP_MED_A
         )
         .count()
     )
-    metrics['invalid_or_nonstandard_distinct_omop_ids'] = int(invalid_omop)
+    metrics['invalid_or_nonstandard_distinct_standard_omop_ids'] = int(
+        invalid_standard_omop
+    )
     if config.maintain_ingredient_child:
         child = spark.table(config.ingredient_target_table)
         metrics['duplicate_ingredient_identity_groups'] = int(
@@ -2217,9 +2614,9 @@ def run_map_med_admin_post_deployment_checks(config: MapMedAdminConfig=MAP_MED_A
         )
     failure_keys = {
         'null_event_ids', 'incorrect_exact_mg_rows',
-        'omop_not_marked_standard', 'simplified_mapping_rows',
+        'simplified_mapping_rows',
         'order_cki_is_multum_without_source_support',
-        'invalid_or_nonstandard_distinct_omop_ids',
+        'invalid_or_nonstandard_distinct_standard_omop_ids',
         'duplicate_ingredient_identity_groups',
     }
     failures = {
@@ -2315,6 +2712,15 @@ def _mp_sf(name, data_type, comment):
     return StructField(name, data_type, True, metadata={'comment': comment})
 schema_map_procedure_v2 = StructType([_mp_sf('PROCEDURE_ID', LongType(), 'Primary key from the source procedure table.'), _mp_sf('ENCNTR_ID', LongType(), 'Source encounter identifier.'), _mp_sf('PERSON_ID', LongType(), 'Current person identifier from the encounter source.'), _mp_sf('NOMENCLATURE_ID', LongType(), 'Source procedure nomenclature identifier.'), _mp_sf('ENCNTR_SLICE_ID', LongType(), 'Source encounter-slice identifier.'), _mp_sf('ORGANIZATION_ID', LongType(), 'Source organization associated with the procedure.'), _mp_sf('PARENT_ENTITY_ID', LongType(), 'Source parent-entity identifier.'), _mp_sf('PARENT_ENTITY_NAME', StringType(), 'Source parent-entity table name.'), _mp_sf('SVC_CAT_HIST_ID', LongType(), 'Source service-category history identifier.'), _mp_sf('UPDT_CNT', LongType(), 'Source update counter.'), _mp_sf('UPDT_DT_TM', TimestampType(), 'Source application update datetime.'), _mp_sf('UPDT_ID', LongType(), 'Personnel identifier responsible for the source update.'), _mp_sf('UPDT_TASK', LongType(), 'Source update task identifier.'), _mp_sf('UPDT_APPLCTX', LongType(), 'Source application-context identifier.'), _mp_sf('LAST_UTC_TS', TimestampType(), 'Source last UTC timestamp.'), _mp_sf('TXN_ID_TEXT', StringType(), 'Source transaction identifier text.'), _mp_sf('TRUST', StringType(), 'Source Trust retained for provenance and scope auditing.'), _mp_sf('ACTIVE_IND', LongType(), 'Source active indicator; inactive rows are retained.'), _mp_sf('ACTIVE_STATUS_CD', LongType(), 'Source active-status code.'), _mp_sf('active_status_desc', StringType(), 'Current code-value display for ACTIVE_STATUS_CD.'), _mp_sf('ACTIVE_STATUS_DT_TM', TimestampType(), 'Datetime the source active status was set.'), _mp_sf('ACTIVE_STATUS_PRSNL_ID', LongType(), 'Personnel identifier that set the active status.'), _mp_sf('BEG_EFFECTIVE_DT_TM', TimestampType(), 'Source row beginning-effective datetime.'), _mp_sf('END_EFFECTIVE_DT_TM', TimestampType(), 'Source row ending-effective datetime.'), _mp_sf('CONTRIBUTOR_SYSTEM_CD', LongType(), 'Source contributor-system code.'), _mp_sf('contributor_system_desc', StringType(), 'Current code-value display for CONTRIBUTOR_SYSTEM_CD.'), _mp_sf('CLINICAL_SERVICE_CD', LongType(), 'Source clinical-service code.'), _mp_sf('clinical_service_desc', StringType(), 'Current code-value display for CLINICAL_SERVICE_CD.'), _mp_sf('PROC_PRIORITY', LongType(), 'Source procedure priority.'), _mp_sf('PROC_FUNC_TYPE_CD', LongType(), 'Source procedure-function type code.'), _mp_sf('proc_func_type_desc', StringType(), 'Current code-value display for PROC_FUNC_TYPE_CD.'), _mp_sf('PROC_TYPE_FLAG', LongType(), 'Source procedure-type flag.'), _mp_sf('CATEGORY_CD', LongType(), 'Source procedure category code.'), _mp_sf('category_desc', StringType(), 'Current code-value display for CATEGORY_CD.'), _mp_sf('RANKING_CD', LongType(), 'Source procedure ranking code.'), _mp_sf('ranking_desc', StringType(), 'Current code-value display for RANKING_CD.'), _mp_sf('DGVP_IND', LongType(), 'Source dominant-group-variable procedure indicator.'), _mp_sf('SUPPRESS_NARRATIVE_IND', LongType(), 'Source narrative-suppression indicator.'), _mp_sf('PROC_DT_TM', TimestampType(), 'Unmodified source procedure datetime.'), _mp_sf('PROC_START_DT_TM', TimestampType(), 'Unmodified source procedure start datetime.'), _mp_sf('PROC_END_DT_TM', TimestampType(), 'Unmodified source procedure end datetime.'), _mp_sf('PROC_DT_TM_PREC_FLAG', LongType(), 'Source procedure datetime precision flag.'), _mp_sf('PROC_DT_TM_PREC_CD', LongType(), 'Source procedure datetime precision code.'), _mp_sf('proc_dt_tm_precision_desc', StringType(), 'Current code-value display for PROC_DT_TM_PREC_CD.'), _mp_sf('PROC_FT_DT_TM_IND', LongType(), 'Source free-text datetime indicator.'), _mp_sf('PROC_FT_TIME_FRAME', StringType(), 'Source free-text procedure timeframe.'), _mp_sf('PROCEDURE_DT_TM_EFFECTIVE', TimestampType(), 'Derived datetime from PROC_DT_TM, then start, then end; raw fields remain unchanged.'), _mp_sf('PROCEDURE_DT_TM_SOURCE', StringType(), 'Column used for PROCEDURE_DT_TM_EFFECTIVE.'), _mp_sf('PROC_DT_TM_MISSING_IND', BooleanType(), 'True when raw PROC_DT_TM is null; no row is filtered.'), _mp_sf('PROC_MINUTES', DoubleType(), 'Unmodified source procedure minutes, including zero.'), _mp_sf('PROC_MINUTES_SOURCE_ZERO_IND', BooleanType(), 'True when source PROC_MINUTES equals zero.'), _mp_sf('PROC_MINUTES_CALCULATED', DoubleType(), 'Duration calculated from valid start/end timestamps; does not replace source PROC_MINUTES.'), _mp_sf('ANESTHESIA_CD', LongType(), 'Source anesthesia code.'), _mp_sf('anesthesia_desc', StringType(), 'Current code-value display for ANESTHESIA_CD.'), _mp_sf('ANESTHESIA_MINUTES', DoubleType(), 'Unmodified source anesthesia minutes.'), _mp_sf('UNITS_OF_SERVICE', DoubleType(), 'Unmodified source units of service.'), _mp_sf('PROC_LOC_CD', LongType(), 'Source coded procedure location.'), _mp_sf('proc_location_desc', StringType(), 'Current code-value display for PROC_LOC_CD.'), _mp_sf('PROC_LOC_FT_IND', LongType(), 'Source free-text procedure-location indicator.'), _mp_sf('PROC_FT_LOC', StringType(), 'Source free-text procedure location.'), _mp_sf('LATERALITY_CD', LongType(), 'Source procedure laterality code.'), _mp_sf('laterality_desc', StringType(), 'Current code-value display for LATERALITY_CD.'), _mp_sf('TISSUE_TYPE_CD', LongType(), 'Source tissue-type code.'), _mp_sf('tissue_type_desc', StringType(), 'Current code-value display for TISSUE_TYPE_CD.'), _mp_sf('PROCEDURE_NOTE', StringType(), 'Unmodified source procedure note.'), _mp_sf('PROC_FTDESC', StringType(), 'Unmodified source free-text procedure description.'), _mp_sf('PROCEDURE_DISPLAY', StringType(), 'First nonblank value from nomenclature source string, PROC_FTDESC and PROCEDURE_NOTE.'), _mp_sf('PROCEDURE_DISPLAY_SOURCE', StringType(), 'Column used for PROCEDURE_DISPLAY.'), _mp_sf('COMMENT_IND', LongType(), 'Source indicator that procedure comment content exists.'), _mp_sf('LONG_TEXT_ID', LongType(), 'Source long-text identifier.'), _mp_sf('REFERENCE_NBR', StringType(), 'Source reference number; unique with contributor system where populated.'), _mp_sf('SEG_UNIQUE_KEY', StringType(), 'Source HL7 segment unique key.'), _mp_sf('CONSENT_CD', LongType(), 'Source consent code.'), _mp_sf('consent_desc', StringType(), 'Current code-value display for CONSENT_CD.'), _mp_sf('GENERIC_VAL_CD', LongType(), 'Source generic-value code.'), _mp_sf('generic_value_desc', StringType(), 'Current code-value display for GENERIC_VAL_CD.'), _mp_sf('DIAG_NOMENCLATURE_ID', LongType(), 'Source diagnosis nomenclature identifier.'), _mp_sf('MOD_NOMENCLATURE_ID', LongType(), 'Source modifier nomenclature identifier.'), _mp_sf('SOURCE_IDENTIFIER', StringType(), 'Current nomenclature source-vocabulary identifier.'), _mp_sf('SOURCE_STRING', StringType(), 'Current nomenclature source string.'), _mp_sf('SOURCE_VOCABULARY_CD', LongType(), 'Current nomenclature source-vocabulary code.'), _mp_sf('source_vocabulary_desc', StringType(), 'Current code-value display for SOURCE_VOCABULARY_CD.'), _mp_sf('VOCAB_AXIS_CD', LongType(), 'Current nomenclature vocabulary-axis code.'), _mp_sf('vocab_axis_desc', StringType(), 'Current code-value display for VOCAB_AXIS_CD.'), _mp_sf('CONCEPT_CKI', StringType(), 'Complete current nomenclature concept CKI.'), _mp_sf('CONCEPT_CKI_SOURCE', StringType(), 'Source component before the first exclamation mark in CONCEPT_CKI.'), _mp_sf('CONCEPT_CKI_IDENTIFIER', StringType(), 'Identifier component after the final exclamation mark in CONCEPT_CKI.'), _mp_sf('FOUND_CUI', StringType(), 'CUI found during nomenclature mapping.'), _mp_sf('NOMENCLATURE_IS_ACTIVE', BooleanType(), 'Current nomenclature active indicator; inactive mappings are retained.'), _mp_sf('NOMENCLATURE_SOURCE_CHANGE_TS', TimestampType(), 'True source-change timestamp from nomenclature.'), _mp_sf('NOMENCLATURE_MAPPING_HASH', StringType(), 'Stable hash of current nomenclature mapping content.'), _mp_sf('ENCOUNTER_MATCHED_IND', BooleanType(), 'True when ENCNTR_ID resolved in the encounter projection.'), _mp_sf('NOMENCLATURE_MATCHED_IND', BooleanType(), 'True when NOMENCLATURE_ID resolved in nomenclature.'), _mp_sf('OMOP_CONCEPT_ID', LongType(), 'Current mapped OMOP concept identifier.'), _mp_sf('OMOP_CONCEPT_NAME', StringType(), 'Current mapped OMOP concept name.'), _mp_sf('OMOP_STANDARD_CONCEPT', StringType(), 'Current OMOP standard-concept flag.'), _mp_sf('OMOP_MATCH_NUMBER', LongType(), 'Number of OMOP mapping matches.'), _mp_sf('OMOP_SIMILARITY', DoubleType(), 'Source-to-OMOP similarity score.'), _mp_sf('OMOP_CONCEPT_DOMAIN', StringType(), 'Current OMOP concept domain.'), _mp_sf('OMOP_CONCEPT_CLASS', StringType(), 'Current OMOP concept class.'), _mp_sf('SNOMED_CODE', LongType(), 'Current mapped SNOMED code.'), _mp_sf('SNOMED_TYPE', StringType(), 'Current SNOMED mapping method.'), _mp_sf('SNOMED_MATCH_NUMBER', LongType(), 'Number of SNOMED mapping matches.'), _mp_sf('SNOMED_SIMILARITY', DoubleType(), 'Source-to-SNOMED similarity score.'), _mp_sf('SNOMED_TERM', StringType(), 'Current mapped SNOMED term.'), _mp_sf('ICD10_CODE', StringType(), 'Current mapped ICD-10 code.'), _mp_sf('ICD10_TYPE', StringType(), 'Current ICD-10 mapping method.'), _mp_sf('ICD10_MATCH_NUMBER', LongType(), 'Number of ICD-10 mapping matches.'), _mp_sf('ICD10_SIMILARITY', DoubleType(), 'Source-to-ICD-10 similarity score.'), _mp_sf('ICD10_TERM', StringType(), 'Current mapped ICD-10 term.'), _mp_sf('OPCS4_CODE', StringType(), 'Current mapped OPCS-4 code.'), _mp_sf('OPCS4_TYPE', StringType(), 'Current OPCS-4 mapping method.'), _mp_sf('OPCS4_MATCH_NUMBER', LongType(), 'Number of OPCS-4 mapping matches.'), _mp_sf('OPCS4_SIMILARITY', DoubleType(), 'Source-to-OPCS-4 similarity score.'), _mp_sf('OPCS4_TERM', StringType(), 'Current mapped OPCS-4 term.'), _mp_sf('SIMILARITY_SOURCE_SNOMED', DoubleType(), 'Similarity between source string and SNOMED term.'), _mp_sf('SIMILARITY_SOURCE_ICD10', DoubleType(), 'Similarity between source string and ICD-10 term.'), _mp_sf('SIMILARITY_SOURCE_OPCS4', DoubleType(), 'Similarity between source string and OPCS-4 term.'), _mp_sf('SIMILARITY_SOURCE_OMOP', DoubleType(), 'Similarity between source string and OMOP term.'), _mp_sf('SIMILARITY_SNOMED_ICD10', DoubleType(), 'Similarity between SNOMED and ICD-10 terms.'), _mp_sf('SIMILARITY_SNOMED_OPCS4', DoubleType(), 'Similarity between SNOMED and OPCS-4 terms.'), _mp_sf('SIMILARITY_SNOMED_OMOP', DoubleType(), 'Similarity between SNOMED and OMOP terms.'), _mp_sf('SIMILARITY_ICD10_OMOP', DoubleType(), 'Similarity between ICD-10 and OMOP terms.'), _mp_sf('SIMILARITY_OPCS4_OMOP', DoubleType(), 'Similarity between OPCS-4 and OMOP terms.'), _mp_sf('CODE_VALUE_LOOKUP_HASH', StringType(), 'Stable hash of code-value descriptions used by the row.'), _mp_sf('PROCEDURE_ADC_UPDT', TimestampType(), 'ADC_UPDT from the procedure source only.'), _mp_sf('NOMENCLATURE_ADC_UPDT', TimestampType(), 'ADC_UPDT from the nomenclature source only.'), _mp_sf('ENCOUNTER_ADC_UPDT', TimestampType(), 'ADC_UPDT from the encounter projection only.'), _mp_sf('CODE_VALUE_ADC_UPDT', TimestampType(), 'Greatest ADC_UPDT among code-value rows used by the row.'), _mp_sf('MAP_REFRESH_DT_TM', TimestampType(), 'Datetime this mapped row last materially changed.'), _mp_sf('MAP_ROW_HASH', StringType(), 'Stable content hash used to avoid rewriting unchanged rows.'), _mp_sf('ADC_UPDT', TimestampType(), 'Compatibility composite source update timestamp; never use as a CDF checkpoint.')])
 schema_map_procedure = schema_map_procedure_v2
+# S4-C1b BEGIN
+schema_map_procedure_v2 = StructType(list(schema_map_procedure_v2.fields) + [
+    _mp_sf('OMOP_STANDARD_CONCEPT_ID', LongType(), 'Standard OMOP concept via exactly-one Maps-to, or the source concept when already standard.'),
+    _mp_sf('OMOP_STANDARD_CONCEPT_NAME', StringType(), 'Name of OMOP_STANDARD_CONCEPT_ID.'),
+    _mp_sf('OMOP_STANDARD_CANDIDATE_COUNT', LongType(), 'Distinct valid standard Maps-to targets; values greater than one are deliberately unresolved.'),
+    _mp_sf('OMOP_STANDARD_MAPPING_METHOD', StringType(), 'ALREADY_STANDARD | MAPS_TO_EXACT | MAPS_TO_MULTI | NO_STANDARD_MAP; NULL when OMOP_CONCEPT_ID is NULL.'),
+])
+schema_map_procedure = schema_map_procedure_v2
+# S4-C1b END
 
 def _mp_sql_name(table_name: str) -> str:
     quote = chr(96)
@@ -2506,6 +2912,10 @@ def _mp_current_nomenclature_projection() -> DataFrame:
     return selected.withColumn('NOMENCLATURE_MAPPING_HASH', _mp_stable_hash(hash_columns))
 _MP_CODE_SPECS = [('p', 'ACTIVE_STATUS_CD', 'active_status', 'active_status_desc'), ('p', 'CONTRIBUTOR_SYSTEM_CD', 'contributor_system', 'contributor_system_desc'), ('p', 'CLINICAL_SERVICE_CD', 'clinical_service', 'clinical_service_desc'), ('p', 'PROC_FUNC_TYPE_CD', 'proc_func_type', 'proc_func_type_desc'), ('p', 'CATEGORY_CD', 'category', 'category_desc'), ('p', 'RANKING_CD', 'ranking', 'ranking_desc'), ('p', 'PROC_DT_TM_PREC_CD', 'proc_dt_tm_precision', 'proc_dt_tm_precision_desc'), ('p', 'ANESTHESIA_CD', 'anesthesia', 'anesthesia_desc'), ('p', 'PROC_LOC_CD', 'proc_location', 'proc_location_desc'), ('p', 'LATERALITY_CD', 'laterality', 'laterality_desc'), ('p', 'TISSUE_TYPE_CD', 'tissue_type', 'tissue_type_desc'), ('p', 'CONSENT_CD', 'consent', 'consent_desc'), ('p', 'GENERIC_VAL_CD', 'generic_value', 'generic_value_desc'), ('n', 'SOURCE_VOCABULARY_CD', 'source_vocabulary', 'source_vocabulary_desc'), ('n', 'VOCAB_AXIS_CD', 'vocab_axis', 'vocab_axis_desc')]
 _MP_CODE_COLUMNS = [spec[1] for spec in _MP_CODE_SPECS if spec[0] == 'p'] + ['SOURCE_VOCABULARY_CD', 'VOCAB_AXIS_CD']
+# S4-C1b BEGIN
+def _mp_s4_standard_resolution(frame: DataFrame) -> DataFrame:
+    return _s4_c1b_diagnosis_standard_resolution(frame)
+# S4-C1b END
 
 def _mp_build_map_rows(procedure_rows: DataFrame) -> DataFrame:
     encounter = _mp_current_encounter_projection().alias('e')
@@ -2531,6 +2941,9 @@ def _mp_build_map_rows(procedure_rows: DataFrame) -> DataFrame:
     description_columns = [spec[3] for spec in _MP_CODE_SPECS]
     selected = selected.withColumn('CODE_VALUE_LOOKUP_HASH', _mp_stable_hash(description_columns))
     selected = selected.withColumn('ADC_UPDT', F.greatest(F.col('PROCEDURE_ADC_UPDT'), F.col('NOMENCLATURE_SOURCE_CHANGE_TS'), F.col('NOMENCLATURE_ADC_UPDT'), F.col('ENCOUNTER_ADC_UPDT'), F.col('CODE_VALUE_ADC_UPDT')))
+    # S4-C1b BEGIN
+    selected = _mp_s4_standard_resolution(selected)
+    # S4-C1b END
     row_hash_exclusions = {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'ENCOUNTER_ADC_UPDT', 'CODE_VALUE_ADC_UPDT'}
     row_hash_columns = [field.name for field in schema_map_procedure_v2.fields if field.name not in row_hash_exclusions]
     selected = selected.withColumn('MAP_ROW_HASH', _mp_stable_hash(row_hash_columns)).withColumn('MAP_REFRESH_DT_TM', F.current_timestamp())
@@ -2557,19 +2970,89 @@ def _mp_target_ids_for_encounter_ids(encounter_ids: DataFrame) -> DataFrame:
     return targets.join(current, 'ENCNTR_ID', 'left').filter(~F.col('_target_person_id').eqNullSafe(F.col('_current_person_id'))).select('PROCEDURE_ID').dropDuplicates(['PROCEDURE_ID'])
 
 def _mp_target_ids_for_code_values(code_values: DataFrame) -> DataFrame:
+    """Return procedures whose *published* code descriptions may have changed.
+
+    The curated target intentionally omits several raw code columns. The previous
+    implementation nevertheless referenced every raw code directly on the target,
+    so a CODE_VALUE change failed analysis on ACTIVE_STATUS_CD before any refresh.
+    Resolve procedure-owned codes from the pinned raw procedure snapshot and use
+    the target only for published nomenclature-owned codes.
+    """
     if _mp_is_empty(code_values):
         return _mp_empty_procedure_ids()
-    sample = code_values.select('CODE_VALUE').limit(1001).collect()
+
     target = spark.table(MAP_PROCEDURE_TARGET)
-    if len(sample) <= 1000:
-        values = [int(row['CODE_VALUE']) for row in sample if row['CODE_VALUE'] is not None]
-        if not values:
+    target_columns = set(target.columns)
+    published_specs = [
+        spec for spec in _MP_CODE_SPECS if spec[3] in target_columns
+    ]
+    procedure_code_columns = [
+        code_column
+        for source_alias, code_column, _, _ in published_specs
+        if source_alias == 'p'
+    ]
+    nomenclature_code_columns = [
+        code_column
+        for source_alias, code_column, _, _ in published_specs
+        if source_alias == 'n' and code_column in target_columns
+    ]
+    changed_codes = (
+        code_values.select(F.col('CODE_VALUE').cast('long').alias('CODE_VALUE'))
+        .where(F.col('CODE_VALUE').isNotNull())
+        .dropDuplicates(['CODE_VALUE'])
+    )
+    sample = changed_codes.limit(1001).collect()
+    if not sample:
+        return _mp_empty_procedure_ids()
+
+    def affected_ids(frame: DataFrame, code_columns) -> DataFrame:
+        if not code_columns:
             return _mp_empty_procedure_ids()
-        conditions = [F.col(column_name).isin(values) for column_name in _MP_CODE_COLUMNS]
-        condition = reduce(lambda left, right: left | right, conditions)
-        return target.filter(condition).select('PROCEDURE_ID').dropDuplicates(['PROCEDURE_ID'])
-    long_codes = target.select('PROCEDURE_ID', F.explode(F.array(*[F.col(name) for name in _MP_CODE_COLUMNS])).alias('CODE_VALUE')).filter(F.col('CODE_VALUE').isNotNull())
-    return long_codes.join(F.broadcast(code_values), 'CODE_VALUE', 'left_semi').select('PROCEDURE_ID').dropDuplicates(['PROCEDURE_ID'])
+        if len(sample) <= 1000:
+            values = [int(row['CODE_VALUE']) for row in sample]
+            condition = reduce(
+                lambda left, right: left | right,
+                [F.col(name).cast('long').isin(values) for name in code_columns],
+            )
+            return (
+                frame.filter(condition)
+                .select('PROCEDURE_ID')
+                .dropDuplicates(['PROCEDURE_ID'])
+            )
+        long_codes = (
+            frame.select(
+                'PROCEDURE_ID',
+                F.explode(
+                    F.array(*[F.col(name).cast('long') for name in code_columns])
+                ).alias('CODE_VALUE'),
+            )
+            .where(F.col('CODE_VALUE').isNotNull())
+        )
+        return (
+            long_codes.join(F.broadcast(changed_codes), 'CODE_VALUE', 'left_semi')
+            .select('PROCEDURE_ID')
+            .dropDuplicates(['PROCEDURE_ID'])
+        )
+
+    frames = []
+    if procedure_code_columns:
+        procedure_source = _mp_current_procedure_snapshot().select(
+            'PROCEDURE_ID', *procedure_code_columns
+        )
+        frames.append(affected_ids(procedure_source, procedure_code_columns))
+    if nomenclature_code_columns:
+        frames.append(
+            affected_ids(
+                target.select('PROCEDURE_ID', *nomenclature_code_columns),
+                nomenclature_code_columns,
+            )
+        )
+    if not frames:
+        return _mp_empty_procedure_ids()
+    return reduce(
+        lambda left, right: left.unionByName(right),
+        frames,
+    ).dropDuplicates(['PROCEDURE_ID'])
 
 def _mp_requires_full_refresh(checkpoints: Dict[str, int], end_versions: Dict[str, int]) -> bool:
     if not spark.catalog.tableExists(MAP_PROCEDURE_TARGET):
@@ -2621,9 +3104,9 @@ def _mp_prepare_full_refresh(end_versions: Dict[str, int], run_id: str, minimum_
 
 def _mp_prepare_incremental_refresh(checkpoints: Dict[str, int], end_versions: Dict[str, int], run_id: str) -> Dict:
     changed_procedures = _mp_cdf_changed_keys(MAP_PROCEDURE_SOURCE, 'PROCEDURE_ID', 'PROCEDURE_ID', checkpoints[MAP_PROCEDURE_SOURCE] + 1, end_versions['procedure'])
-    changed_nomenclature = _mp_cdf_changed_keys(MAP_PROCEDURE_NOMENCLATURE, 'NOMENCLATURE_ID', 'NOMENCLATURE_ID', checkpoints[MAP_PROCEDURE_NOMENCLATURE] + 1, end_versions['nomenclature'])
+    changed_nomenclature = _m20_semantic_snapshot_keys(MAP_PROCEDURE_NOMENCLATURE, checkpoints[MAP_PROCEDURE_NOMENCLATURE], end_versions['nomenclature'], ['NOMENCLATURE_ID'])
     changed_encounters = _mp_cdf_changed_keys(MAP_PROCEDURE_ENCOUNTER, 'ENCNTR_ID', 'ENCNTR_ID', checkpoints[MAP_PROCEDURE_ENCOUNTER] + 1, end_versions['encounter'])
-    changed_code_values = _mp_cdf_changed_keys(MAP_PROCEDURE_CODE_VALUE, 'CODE_VALUE', 'CODE_VALUE', checkpoints[MAP_PROCEDURE_CODE_VALUE] + 1, end_versions['code_value'])
+    changed_code_values = _m20_semantic_snapshot_keys(MAP_PROCEDURE_CODE_VALUE, checkpoints[MAP_PROCEDURE_CODE_VALUE], end_versions['code_value'], ['CODE_VALUE'], ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'])
     materially_changed_nomenclature = _mp_materially_changed_nomenclature_ids(changed_nomenclature)
     nomenclature_procedures = _mp_target_ids_for_nomenclature_ids(materially_changed_nomenclature)
     encounter_procedures = _mp_target_ids_for_encounter_ids(changed_encounters)
@@ -2681,16 +3164,11 @@ def _mp_merge_target(rows: DataFrame) -> None:
         for name in target_columns
         if name != 'PROCEDURE_ID'
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{name}` <=> s.`{name}`)'
-        for name in target_columns
-        if name != 'PROCEDURE_ID'
-    )
     DeltaTable.forName(spark, MAP_PROCEDURE_TARGET).alias('t').merge(
         rows.alias('s'),
         't.PROCEDURE_ID <=> s.PROCEDURE_ID',
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.MAP_ROW_HASH <=> s.MAP_ROW_HASH)',
         set=update_values,
     ).whenNotMatchedInsert(values=insert_values).execute()
 
@@ -3149,10 +3627,19 @@ def _md_clinical_event_cdf_triggers(config: MapDeathConfig, previous_version: in
     return cdf.select(F.col('PERSON_ID').cast('long').alias('PERSON_ID'), F.col('_commit_version').cast('long').alias('_COMMIT_VERSION'), F.col('_commit_timestamp').cast('timestamp').alias('_COMMIT_TIMESTAMP')).filter(F.col('PERSON_ID').isNotNull()).groupBy('PERSON_ID').agg(F.max('_COMMIT_VERSION').alias('CLINICAL_EVENT_CDF_COMMIT_VERSION'), F.max('_COMMIT_TIMESTAMP').alias('CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP')).select('PERSON_ID', F.lit('CLINICAL_EVENT').alias('TRIGGER_SOURCE'), F.lit(None).cast('long').alias('PERSON_CDF_COMMIT_VERSION'), F.lit(None).cast('timestamp').alias('PERSON_CDF_COMMIT_TIMESTAMP'), 'CLINICAL_EVENT_CDF_COMMIT_VERSION', 'CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP')
 
 def _md_changed_code_values(config: MapDeathConfig, previous_version: int, current_version: int) -> DataFrame:
-    cdf = _md_read_cdf(config.code_value_table, previous_version + 1, current_version)
-    if cdf is None:
-        return spark.createDataFrame([], 'CODE_VALUE_LONG long, CODE_CDF_COMMIT_VERSION long, CODE_CDF_COMMIT_TIMESTAMP timestamp')
-    return cdf.select(_md_checked_double_long(F.col('CODE_VALUE'), 'CODE_VALUE CDF.CODE_VALUE', required=True).alias('CODE_VALUE_LONG'), F.col('_commit_version').cast('long').alias('_COMMIT_VERSION'), F.col('_commit_timestamp').cast('timestamp').alias('_COMMIT_TIMESTAMP')).groupBy('CODE_VALUE_LONG').agg(F.max('_COMMIT_VERSION').alias('CODE_CDF_COMMIT_VERSION'), F.max('_COMMIT_TIMESTAMP').alias('CODE_CDF_COMMIT_TIMESTAMP'))
+    keys = _m20_semantic_snapshot_keys(
+        config.code_value_table,
+        previous_version,
+        current_version,
+        ['CODE_VALUE'],
+        ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'],
+    )
+    return keys.select(
+        _md_checked_double_long(F.col('CODE_VALUE'), 'CODE_VALUE.CODE_VALUE', required=True).alias('CODE_VALUE_LONG'),
+        F.lit(int(current_version)).cast('long').alias('CODE_CDF_COMMIT_VERSION'),
+        F.current_timestamp().alias('CODE_CDF_COMMIT_TIMESTAMP'),
+    )
+
 
 def _md_scope_direct_triggers(direct_triggers: DataFrame, person_snapshot: DataFrame, existing_target_ids: DataFrame, config: MapDeathConfig) -> DataFrame:
     direct_ids = direct_triggers.select('PERSON_ID').dropDuplicates()
@@ -3206,7 +3693,7 @@ def _md_build_death_rows(config: MapDeathConfig, person_rows: DataFrame, clinica
     lookup_adc_updt = F.greatest(*lookup_update_columns)
     effective_adc_updt = F.greatest(F.col('PERSON_ADC_UPDT'), F.col('PERSON_UPDT_DT_TM'), F.col('CLINICAL_EVENT_ADC_UPDT'), lookup_adc_updt)
     prepared = enriched.select(F.col('PERSON_ID'), F.col('DECEASED_DT_TM'), F.col('LAST_ENCNTR_DT_TM'), F.col('LAST_NON_ERROR_CE_CLINSIG_UPDT_DT_TM').alias('LAST_CE_DT_TM'), F.col('DECEASED_DT_TM').alias('CALC_DEATH_DATE'), F.col('DECEASED_SOURCE_CD'), _md_expected_description(F.col('DECEASED_SOURCE_CD'), F.col('DSOURCE_CODE_SET'), F.col('DSOURCE_DESC'), config.deceased_source_code_set).alias('DECEASED_SOURCE_DESC'), F.col('DECEASED_ID_METHOD_CD'), _md_expected_description(F.col('DECEASED_ID_METHOD_CD'), F.col('DMETHOD_CODE_SET'), F.col('DMETHOD_DESC'), config.deceased_method_code_set).alias('DECEASED_METHOD_DESC'), effective_adc_updt.alias('ADC_UPDT'), F.col('DECEASED_CD'), F.col('DSTATUS_DESC').alias('DECEASED_STATUS_DESC'), F.col('DSTATUS_CODE_SET').alias('DECEASED_STATUS_CODE_SET'), (F.col('DECEASED_CD') == F.lit(config.deceased_yes_code)).alias('IS_CURRENTLY_DECEASED'), F.col('ACTIVE_IND'), F.col('ACTIVE_STATUS_CD'), F.col('ACTIVE_DESC').alias('ACTIVE_STATUS_DESC'), F.col('END_EFFECTIVE_DT_TM'), F.col('PERSON_STATUS_CD'), F.col('PSTATUS_DESC').alias('PERSON_STATUS_DESC'), F.col('DECEASED_TZ'), F.col('DECEASED_DT_TM_PREC_FLAG'), _md_death_precision_description(F.col('DECEASED_DT_TM_PREC_FLAG')).alias('DECEASED_DT_TM_PREC_DESC'), F.col('LAST_CLINICAL_EVENT_DT_TM'), F.col('LAST_NON_ERROR_CLINICAL_EVENT_DT_TM'), F.col('LAST_CE_CLINSIG_UPDT_DT_TM'), F.col('LAST_NON_ERROR_CE_CLINSIG_UPDT_DT_TM'), last_known_activity.alias('LAST_KNOWN_ACTIVITY_DT_TM'), death_estimate.alias('DEATH_DATE_ESTIMATE_DT_TM'), death_estimate_source.alias('DEATH_DATE_ESTIMATE_SOURCE'), (F.col('DECEASED_DT_TM').isNull() & death_estimate.isNotNull()).alias('DEATH_DATE_ESTIMATE_IND'), F.col('DSOURCE_CODE_SET').alias('DECEASED_SOURCE_CODE_SET'), _md_expected_code_validity(F.col('DECEASED_SOURCE_CD'), F.col('DSOURCE_CODE_SET'), config.deceased_source_code_set).alias('DECEASED_SOURCE_CODE_VALID_IND'), F.col('DMETHOD_CODE_SET').alias('DECEASED_ID_METHOD_CODE_SET'), _md_expected_code_validity(F.col('DECEASED_ID_METHOD_CD'), F.col('DMETHOD_CODE_SET'), config.deceased_method_code_set).alias('DECEASED_ID_METHOD_CODE_VALID_IND'), F.col('DECEASED_NOTIFY_SOURCE_CD'), F.col('DNOTIFY_DESC').alias('DECEASED_NOTIFY_SOURCE_DESC'), F.col('DNOTIFY_CODE_SET').alias('DECEASED_NOTIFY_SOURCE_CODE_SET'), F.col('CAUSE_OF_DEATH'), F.col('CAUSE_OF_DEATH_CD'), F.col('CAUSE_DESC').alias('CAUSE_OF_DEATH_DESC'), F.col('CAUSE_CODE_SET').alias('CAUSE_OF_DEATH_CODE_SET'), F.col('AUTOPSY_CD'), F.col('AUTOPSY_DESC'), F.col('AUTOPSY_CODE_SET'), F.col('AGE_AT_DEATH'), F.col('AGE_AT_DEATH_UNIT_CD'), F.col('AGEUNIT_DESC').alias('AGE_AT_DEATH_UNIT_DESC'), F.col('AGEUNIT_CODE_SET').alias('AGE_AT_DEATH_UNIT_CODE_SET'), F.col('AGE_AT_DEATH_PREC_MOD_FLAG'), _md_age_precision_description(F.col('AGE_AT_DEATH_PREC_MOD_FLAG')).alias('AGE_AT_DEATH_PREC_MOD_DESC'), F.col('CONTRIBUTOR_SYSTEM_CD'), F.col('CONTRIB_DESC').alias('CONTRIBUTOR_SYSTEM_DESC'), F.col('CONTRIB_CODE_SET').alias('CONTRIBUTOR_SYSTEM_CODE_SET'), F.col('INST_ID'), F.col('LOGICAL_DOMAIN_ID'), F.col('PERSON_UPDT_DT_TM'), F.col('PERSON_UPDT_CNT'), F.col('PERSON_LAST_UTC_TS'), F.col('PERSON_ADC_UPDT'), F.col('CLINICAL_EVENT_ADC_UPDT'), lookup_adc_updt.alias('LOOKUP_ADC_UPDT'), F.coalesce(F.col('CLINICAL_EVENT_COUNT'), F.lit(0).cast('long')).alias('CLINICAL_EVENT_COUNT'), F.coalesce(F.col('CLINICAL_EVENT_IN_ERROR_COUNT'), F.lit(0).cast('long')).alias('CLINICAL_EVENT_IN_ERROR_COUNT'), F.coalesce(F.col('CLINICAL_EVENT_NULL_RESULT_STATUS_COUNT'), F.lit(0).cast('long')).alias('CLINICAL_EVENT_NULL_RESULT_STATUS_COUNT'), F.col('PERSON_CDF_COMMIT_VERSION'), F.col('PERSON_CDF_COMMIT_TIMESTAMP'), F.col('CLINICAL_EVENT_CDF_COMMIT_VERSION'), F.col('CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP'), F.coalesce(F.col('TRIGGER_SOURCES'), F.lit('UNKNOWN')).alias('TRIGGER_SOURCES'), F.lit(source_versions[config.person_table]).cast('long').alias('PERSON_SOURCE_VERSION'), F.lit(source_versions[config.clinical_event_table]).cast('long').alias('CLINICAL_EVENT_SOURCE_VERSION'), F.lit(source_versions[config.code_value_table]).cast('long').alias('CODE_VALUE_SOURCE_VERSION'), F.lit(run_id).alias('PIPELINE_RUN_ID'), F.lit(run_timestamp).cast('timestamp').alias('PIPELINE_UPDT_DT_TM'))
-    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'PERSON_CDF_COMMIT_VERSION', 'PERSON_CDF_COMMIT_TIMESTAMP', 'CLINICAL_EVENT_CDF_COMMIT_VERSION', 'CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP', 'PERSON_SOURCE_VERSION', 'CLINICAL_EVENT_SOURCE_VERSION', 'CODE_VALUE_SOURCE_VERSION'}
+    hash_exclusions = {'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'TRIGGER_SOURCES', 'PERSON_CDF_COMMIT_VERSION', 'PERSON_CDF_COMMIT_TIMESTAMP', 'CLINICAL_EVENT_CDF_COMMIT_VERSION', 'CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP', 'PERSON_SOURCE_VERSION', 'CLINICAL_EVENT_SOURCE_VERSION', 'CODE_VALUE_SOURCE_VERSION', 'ADC_UPDT', 'PERSON_ADC_UPDT', 'CLINICAL_EVENT_ADC_UPDT', 'LOOKUP_ADC_UPDT', 'LAST_CE_DT_TM', 'LAST_CE_CLINSIG_UPDT_DT_TM', 'LAST_NON_ERROR_CE_CLINSIG_UPDT_DT_TM'}
     hash_columns = [F.col(field.name) for field in schema_map_death.fields if field.name not in hash_exclusions and field.name != 'ROW_HASH']
     with_hash = prepared.withColumn('ROW_HASH', _md_stable_hash(hash_columns))
     return _md_align_to_schema(with_hash, schema_map_death)
@@ -3214,14 +3701,34 @@ def _md_build_death_rows(config: MapDeathConfig, person_rows: DataFrame, clinica
 def _md_full_rebuild_trigger_metadata(person_rows: DataFrame) -> DataFrame:
     return person_rows.select('PERSON_ID', F.lit('FULL_REBUILD').alias('TRIGGER_SOURCES'), F.lit(None).cast('long').alias('PERSON_CDF_COMMIT_VERSION'), F.lit(None).cast('timestamp').alias('PERSON_CDF_COMMIT_TIMESTAMP'), F.lit(None).cast('long').alias('CLINICAL_EVENT_CDF_COMMIT_VERSION'), F.lit(None).cast('timestamp').alias('CLINICAL_EVENT_CDF_COMMIT_TIMESTAMP'))
 
-def _md_validate_output_dataframe(df: DataFrame, expected_rows: Optional[int]=None) -> Dict[str, int]:
-    summary = df.agg(F.count(F.lit(1)).cast('long').alias('row_count'), F.countDistinct('PERSON_ID').cast('long').alias('distinct_person_ids'), F.sum(F.when(F.col('PERSON_ID').isNull(), F.lit(1)).otherwise(F.lit(0))).cast('long').alias('null_person_ids'), F.sum(F.when(~F.coalesce(F.col('IS_CURRENTLY_DECEASED'), F.lit(False)), F.lit(1)).otherwise(F.lit(0))).cast('long').alias('not_currently_deceased_rows'), F.sum(F.when(F.col('ROW_HASH').isNull(), F.lit(1)).otherwise(F.lit(0))).cast('long').alias('null_row_hashes')).first().asDict()
+def _md_validate_output_dataframe(df: DataFrame, expected_rows: Optional[int]=None, require_current_flag: bool=True) -> Dict[str, int]:
+    aggregates = [
+        F.count(F.lit(1)).cast('long').alias('row_count'),
+        F.countDistinct('PERSON_ID').cast('long').alias('distinct_person_ids'),
+        F.sum(F.when(F.col('PERSON_ID').isNull(), F.lit(1)).otherwise(F.lit(0))).cast('long').alias('null_person_ids'),
+        F.sum(F.when(F.col('ROW_HASH').isNull(), F.lit(1)).otherwise(F.lit(0))).cast('long').alias('null_row_hashes'),
+    ]
+    if 'IS_CURRENTLY_DECEASED' in df.columns:
+        aggregates.append(
+            F.sum(
+                F.when(
+                    ~F.coalesce(F.col('IS_CURRENTLY_DECEASED'), F.lit(False)),
+                    F.lit(1),
+                ).otherwise(F.lit(0))
+            ).cast('long').alias('not_currently_deceased_rows')
+        )
+    elif require_current_flag:
+        raise RuntimeError(
+            'map_death semantic validation requires IS_CURRENTLY_DECEASED before '
+            'the retained-column contract is projected'
+        )
+    summary = df.agg(*aggregates).first().asDict()
     metrics = {key: int(value or 0) for key, value in summary.items()}
     if metrics['row_count'] != metrics['distinct_person_ids']:
         raise RuntimeError(f"map_death output contains duplicate PERSON_ID rows: {metrics['row_count']} rows versus {metrics['distinct_person_ids']} distinct IDs")
     if metrics['null_person_ids'] != 0:
         raise RuntimeError('map_death output contains null PERSON_ID values')
-    if metrics['not_currently_deceased_rows'] != 0:
+    if require_current_flag and metrics.get('not_currently_deceased_rows', 0) != 0:
         raise RuntimeError('map_death output contains people not currently marked deceased')
     if metrics['null_row_hashes'] != 0:
         raise RuntimeError('map_death output contains null ROW_HASH values')
@@ -3230,21 +3737,53 @@ def _md_validate_output_dataframe(df: DataFrame, expected_rows: Optional[int]=No
     return metrics
 
 def _md_safe_overwrite_target(config: MapDeathConfig, rows: DataFrame, run_id: str, expected_rows: int, safe_rebuild: bool) -> Dict[str, int]:
-    rows = bronze_project_contract(rows, config.target_table)
     staging_table = f"{config.target_table.rsplit('.', 1)[0]}.__map_death_rebuild_{run_id.replace('-', '_')}"
     if safe_rebuild:
         try:
+            # Keep the full semantic schema in the private staging table. The
+            # production compatibility projection deliberately omits newer
+            # columns such as IS_CURRENTLY_DECEASED, so semantic validation must
+            # happen before bronze_project_contract().
             rows.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(staging_table)
-            staging_metrics = _md_validate_output_dataframe(spark.table(staging_table), expected_rows=expected_rows)
-            spark.table(staging_table).write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(config.target_table)
+            staged_rows = spark.table(staging_table)
+            staging_metrics = _md_validate_output_dataframe(
+                staged_rows,
+                expected_rows=expected_rows,
+                require_current_flag=True,
+            )
+            published_rows = bronze_project_contract(staged_rows, config.target_table)
+            projected_metrics = _md_validate_output_dataframe(
+                published_rows,
+                expected_rows=expected_rows,
+                require_current_flag=False,
+            )
+            published_rows.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(config.target_table)
         finally:
             spark.sql(f'DROP TABLE IF EXISTS {_md_sql_identifier(staging_table)}')
     else:
-        rows.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(config.target_table)
-        staging_metrics = _md_validate_output_dataframe(spark.table(config.target_table), expected_rows=expected_rows)
+        staging_metrics = _md_validate_output_dataframe(
+            rows,
+            expected_rows=expected_rows,
+            require_current_flag=True,
+        )
+        published_rows = bronze_project_contract(rows, config.target_table)
+        projected_metrics = _md_validate_output_dataframe(
+            published_rows,
+            expected_rows=expected_rows,
+            require_current_flag=False,
+        )
+        published_rows.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(config.target_table)
     _md_apply_target_metadata(config)
-    final_metrics = _md_validate_output_dataframe(spark.table(config.target_table), expected_rows=expected_rows)
-    return {**{f'staging_{key}': value for key, value in staging_metrics.items()}, **{f'target_{key}': value for key, value in final_metrics.items()}}
+    final_metrics = _md_validate_output_dataframe(
+        spark.table(config.target_table),
+        expected_rows=expected_rows,
+        require_current_flag=False,
+    )
+    return {
+        **{f'staging_{key}': value for key, value in staging_metrics.items()},
+        **{f'projected_{key}': value for key, value in projected_metrics.items()},
+        **{f'target_{key}': value for key, value in final_metrics.items()},
+    }
 
 def _md_merge_current_deaths(config: MapDeathConfig, updates: DataFrame) -> Dict[str, int]:
     updates = bronze_project_contract(updates, config.target_table)
@@ -3255,16 +3794,11 @@ def _md_merge_current_deaths(config: MapDeathConfig, updates: DataFrame) -> Dict
         column_name: F.col(f's.{column_name}')
         for column_name in updates.columns
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-        for column_name in updates.columns
-        if column_name != 'PERSON_ID'
-    )
     DeltaTable.forName(spark, config.target_table).alias('t').merge(
         updates.alias('s'),
         't.PERSON_ID <=> s.PERSON_ID',
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
         set=assignments,
     ).whenNotMatchedInsert(values=assignments).execute()
     return {'upsert_source_rows': int(source_rows)}

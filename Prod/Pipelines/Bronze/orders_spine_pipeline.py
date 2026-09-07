@@ -5,7 +5,7 @@
 # never ACTIVITY_TYPE_CD=705. Display-line, action/review/verify, protocol/template,
 # and cost/billing families are named exclusions.
 
-# release: bronze_completeness_20260816_v1 — prod-idiom refactor; behavior-identical (NO_OP re-proof run 1008566672745369)
+# release: bronze_orders_bounded_gates_20260823_v1 — bounded operational validation; gate_mode=full retains explicit exhaustive gates
 import json
 
 # Prod-idiom target resolution (house pattern: jac_pipeline/endobase_pipeline).
@@ -34,6 +34,8 @@ SCHEMA = TARGET_SCHEMA
 CONTROL = CONTROL_SCHEMA
 MODE = _widget_text("mode", "prod" if TARGET_SCHEMA == "4_prod.bronze" else "dev")
 ACTION = _widget_text("action", "build").lower()
+GATE_MODE = _widget_text("gate_mode", "bounded").lower()
+assert GATE_MODE in ("bounded", "full"), GATE_MODE
 ORDERS_SOURCE = _widget_text("orders_source", "4_prod.raw.mill_orders")
 MED_SOURCE = _widget_text("med_source", "4_prod.bronze.map_medication_order")
 assert ACTION in ("pre_gates", "build", "gates")
@@ -267,7 +269,7 @@ BASE_COLS=["ORDER_ID","PERSON_ID","ENCNTR_ID","ACTIVITY_TYPE_CD","CATALOG_CD","C
            "DEPT_STATUS_CD","ACTIVE_IND","ORIG_ORDER_DT_TM","CURRENT_START_DT_TM","STATUS_DT_TM",
            "PROJECTED_STOP_DT_TM","DISCONTINUE_EFFECTIVE_DT_TM","SOURCE_ADC_UPDT"]
 
-def run_gates():
+def run_full_gates():
     assert spark.catalog.tableExists(TARGET),f"TABLE_OR_VIEW_NOT_FOUND: {TARGET}"
     d=spark.table(TARGET)
     agg=d.agg(F.count("*").alias("n"),F.countDistinct("ORDER_ID").alias("du"),
@@ -305,10 +307,51 @@ def run_gates():
            "rde_pathology":path.asDict(),"rde_radiology":rad.asDict()})
     print("A8a gates PASS")
 
+
+def run_bounded_gates():
+    """Cheap per-run safety checks. Full-table gates remain available via gate_mode=full."""
+    assert spark.catalog.tableExists(TARGET), f"TABLE_OR_VIEW_NOT_FOUND: {TARGET}"
+    columns = set(spark.table(TARGET).columns)
+    required = {
+        "ORDER_ID", "MED_FAMILY_IND", "ROW_HASH", "PIPELINE_UPDT_DT_TM",
+        "ACTIVITY_TYPE_DESC", "ORDER_STATUS_DESC", "DEPT_STATUS_DESC",
+        "CATALOG_DISPLAY", "CATALOG_TYPE_DESC",
+    }
+    required.update(
+        f"{column}{suffix}"
+        for column in (
+            "ORIG_ORDER_DT_TM", "CURRENT_START_DT_TM", "STATUS_DT_TM",
+            "PROJECTED_STOP_DT_TM", "DISCONTINUE_EFFECTIVE_DT_TM",
+        )
+        for suffix in ("_FUTURE_IND", "_SENTINEL_IND", "_CLEAN")
+    )
+    assert required <= columns, sorted(required - columns)
+    sample = spark.table(TARGET).select(
+        "ORDER_ID", "MED_FAMILY_IND", "ROW_HASH"
+    ).limit(10000)
+    duplicate = (
+        sample.groupBy("ORDER_ID").count().where(F.col("count") != 1).limit(1).count()
+    )
+    assert duplicate == 0, "Bounded sample contains duplicate ORDER_ID values"
+    assert sample.where(F.col("ORDER_ID").isNull()).limit(1).count() == 0
+    latest = spark.sql(f"DESCRIBE HISTORY {TARGET} LIMIT 1").first()
+    print({
+        "gate_mode": "bounded",
+        "target": TARGET,
+        "sample_limit": 10000,
+        "latest_version": int(latest["version"]),
+        "latest_operation": latest["operation"],
+    })
+
+def run_gates():
+    if GATE_MODE == "full":
+        return run_full_gates()
+    return run_bounded_gates()
+
 if ACTION=="pre_gates":
-    run_gates(); dbutils.notebook.exit("unexpected pre-gate pass")
+    run_full_gates(); dbutils.notebook.exit("unexpected pre-gate pass")
 if ACTION=="gates":
-    run_gates(); dbutils.notebook.exit("gates pass")
+    run_full_gates(); dbutils.notebook.exit("gates pass")
 
 # COMMAND ----------
 
@@ -386,6 +429,128 @@ if not spark.catalog.tableExists(TARGET):
     out.limit(0).write.format("delta").mode("overwrite").option("delta.enableChangeDataFeed","true").saveAsTable(TARGET)
 metrics=keyed_upsert(TARGET,["ORDER_ID"],out)
 print({"affected_orders":affected.count(),"dq_flagged":flagged,"metrics":metrics})
+
+# Completeness self-heal for late/backfilled medication orders. The timestamp
+# watermark can miss source rows whose ADC_UPDT predates their Delta commit.
+# Preserve the strict G2 gate and reconstruct only medication ORDER_IDs absent
+# from the generic spine.
+target_order_ids = spark.table(TARGET).select(
+    F.col("ORDER_ID").alias("_TARGET_ORDER_ID")
+)
+missing_med_order_ids = (
+    med_keys.join(
+        target_order_ids,
+        F.col("_MED_ORDER_ID") == F.col("_TARGET_ORDER_ID"),
+        "left_anti",
+    )
+    .select(F.col("_MED_ORDER_ID").alias("ORDER_ID"))
+    .distinct()
+)
+missing_med_order_count = missing_med_order_ids.count()
+recovery_metrics = None
+if missing_med_order_count:
+    recovery_base = (
+        spark.table(ORDERS_SOURCE)
+        .alias("source")
+        .join(
+            missing_med_order_ids.alias("missing"),
+            F.col("source.ORDER_ID").cast("bigint") == F.col("missing.ORDER_ID"),
+            "inner",
+        )
+        .select(
+            F.col("source.ORDER_ID").cast("bigint").alias("ORDER_ID"),
+            F.col("source.PERSON_ID").cast("bigint").alias("PERSON_ID"),
+            F.col("source.ENCNTR_ID").cast("bigint").alias("ENCNTR_ID"),
+            F.col("source.ACTIVITY_TYPE_CD").cast("bigint").alias("ACTIVITY_TYPE_CD"),
+            F.col("source.CATALOG_CD").cast("bigint").alias("CATALOG_CD"),
+            F.col("source.CATALOG_TYPE_CD").cast("bigint").alias("CATALOG_TYPE_CD"),
+            F.col("source.ORDER_MNEMONIC"),
+            F.col("source.HNA_ORDER_MNEMONIC"),
+            F.col("source.ORDERED_AS_MNEMONIC"),
+            F.col("source.ORDER_STATUS_CD").cast("bigint").alias("ORDER_STATUS_CD"),
+            F.col("source.DEPT_STATUS_CD").cast("bigint").alias("DEPT_STATUS_CD"),
+            F.col("source.ACTIVE_IND").cast("bigint").alias("ACTIVE_IND"),
+            F.col("source.ORIG_ORDER_DT_TM"),
+            F.col("source.CURRENT_START_DT_TM"),
+            F.col("source.STATUS_DT_TM"),
+            F.col("source.PROJECTED_STOP_DT_TM"),
+            F.col("source.DISCONTINUE_EFFECTIVE_DT_TM"),
+            F.col("source.ADC_UPDT").alias("SOURCE_ADC_UPDT"),
+        )
+    )
+    recovery_base = latest_per_key(
+        recovery_base,
+        ["ORDER_ID"],
+        [F.col("SOURCE_ADC_UPDT").desc_nulls_last()],
+    )
+    recovery_base = (
+        recovery_base.join(
+            catalog,
+            F.col("CATALOG_CD") == F.col("_CATALOG_CD"),
+            "left",
+        )
+        .drop("_CATALOG_CD")
+    )
+    for code_col, out_col in [
+        ("ACTIVITY_TYPE_CD", "ACTIVITY_TYPE_DESC"),
+        ("ORDER_STATUS_CD", "ORDER_STATUS_DESC"),
+        ("DEPT_STATUS_CD", "DEPT_STATUS_DESC"),
+        ("CATALOG_TYPE_CD", "CATALOG_TYPE_DESC"),
+    ]:
+        lookup = (
+            cv.withColumnRenamed("_CD", f"_{out_col}_CD")
+            .withColumnRenamed("_DESC", out_col)
+        )
+        recovery_base = (
+            recovery_base.join(
+                lookup,
+                F.col(code_col) == F.col(f"_{out_col}_CD"),
+                "left",
+            )
+            .drop(f"_{out_col}_CD")
+        )
+    recovery_base = (
+        recovery_base.join(
+            med_keys,
+            F.col("ORDER_ID") == F.col("_MED_ORDER_ID"),
+            "left",
+        )
+        .withColumn("MED_FAMILY_IND", F.col("_MED_ORDER_ID").isNotNull())
+        .drop("_MED_ORDER_ID")
+    )
+    recovery_base, recovery_flagged = dq_all_clinical(
+        recovery_base,
+        admin_stamps={"SOURCE_ADC_UPDT"},
+    )
+    recovery_hash_columns = [
+        column
+        for column in recovery_base.columns
+        if column not in admin
+        and not column.endswith(("_FUTURE_IND", "_SENTINEL_IND", "_CLEAN"))
+    ]
+    recovery_out = (
+        recovery_base.withColumn(
+            "ROW_HASH",
+            F.xxhash64(
+                F.to_json(
+                    F.struct(*[F.col(column) for column in recovery_hash_columns])
+                )
+            ),
+        )
+        .withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
+    )
+    recovered_rows = recovery_out.count()
+    assert recovered_rows == missing_med_order_count, (
+        f"Medication-order recovery source rows {recovered_rows} "
+        f"!= missing pointers {missing_med_order_count}"
+    )
+    recovery_metrics = keyed_upsert(TARGET, ["ORDER_ID"], recovery_out)
+    print({
+        "medication_pointer_recovery": missing_med_order_count,
+        "dq_flagged": recovery_flagged,
+        "metrics": recovery_metrics,
+    })
+
 run_gates()
 for source,boundary in [(ORDERS_SOURCE,orders_boundary),(MED_SOURCE,med_boundary),
                         (catalog_table,cat_boundary),(cv_table,cv_boundary)]:

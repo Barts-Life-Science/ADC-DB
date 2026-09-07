@@ -53,6 +53,7 @@ DEV_TEST_SNAPSHOT_DATE_UTC_OVERRIDE = bronze_value(
 
 RUN_ID = bronze_run_id()
 ATTEMPT_ID = uuid.uuid4().hex
+LOCK_OWNER_ID = RUN_ID
 RUN_AS_OF = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
 WRITE_TS = RUN_AS_OF
 # Assigned exactly once in run_pipeline after both raw Delta versions/frames are pinned.
@@ -60,8 +61,8 @@ SNAPSHOT_CUTOFF_TS_VALUE = None
 SNAPSHOT_DATE_UTC = None
 SNAPSHOT_SPARK_DAYOFWEEK = None
 
-PIPELINE_LOGIC_VERSION = "2026.08.v2.4"
-LOGIC_VERSION_INT = 2026081104
+PIPELINE_LOGIC_VERSION = "2026.08.v2.5"
+LOGIC_VERSION_INT = 2026082101
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 DECODE_REFRESH_WEEK_SOURCE = "__DECODE_REFRESH_WEEK__"
 USE_PM_WAIT_LIST_STATUS = False
@@ -70,7 +71,7 @@ SNAPSHOT_WEEKDAY = 2
 SNAPSHOT_ENABLED = True
 REMOVED_STATUS_CD = 3768701
 LOCK_KEY = "__RUN_LOCK__"
-LOCK_TTL_HOURS = 12
+LOCK_TTL_HOURS = 2
 SOURCE_OVERLAP_HOURS = 24
 RAW_FRESHNESS_TOLERANCE_DAYS = 2
 SOURCE_WATERMARK_FUTURE_TOLERANCE_DAYS = 2
@@ -2543,8 +2544,13 @@ def full_drain_accounting() -> dict:
                     f"{checkpoint_version} is ahead of pinned raw version "
                     f"{pinned_version}; fail closed"
                 )
+            # A successful Bronze run can checkpoint a maintenance-only Delta version
+            # (for example OPTIMIZE) immediately after the classifier MERGE. When the
+            # checkpoint already equals the pinned version, search retained history for
+            # the authoritative ledger MERGE; all later data-changing MERGEs are rejected
+            # below, so this does not weaken the fail-closed accounting contract.
             history_version_lower_bound = (
-                checkpoint_version
+                0
                 if checkpoint_version == pinned_version
                 else checkpoint_version + 1
             )
@@ -2605,46 +2611,122 @@ def full_drain_accounting() -> dict:
                     f"{matching_merges}; fail closed"
                 )
             matching_merge = matching_merges[0]
-            merges_since_checkpoint = [
-                int(history_row["version"])
-                for history_row in history_rows
+            post_matching_data_changing_merges = []
+            for history_row in history_rows:
+                version = int(history_row["version"])
                 if (
-                    history_row["operation"] == "MERGE"
-                    and checkpoint_version < int(history_row["version"]) <= pinned_version
+                    history_row["operation"] != "MERGE"
+                    or not (matching_merge["version"] < version <= pinned_version)
+                ):
+                    continue
+                metrics = required_drain_merge_metrics(
+                    history_row["operationMetrics"] or {},
+                    f"{basename}: post-ledger raw MERGE version {version}",
+                )
+                evidence = {
+                    "version": version,
+                    "num_source_rows": metrics["numSourceRows"],
+                    "num_output_rows": metrics["numOutputRows"],
+                    "num_updated_rows": metrics["numTargetRowsUpdated"],
+                    "num_inserted_rows": metrics["numTargetRowsInserted"],
+                    "num_deleted_rows": metrics["numTargetRowsDeleted"],
+                }
+                if (
+                    evidence["num_output_rows"] > 0
+                    or evidence["num_updated_rows"] > 0
+                    or evidence["num_inserted_rows"] > 0
+                    or evidence["num_deleted_rows"] > 0
+                ):
+                    post_matching_data_changing_merges.append(evidence)
+            if post_matching_data_changing_merges:
+                fail(
+                    f"{basename}: raw contains data-changing MERGEs after the "
+                    f"authoritative ledger MERGE version {matching_merge['version']}: "
+                    f"{post_matching_data_changing_merges}; fail closed"
+                )
+
+            merge_evidence_since_checkpoint = []
+            for history_row in history_rows:
+                version = int(history_row["version"])
+                if (
+                    history_row["operation"] != "MERGE"
+                    or not (checkpoint_version < version <= pinned_version)
+                ):
+                    continue
+                metrics = required_drain_merge_metrics(
+                    history_row["operationMetrics"] or {},
+                    f"{basename}: raw MERGE version {version}",
+                )
+                merge_evidence_since_checkpoint.append({
+                    "version": version,
+                    "num_source_rows": metrics["numSourceRows"],
+                    "num_output_rows": metrics["numOutputRows"],
+                    "num_updated_rows": metrics["numTargetRowsUpdated"],
+                    "num_inserted_rows": metrics["numTargetRowsInserted"],
+                    "num_deleted_rows": metrics["numTargetRowsDeleted"],
+                })
+            merge_evidence_since_checkpoint.sort(key=lambda item: item["version"])
+            data_changing_merges = [
+                item
+                for item in merge_evidence_since_checkpoint
+                if (
+                    item["num_output_rows"] > 0
+                    or item["num_updated_rows"] > 0
+                    or item["num_inserted_rows"] > 0
+                    or item["num_deleted_rows"] > 0
                 )
             ]
-            if matching_merge["version"] != pinned_version:
-                fail(
-                    f"{basename}: authoritative matching raw MERGE version "
-                    f"{matching_merge['version']} != pinned raw version "
-                    f"{pinned_version}; fail closed"
+            subsequent_noop_merges = [
+                item["version"]
+                for item in merge_evidence_since_checkpoint
+                if (
+                    item["version"] > matching_merge["version"]
+                    and item["num_output_rows"] == 0
+                    and item["num_updated_rows"] == 0
+                    and item["num_inserted_rows"] == 0
+                    and item["num_deleted_rows"] == 0
                 )
+            ]
 
             checkpoint_watermark = checkpoint.get("source_watermark")
             if checkpoint_version < pinned_version:
-                checkpoint_relation = "ADVANCED_ONE_MERGE"
-                if merges_since_checkpoint != [matching_merge["version"]]:
+                checkpoint_relation = "ADVANCED_MERGE_SEQUENCE"
+                if not data_changing_merges:
                     fail(
-                        f"{basename}: advanced incremental-ledger relation requires "
-                        f"exactly one matching MERGE since checkpoint; checkpoint_version="
+                        f"{basename}: advanced incremental-ledger relation found no "
+                        f"data-changing MERGE since checkpoint; checkpoint_version="
                         f"{checkpoint_version}, pinned_version={pinned_version}, "
-                        f"merges_since_checkpoint={merges_since_checkpoint}, "
-                        f"matching_merge={matching_merge}; fail closed"
+                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
+                    )
+                last_data_change_version = data_changing_merges[-1]["version"]
+                if last_data_change_version != matching_merge["version"]:
+                    fail(
+                        f"{basename}: authoritative matching raw MERGE version "
+                        f"{matching_merge['version']} is not the final data-changing "
+                        f"MERGE version {last_data_change_version} since checkpoint; "
+                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
                     )
                 cumulative_row_delta = int(raw_metrics["rows"]) - checkpoint_rows
-                if cumulative_row_delta != matching_merge["num_inserted_rows"]:
+                expected_cumulative_row_delta = sum(
+                    item["num_inserted_rows"] - item["num_deleted_rows"]
+                    for item in merge_evidence_since_checkpoint
+                )
+                if cumulative_row_delta != expected_cumulative_row_delta:
                     fail(
                         f"{basename}: advanced incremental-ledger cumulative raw row "
-                        f"delta {cumulative_row_delta} != MERGE inserted rows "
-                        f"{matching_merge['num_inserted_rows']}; fail closed"
+                        f"delta {cumulative_row_delta} != aggregate MERGE insert-delete "
+                        f"delta {expected_cumulative_row_delta}; "
+                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
                     )
             else:
                 checkpoint_relation = "REUSED_PINNED_RAW_VERSION"
                 cumulative_row_delta = 0
-                if merges_since_checkpoint:
+                expected_cumulative_row_delta = 0
+                if merge_evidence_since_checkpoint:
                     fail(
                         f"{basename}: reused pinned checkpoint requires zero MERGEs "
-                        f"since checkpoint, found {merges_since_checkpoint}; fail closed"
+                        f"after the checkpoint, found "
+                        f"{merge_evidence_since_checkpoint}; fail closed"
                     )
                 if checkpoint_rows != int(raw_metrics["rows"]):
                     fail(
@@ -2852,9 +2934,14 @@ def full_drain_accounting() -> dict:
                         remaining_batch_metrics["distinct_keys"]
                     ),
                 },
-                "one_merge_since_checkpoint": (
-                    checkpoint_relation == "ADVANCED_ONE_MERGE"
-                ),
+                "merge_evidence_since_checkpoint": merge_evidence_since_checkpoint,
+                "data_changing_merge_versions": [
+                    item["version"] for item in data_changing_merges
+                ],
+                "subsequent_noop_merge_versions": subsequent_noop_merges,
+                "post_matching_data_changing_merges": post_matching_data_changing_merges,
+                "expected_cumulative_row_delta": expected_cumulative_row_delta,
+                "all_data_changing_merges_accounted": True,
                 "zero_merges_since_checkpoint": (
                     checkpoint_relation == "REUSED_PINNED_RAW_VERSION"
                 ),
@@ -3230,8 +3317,9 @@ def commit_checkpoints() -> None:
 
 
 def acquire_run_lock() -> None:
+    # Retries of one Workflow run share ownership; ATTEMPT_ID remains unique for staging/audit.
     lock = spark.createDataFrame(
-        [(LOCK_KEY, LOCK_KEY, 0, None, None, ATTEMPT_ID)],
+        [(LOCK_KEY, LOCK_KEY, 0, None, None, LOCK_OWNER_ID)],
         "target_table string, source_table string, source_version long, "
         "source_watermark timestamp, source_rows long, run_id string",
     ).withColumn("committed_at", F.current_timestamp())
@@ -3240,7 +3328,10 @@ def acquire_run_lock() -> None:
         .alias("t")
         .merge(lock.alias("s"), "t.target_table = s.target_table AND t.source_table = s.source_table")
         .whenMatchedUpdate(
-            condition=f"t.committed_at < current_timestamp() - INTERVAL {LOCK_TTL_HOURS} HOURS",
+            condition=(
+                f"t.run_id = s.run_id OR "
+                f"t.committed_at < current_timestamp() - INTERVAL {LOCK_TTL_HOURS} HOURS"
+            ),
             set={"run_id": "s.run_id", "committed_at": "current_timestamp()"},
         )
         .whenNotMatchedInsertAll()
@@ -3249,11 +3340,11 @@ def acquire_run_lock() -> None:
     owners = spark.table(STATE_TABLE).where(
         (F.col("target_table") == LOCK_KEY) & (F.col("source_table") == LOCK_KEY)
     ).collect()
-    if len(owners) != 1 or owners[0]["run_id"] != ATTEMPT_ID:
+    if len(owners) != 1 or owners[0]["run_id"] != LOCK_OWNER_ID:
         owner = owners[0]["run_id"] if owners else None
         fail(
-            "Another waiting_list_pipeline attempt holds the lock "
-            f"(attempt_id={owner}, orchestration_run_id={RUN_ID}, TTL={LOCK_TTL_HOURS}h)."
+            "Another waiting_list_pipeline Workflow run holds the lock "
+            f"(owner_run_id={owner}, orchestration_run_id={RUN_ID}, TTL={LOCK_TTL_HOURS}h)."
         )
 
 
@@ -3261,18 +3352,18 @@ def heartbeat_run_lock(label: str) -> None:
     owners = spark.table(STATE_TABLE).where(
         (F.col("target_table") == LOCK_KEY) & (F.col("source_table") == LOCK_KEY)
     ).collect()
-    if len(owners) != 1 or owners[0]["run_id"] != ATTEMPT_ID:
+    if len(owners) != 1 or owners[0]["run_id"] != LOCK_OWNER_ID:
         observed = owners[0]["run_id"] if owners else None
         fail(f"Lost waiting_list_pipeline lock before {label}; observed_owner={observed}")
     spark.sql(
         f"UPDATE {qname(STATE_TABLE)} SET committed_at = current_timestamp() "
         f"WHERE target_table = '{LOCK_KEY}' AND source_table = '{LOCK_KEY}' "
-        f"AND run_id = '{sql_escape(ATTEMPT_ID)}'"
+        f"AND run_id = '{sql_escape(LOCK_OWNER_ID)}'"
     )
     refreshed = spark.table(STATE_TABLE).where(
         (F.col("target_table") == LOCK_KEY)
         & (F.col("source_table") == LOCK_KEY)
-        & (F.col("run_id") == ATTEMPT_ID)
+        & (F.col("run_id") == LOCK_OWNER_ID)
     ).count()
     if refreshed != 1:
         fail(f"Lost waiting_list_pipeline lock while heartbeating before {label}")
@@ -3281,7 +3372,7 @@ def heartbeat_run_lock(label: str) -> None:
 def release_run_lock() -> None:
     spark.sql(
         f"DELETE FROM {qname(STATE_TABLE)} WHERE target_table = '{LOCK_KEY}' "
-        f"AND source_table = '{LOCK_KEY}' AND run_id = '{sql_escape(ATTEMPT_ID)}'"
+        f"AND source_table = '{LOCK_KEY}' AND run_id = '{sql_escape(LOCK_OWNER_ID)}'"
     )
 
 
@@ -3773,7 +3864,6 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 
 
 

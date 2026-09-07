@@ -5,7 +5,7 @@
 # MAGIC Lightweight widget, JSON and table helpers shared by `bronze_pipeline` and the
 # MAGIC domain pipelines it orchestrates. No Spark cache or persistence is used.
 # MAGIC
-# MAGIC Release `20260811_luna_wl_v2`.
+# MAGIC Release `20260821_bronze_retry_v1`.
 # MAGIC
 # MAGIC Defaults are the **weekly incremental** defaults: `force_full_refresh=false` and
 # MAGIC `create_cutover_backups=false`. Backups are taken once by the release cutover
@@ -18,7 +18,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-_BRONZE_RELEASE_ID = "20260811_luna_wl_v2"
+_BRONZE_RELEASE_ID = "20260821_bronze_retry_v1"
 
 _BRONZE_WIDGET_DEFAULTS = {
     "pipeline_run_id": "",
@@ -35,15 +35,36 @@ _BRONZE_WIDGET_DEFAULTS = {
     "run_slam_finance_pipeline": "true",
     "run_cancer_pipeline": "true",
     "run_community_pipeline": "true",
-    "run_scheduling_pipeline": "true",
-    "run_theatre_pipeline": "true",
-    "run_medication_order_pipeline": "true",
-    "run_pacs_pipeline": "true",
-    "run_referral_rtt_pipeline": "true",
-    "run_waiting_list_pipeline": "true",
+    "run_scheduling_pipeline": "false",
+    "run_theatre_pipeline": "false",
+    "run_medication_order_pipeline": "false",
+    "run_pacs_pipeline": "false",
+    "run_referral_rtt_pipeline": "false",
+    "run_waiting_list_pipeline": "false",
+    "run_allergy": "true",
+    "run_research_study": "true",
+    "run_maternity_msds": "true",
+    "run_critical_care_medicus": "true",
+    "run_critical_care_ccmds": "true",
+    "run_neonatal": "true",
+    "run_person_encntr_attribute": "true",
+    "run_orders_spine": "true",
+    "run_order_comment": "true",
+    "run_radiology_event": "true",
+    "run_identifier": "true",
+    "run_parity_closure": "true",
+    "run_episode": "true",
+    "run_endobase_exam": "true",
+    "run_iweb_coronary": "true",
+    "run_luna_eal": "true",
+    "run_luna_cancer_ptl": "true",
+    "run_aria_staging": "false",
+    "run_pacs_text_bridge": "false",
+    "run_dicom_tag": "false",
+    "run_pathology_expansion": "true",
     "run_snapshots": "false",
     "refresh_decodes": "false",
-    "run_powerform_pipeline": "true",
+    "run_powerform_pipeline": "false",
 }
 
 for _bronze_widget_name, _bronze_widget_default in _BRONZE_WIDGET_DEFAULTS.items():
@@ -331,6 +352,19 @@ def bronze_merge_assignments(frame, table_name: str, source_alias: str = "s"):
     return projected, assignments
 
 
+_BRONZE_APPROVED_ADDITIVE_COLUMNS = {
+    "map_text_events": {
+        "anon_text_result": "string",
+        "anon_status": "string",
+        "anon_redactor_version": "string",
+        "anon_source_text_sha": "string",
+        "anon_identity_fingerprint": "string",
+        "anon_redaction_count": "bigint",
+        "anon_processed_at": "timestamp",
+    },
+}
+
+
 def bronze_assert_primary_contract(table_name: str):
     if not bronze_table_exists(table_name):
         raise RuntimeError(f"Missing primary Bronze table {table_name}")
@@ -342,14 +376,32 @@ def bronze_assert_primary_contract(table_name: str):
         (field.name, field.dataType.simpleString().lower())
         for field in bronze_active_spark().table(table_name).schema.fields
     ]
-    if actual != expected:
+    expected_names = {name.lower() for name, _ in expected}
+    actual_base = [field for field in actual if field[0].lower() in expected_names]
+    additive = [
+        (name.lower(), data_type)
+        for name, data_type in actual
+        if name.lower() not in expected_names
+    ]
+    allowed = _BRONZE_APPROVED_ADDITIVE_COLUMNS.get(
+        bronze_base_table_name(table_name).lower(), {}
+    )
+    unapproved = [
+        (name, data_type)
+        for name, data_type in additive
+        if allowed.get(name) != data_type
+    ]
+    if actual_base != expected or unapproved:
         raise RuntimeError(
             f"Single-layer schema drift for {table_name}: "
-            f"expected={expected}, actual={actual}"
+            f"expected={expected}, actual={actual}, "
+            f"unapproved_additive={unapproved}"
         )
     return {
         "table": table_name,
         "columns": len(actual),
+        "base_columns": len(actual_base),
+        "additive_columns": [name for name, _ in additive],
         "status": "PASS",
     }
 

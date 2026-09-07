@@ -4,7 +4,7 @@
 # Every comment type and revision is retained. LATEST_IND is ranked only within the RDE lane:
 # type 66 + available text + active long_text. Missing post-stall text is explicit and self-healing.
 
-# release: bronze_completeness_20260816_v1 — prod-idiom refactor; behavior-identical (NO_OP re-proof run 543833752575381)
+# release: bronze_orders_bounded_gates_20260823_v1 — bounded operational validation; gate_mode=full retains explicit exhaustive gates
 import json
 
 # Prod-idiom target resolution (house pattern: jac_pipeline/endobase_pipeline).
@@ -33,6 +33,8 @@ SCHEMA = TARGET_SCHEMA
 CONTROL = CONTROL_SCHEMA
 MODE = _widget_text("mode", "prod" if TARGET_SCHEMA == "4_prod.bronze" else "dev")
 ACTION = _widget_text("action", "build").lower()
+GATE_MODE = _widget_text("gate_mode", "bounded").lower()
+assert GATE_MODE in ("bounded", "full"), GATE_MODE
 COMMENT_SOURCE = _widget_text("comment_source", "4_prod.raw.mill_order_comment")
 TEXT_SOURCE = _widget_text("text_source", "4_prod.raw.mill_long_text")
 assert ACTION in ("pre_gates", "build", "gates")
@@ -224,14 +226,26 @@ def incr_slice(source_table, pipeline, source_key, lookback_hours=24):
 # the rewrite cheap and idempotent.
 
 def keyed_upsert(target, key_cols, df):
-    """ROW_HASH-guarded keyed MERGE: one code path for initial build (empty target)
-    and weekly increments; unchanged rows are never rewritten (§2.3 rule 3).
-    df MUST already carry ROW_HASH = xxhash64(to_json(struct(<all published non-admin cols>)))."""
-    df.createOrReplaceTempView("s3_upsert_src")
-    on = " AND ".join(f"t.{c} = s.{c}" for c in key_cols)
+    """Schema-safe ROW_HASH merge that preserves target-only additive columns."""
+    target_columns = spark.table(target).columns
+    source_columns = set(df.columns)
+    writable = [name for name in target_columns if name in source_columns]
+    missing_keys = [name for name in key_cols if name not in writable]
+    if missing_keys:
+        raise RuntimeError(f"{target}: source is missing merge keys {missing_keys}")
+    if "ROW_HASH" not in writable:
+        raise RuntimeError(f"{target}: source is missing ROW_HASH")
+    df.select(*writable).createOrReplaceTempView("s3_upsert_src")
+    q = lambda name: f"`{name.replace('`', '``')}`"
+    on = " AND ".join(f"t.{q(name)} <=> s.{q(name)}" for name in key_cols)
+    updates = ", ".join(
+        f"t.{q(name)} = s.{q(name)}" for name in writable if name not in key_cols
+    )
+    insert_columns = ", ".join(q(name) for name in writable)
+    insert_values = ", ".join(f"s.{q(name)}" for name in writable)
     spark.sql(f"""MERGE INTO {target} t USING s3_upsert_src s ON {on}
-        WHEN MATCHED AND t.ROW_HASH <> s.ROW_HASH THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *""")
+        WHEN MATCHED AND NOT (t.ROW_HASH <=> s.ROW_HASH) THEN UPDATE SET {updates}
+        WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})""")
     return spark.sql(f"DESCRIBE HISTORY {target} LIMIT 1").collect()[0]["operationMetrics"]
 
 def latest_per_key(df, key_cols, order_exprs):
@@ -252,7 +266,7 @@ from pyspark.sql import functions as F
 COMMENT_BASE=["ORDER_ID","ACTION_SEQUENCE","COMMENT_TYPE_CD","LONG_TEXT_ID","COMMENT_UPDT_DT_TM",
               "COMMENT_UPDT_CNT","COMMENT_DT_TM","SOURCE_COMMENT_ADC_UPDT"]
 
-def run_gates():
+def run_full_gates():
     assert spark.catalog.tableExists(TARGET),f"TABLE_OR_VIEW_NOT_FOUND: {TARGET}"
     d=spark.table(TARGET)
     a=d.agg(F.count("*").alias("n"),
@@ -291,10 +305,60 @@ def run_gates():
            "no_text":a["no_text"],"truncated":a["truncated"],"oracle":oracle.asDict()})
     print("A8b gates PASS")
 
+
+def run_bounded_gates():
+    """Cheap per-run safety checks. Full-table gates remain available via gate_mode=full."""
+    assert spark.catalog.tableExists(TARGET), f"TABLE_OR_VIEW_NOT_FOUND: {TARGET}"
+    columns = set(spark.table(TARGET).columns)
+    required = {
+        "ORDER_ID", "ACTION_SEQUENCE", "COMMENT_TYPE_CD", "LATEST_IND",
+        "TEXT_AVAILABLE_IND", "TEXT_ACTIVE_IND", "COMMENT_TEXT",
+        "ROW_HASH", "PIPELINE_UPDT_DT_TM",
+    }
+    required.update(
+        f"{column}{suffix}"
+        for column in ("COMMENT_DT_TM", "COMMENT_UPDT_DT_TM", "TEXT_UPDT_DT_TM")
+        for suffix in ("_FUTURE_IND", "_SENTINEL_IND", "_CLEAN")
+    )
+    assert required <= columns, sorted(required - columns)
+    sample = spark.table(TARGET).select(
+        "ORDER_ID", "ACTION_SEQUENCE", "COMMENT_TYPE_CD", "LATEST_IND",
+        "TEXT_AVAILABLE_IND", "TEXT_ACTIVE_IND", "COMMENT_TEXT",
+    ).limit(10000)
+    duplicate = (
+        sample.groupBy("ORDER_ID", "ACTION_SEQUENCE", "COMMENT_TYPE_CD")
+        .count().where(F.col("count") != 1).limit(1).count()
+    )
+    assert duplicate == 0, "Bounded sample contains duplicate order-comment keys"
+    assert sample.where(
+        F.col("LATEST_IND")
+        & ~(
+            (F.col("COMMENT_TYPE_CD") == 66)
+            & F.col("TEXT_AVAILABLE_IND")
+            & (F.col("TEXT_ACTIVE_IND") == 1)
+        )
+    ).limit(1).count() == 0
+    assert sample.where(
+        F.col("TEXT_AVAILABLE_IND") & F.col("COMMENT_TEXT").isNull()
+    ).limit(1).count() == 0
+    latest = spark.sql(f"DESCRIBE HISTORY {TARGET} LIMIT 1").first()
+    print({
+        "gate_mode": "bounded",
+        "target": TARGET,
+        "sample_limit": 10000,
+        "latest_version": int(latest["version"]),
+        "latest_operation": latest["operation"],
+    })
+
+def run_gates():
+    if GATE_MODE == "full":
+        return run_full_gates()
+    return run_bounded_gates()
+
 if ACTION=="pre_gates":
-    run_gates(); dbutils.notebook.exit("unexpected pre-gate pass")
+    run_full_gates(); dbutils.notebook.exit("unexpected pre-gate pass")
 if ACTION=="gates":
-    run_gates(); dbutils.notebook.exit("gates pass")
+    run_full_gates(); dbutils.notebook.exit("gates pass")
 
 # COMMAND ----------
 

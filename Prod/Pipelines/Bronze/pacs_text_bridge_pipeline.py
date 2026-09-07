@@ -44,7 +44,7 @@ SRC_BLOB = "4_prod.pacs_dlt.pacs_blob_content"
 CONTROL_TABLE = f"{CONTROL_SCHEMA}.s6_source_versions"
 CONTROL_PIPELINE = "s6_b12_pacs_text_bridge_pipeline"
 
-LOGIC_VERSION = "2026-08-13.b12.v1"
+LOGIC_VERSION = "2026-08-22.b12.v3"
 PIPELINE_NAME = "pacs_text_bridge_pipeline"
 RTF_PREFIX = "{" + chr(92) + "rtf"
 ACCOUNTING_CLASSES = (
@@ -154,16 +154,59 @@ def dq_all_clinical(df, admin_stamps):
     return dq_columns(df, cols), cols
 
 def replace_with_tombstones(df, target, key_cols):
+    """Replace current rows and retain disappeared rows as tombstones.
+
+    Snapshot the current target before overwrite instead of reading its prior
+    version afterwards. The latter fails once old Delta files have passed the
+    deleted-file retention window, even though the current table is healthy.
+    """
+    import uuid as _tombstone_uuid
+
     fresh = df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
-    v_prev = table_version(target) if spark.catalog.tableExists(target) else None
-    (fresh.write.format("delta").mode("overwrite")
-          .option("overwriteSchema", "true").saveAsTable(target))
-    if v_prev is not None:
-        prior = spark.read.option("versionAsOf", v_prev).table(target)
-        gone = (prior.join(spark.table(target).select(*key_cols).distinct(),
-                           key_cols, "left_anti")
-                     .withColumn("SOURCE_PRESENT_IND", F.lit(False)))
-        gone.write.format("delta").mode("append").saveAsTable(target)
+    prior_stage = None
+    completed = False
+    try:
+        if spark.catalog.tableExists(target):
+            prior_stage = (
+                f"{target}__tombstone_prior_"
+                f"{_tombstone_uuid.uuid4().hex}"
+            )
+            spark.sql(
+                f"CREATE TABLE {qname(prior_stage)} "
+                f"SHALLOW CLONE {qname(target)}"
+            )
+
+        (fresh.write.format("delta").mode("overwrite")
+              .option("overwriteSchema", "true").saveAsTable(target))
+
+        if prior_stage is not None:
+            current = spark.table(target)
+            gone = (
+                spark.table(prior_stage)
+                .join(current.select(*key_cols).distinct(), key_cols, "left_anti")
+                .withColumn("SOURCE_PRESENT_IND", F.lit(False))
+            )
+            gone_columns = set(gone.columns)
+            aligned_gone = gone.select(*[
+                (
+                    F.col(field.name).cast(field.dataType)
+                    if field.name in gone_columns
+                    else F.lit(None).cast(field.dataType)
+                ).alias(field.name)
+                for field in current.schema.fields
+            ])
+            aligned_gone.write.format("delta").mode("append").saveAsTable(target)
+
+        completed = True
+    finally:
+        if prior_stage is not None:
+            if completed:
+                spark.sql(f"DROP TABLE IF EXISTS {qname(prior_stage)}")
+            else:
+                print(
+                    "[B12][RECOVERY] retained pre-overwrite shallow snapshot "
+                    f"after failure: {prior_stage}"
+                )
 
 def table_fingerprint(tbl, exclude=("PIPELINE_UPDT_DT_TM",)):
     cols = [c for c in spark.table(tbl).columns if c not in exclude]
@@ -372,6 +415,16 @@ def record_s6_source_versions(state):
 # COMMAND ----------
 
 def build_classification(report_version, exam_version):
+    """Classify textless reports with one physical read path to the remote blob MV.
+
+    The prior plan joined blob_by_accession twice and then self-joined selected
+    to its own aggregation. Databricks Runtime 18 correctly blocks that as a
+    self-join on a remotely evaluated materialized view. Candidate keys and
+    accession multiplicity are now expressed with explode/window operations,
+    preserving REQUEST_ID preference without duplicating the remote relation.
+    """
+    from pyspark.sql.window import Window as _BridgeWindow
+
     blob = (spark.table(SRC_BLOB)
         .select(
             F.trim("MillAccessionNbr").alias("ACCESSION"),
@@ -406,47 +459,84 @@ def build_classification(report_version, exam_version):
             F.trim("REQUEST_ID_STRING").alias("REQUEST_ID_STRING"),
             F.trim("EXAMINATION_ID_STRING").alias("EXAMINATION_ID_STRING")))
 
-    r = textless.alias("r")
-    e = exams.alias("e")
-    br = blob_by_accession.alias("br")
-    be = blob_by_accession.alias("be")
+    report_exam = (textless.alias("r")
+        .join(
+            exams.alias("e"),
+            F.col("r.PACS_EXAMINATION_ID") == F.col("e.PACS_EXAMINATION_ID"),
+            "left",
+        )
+        .select(
+            F.col("r.REPORT_ID").alias("REPORT_ID"),
+            F.col("r.REPORT_SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT"),
+            F.col("e.PACS_EXAMINATION_ID").alias("RESOLVED_EXAM_ID"),
+            F.col("e.REQUEST_ID_STRING").alias("REQUEST_ID_STRING"),
+            F.col("e.EXAMINATION_ID_STRING").alias("EXAMINATION_ID_STRING"),
+        ))
 
-    joined = (r.join(e, F.col("r.PACS_EXAMINATION_ID") == F.col("e.PACS_EXAMINATION_ID"), "left")
-        .join(br, F.col("br.ACCESSION") == F.col("e.REQUEST_ID_STRING"), "left")
-        .join(be,
-              F.col("br.ACCESSION").isNull()
-              & (F.col("be.ACCESSION") == F.col("e.EXAMINATION_ID_STRING")),
-              "left"))
+    candidates = (report_exam
+        .withColumn(
+            "_MATCH_CANDIDATE",
+            F.explode(F.array(
+                F.struct(
+                    F.lit(1).alias("priority"),
+                    F.lit("REQUEST_ID").alias("lane"),
+                    F.col("REQUEST_ID_STRING").alias("accession"),
+                ),
+                F.struct(
+                    F.lit(2).alias("priority"),
+                    F.lit("EXAMINATION_ID").alias("lane"),
+                    F.col("EXAMINATION_ID_STRING").alias("accession"),
+                ),
+            )),
+        )
+        .select(
+            "REPORT_ID",
+            "REPORT_SRC_ADC_UPDT",
+            "RESOLVED_EXAM_ID",
+            F.col("_MATCH_CANDIDATE.priority").alias("MATCH_PRIORITY"),
+            F.col("_MATCH_CANDIDATE.lane").alias("CANDIDATE_LANE"),
+            F.col("_MATCH_CANDIDATE.accession").alias("CANDIDATE_ACCESSION"),
+        ))
 
-    selected = joined.select(
-        F.col("r.REPORT_ID"),
-        F.col("r.REPORT_SRC_ADC_UPDT"),
-        F.coalesce(F.col("br.ACCESSION"), F.col("be.ACCESSION")).alias("ACCESSION"),
-        F.when(F.col("br.ACCESSION").isNotNull(), F.lit("REQUEST_ID"))
-         .when(F.col("be.ACCESSION").isNotNull(), F.lit("EXAMINATION_ID"))
-         .alias("MATCH_LANE"),
-        F.coalesce(F.col("br.BLOB_EVENT_COUNT"), F.col("be.BLOB_EVENT_COUNT"))
-         .alias("BLOB_EVENT_COUNT"),
-        F.coalesce(F.col("br.ONLY_EVENT_ID"), F.col("be.ONLY_EVENT_ID")).alias("EVENT_ID"),
-        F.coalesce(F.col("br.ONLY_BLOB_CONTENTS"), F.col("be.ONLY_BLOB_CONTENTS"))
-         .alias("BLOB_CONTENTS"),
-        F.coalesce(F.col("br.ONLY_EXTRACT_DT_TM"), F.col("be.ONLY_EXTRACT_DT_TM"))
-         .alias("BLOB_EXTRACT_DT_TM"),
-        F.coalesce(F.col("br.ONLY_UPDT_DT_TM"), F.col("be.ONLY_UPDT_DT_TM"))
-         .alias("BLOB_UPDT_DT_TM"),
-        F.coalesce(F.col("br.ONLY_ADC_UPDT"), F.col("be.ONLY_ADC_UPDT"))
-         .alias("BLOB_ADC_UPDT"),
-        F.when(F.col("e.PACS_EXAMINATION_ID").isNull(), F.lit("NO_RESOLVED_EXAM"))
-         .when(F.col("br.ACCESSION").isNull() & F.col("be.ACCESSION").isNull(),
-               F.lit("NO_BLOB_ON_MATCH_KEYS"))
-         .alias("_UNMATCHED_REASON"),
+    matched = (candidates.alias("c")
+        .join(
+            blob_by_accession.alias("b"),
+            F.col("b.ACCESSION") == F.col("c.CANDIDATE_ACCESSION"),
+            "left",
+        ))
+
+    choice_window = _BridgeWindow.partitionBy(F.col("c.REPORT_ID")).orderBy(
+        F.when(F.col("b.ACCESSION").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
+        F.col("c.MATCH_PRIORITY").asc(),
     )
+    selected = (matched
+        .withColumn("_CHOICE_RN", F.row_number().over(choice_window))
+        .where(F.col("_CHOICE_RN") == 1)
+        .select(
+            F.col("c.REPORT_ID").alias("REPORT_ID"),
+            F.col("c.REPORT_SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT"),
+            F.col("b.ACCESSION").alias("ACCESSION"),
+            F.when(F.col("b.ACCESSION").isNotNull(), F.col("c.CANDIDATE_LANE"))
+             .alias("MATCH_LANE"),
+            F.col("b.BLOB_EVENT_COUNT").alias("BLOB_EVENT_COUNT"),
+            F.col("b.ONLY_EVENT_ID").alias("EVENT_ID"),
+            F.col("b.ONLY_BLOB_CONTENTS").alias("BLOB_CONTENTS"),
+            F.col("b.ONLY_EXTRACT_DT_TM").alias("BLOB_EXTRACT_DT_TM"),
+            F.col("b.ONLY_UPDT_DT_TM").alias("BLOB_UPDT_DT_TM"),
+            F.col("b.ONLY_ADC_UPDT").alias("BLOB_ADC_UPDT"),
+            F.when(F.col("c.RESOLVED_EXAM_ID").isNull(), F.lit("NO_RESOLVED_EXAM"))
+             .when(F.col("b.ACCESSION").isNull(), F.lit("NO_BLOB_ON_MATCH_KEYS"))
+             .alias("_UNMATCHED_REASON"),
+        ))
 
-    report_multiplicity = (selected.where(F.col("ACCESSION").isNotNull())
-        .groupBy("ACCESSION")
-        .agg(F.count(F.lit(1)).cast("long").alias("TEXTLESS_REPORT_COUNT")))
-
-    classified = selected.join(report_multiplicity, "ACCESSION", "left")
+    accession_window = _BridgeWindow.partitionBy("ACCESSION")
+    classified = selected.withColumn(
+        "TEXTLESS_REPORT_COUNT",
+        F.when(
+            F.col("ACCESSION").isNotNull(),
+            F.count(F.lit(1)).over(accession_window),
+        ).otherwise(F.lit(None).cast("long")),
+    )
     blank_blob = F.col("BLOB_CONTENTS").isNull() | (F.trim("BLOB_CONTENTS") == "")
     accounting_class = (
         F.when(F.col("ACCESSION").isNull(), F.lit("UNMATCHED"))
@@ -865,5 +955,4 @@ dbutils.notebook.exit(json.dumps(summary, default=str, sort_keys=True))
 #    if the PACS or blob feed resumes. Future durable ownership belongs inside pacs_pipeline.
 # 8. Capture the production run ID, source signature, counts, table version, and fingerprint.
 #    Promotion remains incomplete until a human signs off those artifacts.
-
 

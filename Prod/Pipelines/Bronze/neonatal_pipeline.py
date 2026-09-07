@@ -304,6 +304,82 @@ print(f"BUILD done; dq flagged: episode={ep_dq}, exam={ex_dq}, nccmds={cc_dq}")
 #    in silver_source_registry.py, coordinate under interface rule 1 before the next rebuild
 #    and likely convert the target to keyed MERGE.
 
+# ANON_TEXT_STATE_REATTACH_V3_2
+import json as _anon_json
+from pyspark.sql import functions as _anon_F
+
+_ANON_REATTACH_SPECS = _anon_json.loads('[{"feed": "neonatal_episode_narrative", "keys": ["EntityID"], "outputs": ["anon_final_summary_text", "anon_birth_summary", "anon_episode_summary", "anon_diagnosis_during_stay", "anon_drugs_during_stay", "anon_maternal_medical_notes"], "state_table": "6_mgmt.anon.state_neonatal_episode_narrative", "table": "4_prod.bronze.map_neonatal_episode_narrative"}]')
+_ANON_STATE_TYPES = {'anon_status': 'STRING', 'anon_redactor_version': 'STRING', 'anon_source_text_sha': 'STRING', 'anon_identity_fingerprint': 'STRING', 'anon_redaction_count': 'BIGINT', 'anon_processed_at': 'TIMESTAMP'}
+
+def _anon_qtable(name):
+    return ".".join(f"`{part}`" for part in name.replace("`", "").split("."))
+
+for _anon_spec in _ANON_REATTACH_SPECS:
+    _anon_target = _anon_spec["table"]
+    _anon_state = _anon_spec["state_table"]
+    _anon_columns = {field.name: field.dataType.simpleString()
+                     for field in spark.table(_anon_target).schema.fields}
+    for _anon_name in _anon_spec["outputs"]:
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` STRING)")
+    for _anon_name, _anon_type in _ANON_STATE_TYPES.items():
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` {_anon_type})")
+    for _anon_name in _anon_spec["outputs"]:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='3','ig_severity'='2')"
+        )
+    for _anon_name in _ANON_STATE_TYPES:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='1','ig_severity'='1')"
+        )
+    if spark.catalog.tableExists(_anon_state):
+        _anon_target_df = spark.table(_anon_target).alias("t")
+        _anon_state_df = spark.table(_anon_state).alias("s")
+        _anon_condition = None
+        for _anon_key in _anon_spec["keys"]:
+            _anon_term = _anon_F.col(f"t.`{_anon_key}`").eqNullSafe(
+                _anon_F.col(f"s.`{_anon_key}`")
+            )
+            _anon_condition = _anon_term if _anon_condition is None else _anon_condition & _anon_term
+        _anon_expected = _anon_target_df.join(
+            _anon_state_df, _anon_condition, "inner"
+        ).count()
+        _anon_join_sql = " AND ".join(
+            f"t.`{column}` <=> s.`{column}`" for column in _anon_spec["keys"]
+        )
+        spark.sql(
+            f"MERGE INTO {_anon_qtable(_anon_target)} t USING {_anon_qtable(_anon_state)} s "
+            f"ON {_anon_join_sql} WHEN MATCHED THEN UPDATE SET "
+            + ", ".join(
+                f"t.`{column}` = s.`{column}`"
+                for column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES)
+            )
+        )
+        _anon_post = spark.table(_anon_target).alias("t").join(
+            spark.table(_anon_state).alias("s"), _anon_condition, "inner"
+        )
+        _anon_mismatch = _anon_F.lit(False)
+        for _anon_column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES):
+            _anon_mismatch = _anon_mismatch | ~_anon_F.col(
+                f"t.`{_anon_column}`"
+            ).eqNullSafe(_anon_F.col(f"s.`{_anon_column}`"))
+        _anon_metrics = _anon_post.agg(
+            _anon_F.count("*").alias("matched_rows"),
+            _anon_F.sum(_anon_F.when(_anon_mismatch, 1).otherwise(0)).alias("mismatches"),
+        ).first()
+        if (int(_anon_metrics.matched_rows) != int(_anon_expected)
+                or int(_anon_metrics.mismatches or 0) != 0):
+            raise AssertionError(
+                f"anonymous-state reattach failed for {_anon_target}: "
+                f"expected={_anon_expected}, matched={_anon_metrics.matched_rows}, "
+                f"mismatches={_anon_metrics.mismatches}"
+            )
+# END_ANON_TEXT_STATE_REATTACH_V3_2
+
+
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET_SCHEMA, "target_schema": TARGET_SCHEMA}, sort_keys=True))
 
 

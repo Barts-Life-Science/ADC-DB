@@ -978,6 +978,179 @@ def build_examinations(gates) -> DataFrame:
         "PERFORMED_EVIDENCE",
         F.concat_ws(",", *[F.when(cond, F.lit(tag)) for cond, tag in _signals]))
     e = e.where(F.col("PERFORMED_EVIDENCE") != "")
+    # S4-C2 BEGIN
+    # NHSI is unconditional. NICIP stays schema-stable but NULL until the canonical
+    # TRUD lookup exists; once present, active NICIP rows resolve through SNOMED and
+    # the deterministic OMOP standard-concept contract.
+    _s4_exam_code_norm = "_S4_EXAMINATION_CODE_NORM"
+    e = e.withColumn(
+        _s4_exam_code_norm,
+        F.upper(F.trim(F.col("EXAMINATION_CODE"))),
+    )
+
+    _s4_nhsi = (
+        spark.table("3_lookup.dwh.nhsi_exam_mapping")
+        .select(
+            F.col("EXAM_TYPE_CODE").alias(_s4_exam_code_norm),
+            F.col("NHSI_MAPPING").alias("NHSI_MODALITY_CATEGORY"),
+        )
+    )
+    e = e.join(F.broadcast(_s4_nhsi), _s4_exam_code_norm, "left")
+
+    _s4_nicip_table = "3_lookup.trud.maps_nicipsctmap"
+    if bronze_table_exists(_s4_nicip_table):
+        _s4_nicip = (
+            spark.table(_s4_nicip_table)
+            .where(F.col("IS_ACTIVE") == F.lit(True))
+            .select(
+                F.col("NICIP_CODE_NORM").alias(_s4_exam_code_norm),
+                F.col("SNOMED_CODE").alias("NICIP_SNOMED_CODE"),
+                F.lit(True).alias("_S4_NICIP_MATCHED"),
+            )
+        )
+        e = e.join(F.broadcast(_s4_nicip), _s4_exam_code_norm, "left")
+
+        _s4_snomed_concepts = (
+            spark.table("4_prod.omop.concept")
+            .where(F.col("vocabulary_id") == F.lit("SNOMED"))
+            .select(
+                F.col("concept_code").alias("NICIP_SNOMED_CODE"),
+                F.col("concept_id").cast("long").alias("SNOMED_CONCEPT_ID"),
+                F.col("standard_concept").alias("_S4_SNOMED_STANDARD"),
+            )
+        )
+        e = e.join(_s4_snomed_concepts, "NICIP_SNOMED_CODE", "left")
+
+        _s4_source_concepts = (
+            e.select("SNOMED_CONCEPT_ID")
+            .where(F.col("SNOMED_CONCEPT_ID").isNotNull())
+            .distinct()
+        )
+        _s4_maps_to = (
+            _s4_source_concepts.alias("src")
+            .join(
+                spark.table("4_prod.omop.concept_relationship").alias("cr"),
+                F.col("src.SNOMED_CONCEPT_ID") == F.col("cr.concept_id_1"),
+                "left",
+            )
+            .join(
+                spark.table("4_prod.omop.concept").alias("dst"),
+                (F.col("cr.concept_id_2") == F.col("dst.concept_id"))
+                & (F.col("dst.standard_concept") == F.lit("S")),
+                "left",
+            )
+            .where(
+                (F.col("cr.relationship_id") == F.lit("Maps to"))
+                & F.col("cr.invalid_reason").isNull()
+                & F.col("dst.concept_id").isNotNull()
+            )
+            .select(
+                F.col("src.SNOMED_CONCEPT_ID").alias("SNOMED_CONCEPT_ID"),
+                F.col("dst.concept_id").cast("long").alias("_S4_STANDARD_CANDIDATE_ID"),
+            )
+            .distinct()
+            .groupBy("SNOMED_CONCEPT_ID")
+            .agg(
+                F.countDistinct("_S4_STANDARD_CANDIDATE_ID").cast("long").alias(
+                    "_S4_STANDARD_CANDIDATE_COUNT"
+                ),
+                F.min("_S4_STANDARD_CANDIDATE_ID").cast("long").alias(
+                    "_S4_ONLY_STANDARD_CONCEPT_ID"
+                ),
+            )
+        )
+        e = e.join(_s4_maps_to, "SNOMED_CONCEPT_ID", "left")
+        e = (
+            e.withColumn(
+                "OMOP_STANDARD_CONCEPT_ID",
+                F.when(
+                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
+                    F.col("SNOMED_CONCEPT_ID"),
+                )
+                .when(
+                    F.col("_S4_STANDARD_CANDIDATE_COUNT") == F.lit(1),
+                    F.col("_S4_ONLY_STANDARD_CONCEPT_ID"),
+                )
+                .cast("long"),
+            )
+            .withColumn(
+                "OMOP_STANDARD_CANDIDATE_COUNT",
+                F.when(
+                    F.col("SNOMED_CONCEPT_ID").isNull(),
+                    F.lit(None).cast("long"),
+                )
+                .when(
+                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
+                    F.lit(1).cast("long"),
+                )
+                .otherwise(
+                    F.coalesce(
+                        F.col("_S4_STANDARD_CANDIDATE_COUNT"),
+                        F.lit(0).cast("long"),
+                    )
+                ),
+            )
+            .withColumn(
+                "OMOP_STANDARD_MAPPING_METHOD",
+                F.when(
+                    F.col("SNOMED_CONCEPT_ID").isNull(),
+                    F.lit(None).cast("string"),
+                )
+                .when(
+                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
+                    F.lit("ALREADY_STANDARD"),
+                )
+                .when(
+                    F.col("_S4_STANDARD_CANDIDATE_COUNT") == F.lit(1),
+                    F.lit("MAPS_TO_EXACT"),
+                )
+                .when(
+                    F.col("_S4_STANDARD_CANDIDATE_COUNT") > F.lit(1),
+                    F.lit("MAPS_TO_MULTI"),
+                )
+                .otherwise(F.lit("NO_STANDARD_MAP")),
+            )
+            .withColumn(
+                "PROCEDURE_MAPPING_METHOD",
+                F.when(
+                    F.col(_s4_exam_code_norm).isNull(),
+                    F.lit("NONE_NO_CODE"),
+                )
+                .when(F.col("_S4_NICIP_MATCHED"), F.lit("NICIP_TRUD"))
+                .otherwise(F.lit("NONE_NO_NICIP_MATCH")),
+            )
+        )
+
+        _s4_standard_names = (
+            spark.table("4_prod.omop.concept")
+            .where(F.col("standard_concept") == F.lit("S"))
+            .select(
+                F.col("concept_id").cast("long").alias("OMOP_STANDARD_CONCEPT_ID"),
+                F.col("concept_name").alias("OMOP_STANDARD_CONCEPT_NAME"),
+            )
+        )
+        e = e.join(_s4_standard_names, "OMOP_STANDARD_CONCEPT_ID", "left")
+        e = e.drop(
+            "_S4_NICIP_MATCHED",
+            "_S4_SNOMED_STANDARD",
+            "_S4_STANDARD_CANDIDATE_COUNT",
+            "_S4_ONLY_STANDARD_CONCEPT_ID",
+        )
+    else:
+        e = (
+            e.withColumn("NICIP_SNOMED_CODE", F.lit(None).cast("string"))
+            .withColumn("SNOMED_CONCEPT_ID", F.lit(None).cast("long"))
+            .withColumn("OMOP_STANDARD_CONCEPT_ID", F.lit(None).cast("long"))
+            .withColumn("OMOP_STANDARD_CONCEPT_NAME", F.lit(None).cast("string"))
+            .withColumn("OMOP_STANDARD_CANDIDATE_COUNT", F.lit(None).cast("long"))
+            .withColumn("OMOP_STANDARD_MAPPING_METHOD", F.lit(None).cast("string"))
+            .withColumn("PROCEDURE_MAPPING_METHOD", F.lit(None).cast("string"))
+        )
+
+    # pacs_update_table derives staged INSERT/UPDATE values from df.columns, so these
+    # eight columns flow through its existing write/MERGE path without another list.
+    e = e.drop(_s4_exam_code_norm)
+    # S4-C2 END
 
     return join_person(e, "PACS_PATIENT_ID", gates)
 
@@ -1330,5 +1503,82 @@ _summary["completed_at"] = bronze_utc_now()
 audit(None, "RUN_SUCCESS", _summary)
 release_run_lock()
 print(bronze_json(_summary))
+
+# ANON_TEXT_STATE_REATTACH_V3_2
+import json as _anon_json
+from pyspark.sql import functions as _anon_F
+
+_ANON_REATTACH_SPECS = _anon_json.loads('[{"feed": "pacs_report", "keys": ["PACS_REPORT_ID"], "outputs": ["anon_report_text"], "state_table": "6_mgmt.anon.state_pacs_report", "table": "4_prod.bronze.map_pacs_report"}]')
+_ANON_STATE_TYPES = {'anon_status': 'STRING', 'anon_redactor_version': 'STRING', 'anon_source_text_sha': 'STRING', 'anon_identity_fingerprint': 'STRING', 'anon_redaction_count': 'BIGINT', 'anon_processed_at': 'TIMESTAMP'}
+
+def _anon_qtable(name):
+    return ".".join(f"`{part}`" for part in name.replace("`", "").split("."))
+
+for _anon_spec in _ANON_REATTACH_SPECS:
+    _anon_target = _anon_spec["table"]
+    _anon_state = _anon_spec["state_table"]
+    _anon_columns = {field.name: field.dataType.simpleString()
+                     for field in spark.table(_anon_target).schema.fields}
+    for _anon_name in _anon_spec["outputs"]:
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` STRING)")
+    for _anon_name, _anon_type in _ANON_STATE_TYPES.items():
+        if _anon_name not in _anon_columns:
+            spark.sql(f"ALTER TABLE {_anon_qtable(_anon_target)} ADD COLUMNS (`{_anon_name}` {_anon_type})")
+    for _anon_name in _anon_spec["outputs"]:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='3','ig_severity'='2')"
+        )
+    for _anon_name in _ANON_STATE_TYPES:
+        spark.sql(
+            f"ALTER TABLE {_anon_qtable(_anon_target)} ALTER COLUMN `{_anon_name}` "
+            "SET TAGS ('ig_risk'='1','ig_severity'='1')"
+        )
+    if spark.catalog.tableExists(_anon_state):
+        _anon_target_df = spark.table(_anon_target).alias("t")
+        _anon_state_df = spark.table(_anon_state).alias("s")
+        _anon_condition = None
+        for _anon_key in _anon_spec["keys"]:
+            _anon_term = _anon_F.col(f"t.`{_anon_key}`").eqNullSafe(
+                _anon_F.col(f"s.`{_anon_key}`")
+            )
+            _anon_condition = _anon_term if _anon_condition is None else _anon_condition & _anon_term
+        _anon_expected = _anon_target_df.join(
+            _anon_state_df, _anon_condition, "inner"
+        ).count()
+        _anon_join_sql = " AND ".join(
+            f"t.`{column}` <=> s.`{column}`" for column in _anon_spec["keys"]
+        )
+        spark.sql(
+            f"MERGE INTO {_anon_qtable(_anon_target)} t USING {_anon_qtable(_anon_state)} s "
+            f"ON {_anon_join_sql} WHEN MATCHED THEN UPDATE SET "
+            + ", ".join(
+                f"t.`{column}` = s.`{column}`"
+                for column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES)
+            )
+        )
+        _anon_post = spark.table(_anon_target).alias("t").join(
+            spark.table(_anon_state).alias("s"), _anon_condition, "inner"
+        )
+        _anon_mismatch = _anon_F.lit(False)
+        for _anon_column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES):
+            _anon_mismatch = _anon_mismatch | ~_anon_F.col(
+                f"t.`{_anon_column}`"
+            ).eqNullSafe(_anon_F.col(f"s.`{_anon_column}`"))
+        _anon_metrics = _anon_post.agg(
+            _anon_F.count("*").alias("matched_rows"),
+            _anon_F.sum(_anon_F.when(_anon_mismatch, 1).otherwise(0)).alias("mismatches"),
+        ).first()
+        if (int(_anon_metrics.matched_rows) != int(_anon_expected)
+                or int(_anon_metrics.mismatches or 0) != 0):
+            raise AssertionError(
+                f"anonymous-state reattach failed for {_anon_target}: "
+                f"expected={_anon_expected}, matched={_anon_metrics.matched_rows}, "
+                f"mismatches={_anon_metrics.mismatches}"
+            )
+# END_ANON_TEXT_STATE_REATTACH_V3_2
+
+
 dbutils.notebook.exit(bronze_json(_summary))
 
