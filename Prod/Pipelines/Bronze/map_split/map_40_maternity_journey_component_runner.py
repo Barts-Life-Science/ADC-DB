@@ -1,6 +1,7 @@
 # Databricks notebook source
+# BRONZE_PERF_946452877034658_V2
 # Generated Map split runner. Do not edit; regenerate from the validated source group.
-# MAGIC %pip install openai pyarrow
+%pip install openai pyarrow
 
 # COMMAND ----------
 
@@ -8,12 +9,27 @@
 
 # COMMAND ----------
 
-_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': ''}
+_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': '', 'perf_task_run_id': ''}
 for _map_split_name, _map_split_default in _MAP_SPLIT_WIDGET_DEFAULTS.items():
     try:
         dbutils.widgets.get(_map_split_name)
     except Exception:
         dbutils.widgets.text(_map_split_name, _map_split_default)
+
+import time as _perf_time
+_PERF_TASK_STARTED_AT = _perf_time.time()
+_PERF_TASK_START_BASIS = 'runner_preamble_after_python_restart'
+try:
+    from databricks.sdk import WorkspaceClient as _PerfWorkspaceClient
+    _perf_task_id = dbutils.widgets.get('perf_task_run_id')
+    if _perf_task_id:
+        _perf_task_run = _PerfWorkspaceClient().jobs.get_run(int(_perf_task_id))
+        if _perf_task_run.start_time:
+            _PERF_TASK_STARTED_AT = _perf_task_run.start_time / 1000.0
+            _PERF_TASK_START_BASIS = 'jobs_api_task_start'
+except Exception as _perf_exc:
+    print('[PERF] Task start unavailable; timing explicitly excludes earlier bootstrap: ' + str(_perf_exc)[:200])
+
 
 # COMMAND ----------
 

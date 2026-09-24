@@ -6,6 +6,14 @@
 # regex-quotes every code, preserving digit-bearing and underscore-bearing codes.
 
 # release: bronze_completeness_20260816_v1 — prod-idiom refactor; behavior-identical (NO_OP re-proof run 700525436450654)
+# release: pacs_integration_v2 (2026-09-24) — additive: REFERENCE_NBR is parsed by the shared
+# _pacs_accession_rules into SECTRA_ACCESSION_NBR + EXAM_CODE_FROM_REF; the trailing digit is
+# an event-ROLE marker (exam CODE1, DOC report CODECODE0, section CODE0), so the report link
+# is the class-224 DOC event sharing REF_EXAM_KEY (accession|code) with the class-234 exam -
+# the v1 DOC-child PARENT_EVENT_ID link matched nothing. Each event is also linked to its
+# PACS examination (map_pacs_examination, a new secondary source) with method + candidate
+# count; unresolvable candidates stay unlinked, never chosen.
+# RADIOLOGY_EVENT_V2_PATCHED
 import json
 
 # Prod-idiom target resolution (house pattern: jac_pipeline/endobase_pipeline).
@@ -42,6 +50,7 @@ _nhsi_default = (
     else "8_dev.s4_bronze.nhsi_exam_mapping"
 )
 NHSI_LOOKUP = _widget_text("nhsi_lookup", _nhsi_default)
+PACS_SOURCE = _widget_text("pacs_source", "4_prod.bronze.map_pacs_examination")
 assert ACTION in ("fixture", "pre_gates", "build", "gates")
 assert not (TARGET_SCHEMA == "4_prod.bronze" and NHSI_LOOKUP.startswith("8_dev.")), (
     "prod may not read staged NHSI lookup")
@@ -63,12 +72,25 @@ def _target_state_current(target, versions):
         properties.get(SOURCE_STATE_PROPERTY, "{}")).items()}
     return previous == versions
 
+def _quoted(name):
+    return ".".join(f"`{part}`" for part in name.split("."))
+
+def _previous_source_versions(target):
+    if not spark.catalog.tableExists(target):
+        return {}
+    properties = spark.sql(f"DESCRIBE DETAIL {target}").first()["properties"] or {}
+    return {k: int(v) for k, v in json.loads(properties.get(SOURCE_STATE_PROPERTY, "{}")).items()}
+
 def _record_source_versions(target, versions):
     payload = json.dumps(versions, sort_keys=True, separators=(",", ":")).replace("'", "''")
     spark.sql(
         f"ALTER TABLE {target} SET TBLPROPERTIES "
         f"('{SOURCE_STATE_PROPERTY}'='{payload}')"
     )
+
+# COMMAND ----------
+
+# MAGIC %run ./_pacs_accession_rules
 
 # COMMAND ----------
 
@@ -290,6 +312,12 @@ def incr_slice_clock(source_table,clock_col):
     if boundary is not None:inc=inc.where(F.col(clock_col)<=F.lit(boundary))
     return inc,boundary
 
+# Floors from demo 1 (2026-09-24, 2% accession-hash sample of the live table):
+# accession 99.96%, report link 99.98% of accession-bearing exams, PACS link 86.7%.
+REPORT_LINK_FLOOR = 0.95
+ACCESSION_PARSE_FLOOR = 0.99
+PACS_LINK_FLOOR = 0.80
+
 def run_gates():
     assert spark.catalog.tableExists(TARGET),f"TABLE_OR_VIEW_NOT_FOUND: {TARGET}"
     d=spark.table(TARGET)
@@ -308,7 +336,29 @@ def run_gates():
     blob_rate=c224.where("BLOB_TEXT_IND").count()/max(c224.count(),1)
     assert blob_rate>=0.970,f"G3 DOC blob rate {blob_rate}"
     assert d.where("EVENT_CLASS_CD<>224 AND BLOB_TEXT_IND").count()/max(d.where("EVENT_CLASS_CD<>224").count(),1)<0.001,         "G3 unexpected non-DOC blobs"
-    assert d.where("REPORT_LINK_STATUS='LINKED' AND RADIOLOGY_REPORT_EVENT_ID IS NULL").limit(1).count()==0
+    # v2 link contract: a pointer exactly when the status says so; SELF only on DOC events;
+    # every source event carries a PACS link method; a PACS id only on a resolving method.
+    # keyed_upsert never deletes, so events purged from EVENT_SOURCE stay with their last
+    # values and are never recomputed: a NULL method is allowed only for those.
+    assert d.where("""(REPORT_LINK_STATUS IN ('SELF','SIBLING','SIBLING_LATEST_OF_MULTIPLE'))
+                      <> (RADIOLOGY_REPORT_EVENT_ID IS NOT NULL)""").limit(1).count()==0,"G3 report pointer/status"
+    assert d.where("REPORT_LINK_STATUS='SELF' AND EVENT_CLASS_CD<>224").limit(1).count()==0,"G3 SELF on non-DOC"
+    assert d.where("""PACS_LINK_METHOD IS NOT NULL AND (PACS_EXAMINATION_ID IS NOT NULL) <>
+                      (PACS_LINK_METHOD IN ('ACCESSION_EXAM_CODE','ACCESSION_ONLY_UNIQUE'))""").limit(1).count()==0,"G7 PACS link method/id"
+    source_ids=(spark.table(EVENT_SOURCE).where(F.col("CONTRIBUTOR_SYSTEM_CD").cast("bigint").isin(CONTRIBUTORS))
+                .select(F.col("EVENT_ID").cast("bigint").alias("EVENT_ID")))
+    assert d.where("PACS_LINK_METHOD IS NULL").join(source_ids,"EVENT_ID","left_semi").limit(1).count()==0,         "G7 source event without PACS link method"
+    assert d.where("SECTRA_ACCESSION_NBR IS NOT NULL AND REF_PARSE_METHOD IN ('NO_REFERENCE','UNRECOGNISED_FORMAT')").limit(1).count()==0,"G7 accession provenance"
+    links=d.where("EVENT_CLASS_CD=234").agg(
+        F.count("*").alias("exams"),
+        F.sum(F.col("RADIOLOGY_REPORT_EVENT_ID").isNotNull().cast("long")).alias("report_linked"),
+        F.sum((F.col("REPORT_LINK_STATUS")=="AMBIGUOUS").cast("long")).alias("report_ambiguous"),
+        F.sum(F.col("SECTRA_ACCESSION_NBR").isNotNull().cast("long")).alias("with_accession"),
+        F.sum(F.col("PACS_EXAMINATION_ID").isNotNull().cast("long")).alias("pacs_linked")).collect()[0].asDict()
+    # The v1 link produced zero; the floors fail any collapse of the v2 link.
+    assert links["report_linked"]/max(links["exams"],1)>=REPORT_LINK_FLOOR,f"G3 report link rate {links}"
+    assert links["with_accession"]/max(links["exams"],1)>=ACCESSION_PARSE_FLOOR,f"G7 accession parse rate {links}"
+    assert links["pacs_linked"]/max(links["exams"],1)>=PACS_LINK_FLOOR,f"G7 PACS link rate {links}"
     assert d.where("RESULT_STATUS_DESC IS NULL").limit(1).count()==0,"G5 result-status decode"
     assert 0<a["in_error"]<=147,f"G5 in-error scale {a['in_error']}"
     for c in ("EVENT_START_DT_TM","EVENT_END_DT_TM","PERFORMED_DT_TM"):
@@ -337,7 +387,7 @@ def run_gates():
       FROM (SELECT ORDER_ID FROM {TARGET} WHERE ORDER_ID IS NOT NULL AND pmod(xxhash64(ORDER_ID),331)=0) x
       LEFT JOIN 4_prod.raw.mill_orders o ON x.ORDER_ID=CAST(o.ORDER_ID AS BIGINT)""").collect()[0]
     assert orders["ok"]/orders["n"]>=0.996,f"G4 order linkage {orders}"
-    print({"rows":a["n"],"multi_open":a["multi"],"closed_only":a["closed"],"parse_234":parse,
+    print({"rows":a["n"],"multi_open":a["multi"],"closed_only":a["closed"],"parse_234":parse,"links_234":links,
            "doc_blob_rate":blob_rate,"in_error":a["in_error"],"person_link":person.asDict(),
            "order_link":orders.asDict()})
     print("A9 gates PASS")
@@ -350,7 +400,8 @@ if ACTION=="gates":
 # COMMAND ----------
 
 cv_table="3_lookup.mill.mill_code_value"
-SOURCE_TABLES=[EVENT_SOURCE,BLOB_SOURCE,NHSI_LOOKUP,cv_table]
+SOURCE_TABLES=[EVENT_SOURCE,BLOB_SOURCE,NHSI_LOOKUP,cv_table,PACS_SOURCE]
+PREVIOUS_SOURCE_VERSIONS=_previous_source_versions(TARGET)
 CURRENT_SOURCE_VERSIONS=_source_versions(SOURCE_TABLES)
 if _target_state_current(TARGET,CURRENT_SOURCE_VERSIONS):
     run_gates()
@@ -388,6 +439,42 @@ if spark.catalog.tableExists(TARGET):
       .select("EVENT_ID"))
     affected=affected.union(cv_events).distinct()
 
+assert_accession_rules()
+_REF=accession_parse_sql("REFERENCE_NBR")
+V2_COLUMNS={"SECTRA_ACCESSION_NBR","REF_EXAM_KEY","PACS_LINK_METHOD","RADIOLOGY_REPORT_CANDIDATE_COUNT"}
+TARGET_IS_V2=spark.catalog.tableExists(TARGET) and V2_COLUMNS<=set(spark.table(TARGET).columns)
+if not TARGET_IS_V2:
+    # First v2 build (or new target): every event is recomputed once.
+    affected=snap.select(F.col("EVENT_ID").cast("bigint").alias("EVENT_ID")).distinct()
+    FULL_RECOMPUTE_REASON="target lacks v2 columns"
+else:
+    FULL_RECOMPUTE_REASON=None
+    # Secondary source: PACS examinations. Their change set (Delta CDF between the version
+    # recorded at the last publish and now, pre- AND post-images) yields accessions whose
+    # candidate sets moved; every Mill event carrying one is re-linked.
+    _pacs_from=PREVIOUS_SOURCE_VERSIONS.get(PACS_SOURCE)
+    _pacs_to=CURRENT_SOURCE_VERSIONS[PACS_SOURCE]
+    _pacs_acc_sql,_=sectra_accession_sql("REQUEST_ID_STRING")
+    if _pacs_from is None:
+        affected=spark.table(TARGET).select("EVENT_ID")
+        FULL_RECOMPUTE_REASON="no recorded PACS source version"
+    elif _pacs_to>_pacs_from:
+        changed_acc=(spark.sql(f"SELECT REQUEST_ID_STRING FROM table_changes('{_quoted(PACS_SOURCE)}',{_pacs_from+1},{_pacs_to})")
+                     .select(F.upper(F.expr(_pacs_acc_sql)).alias("_ACC")).where("_ACC IS NOT NULL").distinct())
+        affected=affected.union(spark.table(TARGET)
+            .join(changed_acc,F.upper(F.col("SECTRA_ACCESSION_NBR"))==F.col("_ACC"),"inner")
+            .select("EVENT_ID")).distinct()
+    # Report links are exam-key groups: close the work set over every REF_EXAM_KEY an
+    # affected event carries now (raw) or carried before (target), so a sibling's link is
+    # recomputed whenever any member of its group changes.
+    _seed=affected
+    _keys=(snap.select(F.col("EVENT_ID").cast("bigint").alias("EVENT_ID"),F.expr(_REF["exam_key"]).alias("_K"))
+           .join(_seed,"EVENT_ID","inner").select("_K")
+           .union(spark.table(TARGET).join(_seed,"EVENT_ID","inner").select(F.col("REF_EXAM_KEY").alias("_K")))
+           .where("_K IS NOT NULL").distinct())
+    affected=_seed.union(spark.table(TARGET).join(_keys,F.col("REF_EXAM_KEY")==F.col("_K"),"inner")
+                         .select("EVENT_ID")).distinct()
+
 raw=(snap.select(
  F.col("EVENT_ID").cast("bigint").alias("EVENT_ID"),
  F.col("PARENT_EVENT_ID").cast("bigint").alias("PARENT_EVENT_ID"),
@@ -397,7 +484,9 @@ raw=(snap.select(
  F.col("CONTRIBUTOR_SYSTEM_CD").cast("bigint").alias("CONTRIBUTOR_SYSTEM_CD"),
  F.col("EVENT_CLASS_CD").cast("bigint").alias("EVENT_CLASS_CD"),
  F.col("EVENT_CD").cast("bigint").alias("EVENT_CD"),
- "EVENT_TAG","EVENT_TITLE_TEXT","REFERENCE_NBR","EVENT_START_DT_TM","EVENT_END_DT_TM","PERFORMED_DT_TM",
+ "EVENT_TAG","EVENT_TITLE_TEXT","REFERENCE_NBR","SERIES_REF_NBR",
+ F.nullif(F.trim(F.col("ACCESSION_NBR")),F.lit("")).alias("CE_ACCESSION_NBR"),
+ "EVENT_START_DT_TM","EVENT_END_DT_TM","PERFORMED_DT_TM",
  F.col("RESULT_STATUS_CD").cast("bigint").alias("RESULT_STATUS_CD"),
  "VALID_FROM_DT_TM","VALID_UNTIL_DT_TM",F.col("UPDT_CNT").cast("bigint").alias("UPDT_CNT"),
  "UPDT_DT_TM",F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"))
@@ -419,6 +508,22 @@ for c,o in [("CONTRIBUTOR_SYSTEM_CD","CONTRIBUTOR_SYSTEM_DESC"),("EVENT_CLASS_CD
     lk=cv.withColumnRenamed("_CD",f"_{o}_CD").withColumnRenamed("_DESC",o)
     resolved=resolved.join(lk,F.col(c)==F.col(f"_{o}_CD"),"left").drop(f"_{o}_CD")
 resolved=resolved.withColumn("IN_ERROR_IND",F.col("RESULT_STATUS_CD")==31)
+
+# Shared accession rules (identical SQL to pacs_pipeline). SERIES_REF_NBR mirrors
+# REFERENCE_NBR on sampled rows; a disagreement is flagged, never resolved.
+_SER=accession_parse_sql("SERIES_REF_NBR")
+resolved=(resolved
+  .withColumn("SECTRA_ACCESSION_NBR",F.expr(_REF["accession"]))
+  .withColumn("ACCESSION_FORMAT",F.expr(_REF["format"]))
+  .withColumn("EXAM_CODE_FROM_REF",F.expr(_REF["code"]))
+  .withColumn("REF_ROLE_DIGIT",F.expr(_REF["seq"]))
+  .withColumn("REF_PARSE_METHOD",F.expr(_REF["method"]))
+  .withColumn("REF_EXAM_KEY",F.expr(_REF["exam_key"]))
+  .withColumn("ACCESSION_RULE_VERSION",F.lit(ACCESSION_RULE_VERSION))
+  .withColumn("SERIES_REF_ACCESSION_NBR",F.expr(_SER["accession"]))
+  .withColumn("REFERENCE_SERIES_MISMATCH_IND",
+              F.col("SERIES_REF_ACCESSION_NBR").isNotNull()&F.col("SECTRA_ACCESSION_NBR").isNotNull()
+              &(F.col("SERIES_REF_ACCESSION_NBR")!=F.col("SECTRA_ACCESSION_NBR"))))
 
 # Exact suffix parser: lookup codes have only six lengths. Generate 0/1 trailing-sequence
 # variants only for class-234 exam events, then use one broadcast equality join.
@@ -453,26 +558,91 @@ blob_keys_all=spark.table(BLOB_SOURCE).select(F.col("EVENT_ID").cast("bigint").a
 best=(best.join(blob_keys_all,F.col("EVENT_ID")==F.col("_BLOB_EVENT_ID"),"left")
       .withColumn("BLOB_TEXT_IND",F.col("_BLOB_EVENT_ID").isNotNull()).drop("_BLOB_EVENT_ID"))
 
-parent_events=best.where("EVENT_CLASS_CD=234").select(F.col("EVENT_ID").alias("_PARENT")).distinct()
-new_children=(best.where("EVENT_CLASS_CD=224")
-              .select(F.col("PARENT_EVENT_ID_NORM").alias("_PARENT"),
-                      F.col("EVENT_ID").alias("_REPORT")))
-if spark.catalog.tableExists(TARGET):
-    old_children=(spark.table(TARGET).where("EVENT_CLASS_CD=224")
-                  .select(F.col("PARENT_EVENT_ID_NORM").alias("_PARENT"),
-                          F.col("EVENT_ID").alias("_REPORT")).join(parent_events,"_PARENT","inner"))
-    children=old_children.unionByName(new_children)
-else:
-    children=new_children
-report=(children.groupBy("_PARENT").agg(F.countDistinct("_REPORT").alias("_REPORT_N"),
-                                        F.min("_REPORT").alias("_ONLY_REPORT")))
-best=(best.join(report,F.col("EVENT_ID")==F.col("_PARENT"),"left")
- .withColumn("RADIOLOGY_REPORT_EVENT_ID",
-   F.when((F.col("EVENT_CLASS_CD")==234)&(F.col("_REPORT_N")==1),F.col("_ONLY_REPORT")))
+# Report link (v2). The report is the class-224 DOC event (blob-bearing, G3) sharing the exam's
+# REF_EXAM_KEY; in-error DOCs never link. Identity-compatible = either PERSON_ID NULL or equal.
+# The work set is closed over exam keys above, so `best` holds every member of each group.
+_docs=(best.where((F.col("EVENT_CLASS_CD")==224)&~F.coalesce(F.col("IN_ERROR_IND"),F.lit(False))
+                  &F.col("REF_EXAM_KEY").isNotNull())
+       .select(F.col("REF_EXAM_KEY").alias("_K"),F.col("EVENT_ID").alias("_DOC_ID"),
+               F.col("PERSON_ID").alias("_DOC_PERSON"),F.col("BLOB_TEXT_IND").alias("_DOC_BLOB"),
+               F.col("EVENT_END_DT_TM").alias("_DOC_END"),F.col("UPDT_DT_TM").alias("_DOC_UPDT")))
+_pairs=(best.where("EVENT_CLASS_CD=234 AND REF_EXAM_KEY IS NOT NULL")
+        .select("EVENT_ID",F.col("REF_EXAM_KEY").alias("_K"),F.col("PERSON_ID").alias("_EXAM_PERSON"))
+        .join(_docs,"_K","inner")
+        .withColumn("_COMPAT",F.col("_EXAM_PERSON").isNull()|F.col("_DOC_PERSON").isNull()
+                    |(F.col("_EXAM_PERSON")==F.col("_DOC_PERSON"))))
+_compat=_pairs.where("_COMPAT")
+_report_stats=(_pairs.groupBy("EVENT_ID").agg(
+    F.countDistinct(F.when(F.col("_COMPAT"),F.col("_DOC_ID"))).alias("_N"),
+    F.countDistinct(F.when(~F.col("_COMPAT"),F.col("_DOC_ID"))).alias("_CONFLICT_N"),
+    F.countDistinct(F.when(F.col("_COMPAT"),F.col("_DOC_PERSON"))).alias("_DOC_PERSONS")))
+# Latest report among compatible candidates: blob-bearing first (has-data), then the latest
+# clinical end time, then the latest update, NULLS LAST throughout, EVENT_ID as final tiebreak.
+_latest=(latest_per_key(_compat,["EVENT_ID"],[
+            F.col("_DOC_BLOB").desc_nulls_last(),F.col("_DOC_END").desc_nulls_last(),
+            F.col("_DOC_UPDT").desc_nulls_last(),F.col("_DOC_ID").desc()])
+         .select("EVENT_ID",F.col("_DOC_ID").alias("_LATEST_DOC")))
+best=(best.join(_report_stats,"EVENT_ID","left").join(_latest,"EVENT_ID","left")
+ .withColumn("_N",F.coalesce("_N",F.lit(0)))
  .withColumn("REPORT_LINK_STATUS",
-   F.when(F.col("EVENT_CLASS_CD")!=234,"NONE")
-    .when(F.col("_REPORT_N")==1,"LINKED").when(F.col("_REPORT_N")>1,"AMBIGUOUS").otherwise("NONE"))
- .drop("_PARENT","_REPORT_N","_ONLY_REPORT"))
+   F.when(F.col("EVENT_CLASS_CD")==224,F.lit("SELF"))
+    .when(F.col("EVENT_CLASS_CD")!=234,F.lit("NONE"))
+    # Several persons among the candidates while the exam has none: never pick one.
+    .when((F.col("_N")>0)&(F.col("_DOC_PERSONS")>1)&F.col("PERSON_ID").isNull(),F.lit("AMBIGUOUS"))
+    .when(F.col("_N")==1,F.lit("SIBLING"))
+    .when(F.col("_N")>1,F.lit("SIBLING_LATEST_OF_MULTIPLE"))
+    .when(F.coalesce(F.col("_CONFLICT_N"),F.lit(0))>0,F.lit("AMBIGUOUS"))
+    .otherwise(F.lit("NONE")))
+ .withColumn("RADIOLOGY_REPORT_EVENT_ID",
+   F.when(F.col("REPORT_LINK_STATUS")=="SELF",F.col("EVENT_ID"))
+    .when(F.col("REPORT_LINK_STATUS").isin("SIBLING","SIBLING_LATEST_OF_MULTIPLE"),F.col("_LATEST_DOC")))
+ .withColumn("RADIOLOGY_REPORT_CANDIDATE_COUNT",
+   F.when(F.col("EVENT_CLASS_CD")==234,F.col("_N").cast("int")))
+ .withColumn("REPORT_IDENTITY_CONFLICT_COUNT",
+   F.when(F.col("EVENT_CLASS_CD")==234,F.coalesce(F.col("_CONFLICT_N"),F.lit(0)).cast("int")))
+ .drop("_N","_CONFLICT_N","_DOC_PERSONS","_LATEST_DOC"))
+
+# PACS examination link (v2): candidates = present PACS exams whose Sectra extraction
+# accession equals this event's accession. Exactly one identity-compatible exam with the
+# same examination code resolves; an accession with exactly one PACS exam (and no code to
+# contradict it) resolves as ACCESSION_ONLY_UNIQUE; anything else stays unlinked with a reason.
+_pacs_acc_sql,_=sectra_accession_sql("REQUEST_ID_STRING")
+_pacs=(spark.read.option("versionAsOf",CURRENT_SOURCE_VERSIONS[PACS_SOURCE]).table(PACS_SOURCE)
+       .where(F.col("SOURCE_PRESENT_IND"))
+       .select(F.col("PACS_EXAMINATION_ID").alias("_PX"),F.upper(F.expr(_pacs_acc_sql)).alias("_ACC"),
+               F.upper(F.trim(F.col("EXAMINATION_CODE"))).alias("_PCODE"),F.col("PERSON_ID").alias("_PPERSON"))
+       .where("_ACC IS NOT NULL"))
+_cand=(best.where("SECTRA_ACCESSION_NBR IS NOT NULL")
+       .select("EVENT_ID",F.upper(F.col("SECTRA_ACCESSION_NBR")).alias("_ACC"),
+               F.upper(F.coalesce(F.col("EXAM_TYPE_CODE"),F.col("EXAM_CODE_FROM_REF"))).alias("_MCODE"),
+               F.col("PERSON_ID").alias("_MPERSON"))
+       .join(_pacs,"_ACC","inner")
+       .withColumn("_OK",F.col("_MPERSON").isNull()|F.col("_PPERSON").isNull()|(F.col("_MPERSON")==F.col("_PPERSON")))
+       .withColumn("_CODE",F.col("_MCODE").isNotNull()&(F.col("_MCODE")==F.col("_PCODE"))))
+_pacs_stats=(_cand.groupBy("EVENT_ID").agg(
+    F.countDistinct("_PX").alias("_ALL"),
+    F.countDistinct(F.when(F.col("_OK"),F.col("_PX"))).alias("_COMPAT"),
+    F.countDistinct(F.when(F.col("_CODE"),F.col("_PX"))).alias("_CODE_ANY"),
+    F.countDistinct(F.when(F.col("_OK")&F.col("_CODE"),F.col("_PX"))).alias("_CODE_OK"),
+    F.min(F.when(F.col("_OK")&F.col("_CODE"),F.col("_PX"))).alias("_CODE_PX"),
+    F.min(F.when(F.col("_OK"),F.col("_PX"))).alias("_ONLY_PX"),
+    F.max(F.col("_MCODE").isNotNull().cast("int")).alias("_HAS_CODE")))
+best=(best.join(_pacs_stats,"EVENT_ID","left")
+ .withColumn("PACS_LINK_METHOD",
+   F.when(F.col("SECTRA_ACCESSION_NBR").isNull(),F.lit("NO_ACCESSION"))
+    .when(F.col("_ALL").isNull(),F.lit("NO_PACS_CANDIDATE"))
+    .when(F.col("_CODE_OK")==1,F.lit("ACCESSION_EXAM_CODE"))
+    .when(F.col("_CODE_OK")>1,F.lit("AMBIGUOUS_EXAM_CODE"))
+    .when(F.col("_CODE_ANY")>0,F.lit("IDENTITY_CONFLICT"))
+    .when((F.col("_ALL")==1)&(F.col("_COMPAT")==1)&(F.col("_HAS_CODE")==0),F.lit("ACCESSION_ONLY_UNIQUE"))
+    .when(F.col("_COMPAT")==0,F.lit("IDENTITY_CONFLICT"))
+    .when(F.col("_HAS_CODE")==1,F.lit("EXAM_CODE_NOT_IN_ACCESSION"))
+    .otherwise(F.lit("ACCESSION_AMBIGUOUS")))
+ .withColumn("PACS_EXAMINATION_ID",
+   F.when(F.col("PACS_LINK_METHOD")=="ACCESSION_EXAM_CODE",F.col("_CODE_PX"))
+    .when(F.col("PACS_LINK_METHOD")=="ACCESSION_ONLY_UNIQUE",F.col("_ONLY_PX")).cast("long"))
+ .withColumn("PACS_LINK_CANDIDATE_COUNT",F.coalesce(F.col("_ALL"),F.lit(0)).cast("int"))
+ .drop("_ALL","_COMPAT","_CODE_ANY","_CODE_OK","_CODE_PX","_ONLY_PX","_HAS_CODE"))
 best,flagged=dq_all_clinical(best,admin_stamps={"UPDT_DT_TM","SOURCE_ADC_UPDT"})
 admin={"UPDT_DT_TM","SOURCE_ADC_UPDT","PIPELINE_UPDT_DT_TM","ROW_HASH"}
 hash_cols=[c for c in best.columns if c not in admin and not c.endswith(("_FUTURE_IND","_SENTINEL_IND","_CLEAN"))]
@@ -480,6 +650,16 @@ out=(best.withColumn("ROW_HASH",F.xxhash64(F.to_json(F.struct(*[F.col(c) for c i
      .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp()))
 if not spark.catalog.tableExists(TARGET):
     out.limit(0).write.format("delta").mode("overwrite").option("delta.enableChangeDataFeed","true").saveAsTable(TARGET)
+# Additive-only schema evolution (no reliance on session autoMerge): add staged columns the
+# target lacks; any retype or disappearing column aborts before the write.
+_have={f.name.lower():f.dataType.simpleString() for f in spark.table(TARGET).schema.fields}
+_want={f.name.lower():(f.name,f.dataType.simpleString()) for f in out.schema.fields}
+_bad=sorted([c for c,(_,t) in _want.items() if c in _have and _have[c]!=t]+[c for c in _have if c not in _want])
+assert not _bad,f"non-additive schema change on {TARGET}: {_bad}"
+_add=[(n,t) for c,(n,t) in _want.items() if c not in _have]
+if _add:
+    spark.sql(f"ALTER TABLE {TARGET} ADD COLUMNS ("+", ".join(f"`{n}` {t}" for n,t in _add)+")")
+print({"full_recompute_reason":FULL_RECOMPUTE_REASON,"added_columns":[n for n,_ in _add]})
 metrics=keyed_upsert(TARGET,["EVENT_ID"],out)
 unmatched=(spark.table(TARGET).where("EVENT_CLASS_CD=234 AND EXAM_TYPE_CODE IS NULL")
            .groupBy(F.regexp_extract(F.upper("REFERENCE_NBR"),"([A-Z0-9_]+)[0-9]*$",1).alias("STEM"))
@@ -493,7 +673,43 @@ for source,boundary in [(EVENT_SOURCE,event_boundary),(BLOB_SOURCE,blob_boundary
     if boundary is not None and (old is None or boundary>old):wm_set(PIPE,source,boundary)
 _record_source_versions(TARGET,CURRENT_SOURCE_VERSIONS)
 spark.sql(f"""COMMENT ON TABLE {TARGET} IS
-'Grain: one latest resolved EVENT_ID from BLT_TIE_RAD plus BHR_TIE_SECTRA_RAD. Resolution prefers open versions and deterministically handles multi-open and closed-only events. REFERENCE_NBR is matched against regex-quoted NHSI codes plus optional trailing sequence digits; no code is invented. Report links use DOC child PARENT_EVENT_ID and record ambiguity. In-error results and implausible dates are retained and flagged. No EVENT_STATUS_CD exists; RESULT_STATUS_CD is the status source.'""")
+'Grain: one latest resolved EVENT_ID from BLT_TIE_RAD plus BHR_TIE_SECTRA_RAD. Resolution prefers open versions and deterministically handles multi-open and closed-only events. REFERENCE_NBR is matched against regex-quoted NHSI codes plus an optional trailing role digit; no code is invented. REFERENCE_NBR is also parsed by the shared accession rules into SECTRA_ACCESSION_NBR and REF_EXAM_KEY (accession|code; the trailing digit is an event-role marker). The report link is the DOC event sharing REF_EXAM_KEY with the exam (identity-compatible; latest when several; ambiguity recorded, never chosen). PACS_EXAMINATION_ID links to map_pacs_examination by accession + exam code with method and candidate count. In-error results and implausible dates are retained and flagged. No EVENT_STATUS_CD exists; RESULT_STATUS_CD is the status source.'""")
+RADIOLOGY_V2_COMMENTS={
+ "SERIES_REF_NBR":"Raw clinical_event SERIES_REF_NBR (mirrors REFERENCE_NBR on sampled rows). Identifier.",
+ "CE_ACCESSION_NBR":"Raw clinical_event ACCESSION_NBR, trimmed; blank on radiology contributors (evidence only). Identifier.",
+ "SECTRA_ACCESSION_NBR":"Accession parsed from REFERENCE_NBR by the shared _pacs_accession_rules (same SQL as pacs_pipeline). Joins map_pacs_examination.SECTRA_ACCESSION_NBR. Identifier.",
+ "ACCESSION_FORMAT":"SECTRA_16 | SITE_16 | RNH_14 | OTHER_SITE_14 | NUMERIC_16 | LEGACY_7_8 | LEGACY_6 | NUMERIC_OTHER | UNRECOGNISED.",
+ "EXAM_CODE_FROM_REF":"Examination code after the accession in REFERENCE_NBR; a doubled DOC code (CODECODE0) is collapsed. Lookup-independent (EXAM_TYPE_CODE is the NHSI-anchored parse).",
+ "REF_ROLE_DIGIT":"Trailing digit of REFERENCE_NBR: an event-ROLE marker (exam=1, DOC report/section=0), NOT an exam sequence.",
+ "REF_PARSE_METHOD":"NO_REFERENCE | UNRECOGNISED_FORMAT | ACCESSION_ONLY | CODE_SEQ | CODE_DOUBLED_SEQ | TAIL_UNPARSED (+SECTRA_SUFFIX).",
+ "REF_EXAM_KEY":"SECTRA_ACCESSION_NBR|EXAM_CODE_FROM_REF - the exam-scoped key shared by an exam event, its sections and its DOC report. Identifier-bearing.",
+ "ACCESSION_RULE_VERSION":"Version of the shared accession rules.",
+ "SERIES_REF_ACCESSION_NBR":"Accession parsed from SERIES_REF_NBR by the same rules. Identifier.",
+ "REFERENCE_SERIES_MISMATCH_IND":"Both references parse to an accession and they differ (flag only; REFERENCE_NBR is authoritative).",
+ "RADIOLOGY_REPORT_EVENT_ID":"Report DOC event: own EVENT_ID for DOC rows (SELF); for an exam, the identity-compatible DOC sharing REF_EXAM_KEY (latest when several). NULL otherwise.",
+ "REPORT_LINK_STATUS":"SELF | SIBLING | SIBLING_LATEST_OF_MULTIPLE (other reports remain relational via REF_EXAM_KEY) | AMBIGUOUS (identity conflict - no pointer) | NONE.",
+ "RADIOLOGY_REPORT_CANDIDATE_COUNT":"Exams only: identity-compatible, non-in-error DOC events sharing REF_EXAM_KEY.",
+ "REPORT_IDENTITY_CONFLICT_COUNT":"Exams only: DOC events sharing REF_EXAM_KEY but with a different PERSON_ID.",
+ "PACS_EXAMINATION_ID":"Linked map_pacs_examination row; set only for PACS_LINK_METHOD ACCESSION_EXAM_CODE or ACCESSION_ONLY_UNIQUE.",
+ "PACS_LINK_METHOD":"ACCESSION_EXAM_CODE | ACCESSION_ONLY_UNIQUE | AMBIGUOUS_EXAM_CODE | EXAM_CODE_NOT_IN_ACCESSION | ACCESSION_AMBIGUOUS | IDENTITY_CONFLICT | NO_PACS_CANDIDATE | NO_ACCESSION.",
+ "PACS_LINK_CANDIDATE_COUNT":"Present PACS examinations sharing the accession (before code/identity filtering).",
+}
+# IG: accession-bearing columns are identifiers (4/2, as REFERENCE_NBR); the rest 0/0.
+RADIOLOGY_V2_IG={c:("0","0") for c in RADIOLOGY_V2_COMMENTS}
+RADIOLOGY_V2_IG.update({c:("4","2") for c in ("REFERENCE_NBR","SERIES_REF_NBR","CE_ACCESSION_NBR",
+    "SECTRA_ACCESSION_NBR","REF_EXAM_KEY","SERIES_REF_ACCESSION_NBR")})
+_cat,_sch,_tbl=TARGET.split(".")
+_have_comments={r["col_name"]:(r["comment"] or "") for r in spark.sql(f"DESCRIBE TABLE {TARGET}").collect()}
+for _c,_txt in RADIOLOGY_V2_COMMENTS.items():
+    if _have_comments.get(_c)!=_txt:
+        spark.sql(f"ALTER TABLE {TARGET} ALTER COLUMN `{_c}` COMMENT '"+_txt.replace("\\","\\\\").replace("'","\\'")+"'")
+_have_tags={}
+for _r in spark.sql(f"""SELECT column_name,tag_name,tag_value FROM `{_cat}`.information_schema.column_tags
+      WHERE schema_name='{_sch}' AND table_name='{_tbl}' AND tag_name IN ('ig_risk','ig_severity')""").collect():
+    _have_tags.setdefault(_r["column_name"],{})[_r["tag_name"]]=_r["tag_value"]
+for _c,(_risk,_sev) in RADIOLOGY_V2_IG.items():
+    if _have_tags.get(_c,{})!={"ig_risk":_risk,"ig_severity":_sev}:
+        spark.sql(f"ALTER TABLE {TARGET} ALTER COLUMN `{_c}` SET TAGS ('ig_risk'='{_risk}','ig_severity'='{_sev}')")
 print("A9 build complete")
 
 # COMMAND ----------

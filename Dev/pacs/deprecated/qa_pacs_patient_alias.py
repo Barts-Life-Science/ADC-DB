@@ -47,3 +47,4 @@
 # MAGIC SELECT *
 # MAGIC FROM 4_prod.raw.mill_person_alias
 # MAGIC WHERE alias = '7059359672'
+

@@ -1,4 +1,6 @@
 # Databricks notebook source
+# BRONZE_FIX_857469999366132_V1
+# BRONZE_FIX_946452877034658_V1
 for _name, _default in {
     "target_schema": "8_dev.bronze_imp_new",
     "allow_production_write": "false",
@@ -587,6 +589,26 @@ def source_version(table: str) -> int:
     return int(row["version"])
 
 
+def required_delete_count(metrics, label):
+    value = metrics.get("numDeletedRows")
+    if value is None or not str(value).isdigit():
+        fail(f"{label}: DELETE requires an explicit nonnegative numDeletedRows; {metrics}")
+    return int(value)
+
+
+def required_drain_change_metrics(history_row, label):
+    metrics = history_row["operationMetrics"] or {}
+    if history_row["operation"] == "MERGE":
+        return required_drain_merge_metrics(metrics, label)
+    if history_row["operation"] == "DELETE":
+        return {
+            "numSourceRows": 0, "numOutputRows": 0, "numTargetRowsUpdated": 0,
+            "numTargetRowsInserted": 0,
+            "numTargetRowsDeleted": required_delete_count(metrics, label),
+        }
+    fail(f"{label}: unsupported row-change operation {history_row['operation']}")
+
+
 def derive_incremental_cumulative_rows(
     table: str,
     checkpoint: dict | None,
@@ -670,6 +692,14 @@ def derive_incremental_cumulative_rows(
                 "inserted_rows": inserted,
                 "deleted_rows": deleted,
                 "row_delta": inserted - deleted,
+            })
+        elif operation == "DELETE":
+            deleted = required_delete_count(history_row["operationMetrics"] or {},
+                                            f"{table}: DELETE version {version}")
+            row_delta -= deleted
+            data_change_commits.append({
+                "version": version, "operation": operation,
+                "inserted_rows": 0, "deleted_rows": deleted, "row_delta": -deleted,
             })
         elif operation in non_data_operations:
             metadata_commits.append({
@@ -2138,6 +2168,8 @@ def optional_archive_category(
     table: str,
     key: str,
     category: str,
+    ledger_run_id=None,
+    ledger_logged_at=None,
 ) -> tuple[DataFrame, dict]:
     try:
         version = source_version(table)
@@ -2157,870 +2189,184 @@ def optional_archive_category(
         .option("versionAsOf", int(version))
         .table(table)
     )
+    if ledger_run_id is not None:
+        required = {"_run_id", "_archived_at"}
+        if not required.issubset(set(frame.columns)) or ledger_logged_at is None:
+            fail(f"{table}: cannot prove archive batch ownership")
+        frame = frame.where(F.col("_run_id") == F.lit(ledger_run_id))
+        invalid_time = frame.where(
+            F.col("_archived_at").isNull()
+            | (F.col("_archived_at") > F.lit(ledger_logged_at).cast("timestamp"))
+        ).limit(1).count()
+        if invalid_time:
+            fail(f"{table}: archive rows postdate or lack the SUCCESS-log timestamp")
     return accounting_category_frame(frame, key, category), {
         "table": table,
         "exists": True,
         "pinned_delta_version": int(version),
+        "ledger_run_id": ledger_run_id,
+        "ledger_logged_at": str(ledger_logged_at),
         "missing_error_class": None,
     }
 
 
 def full_drain_accounting() -> dict:
-    heartbeat_run_lock("authoritative raw-drain accounting")
+    """Reconcile the classifier's physical input keys, including no-op raw merges.
+
+    Candidate routes overlap, so staged_rows is a UNION ALL row count. The
+    SUCCESS log's resolved_keys is the deduplicated key count. Prove that count
+    against time-travel staging, deletion CDF, archives and pinned raw payloads.
+    """
+    heartbeat_run_lock("physical classifier key accounting")
     results = {}
-    control = spark.table(CLASSIFICATION_CONTROL)
-    table_log = spark.table(CLASSIFICATION_TABLE_LOG)
-    source_specs = (
-        (SRC_CURRENT, "PM_WAIT_LIST_ID"),
-        (SRC_HIST, "PM_WAIT_LIST_HIST_ID"),
-    )
-    for source, key in source_specs:
+    for source, key in ((SRC_CURRENT, "PM_WAIT_LIST_ID"), (SRC_HIST, "PM_WAIT_LIST_HIST_ID")):
         basename = source.split(".")[-1]
-        control_rows = control.where(
-            normalized_table_match(F.col("table_name"), basename)
-        ).collect()
-        if len(control_rows) != 1:
-            fail(
-                f"{basename}: expected exactly one authoritative classification control row, "
-                f"found {len(control_rows)}; fail closed"
-            )
-        control_row = control_rows[0].asDict(recursive=True)
-        ledger_run_id = control_row.get("run_id")
-        staging_version = control_row.get("staging_version")
-        staged_at_watermark = control_row.get("staged_at_watermark")
-        control_updated_at = control_row.get("updated_at")
-        if (
-            not ledger_run_id
-            or staging_version is None
-            or staged_at_watermark is None
-            or control_updated_at is None
-        ):
-            fail(
-                f"{basename}: authoritative control row lacks run_id, staging_version, "
-                "staged_at_watermark, or updated_at"
-            )
+        staging = f"4_prod.staging.{basename}"
+        controls = (spark.table(CLASSIFICATION_CONTROL)
+                    .where(normalized_table_match(F.col("table_name"), basename)).collect())
+        if len(controls) != 1:
+            fail(f"{basename}: expected one classification control row")
+        control = controls[0].asDict()
+        ledger = control["run_id"]
+        end = int(control["staging_version"])
+        logs = (spark.table(CLASSIFICATION_TABLE_LOG)
+                .where((F.col("run_id") == ledger)
+                       & normalized_table_match(F.col("table_name"), basename)
+                       & (F.upper(F.trim("status")) == "SUCCESS")
+                       & (F.col("logged_at") <= F.lit(control["updated_at"]))).collect())
+        if len(logs) != 1:
+            fail(f"{basename}: expected one matching SUCCESS ledger")
+        log = logs[0].asDict()
+        names = ("staged_rows", "resolved_keys", "promoted_keys", "excluded_keys", "abandoned_keys", "remaining_rows")
+        if any(log.get(n) is None or int(log[n]) < 0 for n in names):
+            fail(f"{basename}: missing or negative ledger term")
+        terms = {n: int(log[n]) for n in names}
+        # Preserve the pre-existing cumulative row-count/history protection.
+        cumulative_proof = derive_incremental_cumulative_rows(source, last_checkpoint(source))
+        if cumulative_proof["cumulative_rows"] != int(PINNED_SOURCE_METRICS[source]["rows"]):
+            fail(f"{basename}: retained history does not reconcile pinned cumulative raw rows")
+        if terms["abandoned_keys"]:
+            fail(f"{basename}: null/abandoned keys require separate reconciliation")
+        if terms["resolved_keys"] != sum(terms[n] for n in ("promoted_keys", "excluded_keys", "remaining_rows")):
+            fail(f"{basename}: resolved-key accounting identity failed")
+        if terms["staged_rows"] < terms["resolved_keys"]:
+            fail(f"{basename}: candidate rows cannot be fewer than resolved keys")
 
-        successful_logs = (
-            table_log.where(F.col("run_id") == ledger_run_id)
-            .where(normalized_table_match(F.col("table_name"), basename))
-            .where(F.upper(F.trim(F.col("status"))) == "SUCCESS")
-            .where(F.col("logged_at").isNotNull())
-            .where(F.col("logged_at") <= F.lit(control_updated_at).cast("timestamp"))
-            .collect()
-        )
-        if len(successful_logs) != 1:
-            fail(
-                f"{basename}: ledger run_id={ledger_run_id} requires exactly one matching "
-                "SUCCESS table-log row with logged_at <= control.updated_at; "
-                f"found {len(successful_logs)}; fail closed"
-            )
-        log_row = successful_logs[0].asDict(recursive=True)
-        term_names = (
-            "staged_rows", "promoted_keys", "excluded_keys", "abandoned_keys", "remaining_rows",
-        )
-        if any(log_row.get(name) is None for name in term_names):
-            fail(f"{basename}: authoritative SUCCESS log has NULL accounting terms")
-        terms = {name: int(log_row[name]) for name in term_names}
-        if any(value < 0 for value in terms.values()):
-            fail(f"{basename}: authoritative SUCCESS log has negative accounting terms {terms}")
-        log_sum = (
-            terms["promoted_keys"]
-            + terms["excluded_keys"]
-            + terms["abandoned_keys"]
-            + terms["remaining_rows"]
-        )
-        if terms["staged_rows"] != log_sum:
-            fail(
-                f"{basename}: authoritative log identity failed: staged_rows="
-                f"{terms['staged_rows']} != promoted+excluded+abandoned+remaining={log_sum}"
-            )
+        history = (spark.sql(f"DESCRIBE HISTORY {qname(staging)}")
+                   .where((F.col("version") <= end)
+                          & (F.col("timestamp") > F.lit(control["staged_at_watermark"]))
+                          & (F.col("timestamp") <= F.lit(log["logged_at"]))).collect())
+        # The classifier identified from this incident's Delta history. A changed
+        # writer must be investigated, rather than borrowing another writer's CDF.
+        writer_id = "2566476679767010"
+        mutations = [r for r in history if r["operation"] == "MERGE"
+                     and r["notebook"] and str(r["notebook"]["notebookId"]) == writer_id]
+        if not mutations:
+            fail(f"{basename}: no retained classifier staging commits")
+        start = min(int(r["readVersion"]) for r in mutations)
+        mutation_jobs = {str(r["job"]["jobRunId"]) for r in mutations if r["job"]}
+        if len(mutation_jobs) != 1:
+            fail(f"{basename}: ambiguous classifier run window")
+        window = [r for r in history if start < int(r["version"]) <= end]
+        if {int(r["version"]) for r in window} != set(range(start + 1, end + 1)):
+            fail(f"{basename}: incomplete staging history window")
+        for row in window:
+            if row["operation"] == "OPTIMIZE":
+                continue
+            if row not in mutations:
+                fail(f"{basename}: unrelated staging mutation during classification")
+            metrics = row["operationMetrics"] or {}
+            if int(metrics.get("numTargetRowsInserted", -1)) != 0:
+                fail(f"{basename}: classifier staging mutation inserted rows")
 
-        raw_metrics = PINNED_SOURCE_METRICS[source]
-        raw_watermark = raw_metrics["watermark"]
-        freshness_signed_days = (
-            (raw_watermark - staged_at_watermark).total_seconds() / 86400.0
-        )
-        freshness_absolute_days = abs(freshness_signed_days)
-        accounting_mode = (
-            "CUMULATIVE_BOOTSTRAP"
-            if int(raw_metrics["rows"]) == terms["promoted_keys"]
-            else "INCREMENTAL_BATCH"
-        )
-        staging_table = f"4_prod.staging.{basename}"
-        excluded_category, excluded_meta = optional_archive_category(
-            f"4_prod.staging_excluded.{basename}",
-            key,
-            "excluded_archive",
-        )
-        abandoned_category, abandoned_meta = optional_archive_category(
-            f"4_prod.staging_abandoned.{basename}",
-            key,
-            "abandoned_archive",
-        )
-        merge_proof = None
+        def pinned(table, version):
+            return spark.read.option("versionAsOf", int(version)).table(table)
 
-        if accounting_mode == "CUMULATIVE_BOOTSTRAP":
-            raw_category = accounting_category_frame(
-                PINNED_SOURCE_FRAMES[source], key, "raw"
-            )
-            staging_frame = (
-                spark.read.format("delta")
-                .option("versionAsOf", int(staging_version))
-                .table(staging_table)
-            )
-            staging_category = accounting_category_frame(
-                staging_frame, key, "staging_residue"
-            )
-            category_union = (
-                raw_category
-                .unionByName(staging_category)
-                .unionByName(excluded_category)
-                .unionByName(abandoned_category)
-            )
-            per_key = category_union.groupBy("__KEY").agg(
-                *[
-                    F.sum(
-                        F.when(F.col("__CATEGORY") == category, 1).otherwise(0)
-                    ).alias(f"__ROWS__{category}")
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-                *[
-                    F.sum(
-                        F.when(
-                            (F.col("__CATEGORY") == category)
-                            & (F.col("__INVALID_KEY") != 0),
-                            1,
-                        ).otherwise(0)
-                    ).alias(f"__INVALID__{category}")
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-            )
-            positive_category_count = reduce(
-                lambda left, right: left + right,
-                [
-                    F.when(F.col(f"__ROWS__{category}") > 0, 1).otherwise(0)
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-            )
-            summary = per_key.agg(
-                *[
-                    F.sum(F.col(f"__ROWS__{category}")).alias(
-                        f"__COUNT__{category}"
-                    )
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-                *[
-                    F.sum(F.col(f"__INVALID__{category}")).alias(
-                        f"__BAD__{category}"
-                    )
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-                *[
-                    F.sum(
-                        F.when(F.col(f"__ROWS__{category}") > 1, 1).otherwise(0)
-                    ).alias(f"__DUP_GROUPS__{category}")
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-                *[
-                    F.sum(
-                        F.when(
-                            F.col("__KEY").isNull(),
-                            F.col(f"__ROWS__{category}"),
-                        ).otherwise(0)
-                    ).alias(f"__NULL_ROWS__{category}")
-                    for category in ACCOUNTING_CATEGORIES
-                ],
-                F.sum(
-                    F.when(positive_category_count > 1, 1).otherwise(0)
-                ).alias("__CROSS_CATEGORY_DUPLICATE_KEYS"),
-                F.sum(
-                    F.when(F.col("__KEY").isNotNull(), 1).otherwise(0)
-                ).alias("__UNION_DISTINCT_KEYS"),
-            ).collect()[0]
-            actual_counts = {
-                category: int(summary[f"__COUNT__{category}"] or 0)
-                for category in ACCOUNTING_CATEGORIES
-            }
-            invalid_key_rows = {
-                category: int(summary[f"__BAD__{category}"] or 0)
-                for category in ACCOUNTING_CATEGORIES
-            }
-            within_category_duplicate_groups = {
-                category: int(summary[f"__DUP_GROUPS__{category}"] or 0)
-                for category in ACCOUNTING_CATEGORIES
-            }
-            null_key_rows = {
-                category: int(summary[f"__NULL_ROWS__{category}"] or 0)
-                for category in ACCOUNTING_CATEGORIES
-            }
-            cross_category_duplicate_keys = int(
-                summary["__CROSS_CATEGORY_DUPLICATE_KEYS"] or 0
-            )
-            union_total = int(summary["__UNION_DISTINCT_KEYS"] or 0)
-            archive_presence = {
-                "policy": "CUMULATIVE_GROUPED_COUNTS",
-                "excluded_archive_rows": actual_counts["excluded_archive"],
-                "abandoned_archive_rows": actual_counts["abandoned_archive"],
-            }
+        before = pinned(staging, start)
+        after = pinned(staging, end)
+        def checked_keys(frame, expected, label):
+            parsed = F.expr(f"try_cast(`{key}` AS BIGINT)")
+            checked = frame.select(parsed.alias(key),
+                (F.col(key).isNotNull() & (parsed.isNull() | (F.col(key).cast("double") != parsed.cast("double")))).alias("__invalid"))
+            m = checked.agg(F.count("*").alias("rows"), F.countDistinct(key).alias("keys"),
+                            F.sum(F.col("__invalid").cast("long")).alias("invalid")).first()
+            if m["rows"] != expected or m["keys"] != expected or (m["invalid"] or 0):
+                fail(f"{basename}: {label} has null/duplicate/missing keys: {m.asDict()}, expected={expected}")
+            return checked.select(key)
+
+        before_keys = checked_keys(before, terms["resolved_keys"], "physical classifier input")
+        after_keys = checked_keys(after, terms["remaining_rows"], "physical classifier remainder")
+        if after_keys.join(before_keys, key, "left_anti").limit(1).count():
+            fail(f"{basename}: remainder contains a key absent from input")
+        deleted = spark.sql(
+            f"SELECT * FROM table_changes('{staging}', {start + 1}, {end}) WHERE _change_type='delete'"
+        )
+        deleted_keys = checked_keys(deleted, terms["promoted_keys"] + terms["excluded_keys"], "deleted staging rows")
+        expected_deleted = before_keys.join(after_keys, key, "left_anti")
+        if (deleted_keys.join(expected_deleted, key, "left_anti").limit(1).count()
+                or expected_deleted.join(deleted_keys, key, "left_anti").limit(1).count()):
+            fail(f"{basename}: deletion CDF does not equal input minus remainder")
+
+        archive = f"4_prod.staging_excluded.{basename}"
+        if terms["excluded_keys"]:
+            archive_version = source_version(archive)
+            excluded = pinned(archive, archive_version).where(F.col("_run_id") == ledger)
+            if excluded.where(F.col("_archived_at").isNull() | (F.col("_archived_at") > F.lit(log["logged_at"]))).limit(1).count():
+                fail(f"{basename}: archive rows lack or postdate the SUCCESS timestamp")
+            excluded_keys = checked_keys(excluded, terms["excluded_keys"], "excluded archive")
+            if excluded_keys.join(deleted_keys, key, "left_anti").limit(1).count():
+                fail(f"{basename}: excluded archive is not a subset of deletion CDF")
         else:
-            excluded_present = int(excluded_category.limit(1).count())
-            abandoned_present = int(abandoned_category.limit(1).count())
-            archive_presence = {
-                "policy": "BOUNDED_LIMIT_ONE_FAIL_CLOSED",
-                "excluded_archive_present": bool(excluded_present),
-                "abandoned_archive_present": bool(abandoned_present),
-            }
-            if (
-                terms["excluded_keys"] != 0
-                or terms["abandoned_keys"] != 0
-                or excluded_present
-                or abandoned_present
-            ):
-                fail(
-                    f"{basename}: incremental-ledger archives cannot be batch-scoped; "
-                    f"terms={terms}, archive_presence={archive_presence}; fail closed"
-                )
-            actual_counts = {
-                "status": "NOT_SCANNED_INCREMENTAL_BATCH",
-                "pinned_raw_rows": int(raw_metrics["rows"]),
-                "staging_cumulative_rows": "NOT_SCANNED",
-                "excluded_archive_rows": "BOUNDED_EMPTY",
-                "abandoned_archive_rows": "BOUNDED_EMPTY",
-            }
+            excluded_keys = before_keys.limit(0)
+            archive_version = None
+        promoted_keys = deleted_keys.join(excluded_keys, key, "left_anti")
+        checked_keys(promoted_keys, terms["promoted_keys"], "promoted keys")
+        promoted = before.join(F.broadcast(promoted_keys), key, "inner")
+        raw = pinned(source, SOURCE_VERSIONS[source]).join(F.broadcast(promoted_keys), key, "inner")
+        checked_keys(raw, terms["promoted_keys"], "raw coverage of promoted keys")
 
-        if accounting_mode == "CUMULATIVE_BOOTSTRAP":
-            expected_actual = {
-                "raw": terms["promoted_keys"],
-                "staging_residue": terms["remaining_rows"],
-                "excluded_archive": terms["excluded_keys"],
-                "abandoned_archive": terms["abandoned_keys"],
-            }
-            mismatches = {
-                category: {
-                    "actual": actual_counts[category],
-                    "authoritative": expected_actual[category],
-                }
-                for category in ACCOUNTING_CATEGORIES
-                if actual_counts[category] != expected_actual[category]
-            }
-            if (
-                mismatches
-                or any(invalid_key_rows.values())
-                or any(null_key_rows.values())
-                or any(within_category_duplicate_groups.values())
-                or cross_category_duplicate_keys
-            ):
-                fail(
-                    f"{basename}: cumulative/bootstrap pinned category accounting/key "
-                    f"ownership failed closed; count_mismatches={mismatches}, "
-                    f"invalid_key_rows={invalid_key_rows}, null_key_rows={null_key_rows}, "
-                    f"within_category_duplicate_groups={within_category_duplicate_groups}, "
-                    f"cross_category_duplicate_keys={cross_category_duplicate_keys}"
-                )
-            reconciled_actual_counts = actual_counts
-            reconciled_invalid_key_rows = invalid_key_rows
-            reconciled_null_key_rows = null_key_rows
-            reconciled_duplicate_groups = within_category_duplicate_groups
-            reconciled_cross_category_duplicate_keys = cross_category_duplicate_keys
-            reconciled_union_total = union_total
-            actual_sum = sum(reconciled_actual_counts.values())
-            if (
-                reconciled_union_total != actual_sum
-                or reconciled_union_total != terms["staged_rows"]
-            ):
-                fail(
-                    f"{basename}: cumulative/bootstrap physical key union total "
-                    f"{reconciled_union_total} does not equal actual category sum "
-                    f"{actual_sum} and authoritative staged_rows {terms['staged_rows']}; "
-                    "fail closed"
-                )
-            if freshness_absolute_days > RAW_FRESHNESS_TOLERANCE_DAYS:
-                fail(
-                    f"{basename}: cumulative/bootstrap pinned raw/control watermark "
-                    f"difference {freshness_absolute_days:.3f}d exceeds "
-                    f"{RAW_FRESHNESS_TOLERANCE_DAYS}d; fail closed"
-                )
-            freshness_policy = "CUMULATIVE_TOLERANCE"
-            freshness_tolerance_days = RAW_FRESHNESS_TOLERANCE_DAYS
-        else:
-            staging_history_rows = (
-                spark.sql(f"DESCRIBE HISTORY {qname(staging_table)}")
-                .where(F.col("version") == F.lit(int(staging_version)))
-                .collect()
-            )
-            if len(staging_history_rows) != 1:
-                fail(
-                    f"{basename}: incremental-ledger expected one staging commit at "
-                    f"version {staging_version}; found {len(staging_history_rows)}; "
-                    "fail closed"
-                )
-            staging_commit = staging_history_rows[0]
-            if staging_commit["operation"] != "MERGE":
-                fail(
-                    f"{basename}: incremental-ledger staging version "
-                    f"{staging_version} operation={staging_commit['operation']} "
-                    "is not MERGE; fail closed"
-                )
-            staging_metrics = required_drain_merge_metrics(
-                staging_commit["operationMetrics"] or {},
-                f"{basename}: staging version {staging_version}",
-            )
-            staging_source_rows = staging_metrics["numSourceRows"]
-            staging_output_rows = staging_metrics["numOutputRows"]
-            staging_updated_rows = staging_metrics["numTargetRowsUpdated"]
-            staging_inserted_rows = staging_metrics["numTargetRowsInserted"]
-            staging_deleted_rows = staging_metrics["numTargetRowsDeleted"]
-            if (
-                staging_commit["timestamp"] is None
-                or staging_commit["timestamp"] > log_row.get("logged_at")
-                or staging_source_rows != terms["remaining_rows"]
-                or staging_output_rows != terms["remaining_rows"]
-                or staging_updated_rows != terms["remaining_rows"]
-                or staging_inserted_rows != 0
-                or staging_deleted_rows != 0
-            ):
-                fail(
-                    f"{basename}: incremental-ledger staging MERGE metrics do not "
-                    f"prove the logged remainder; version={staging_version}, "
-                    f"operation={staging_commit['operation']}, timestamp="
-                    f"{staging_commit['timestamp']}, source_rows={staging_source_rows}, "
-                    f"output_rows={staging_output_rows}, updated_rows="
-                    f"{staging_updated_rows}, inserted_rows={staging_inserted_rows}, "
-                    f"deleted_rows={staging_deleted_rows}, remaining_rows="
-                    f"{terms['remaining_rows']}; fail closed"
-                )
-            staging_cdf = spark.sql(
-                f"SELECT * FROM table_changes('{sql_escape(staging_table)}', "
-                f"{int(staging_version)}, {int(staging_version)}) "
-                "WHERE _change_type IN ('insert', 'update_postimage')"
-            )
-            remaining_batch_keys = staging_cdf.select(
-                F.expr(f"try_cast({qident(key)} AS BIGINT)").alias("__KEY"),
-                (
-                    F.col(key).isNull()
-                    | bigint_invalid_condition(staging_cdf, key)
-                ).cast("long").alias("__INVALID_KEY"),
-            )
-            remaining_batch_metrics = remaining_batch_keys.agg(
-                F.count(F.lit(1)).alias("rows"),
-                F.countDistinct("__KEY").alias("distinct_keys"),
-                F.sum(F.col("__KEY").isNull().cast("long")).alias("null_rows"),
-                F.sum(F.col("__INVALID_KEY")).alias("invalid_rows"),
-            ).collect()[0]
-            if (
-                int(remaining_batch_metrics["rows"]) != terms["remaining_rows"]
-                or int(remaining_batch_metrics["distinct_keys"])
-                != terms["remaining_rows"]
-                or int(remaining_batch_metrics["null_rows"] or 0) != 0
-                or int(remaining_batch_metrics["invalid_rows"] or 0) != 0
-            ):
-                fail(
-                    f"{basename}: incremental-ledger staging CDF remainder key "
-                    f"gate failed; metrics={remaining_batch_metrics.asDict()}, "
-                    f"remaining_rows={terms['remaining_rows']}; fail closed"
-                )
-            remaining_batch_category = remaining_batch_keys.select(
-                "__KEY",
-                F.lit("remaining_batch").alias("__CATEGORY"),
-                F.col("__INVALID_KEY"),
-            )
+        # A submitted MERGE key may already have the same/newer record in raw.
+        # Compare source counters first; equal counters require equal business
+        # payload, except the three fields filled by trust classification.
+        shared = sorted(set(promoted.columns) & set(raw.columns))
+        counters = [c for c in ("UPDT_CNT", "LAST_UTC_TS", "UPDT_DT_TM") if c in shared]
+        if not counters:
+            fail(f"{basename}: no source counters for no-op proof")
+        a = F.struct(*[F.col(f"a.`{c}`") for c in counters])
+        b = F.struct(*[F.col(f"b.`{c}`") for c in counters])
+        same_payload = F.lit(True)
+        excluded_fields = {key, "ADC_UPDT", "Trust", "TRUST", "ORGANIZATION_ID", "ENCNTR_ID"}
+        for c in shared:
+            if c not in excluded_fields and not c.startswith("_"):
+                same_payload = same_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
+        comparison = promoted.alias("a").join(raw.alias("b"), key)
+        if comparison.where(~F.coalesce((b > a) | (b.eqNullSafe(a) & same_payload), F.lit(False))).limit(1).count():
+            fail(f"{basename}: promoted raw row is older or differs at equal source counters")
 
-            checkpoint = last_checkpoint(source)
-            if (
-                checkpoint is None
-                or checkpoint.get("source_version") is None
-                or checkpoint.get("source_rows") is None
-            ):
-                fail(
-                    f"{basename}: incremental-ledger reconciliation requires a prior "
-                    "checkpoint version and cumulative source_rows; fail closed"
-                )
-            checkpoint_version = int(checkpoint["source_version"])
-            checkpoint_rows = int(checkpoint["source_rows"])
-            pinned_version = int(SOURCE_VERSIONS[source])
-            if checkpoint_version > pinned_version:
-                fail(
-                    f"{basename}: incremental-ledger checkpoint version "
-                    f"{checkpoint_version} is ahead of pinned raw version "
-                    f"{pinned_version}; fail closed"
-                )
-            # A successful Bronze run can checkpoint a maintenance-only Delta version
-            # (for example OPTIMIZE) immediately after the classifier MERGE. When the
-            # checkpoint already equals the pinned version, search retained history for
-            # the authoritative ledger MERGE; all later data-changing MERGEs are rejected
-            # below, so this does not weaken the fail-closed accounting contract.
-            history_version_lower_bound = (
-                0
-                if checkpoint_version == pinned_version
-                else checkpoint_version + 1
-            )
-            if history_version_lower_bound < 0:
-                fail(
-                    f"{basename}: invalid bounded history lower version "
-                    f"{history_version_lower_bound}; fail closed"
-                )
-            successful_logged_at = log_row.get("logged_at")
-            history_rows = (
-                spark.sql(f"DESCRIBE HISTORY {qname(source)}")
-                .where(
-                    (F.col("version") >= F.lit(history_version_lower_bound))
-                    & (F.col("version") <= F.lit(pinned_version))
-                )
-                .collect()
-            )
-
-            matching_merges = []
-            for history_row in history_rows:
-                if history_row["operation"] != "MERGE":
-                    continue
-                commit_ts = history_row["timestamp"]
-                if (
-                    commit_ts is None
-                    or commit_ts <= staged_at_watermark
-                    or commit_ts > successful_logged_at
-                ):
-                    continue
-                metrics = required_drain_merge_metrics(
-                    history_row["operationMetrics"] or {},
-                    f"{basename}: raw MERGE version {int(history_row['version'])}",
-                )
-                source_rows = metrics["numSourceRows"]
-                output_rows = metrics["numOutputRows"]
-                updated_rows = metrics["numTargetRowsUpdated"]
-                inserted_rows = metrics["numTargetRowsInserted"]
-                deleted_rows = metrics["numTargetRowsDeleted"]
-                if (
-                    source_rows == terms["promoted_keys"]
-                    and output_rows == terms["promoted_keys"]
-                    and updated_rows + inserted_rows == terms["promoted_keys"]
-                    and deleted_rows == 0
-                ):
-                    matching_merges.append({
-                        "version": int(history_row["version"]),
-                        "timestamp": commit_ts,
-                        "num_source_rows": source_rows,
-                        "num_output_rows": output_rows,
-                        "num_updated_rows": updated_rows,
-                        "num_inserted_rows": inserted_rows,
-                        "num_deleted_rows": deleted_rows,
-                    })
-            if len(matching_merges) != 1:
-                fail(
-                    f"{basename}: incremental-ledger expected exactly one matching raw "
-                    f"MERGE after control watermark and at/before SUCCESS log; found "
-                    f"{matching_merges}; fail closed"
-                )
-            matching_merge = matching_merges[0]
-            post_matching_data_changing_merges = []
-            for history_row in history_rows:
-                version = int(history_row["version"])
-                if (
-                    history_row["operation"] != "MERGE"
-                    or not (matching_merge["version"] < version <= pinned_version)
-                ):
-                    continue
-                metrics = required_drain_merge_metrics(
-                    history_row["operationMetrics"] or {},
-                    f"{basename}: post-ledger raw MERGE version {version}",
-                )
-                evidence = {
-                    "version": version,
-                    "num_source_rows": metrics["numSourceRows"],
-                    "num_output_rows": metrics["numOutputRows"],
-                    "num_updated_rows": metrics["numTargetRowsUpdated"],
-                    "num_inserted_rows": metrics["numTargetRowsInserted"],
-                    "num_deleted_rows": metrics["numTargetRowsDeleted"],
-                }
-                if (
-                    evidence["num_output_rows"] > 0
-                    or evidence["num_updated_rows"] > 0
-                    or evidence["num_inserted_rows"] > 0
-                    or evidence["num_deleted_rows"] > 0
-                ):
-                    post_matching_data_changing_merges.append(evidence)
-            if post_matching_data_changing_merges:
-                fail(
-                    f"{basename}: raw contains data-changing MERGEs after the "
-                    f"authoritative ledger MERGE version {matching_merge['version']}: "
-                    f"{post_matching_data_changing_merges}; fail closed"
-                )
-
-            merge_evidence_since_checkpoint = []
-            for history_row in history_rows:
-                version = int(history_row["version"])
-                if (
-                    history_row["operation"] != "MERGE"
-                    or not (checkpoint_version < version <= pinned_version)
-                ):
-                    continue
-                metrics = required_drain_merge_metrics(
-                    history_row["operationMetrics"] or {},
-                    f"{basename}: raw MERGE version {version}",
-                )
-                merge_evidence_since_checkpoint.append({
-                    "version": version,
-                    "num_source_rows": metrics["numSourceRows"],
-                    "num_output_rows": metrics["numOutputRows"],
-                    "num_updated_rows": metrics["numTargetRowsUpdated"],
-                    "num_inserted_rows": metrics["numTargetRowsInserted"],
-                    "num_deleted_rows": metrics["numTargetRowsDeleted"],
-                })
-            merge_evidence_since_checkpoint.sort(key=lambda item: item["version"])
-            data_changing_merges = [
-                item
-                for item in merge_evidence_since_checkpoint
-                if (
-                    item["num_output_rows"] > 0
-                    or item["num_updated_rows"] > 0
-                    or item["num_inserted_rows"] > 0
-                    or item["num_deleted_rows"] > 0
-                )
-            ]
-            subsequent_noop_merges = [
-                item["version"]
-                for item in merge_evidence_since_checkpoint
-                if (
-                    item["version"] > matching_merge["version"]
-                    and item["num_output_rows"] == 0
-                    and item["num_updated_rows"] == 0
-                    and item["num_inserted_rows"] == 0
-                    and item["num_deleted_rows"] == 0
-                )
-            ]
-
-            checkpoint_watermark = checkpoint.get("source_watermark")
-            if checkpoint_version < pinned_version:
-                checkpoint_relation = "ADVANCED_MERGE_SEQUENCE"
-                if not data_changing_merges:
-                    fail(
-                        f"{basename}: advanced incremental-ledger relation found no "
-                        f"data-changing MERGE since checkpoint; checkpoint_version="
-                        f"{checkpoint_version}, pinned_version={pinned_version}, "
-                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
-                    )
-                last_data_change_version = data_changing_merges[-1]["version"]
-                if last_data_change_version != matching_merge["version"]:
-                    fail(
-                        f"{basename}: authoritative matching raw MERGE version "
-                        f"{matching_merge['version']} is not the final data-changing "
-                        f"MERGE version {last_data_change_version} since checkpoint; "
-                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
-                    )
-                cumulative_row_delta = int(raw_metrics["rows"]) - checkpoint_rows
-                expected_cumulative_row_delta = sum(
-                    item["num_inserted_rows"] - item["num_deleted_rows"]
-                    for item in merge_evidence_since_checkpoint
-                )
-                if cumulative_row_delta != expected_cumulative_row_delta:
-                    fail(
-                        f"{basename}: advanced incremental-ledger cumulative raw row "
-                        f"delta {cumulative_row_delta} != aggregate MERGE insert-delete "
-                        f"delta {expected_cumulative_row_delta}; "
-                        f"merge_evidence={merge_evidence_since_checkpoint}; fail closed"
-                    )
-            else:
-                checkpoint_relation = "REUSED_PINNED_RAW_VERSION"
-                cumulative_row_delta = 0
-                expected_cumulative_row_delta = 0
-                if merge_evidence_since_checkpoint:
-                    fail(
-                        f"{basename}: reused pinned checkpoint requires zero MERGEs "
-                        f"after the checkpoint, found "
-                        f"{merge_evidence_since_checkpoint}; fail closed"
-                    )
-                if checkpoint_rows != int(raw_metrics["rows"]):
-                    fail(
-                        f"{basename}: reused pinned checkpoint source_rows "
-                        f"{checkpoint_rows} != pinned raw rows {raw_metrics['rows']}; "
-                        "fail closed"
-                    )
-                if checkpoint_watermark != raw_watermark:
-                    fail(
-                        f"{basename}: reused pinned checkpoint watermark "
-                        f"{checkpoint_watermark} != pinned raw watermark "
-                        f"{raw_watermark}; fail closed"
-                    )
-
-            cdf = spark.sql(
-                f"SELECT * FROM table_changes('{sql_escape(source)}', "
-                f"{matching_merge['version']}, {matching_merge['version']}) "
-                "WHERE _change_type IN ('insert', 'update_postimage')"
-            )
-            batch_keys = cdf.select(
-                F.expr(f"try_cast({qident(key)} AS BIGINT)").alias("__KEY"),
-                (
-                    F.col(key).isNull() | bigint_invalid_condition(cdf, key)
-                ).cast("long").alias("__INVALID_KEY"),
-            )
-            batch_key_metrics = batch_keys.agg(
-                F.count(F.lit(1)).alias("rows"),
-                F.countDistinct("__KEY").alias("distinct_keys"),
-                F.sum(F.col("__KEY").isNull().cast("long")).alias("null_rows"),
-                F.sum(F.col("__INVALID_KEY")).alias("invalid_rows"),
-            ).collect()[0]
-            if (
-                int(batch_key_metrics["rows"]) != terms["promoted_keys"]
-                or int(batch_key_metrics["distinct_keys"]) != terms["promoted_keys"]
-                or int(batch_key_metrics["null_rows"] or 0) != 0
-                or int(batch_key_metrics["invalid_rows"] or 0) != 0
-            ):
-                fail(
-                    f"{basename}: incremental-ledger CDF promoted-batch key gate failed; "
-                    f"metrics={batch_key_metrics.asDict()}, promoted_keys="
-                    f"{terms['promoted_keys']}; fail closed"
-                )
-
-            batch_category = batch_keys.select(
-                "__KEY",
-                F.lit("promoted_batch").alias("__CATEGORY"),
-                F.col("__INVALID_KEY"),
-            )
-            batch_categories = (
-                "promoted_batch", "remaining_batch",
-            )
-            batch_union = batch_category.unionByName(
-                remaining_batch_category
-            )
-            batch_per_key = batch_union.groupBy("__KEY").agg(
-                *[
-                    F.sum(
-                        F.when(F.col("__CATEGORY") == category, 1).otherwise(0)
-                    ).alias(f"__ROWS__{category}")
-                    for category in batch_categories
-                ],
-                *[
-                    F.sum(
-                        F.when(
-                            (F.col("__CATEGORY") == category)
-                            & (F.col("__INVALID_KEY") != 0),
-                            1,
-                        ).otherwise(0)
-                    ).alias(f"__INVALID__{category}")
-                    for category in batch_categories
-                ],
-            )
-            batch_positive_category_count = reduce(
-                lambda left, right: left + right,
-                [
-                    F.when(F.col(f"__ROWS__{category}") > 0, 1).otherwise(0)
-                    for category in batch_categories
-                ],
-            )
-            batch_summary = batch_per_key.agg(
-                *[
-                    F.sum(F.col(f"__ROWS__{category}")).alias(
-                        f"__COUNT__{category}"
-                    )
-                    for category in batch_categories
-                ],
-                *[
-                    F.sum(F.col(f"__INVALID__{category}")).alias(
-                        f"__BAD__{category}"
-                    )
-                    for category in batch_categories
-                ],
-                *[
-                    F.sum(
-                        F.when(F.col(f"__ROWS__{category}") > 1, 1).otherwise(0)
-                    ).alias(f"__DUP_GROUPS__{category}")
-                    for category in batch_categories
-                ],
-                *[
-                    F.sum(
-                        F.when(
-                            F.col("__KEY").isNull(),
-                            F.col(f"__ROWS__{category}"),
-                        ).otherwise(0)
-                    ).alias(f"__NULL_ROWS__{category}")
-                    for category in batch_categories
-                ],
-                F.sum(
-                    F.when(batch_positive_category_count > 1, 1).otherwise(0)
-                ).alias("__CROSS_CATEGORY_DUPLICATE_KEYS"),
-                F.sum(
-                    F.when(F.col("__KEY").isNotNull(), 1).otherwise(0)
-                ).alias("__UNION_DISTINCT_KEYS"),
-            ).collect()[0]
-            reconciled_actual_counts = {
-                category: int(batch_summary[f"__COUNT__{category}"] or 0)
-                for category in batch_categories
-            }
-            reconciled_invalid_key_rows = {
-                category: int(batch_summary[f"__BAD__{category}"] or 0)
-                for category in batch_categories
-            }
-            reconciled_duplicate_groups = {
-                category: int(batch_summary[f"__DUP_GROUPS__{category}"] or 0)
-                for category in batch_categories
-            }
-            reconciled_null_key_rows = {
-                category: int(batch_summary[f"__NULL_ROWS__{category}"] or 0)
-                for category in batch_categories
-            }
-            reconciled_cross_category_duplicate_keys = int(
-                batch_summary["__CROSS_CATEGORY_DUPLICATE_KEYS"] or 0
-            )
-            reconciled_union_total = int(
-                batch_summary["__UNION_DISTINCT_KEYS"] or 0
-            )
-            expected_actual = {
-                "promoted_batch": terms["promoted_keys"],
-                "remaining_batch": terms["remaining_rows"],
-            }
-            mismatches = {
-                category: {
-                    "actual": reconciled_actual_counts[category],
-                    "authoritative": expected_actual[category],
-                }
-                for category in batch_categories
-                if reconciled_actual_counts[category] != expected_actual[category]
-            }
-            actual_sum = sum(reconciled_actual_counts.values())
-            if (
-                mismatches
-                or any(reconciled_invalid_key_rows.values())
-                or any(reconciled_null_key_rows.values())
-                or any(reconciled_duplicate_groups.values())
-                or reconciled_cross_category_duplicate_keys
-                or reconciled_union_total != actual_sum
-                or reconciled_union_total != terms["staged_rows"]
-            ):
-                fail(
-                    f"{basename}: incremental-ledger batch/staging key ownership failed "
-                    f"closed; count_mismatches={mismatches}, invalid_key_rows="
-                    f"{reconciled_invalid_key_rows}, null_key_rows="
-                    f"{reconciled_null_key_rows}, duplicate_groups="
-                    f"{reconciled_duplicate_groups}, cross_category_duplicate_keys="
-                    f"{reconciled_cross_category_duplicate_keys}, union_total="
-                    f"{reconciled_union_total}, actual_sum={actual_sum}, staged_rows="
-                    f"{terms['staged_rows']}"
-                )
-            if raw_watermark != staged_at_watermark:
-                fail(
-                    f"{basename}: incremental-ledger pinned raw max ADC_UPDT "
-                    f"{raw_watermark} != control staged_at_watermark "
-                    f"{staged_at_watermark}; fail closed"
-                )
-            freshness_policy = "INCREMENTAL_EXACT_CONTROL_WATERMARK"
-            freshness_tolerance_days = 0
-            merge_proof = {
-                **matching_merge,
-                "checkpoint_relation": checkpoint_relation,
-                "checkpoint_version": checkpoint_version,
-                "checkpoint_rows": checkpoint_rows,
-                "history_version_lower_bound": history_version_lower_bound,
-                "history_version_upper_bound": pinned_version,
-                "checkpoint_watermark": str(checkpoint_watermark),
-                "pinned_version": pinned_version,
-                "pinned_rows": int(raw_metrics["rows"]),
-                "cumulative_row_delta": cumulative_row_delta,
-                "cdf_promoted_batch_rows": int(batch_key_metrics["rows"]),
-                "cdf_promoted_batch_distinct_keys": int(
-                    batch_key_metrics["distinct_keys"]
-                ),
-                "staging_remainder": {
-                    "table": staging_table,
-                    "version": int(staging_version),
-                    "timestamp": str(staging_commit["timestamp"]),
-                    "num_source_rows": staging_source_rows,
-                    "num_output_rows": staging_output_rows,
-                    "num_updated_rows": staging_updated_rows,
-                    "num_inserted_rows": staging_inserted_rows,
-                    "num_deleted_rows": staging_deleted_rows,
-                    "cdf_remaining_batch_rows": int(
-                        remaining_batch_metrics["rows"]
-                    ),
-                    "cdf_remaining_batch_distinct_keys": int(
-                        remaining_batch_metrics["distinct_keys"]
-                    ),
-                },
-                "merge_evidence_since_checkpoint": merge_evidence_since_checkpoint,
-                "data_changing_merge_versions": [
-                    item["version"] for item in data_changing_merges
-                ],
-                "subsequent_noop_merge_versions": subsequent_noop_merges,
-                "post_matching_data_changing_merges": post_matching_data_changing_merges,
-                "expected_cumulative_row_delta": expected_cumulative_row_delta,
-                "all_data_changing_merges_accounted": True,
-                "zero_merges_since_checkpoint": (
-                    checkpoint_relation == "REUSED_PINNED_RAW_VERSION"
-                ),
-            }
-
+        if terms["excluded_keys"]:
+            archive_payload = F.lit(True)
+            for c in sorted(set(before.columns) & set(excluded.columns)):
+                if not c.startswith("_") and c != "ADC_UPDT":
+                    archive_payload = archive_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
+            if before.alias("a").join(excluded.alias("b"), key).where(~archive_payload).limit(1).count():
+                fail(f"{basename}: excluded archive payload differs from classifier input")
         results[source] = {
-            "status": "PASS",
-            "key_name": key,
-            "ledger_run_id": ledger_run_id,
-            "control": {
-                "table_name": control_row.get("table_name"),
-                "staging_delta_version": int(staging_version),
-                "staged_at_watermark": str(staged_at_watermark),
-                "updated_at": str(control_updated_at),
-            },
-            "table_log": {
-                "table_name": log_row.get("table_name"),
-                "status": log_row.get("status"),
-                "logged_at": str(log_row.get("logged_at")),
-                **terms,
-                "accounting_sum": int(log_sum),
-                "identity_exact": True,
-                "logged_before_or_at_control_update": True,
-            },
-            "pinned_versions": {
-                "raw_delta_version": int(SOURCE_VERSIONS[source]),
-                "staging_residue_delta_version": int(staging_version),
-                "excluded_archive_delta_version": excluded_meta["pinned_delta_version"],
-                "abandoned_archive_delta_version": abandoned_meta["pinned_delta_version"],
-            },
-            "archive_state": {
-                "excluded": excluded_meta,
-                "abandoned": abandoned_meta,
-                "presence_evidence": archive_presence,
-            },
-            "accounting_mode": accounting_mode,
-            "cumulative_actual_counts": actual_counts,
-            "reconciled_actual_counts": reconciled_actual_counts,
-            "incremental_merge_proof": merge_proof,
-            "key_ownership": {
-                "invalid_key_rows": reconciled_invalid_key_rows,
-                "null_key_rows": reconciled_null_key_rows,
-                "within_category_duplicate_groups": reconciled_duplicate_groups,
-                "cross_category_duplicate_keys": reconciled_cross_category_duplicate_keys,
-                "pairwise_disjoint": True,
-                "union_total": reconciled_union_total,
-                "union_equals_authoritative_staged_rows": True,
-                "grouped_accounting_actions": 1,
-            },
-            "freshness": {
-                "policy": freshness_policy,
-                "pinned_raw_watermark": str(raw_watermark),
-                "control_staged_at_watermark": str(staged_at_watermark),
-                "signed_days": freshness_signed_days,
-                "absolute_days": freshness_absolute_days,
-                "tolerance_days": freshness_tolerance_days,
-                "within_tolerance": True,
-            },
-            "status_table_included": False,
+            "status": "PASS", "ledger_run_id": ledger, "table_log": terms,
+            "accounting_mode": "PHYSICAL_DISTINCT_KEYS_AND_RAW_PAYLOAD",
+            "staging_before_version": start, "staging_after_version": end,
+            "raw_version": int(SOURCE_VERSIONS[source]), "archive_version": archive_version,
+            "candidate_route_duplicate_rows": terms["staged_rows"] - terms["resolved_keys"],
+            "promoted_raw_payload_verified": True,
+            "cumulative_history_proof": cumulative_proof,
+            "key_ownership": {"pairwise_disjoint": True, "union_total": terms["resolved_keys"]},
         }
+    ledgers = {r["ledger_run_id"] for r in results.values()}
+    if len(ledgers) != 1:
+        fail("Waiting-list current and history have different authoritative classifier runs")
+    return {"status": "PASS", "authoritative_run_id": next(iter(ledgers)), "sources": results,
+            "authoritative_control": CLASSIFICATION_CONTROL,
+            "authoritative_table_log": CLASSIFICATION_TABLE_LOG, "status_table_included": False}
 
-    authoritative_run_ids = {
-        result["ledger_run_id"] for result in results.values()
-    }
-    if len(authoritative_run_ids) != 1:
-        fail(
-            "Waiting-list current/HIST control rows do not identify one authoritative "
-            f"full-accounting run: {sorted(authoritative_run_ids)}; fail closed"
-        )
-    authoritative_run_id = next(iter(authoritative_run_ids))
-    return {
-        "status": "PASS",
-        "authoritative_run_id": authoritative_run_id,
-        "authoritative_control": CLASSIFICATION_CONTROL,
-        "authoritative_table_log": CLASSIFICATION_TABLE_LOG,
-        "successful_table_log_rows_per_source": 1,
-        "sources": results,
-        "status_table_included": False,
-    }
 
 
 def snapshot_date_state(snapshot_date_value, label: str) -> dict:
@@ -3349,6 +2695,10 @@ def acquire_run_lock() -> None:
 
 
 def heartbeat_run_lock(label: str) -> None:
+    # BRONZE_REPAIR_272860676151023_V1
+    from datetime import datetime as _progress_datetime, timezone as _progress_timezone
+    print("WAITING_LIST_PHASE " + json.dumps({"run_id": RUN_ID, "attempt_id": ATTEMPT_ID,
+          "phase": label, "at_utc": _progress_datetime.now(_progress_timezone.utc).isoformat()}), flush=True)
     owners = spark.table(STATE_TABLE).where(
         (F.col("target_table") == LOCK_KEY) & (F.col("source_table") == LOCK_KEY)
     ).collect()
@@ -3527,6 +2877,8 @@ def run_pipeline() -> dict:
     changed_sources = pinned_changed_sources()
     weekly_status = weekly_reconciliation_status()
     mode = choose_mode(changed_sources)
+    print("WAITING_LIST_MODE " + json.dumps({"mode": mode, "changed_sources": changed_sources,
+          "weekly_reconciliation": weekly_status, "run_id": RUN_ID}, default=str), flush=True)
     source_slices, source_slice_status = establish_source_slices(
         mode, changed_sources
     )
@@ -3864,6 +3216,7 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
+
 
 
 

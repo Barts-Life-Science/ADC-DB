@@ -330,6 +330,90 @@ def validate_gold_set(spark, config: PipelineConfig, run_id: str):
     ]
 
 
+def validate_amr_conservation(spark, config: PipelineConfig, run_id: str):
+    """Check that the packed antibiogram expansion conserves blocks and tokens."""
+    F = _imports()
+    source = (
+        spark.table(config.map_pathology_table)
+        .where(
+            (F.col("source_table") == "raw")
+            & (F.col("WkgCode") == "INF")
+            & F.col("value_source_value").like("%[<*%")
+        )
+        .select(
+            "source_record_key",
+            F.regexp_replace(
+                "value_source_value", r">\]\s*\[<\.", ""
+            ).alias("u"),
+        )
+    )
+    expected_isolates = source.select(
+        F.sum(F.size(F.expr(r"regexp_extract_all(u, '\\[<\\*', 0)")).cast("long"))
+    ).first()[0]
+    expected_closed_tokens = (
+        source.select(
+            F.explode(
+                F.expr(r"regexp_extract_all(u, '\\[<\\*([^\\]]*)>\\]', 1)")
+            ).alias("block")
+        )
+        .select(
+            F.explode(
+                F.split(
+                    F.regexp_replace("block", r"^[^/]*//[^/]*/", ""), "//"
+                )
+            ).alias("token")
+        )
+        .where(F.col("token") != "")
+        .count()
+    )
+    isolates = spark.table(
+        f"{config.bronze_schema}.map_pathology_microbiology_isolate"
+    )
+    susceptibility = spark.table(
+        f"{config.bronze_schema}.map_pathology_antimicrobial_susceptibility"
+    )
+    actual_isolates = isolates.count()
+    actual_tokens = susceptibility.count()
+    orphan_tokens = susceptibility.join(
+        isolates.select("microbiology_isolate_id"),
+        "microbiology_isolate_id",
+        "left_anti",
+    ).count()
+    flagged_rows = isolates.where(F.col("parse_status") != "ok").select(
+        "source_record_key"
+    ).distinct().count()
+    return [
+        _result(
+            spark,
+            run_id,
+            "amr_isolate_conservation",
+            "ERROR",
+            actual_isolates == expected_isolates,
+            actual_isolates,
+            expected_isolates,
+        ),
+        _result(
+            spark,
+            run_id,
+            "amr_token_conservation",
+            "WARN",
+            actual_tokens >= expected_closed_tokens,
+            actual_tokens,
+            expected_closed_tokens,
+            f"closed-block baseline; flagged_source_rows={flagged_rows}",
+        ),
+        _result(
+            spark,
+            run_id,
+            "amr_susceptibility_orphans",
+            "ERROR",
+            orphan_tokens == 0,
+            orphan_tokens,
+            0,
+        ),
+    ]
+
+
 def run_validation(spark, config: PipelineConfig | None = None, *, fail_on_error: bool = True):
     config = config or PipelineConfig()
     ensure_contracts(spark, config)
@@ -340,6 +424,7 @@ def run_validation(spark, config: PipelineConfig | None = None, *, fail_on_error
     frames.extend(validate_lifecycle_and_genetics(spark, config, run_id))
     frames.extend(validate_tlc_mapping(spark, config, run_id))
     frames.extend(validate_gold_set(spark, config, run_id))
+    frames.extend(validate_amr_conservation(spark, config, run_id))
     output = frames[0]
     for frame in frames[1:]:
         output = output.unionByName(frame)

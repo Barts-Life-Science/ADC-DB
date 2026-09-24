@@ -1,11 +1,27 @@
 # Databricks notebook source
-# pacs_text_bridge_pipeline — S6/B12 PACS report-text bridge sidecar.
+# pacs_text_bridge_pipeline — PACS report-text bridge sidecar (v4: re-sourced from bronze.mill_blob_text).
 #
-# Scope is deliberately fixed to 8_dev.bronze.map_pacs_report_text_bridge.
-# This notebook never updates map_pacs_report and contains no executable production write.
+# Default target is 8_dev.bronze.map_pacs_report_text_bridge; a production target needs
+# allow_production_write=true. This notebook never updates map_pacs_report and contains no
+# parser or chunk reassembler: text is the blob owner's decoded bronze.mill_blob_text row.
 # Pure Python: no percent-run, magic commands, or hidden notebook dependencies.
-
-# release: bronze_completeness_20260816_v1 — prod-idiom refactor; behavior-identical (NO_OP re-proof run 1096419474549718)
+#
+# release: pacs_integration_20260924 v4 — replaces the frozen 4_prod.pacs_dlt.pacs_blob_content
+# source (MillAccessionNbr) with bronze.mill_blob_text reached through map_radiology_event v2
+# (REF_EXAM_KEY report links, PACS_EXAMINATION_ID links, SECTRA_ACCESSION_NBR) and
+# map_pacs_examination v3.2 (SECTRA_ACCESSION_NBR). Deploy after both of those.
+#
+# VERSION SAFETY. Known blob defects are NOT assumed fixed:
+#   * several open-current SCD2 rows per EVENT_ID in mill_blob_text: byte-identical text collapses
+#     (provenance kept in CURRENT_BLOB_VERSION_IDS); differing text is text_version_ambiguous and
+#     never published — no timestamp-only ROW_NUMBER picks a winner;
+#   * several raw.mill_ce_blob rows per (EVENT_ID, BLOB_SEQ_NUM): the decoded text may stitch
+#     document versions, so it is text_integrity_unknown and never published. The affected IDs
+#     stay queryable in map_pacs_report_text_candidate for the blob owner's automated repair.
+# The accepted projection is gated to one effective-current document per event.
+#
+# Inherited instability: this task failed 47% of runs in the 2026-09-20 slow-task audit
+# (docs/2026-09-20-bronze-parallel-slow-task-report.md §2). Task retries are deliberately unchanged.
 import json
 
 # Prod-idiom target resolution (house pattern: jac_pipeline/endobase_pipeline).
@@ -37,51 +53,55 @@ FORCE_REBUILD = (
 )
 assert ACTION in {"build", "gates"}
 
+# Source overrides exist so dev can point at 8_dev builds of the v2/v3.2 upstream tables.
+PACS_SOURCE_SCHEMA = _widget_text("pacs_source_schema", "4_prod.bronze")
+SRC_RADIOLOGY = _widget_text("radiology_source", "4_prod.bronze.map_radiology_event")
+
 TARGET = f"{TARGET_SCHEMA}.map_pacs_report_text_bridge"
-SRC_REPORT = "4_prod.bronze.map_pacs_report"
-SRC_EXAM = "4_prod.bronze.map_pacs_examination"
-SRC_BLOB = "4_prod.pacs_dlt.pacs_blob_content"
+TARGET_REL = f"{TARGET_SCHEMA}.map_pacs_report_text_candidate"
+SRC_REPORT = f"{PACS_SOURCE_SCHEMA}.map_pacs_report"
+SRC_EXAM = f"{PACS_SOURCE_SCHEMA}.map_pacs_examination"
+SRC_BLOB_TEXT = "4_prod.bronze.mill_blob_text"
+SRC_RAW_CHUNKS = "4_prod.raw.mill_ce_blob"
+SOURCES = {
+    "report": SRC_REPORT,
+    "exam": SRC_EXAM,
+    "radiology": SRC_RADIOLOGY,
+    "blob_text": SRC_BLOB_TEXT,
+    "raw_chunks": SRC_RAW_CHUNKS,
+}
 CONTROL_TABLE = f"{CONTROL_SCHEMA}.s6_source_versions"
 CONTROL_PIPELINE = "s6_b12_pacs_text_bridge_pipeline"
 
-LOGIC_VERSION = "2026-08-22.b12.v3"
+LOGIC_VERSION = "2026-09-24.pacs_integration.v4"
 PIPELINE_NAME = "pacs_text_bridge_pipeline"
 RTF_PREFIX = "{" + chr(92) + "rtf"
+# mill_blob_text marks the open-current version with VALID_UNTIL_DT_TM 2100-12-31.
+CURRENT_VALID_UNTIL_FLOOR = "2100-01-01"
+RADRPT_EVENT_CLASS_CD = 224
 ACCOUNTING_CLASSES = (
     "BRIDGED",
-    "MULTI_BLOB_ACCESSION",
-    "MULTI_REPORT_ACCESSION",
+    "MULTI_DOCUMENT",
+    "MULTI_REPORT",
     "BOTH",
+    "TEXT_VERSION_AMBIGUOUS",
+    "TEXT_INTEGRITY_UNKNOWN",
     "UNMATCHED",
 )
+MATCH_LANES = ("PACS_EXAM_LINK", "ACCESSION_UNIQUE_EXAM")
+ACCEPTED_DECISIONS = ("single_current", "identical_text_collapsed")
+ACCEPTED_INTEGRITY = ("single_version_chunks", "raw_chunks_absent")
 
 # COMMAND ----------
 
 import hashlib
-import importlib.metadata
-import json
 from datetime import datetime, timezone
 
 from pyspark.sql import functions as F
 from pyspark.sql.types import DateType, StringType, TimestampType
+from pyspark.sql.window import Window
 
 RUN_STARTED_AT = datetime.now(timezone.utc).isoformat()
-try:
-    from striprtf.striprtf import rtf_to_text as _rtf_to_text
-    STRIPRTF_VERSION = importlib.metadata.version("striprtf")
-    HAVE_STRIPRTF = True
-except Exception as exc:
-    _rtf_to_text = None
-    STRIPRTF_VERSION = None
-    HAVE_STRIPRTF = False
-    print(f"[B12][PARSER] striprtf unavailable on driver: {type(exc).__name__}: {exc}")
-
-if HAVE_STRIPRTF:
-    _fixture = RTF_PREFIX + "1" + chr(92) + "ansi Hello" + chr(92) + "par world}"
-    _fixture_text = _rtf_to_text(_fixture, errors="ignore")
-    assert "Hello" in _fixture_text and "world" in _fixture_text
-    assert "Helloworld" not in _fixture_text.replace(" ", "")
-    print(f"[B12][PARSER] established Blob Processing v2 striprtf parser available: {STRIPRTF_VERSION}")
 
 # COMMAND ----------
 
@@ -308,7 +328,7 @@ ADMIN_STAMPS = {
     "PIPELINE_UPDT_DT_TM",
 }
 
-ROW_HASH_COLUMNS = [
+BRIDGE_COLUMNS = [
     "REPORT_ID",
     "EVENT_ID",
     "MATCH_LANE",
@@ -321,51 +341,83 @@ ROW_HASH_COLUMNS = [
     "BLOB_UPDT_DT_TM",
     "BLOB_ADC_UPDT",
     "REPORT_SRC_ADC_UPDT",
+    "SOURCE_VERSION_ID",
+    "BLOB_VERSION_ID",
+    "RAW_SHA256",
+    "TEXT_SHA256",
+    "BLOB_CONTENT_TYPE",
+    "EFFECTIVE_CURRENT_DECISION",
+    "CURRENT_ROW_COUNT",
+    "CURRENT_BLOB_VERSION_IDS",
+    "TEXT_INTEGRITY_STATUS",
 ]
 
-def row_hash_expr():
-    return F.sha2(F.to_json(F.struct(*[F.col(c) for c in ROW_HASH_COLUMNS])), 256)
+REL_COLUMNS = [
+    "CANDIDATE_KEY",
+    "REPORT_ID",
+    "EVENT_ID",
+    "PACS_EXAMINATION_ID",
+    "SECTRA_ACCESSION_NBR",
+    "MATCH_LANE",
+    "REPORT_CANDIDATE_DOC_COUNT",
+    "DOC_CANDIDATE_REPORT_COUNT",
+    "IDENTITY_CONFLICT_COUNT",
+    "ACCOUNTING_CLASS",
+    "UNMATCHED_REASON",
+    "EFFECTIVE_CURRENT_DECISION",
+    "CURRENT_ROW_COUNT",
+    "CURRENT_TEXT_VARIANT_COUNT",
+    "CURRENT_BLOB_VERSION_IDS",
+    "SOURCE_VERSION_ID",
+    "BLOB_VERSION_ID",
+    "RAW_SHA256",
+    "TEXT_SHA256",
+    "TEXT_INTEGRITY_STATUS",
+    "RAW_MAX_ROWS_PER_CHUNK_SEQ",
+    "ACCEPTED_IND",
+    "REPORT_SRC_ADC_UPDT",
+]
 
-def blob_snapshot_stats():
-    b = spark.table(SRC_BLOB).select(
-        "EVENT_ID", "MillAccessionNbr", "BLOB_CONTENTS", "BLOB_LENGTH", "BLOB_SEQ_NBR",
-        "EXTRACT_DT_TM", "UPDT_DT_TM", "ADC_UPDT", "TRUNCATION_IND", "ERROR_IND")
-    rtf = F.lower(F.substring(F.ltrim(F.col("BLOB_CONTENTS")), 1, len(RTF_PREFIX))) == F.lit(RTF_PREFIX)
-    row = b.agg(
-        F.count(F.lit(1)).cast("long").alias("rows"),
-        F.countDistinct("EVENT_ID").cast("long").alias("distinct_event_id"),
-        F.countDistinct(F.trim("MillAccessionNbr")).cast("long").alias("distinct_accessions"),
-        F.sum(F.when(F.col("EVENT_ID").isNull(), 1).otherwise(0)).cast("long").alias("null_event_id"),
-        F.sum(F.when(F.col("BLOB_CONTENTS").isNull() | (F.trim("BLOB_CONTENTS") == ""), 1)
-              .otherwise(0)).cast("long").alias("blank_blob_contents"),
-        F.sum(F.when(F.coalesce("TRUNCATION_IND", F.lit(0)) != 0, 1).otherwise(0))
-              .cast("long").alias("truncation_rows"),
-        F.sum(F.when(F.coalesce("ERROR_IND", F.lit(0)) != 0, 1).otherwise(0))
-              .cast("long").alias("error_rows"),
-        F.sum(F.when(rtf, 1).otherwise(0)).cast("long").alias("rtf_rows"),
-        F.max("BLOB_SEQ_NBR").cast("long").alias("max_blob_seq_nbr"),
-        F.min("EXTRACT_DT_TM").alias("min_extract_dt_tm"),
-        F.max("EXTRACT_DT_TM").alias("max_extract_dt_tm"),
-        F.max("ADC_UPDT").alias("max_adc_updt"),
-        F.expr("""bit_xor(xxhash64(
-            EVENT_ID, MillAccessionNbr, BLOB_LENGTH, BLOB_SEQ_NBR, BLOB_CONTENTS, ADC_UPDT
-        ))""").cast("long").alias("content_xor"),
-    ).collect()[0].asDict()
-    return row
+REQUIRED_SOURCE_COLUMNS = {
+    "report": {"PACS_REPORT_ID", "PACS_EXAMINATION_ID", "PERSON_ID", "REPORT_TEXT",
+               "SRC_ADC_UPDT", "SOURCE_PRESENT_IND"},
+    "exam": {"PACS_EXAMINATION_ID", "SECTRA_ACCESSION_NBR", "PERSON_ID", "SOURCE_PRESENT_IND"},
+    "radiology": {"EVENT_ID", "EVENT_CLASS_CD", "IN_ERROR_IND", "PERSON_ID",
+                  "SECTRA_ACCESSION_NBR", "PACS_EXAMINATION_ID", "PACS_LINK_METHOD"},
+    "blob_text": {"EVENT_ID", "VALID_UNTIL_DT_TM", "VALID_FROM_DT_TM", "UPDT_DT_TM", "ADC_UPDT",
+                  "BLOB_TEXT", "STATUS", "CONTENT_TYPE", "raw_sha256", "decompressor_version",
+                  "parser_version", "post_processor_version", "SOURCE_VERSION_ID",
+                  "BLOB_VERSION_ID"},
+    "raw_chunks": {"EVENT_ID", "BLOB_SEQ_NUM"},
+}
 
-def assembly_gate(stats):
-    assert int(stats["rows"]) == int(stats["distinct_event_id"]), (
-        f"blob is not pre-assembled: rows={stats['rows']} distinct_event_id={stats['distinct_event_id']}"
-    )
-    assert int(stats["null_event_id"]) == 0
-    assert int(stats["truncation_rows"]) == 0, f"truncation flags present: {stats['truncation_rows']}"
-    assert int(stats["error_rows"]) == 0, f"error flags present: {stats['error_rows']}"
-    if int(stats["rtf_rows"]) > 0:
-        assert HAVE_STRIPRTF, "RTF rows exist but the established striprtf parser is unavailable"
-    print("[B12][ASSEMBLY] PASS", json.dumps(stats, default=str, sort_keys=True))
+def row_hash_expr(columns):
+    return F.sha2(F.to_json(F.struct(*[F.col(c) for c in columns])), 256)
 
-def report_snapshot_stats(report_version):
-    r = pinned_table(SRC_REPORT, report_version).where(F.col("SOURCE_PRESENT_IND"))
+def source_state():
+    versions = {name: table_version(tbl) for name, tbl in SOURCES.items()}
+    state = {"logic_version": LOGIC_VERSION}
+    state.update({f"{name}_version": int(v) for name, v in versions.items()})
+    signature = hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return state, signature
+
+def pinned(name, state):
+    return pinned_table(SOURCES[name], state[f"{name}_version"])
+
+def assert_source_contract(state):
+    # map_radiology_event v2 and map_pacs_examination v3.2 must be deployed first.
+    missing = {}
+    for name, required in REQUIRED_SOURCE_COLUMNS.items():
+        have = set(pinned(name, state).columns)
+        absent = sorted(required - have)
+        if absent:
+            missing[SOURCES[name]] = absent
+    assert not missing, f"upstream contract not deployed (deploy order violated): {missing}"
+
+def report_snapshot_stats(state):
+    r = pinned("report", state).where(F.col("SOURCE_PRESENT_IND"))
     return r.agg(
         F.count(F.lit(1)).cast("long").alias("total_reports"),
         F.sum(F.when(F.col("REPORT_TEXT").isNull() | (F.trim("REPORT_TEXT") == ""), 1)
@@ -374,194 +426,234 @@ def report_snapshot_stats(report_version):
               .otherwise(0)).cast("long").alias("native_text_reports"),
     ).collect()[0].asDict()
 
-def source_state():
-    report_version = table_version(SRC_REPORT)
-    exam_version = table_version(SRC_EXAM)
-    blob_stats = blob_snapshot_stats()
-    assembly_gate(blob_stats)
-    state = {
-        "logic_version": LOGIC_VERSION,
-        "report_version": report_version,
-        "exam_version": exam_version,
-        "blob_rows": int(blob_stats["rows"]),
-        "blob_distinct_event_id": int(blob_stats["distinct_event_id"]),
-        "blob_distinct_accessions": int(blob_stats["distinct_accessions"]),
-        "blob_max_adc_updt": str(blob_stats["max_adc_updt"]),
-        "blob_content_xor": int(blob_stats["content_xor"]),
-        "striprtf_version": STRIPRTF_VERSION or "UNAVAILABLE_NO_RTF",
-    }
-    signature = hashlib.sha256(
-        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return state, signature, blob_stats
-
 def record_s6_source_versions(state):
     """Post-gate shared S6 ledger commit. The SHA-256 source signature remains the NO_OP authority."""
     spark.sql(f"""CREATE TABLE IF NOT EXISTS {CONTROL_TABLE}
         (pipeline STRING, source STRING, version BIGINT, updated_at TIMESTAMP)""")
-    versions = {
-        SRC_REPORT: int(state["report_version"]),
-        SRC_EXAM: int(state["exam_version"]),
-        SRC_BLOB: int(state["blob_content_xor"]),
-    }
+    versions = {tbl: int(state[f"{name}_version"]) for name, tbl in SOURCES.items()}
     record_versions(CONTROL_TABLE, CONTROL_PIPELINE, versions)
     recorded = {r["source"]: int(r["version"]) for r in spark.sql(f"""
         SELECT source, version FROM {CONTROL_TABLE}
         WHERE pipeline='{CONTROL_PIPELINE}'""").collect()}
-    assert recorded == versions, f"S6 source-version ledger mismatch: {recorded} != {versions}"
-    print("[B12][S6_SOURCE_VERSIONS]", json.dumps(recorded, sort_keys=True))
-    return recorded
+    stale = {k: v for k, v in versions.items() if recorded.get(k) != v}
+    assert not stale, f"S6 source-version ledger mismatch: {stale} vs {recorded}"
+    print("[B12][S6_SOURCE_VERSIONS]", json.dumps(versions, sort_keys=True))
+    return versions
 
 # COMMAND ----------
 
-def build_classification(report_version, exam_version):
-    """Classify textless reports with one physical read path to the remote blob MV.
-
-    The prior plan joined blob_by_accession twice and then self-joined selected
-    to its own aggregation. Databricks Runtime 18 correctly blocks that as a
-    self-join on a remotely evaluated materialized view. Candidate keys and
-    accession multiplicity are now expressed with explode/window operations,
-    preserving REQUEST_ID preference without duplicating the remote relation.
-    """
-    from pyspark.sql.window import Window as _BridgeWindow
-
-    blob = (spark.table(SRC_BLOB)
+def current_blob_rows(state, event_ids):
+    """Open-current mill_blob_text rows for the given events, with their own text hash."""
+    return (pinned("blob_text", state)
+        .where(F.col("VALID_UNTIL_DT_TM") >= F.lit(CURRENT_VALID_UNTIL_FLOOR).cast("timestamp"))
+        .join(event_ids, "EVENT_ID", "left_semi")
         .select(
-            F.trim("MillAccessionNbr").alias("ACCESSION"),
-            F.col("EVENT_ID"),
-            F.col("BLOB_CONTENTS"),
-            F.col("EXTRACT_DT_TM"),
-            F.col("UPDT_DT_TM"),
-            F.col("ADC_UPDT"))
-        .where(F.col("ACCESSION").isNotNull() & (F.col("ACCESSION") != "")))
+            F.col("EVENT_ID").cast("long").alias("EVENT_ID"),
+            "SOURCE_VERSION_ID",
+            "BLOB_VERSION_ID",
+            F.col("raw_sha256").alias("RAW_SHA256"),
+            # Blank text hashes to NULL so NULL and whitespace-only count as one "no text" variant.
+            F.when(F.trim("BLOB_TEXT") != "", F.sha2(F.col("BLOB_TEXT"), 256)).alias("TEXT_SHA256"),
+            "BLOB_TEXT",
+            "STATUS",
+            "CONTENT_TYPE",
+            "decompressor_version",
+            "parser_version",
+            "post_processor_version",
+            "VALID_FROM_DT_TM",
+            "UPDT_DT_TM",
+            "ADC_UPDT"))
 
-    blob_by_accession = (blob.groupBy("ACCESSION").agg(
-        F.countDistinct("EVENT_ID").cast("long").alias("BLOB_EVENT_COUNT"),
-        F.max("EVENT_ID").alias("ONLY_EVENT_ID"),
-        F.max("BLOB_CONTENTS").alias("ONLY_BLOB_CONTENTS"),
-        F.max("EXTRACT_DT_TM").alias("ONLY_EXTRACT_DT_TM"),
-        F.max("UPDT_DT_TM").alias("ONLY_UPDT_DT_TM"),
-        F.max("ADC_UPDT").alias("ONLY_ADC_UPDT"),
-    ))
+def resolve_effective_current(state, event_ids):
+    """One row per event: the effective-current decision and, when decidable, its version.
 
-    textless = (pinned_table(SRC_REPORT, report_version)
+    Several open-current rows with byte-identical text collapse to one document. Differing
+    text is text_version_ambiguous: no ordering is used to pick a winner, and the version
+    pointers stay NULL so nothing downstream can mistake a pick for a resolution.
+    """
+    cur = current_blob_rows(state, event_ids).drop("BLOB_TEXT")
+    w = Window.partitionBy("EVENT_ID")
+    text_key = F.coalesce(F.col("TEXT_SHA256"), F.lit("<NO_TEXT>"))
+    cur = (cur
+        .withColumn("CURRENT_ROW_COUNT", F.count(F.lit(1)).over(w).cast("int"))
+        .withColumn("CURRENT_TEXT_VARIANT_COUNT", F.size(F.collect_set(text_key).over(w)))
+        .withColumn("CURRENT_BLOB_VERSION_IDS", F.when(
+            F.col("CURRENT_ROW_COUNT") > 1,
+            F.concat_ws(",", F.array_sort(F.collect_set("BLOB_VERSION_ID").over(w))))))
+    # Identical-text rows are interchangeable; this ordering only fixes which provenance
+    # row is reported for a collapsed document (latest version first, NULLS LAST).
+    rep_order = Window.partitionBy("EVENT_ID").orderBy(
+        F.col("VALID_FROM_DT_TM").desc_nulls_last(),
+        F.col("ADC_UPDT").desc_nulls_last(),
+        F.col("UPDT_DT_TM").desc_nulls_last(),
+        F.col("BLOB_VERSION_ID").asc_nulls_last(),
+        F.col("SOURCE_VERSION_ID").asc_nulls_last())
+    rep = (cur.withColumn("_REP_RN", F.row_number().over(rep_order))
+        .where(F.col("_REP_RN") == 1).drop("_REP_RN"))
+    decision = (F.when(F.col("CURRENT_ROW_COUNT") == 1, F.lit("single_current"))
+        .when(F.col("CURRENT_TEXT_VARIANT_COUNT") == 1, F.lit("identical_text_collapsed"))
+        .otherwise(F.lit("text_version_ambiguous")))
+    decided = F.col("EFFECTIVE_CURRENT_DECISION") != "text_version_ambiguous"
+    return (rep
+        .withColumn("EFFECTIVE_CURRENT_DECISION", decision)
+        .select(
+            "EVENT_ID",
+            "EFFECTIVE_CURRENT_DECISION",
+            "CURRENT_ROW_COUNT",
+            "CURRENT_TEXT_VARIANT_COUNT",
+            "CURRENT_BLOB_VERSION_IDS",
+            *[F.when(decided, F.col(c)).alias(c) for c in (
+                "SOURCE_VERSION_ID", "BLOB_VERSION_ID", "RAW_SHA256", "TEXT_SHA256",
+                "STATUS", "CONTENT_TYPE", "decompressor_version", "parser_version",
+                "post_processor_version")]))
+
+def raw_chunk_evidence(state, event_ids):
+    """Largest number of raw rows sharing one (EVENT_ID, BLOB_SEQ_NUM) per event.
+
+    More than one means the raw store holds several document versions for a chunk slot, so a
+    decoded text may have been stitched from different versions. No reassembly happens here.
+    """
+    raw = pinned("raw_chunks", state).select(
+        F.col("EVENT_ID").cast("long").alias("EVENT_ID"), F.col("BLOB_SEQ_NUM"))
+    return (raw.join(event_ids, "EVENT_ID", "left_semi")
+        .groupBy("EVENT_ID", "BLOB_SEQ_NUM").agg(F.count(F.lit(1)).alias("_N"))
+        .groupBy("EVENT_ID").agg(F.max("_N").cast("int").alias("RAW_MAX_ROWS_PER_CHUNK_SEQ")))
+
+def build_relationships(state):
+    """Every textless-report candidate relationship, classified at report grain.
+
+    Lanes, strongest first (a report uses only its strongest lane with any candidate):
+      PACS_EXAM_LINK        — the RADRPT event's map_radiology_event PACS link (accession +
+                              exam code + identity) resolves to this report's examination.
+      ACCESSION_UNIQUE_EXAM — the RADRPT event carries this examination's Sectra accession,
+                              the accession names exactly one present PACS examination, and the
+                              event is not PACS-linked to any examination.
+    Both lanes require person compatibility (either side NULL, or equal).
+    """
+    exams = (pinned("exam", state).where(F.col("SOURCE_PRESENT_IND"))
+        .select(
+            F.col("PACS_EXAMINATION_ID").cast("long").alias("_EXAM_ID"),
+            F.upper(F.trim("SECTRA_ACCESSION_NBR")).alias("_EXAM_ACC"),
+            F.col("PERSON_ID").cast("long").alias("_EXAM_PERSON")))
+    acc_n = (exams.where(F.col("_EXAM_ACC").isNotNull() & (F.col("_EXAM_ACC") != ""))
+        .groupBy("_EXAM_ACC").agg(F.countDistinct("_EXAM_ID").alias("_ACC_EXAM_N")))
+    exams = exams.join(acc_n, "_EXAM_ACC", "left")
+
+    reports = (pinned("report", state)
         .where(F.col("SOURCE_PRESENT_IND"))
         .where(F.col("REPORT_TEXT").isNull() | (F.trim("REPORT_TEXT") == ""))
         .select(
             F.col("PACS_REPORT_ID").cast("long").alias("REPORT_ID"),
             F.col("PACS_EXAMINATION_ID").cast("long").alias("PACS_EXAMINATION_ID"),
-            F.col("SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT")))
+            F.col("PERSON_ID").cast("long").alias("_REPORT_PERSON"),
+            F.col("SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT"))
+        .join(exams, F.col("PACS_EXAMINATION_ID") == F.col("_EXAM_ID"), "left")
+        .withColumn("_SUBJECT", F.coalesce("_REPORT_PERSON", "_EXAM_PERSON")))
 
-    exams = (pinned_table(SRC_EXAM, exam_version)
-        .where(F.col("SOURCE_PRESENT_IND"))
+    docs = (pinned("radiology", state)
+        .where((F.col("EVENT_CLASS_CD") == RADRPT_EVENT_CLASS_CD)
+               & ~F.coalesce(F.col("IN_ERROR_IND"), F.lit(False)))
         .select(
-            F.col("PACS_EXAMINATION_ID").cast("long").alias("PACS_EXAMINATION_ID"),
-            F.trim("REQUEST_ID_STRING").alias("REQUEST_ID_STRING"),
-            F.trim("EXAMINATION_ID_STRING").alias("EXAMINATION_ID_STRING")))
+            F.col("EVENT_ID").cast("long").alias("_DOC_ID"),
+            F.col("PERSON_ID").cast("long").alias("_DOC_PERSON"),
+            F.col("PACS_EXAMINATION_ID").cast("long").alias("_DOC_EXAM_ID"),
+            F.upper(F.trim("SECTRA_ACCESSION_NBR")).alias("_DOC_ACC")))
 
-    report_exam = (textless.alias("r")
-        .join(
-            exams.alias("e"),
-            F.col("r.PACS_EXAMINATION_ID") == F.col("e.PACS_EXAMINATION_ID"),
-            "left",
-        )
-        .select(
-            F.col("r.REPORT_ID").alias("REPORT_ID"),
-            F.col("r.REPORT_SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT"),
-            F.col("e.PACS_EXAMINATION_ID").alias("RESOLVED_EXAM_ID"),
-            F.col("e.REQUEST_ID_STRING").alias("REQUEST_ID_STRING"),
-            F.col("e.EXAMINATION_ID_STRING").alias("EXAMINATION_ID_STRING"),
-        ))
+    r = reports.select("REPORT_ID", "_EXAM_ID", "_EXAM_ACC", "_ACC_EXAM_N", "_SUBJECT")
+    lane_exam = (r.join(docs.where(F.col("_DOC_EXAM_ID").isNotNull()),
+                        F.col("_EXAM_ID") == F.col("_DOC_EXAM_ID"), "inner")
+        .withColumn("_PRIORITY", F.lit(1)).withColumn("MATCH_LANE", F.lit("PACS_EXAM_LINK")))
+    lane_acc = (r.where(F.col("_ACC_EXAM_N") == 1)
+        .join(docs.where(F.col("_DOC_EXAM_ID").isNull()),
+              F.col("_EXAM_ACC") == F.col("_DOC_ACC"), "inner")
+        .withColumn("_PRIORITY", F.lit(2)).withColumn("MATCH_LANE", F.lit("ACCESSION_UNIQUE_EXAM")))
+    pairs = (lane_exam.unionByName(lane_acc)
+        .select("REPORT_ID", "_DOC_ID", "_PRIORITY", "MATCH_LANE",
+                (F.col("_SUBJECT").isNull() | F.col("_DOC_PERSON").isNull()
+                 | (F.col("_SUBJECT") == F.col("_DOC_PERSON"))).alias("_COMPAT")))
+    conflicts = (pairs.where(~F.col("_COMPAT")).groupBy("REPORT_ID")
+        .agg(F.countDistinct("_DOC_ID").cast("int").alias("IDENTITY_CONFLICT_COUNT")))
+    compat = pairs.where(F.col("_COMPAT"))
+    by_report = Window.partitionBy("REPORT_ID")
+    chosen = (compat
+        .withColumn("_BEST", F.min("_PRIORITY").over(by_report))
+        .where(F.col("_PRIORITY") == F.col("_BEST"))
+        .select("REPORT_ID", F.col("_DOC_ID").alias("EVENT_ID"), "MATCH_LANE")
+        .dropDuplicates(["REPORT_ID", "EVENT_ID"]))
+    by_doc = Window.partitionBy("EVENT_ID")
+    chosen = (chosen
+        .withColumn("REPORT_CANDIDATE_DOC_COUNT", F.count(F.lit(1)).over(by_report).cast("int"))
+        .withColumn("DOC_CANDIDATE_REPORT_COUNT", F.count(F.lit(1)).over(by_doc).cast("int"))
+        .withColumn("_MAX_DOC_REPORTS", F.max("DOC_CANDIDATE_REPORT_COUNT").over(by_report)))
 
-    candidates = (report_exam
-        .withColumn(
-            "_MATCH_CANDIDATE",
-            F.explode(F.array(
-                F.struct(
-                    F.lit(1).alias("priority"),
-                    F.lit("REQUEST_ID").alias("lane"),
-                    F.col("REQUEST_ID_STRING").alias("accession"),
-                ),
-                F.struct(
-                    F.lit(2).alias("priority"),
-                    F.lit("EXAMINATION_ID").alias("lane"),
-                    F.col("EXAMINATION_ID_STRING").alias("accession"),
-                ),
-            )),
-        )
-        .select(
-            "REPORT_ID",
-            "REPORT_SRC_ADC_UPDT",
-            "RESOLVED_EXAM_ID",
-            F.col("_MATCH_CANDIDATE.priority").alias("MATCH_PRIORITY"),
-            F.col("_MATCH_CANDIDATE.lane").alias("CANDIDATE_LANE"),
-            F.col("_MATCH_CANDIDATE.accession").alias("CANDIDATE_ACCESSION"),
-        ))
+    event_ids = chosen.select("EVENT_ID").distinct()
+    blob = resolve_effective_current(state, event_ids)
+    raw = raw_chunk_evidence(state, event_ids)
 
-    matched = (candidates.alias("c")
-        .join(
-            blob_by_accession.alias("b"),
-            F.col("b.ACCESSION") == F.col("c.CANDIDATE_ACCESSION"),
-            "left",
-        ))
+    rel = (reports.select("REPORT_ID", "PACS_EXAMINATION_ID", "_EXAM_ID", "_EXAM_ACC",
+                          "REPORT_SRC_ADC_UPDT")
+        .join(chosen, "REPORT_ID", "left")
+        .join(conflicts, "REPORT_ID", "left")
+        .join(blob, "EVENT_ID", "left")
+        .join(raw, "EVENT_ID", "left")
+        .withColumn("REPORT_CANDIDATE_DOC_COUNT",
+                    F.coalesce("REPORT_CANDIDATE_DOC_COUNT", F.lit(0)))
+        .withColumn("IDENTITY_CONFLICT_COUNT", F.coalesce("IDENTITY_CONFLICT_COUNT", F.lit(0)))
+        .withColumn("EFFECTIVE_CURRENT_DECISION", F.when(
+            F.col("EVENT_ID").isNotNull(),
+            F.coalesce("EFFECTIVE_CURRENT_DECISION", F.lit("no_current_row")))))
 
-    choice_window = _BridgeWindow.partitionBy(F.col("c.REPORT_ID")).orderBy(
-        F.when(F.col("b.ACCESSION").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
-        F.col("c.MATCH_PRIORITY").asc(),
-    )
-    selected = (matched
-        .withColumn("_CHOICE_RN", F.row_number().over(choice_window))
-        .where(F.col("_CHOICE_RN") == 1)
-        .select(
-            F.col("c.REPORT_ID").alias("REPORT_ID"),
-            F.col("c.REPORT_SRC_ADC_UPDT").alias("REPORT_SRC_ADC_UPDT"),
-            F.col("b.ACCESSION").alias("ACCESSION"),
-            F.when(F.col("b.ACCESSION").isNotNull(), F.col("c.CANDIDATE_LANE"))
-             .alias("MATCH_LANE"),
-            F.col("b.BLOB_EVENT_COUNT").alias("BLOB_EVENT_COUNT"),
-            F.col("b.ONLY_EVENT_ID").alias("EVENT_ID"),
-            F.col("b.ONLY_BLOB_CONTENTS").alias("BLOB_CONTENTS"),
-            F.col("b.ONLY_EXTRACT_DT_TM").alias("BLOB_EXTRACT_DT_TM"),
-            F.col("b.ONLY_UPDT_DT_TM").alias("BLOB_UPDT_DT_TM"),
-            F.col("b.ONLY_ADC_UPDT").alias("BLOB_ADC_UPDT"),
-            F.when(F.col("c.RESOLVED_EXAM_ID").isNull(), F.lit("NO_RESOLVED_EXAM"))
-             .when(F.col("b.ACCESSION").isNull(), F.lit("NO_BLOB_ON_MATCH_KEYS"))
-             .alias("_UNMATCHED_REASON"),
-        ))
+    has_text = F.col("TEXT_SHA256").isNotNull()
+    integrity = (F.when(F.col("EVENT_ID").isNull(), F.lit(None).cast("string"))
+        .when(F.col("EFFECTIVE_CURRENT_DECISION") == "no_current_row", F.lit("no_current_text"))
+        .when(F.col("EFFECTIVE_CURRENT_DECISION") == "text_version_ambiguous",
+              F.lit("not_assessed_version_ambiguous"))
+        .when(F.col("RAW_MAX_ROWS_PER_CHUNK_SEQ").isNull(), F.lit("raw_chunks_absent"))
+        .when(F.col("RAW_MAX_ROWS_PER_CHUNK_SEQ") > 1, F.lit("text_integrity_unknown"))
+        .otherwise(F.lit("single_version_chunks")))
+    rel = rel.withColumn("TEXT_INTEGRITY_STATUS", integrity)
 
-    accession_window = _BridgeWindow.partitionBy("ACCESSION")
-    classified = selected.withColumn(
-        "TEXTLESS_REPORT_COUNT",
-        F.when(
-            F.col("ACCESSION").isNotNull(),
-            F.count(F.lit(1)).over(accession_window),
-        ).otherwise(F.lit(None).cast("long")),
-    )
-    blank_blob = F.col("BLOB_CONTENTS").isNull() | (F.trim("BLOB_CONTENTS") == "")
+    doc_n = F.col("REPORT_CANDIDATE_DOC_COUNT")
+    rep_n = F.coalesce(F.col("_MAX_DOC_REPORTS"), F.lit(0))
     accounting_class = (
-        F.when(F.col("ACCESSION").isNull(), F.lit("UNMATCHED"))
-         .when((F.col("BLOB_EVENT_COUNT") > 1) & (F.col("TEXTLESS_REPORT_COUNT") > 1),
-               F.lit("BOTH"))
-         .when(F.col("BLOB_EVENT_COUNT") > 1, F.lit("MULTI_BLOB_ACCESSION"))
-         .when(F.col("TEXTLESS_REPORT_COUNT") > 1, F.lit("MULTI_REPORT_ACCESSION"))
-         .when(blank_blob, F.lit("UNMATCHED"))
-         .otherwise(F.lit("BRIDGED"))
-    )
-    final_reason = (
-        F.when(F.col("ACCESSION").isNotNull()
-               & (F.col("BLOB_EVENT_COUNT") == 1)
-               & (F.col("TEXTLESS_REPORT_COUNT") == 1)
-               & blank_blob, F.lit("EMPTY_BLOB"))
-         .otherwise(F.col("_UNMATCHED_REASON"))
-    )
-    return (classified
+        F.when(doc_n == 0, F.lit("UNMATCHED"))
+         .when((doc_n > 1) & (rep_n > 1), F.lit("BOTH"))
+         .when(doc_n > 1, F.lit("MULTI_DOCUMENT"))
+         .when(rep_n > 1, F.lit("MULTI_REPORT"))
+         .when(F.col("EFFECTIVE_CURRENT_DECISION") == "text_version_ambiguous",
+               F.lit("TEXT_VERSION_AMBIGUOUS"))
+         .when(F.col("EFFECTIVE_CURRENT_DECISION") == "no_current_row", F.lit("UNMATCHED"))
+         .when(~has_text, F.lit("UNMATCHED"))
+         .when(F.col("TEXT_INTEGRITY_STATUS") == "text_integrity_unknown",
+               F.lit("TEXT_INTEGRITY_UNKNOWN"))
+         .otherwise(F.lit("BRIDGED")))
+    unmatched_reason = (
+        F.when(F.col("_EXAM_ID").isNull(), F.lit("NO_RESOLVED_EXAM"))
+         .when((doc_n == 0) & (F.col("IDENTITY_CONFLICT_COUNT") > 0), F.lit("IDENTITY_CONFLICT"))
+         .when(doc_n == 0, F.lit("NO_MILL_DOCUMENT_ON_LINK_KEYS"))
+         .when(F.col("EFFECTIVE_CURRENT_DECISION") == "no_current_row",
+               F.lit("NO_CURRENT_BLOB_TEXT"))
+         .otherwise(F.lit("EMPTY_BLOB_TEXT")))
+    rel = (rel
         .withColumn("ACCOUNTING_CLASS", accounting_class)
-        .withColumn("UNMATCHED_REASON", final_reason)
-        .drop("_UNMATCHED_REASON"))
+        .withColumn("UNMATCHED_REASON",
+                    F.when(F.col("ACCOUNTING_CLASS") == "UNMATCHED", unmatched_reason))
+        .withColumn("ACCEPTED_IND", F.col("ACCOUNTING_CLASS") == "BRIDGED")
+        .withColumn("SECTRA_ACCESSION_NBR", F.col("_EXAM_ACC"))
+        .withColumn("EVENT_ID", F.col("EVENT_ID").cast("string"))
+        .withColumn("CANDIDATE_KEY", F.concat_ws(
+            "|", F.col("REPORT_ID").cast("string"), F.coalesce(F.col("EVENT_ID"), F.lit("NONE"))))
+        .select(*REL_COLUMNS))
+    rel, flagged = dq_all_clinical(rel, {"REPORT_SRC_ADC_UPDT"})
+    assert flagged == [], f"unexpected clinical temporal columns: {flagged}"
+    return (rel
+        .withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
+        .withColumn("ROW_HASH", row_hash_expr(REL_COLUMNS)))
 
-def collect_accounting(classified, report_stats):
-    rows = (classified.groupBy("ACCOUNTING_CLASS", "MATCH_LANE", "UNMATCHED_REASON")
-        .agg(F.count(F.lit(1)).cast("long").alias("n"))
+def collect_accounting(report_stats):
+    rel = spark.table(TARGET_REL).where(F.col("SOURCE_PRESENT_IND"))
+    rows = (rel.groupBy("ACCOUNTING_CLASS", "MATCH_LANE", "UNMATCHED_REASON")
+        .agg(F.countDistinct("REPORT_ID").cast("long").alias("n"))
         .collect())
     records = [r.asDict() for r in rows]
     class_totals = {c: 0 for c in ACCOUNTING_CLASSES}
@@ -581,19 +673,21 @@ def collect_accounting(classified, report_stats):
     assert accounted == int(report_stats["textless_reports"]), (
         f"accounting mismatch: {accounted} != {report_stats['textless_reports']}"
     )
-    bridge_by_lane = {
-        "REQUEST_ID": sum(int(r["n"]) for r in records
-                          if r["ACCOUNTING_CLASS"] == "BRIDGED" and r["MATCH_LANE"] == "REQUEST_ID"),
-        "EXAMINATION_ID": sum(int(r["n"]) for r in records
-                              if r["ACCOUNTING_CLASS"] == "BRIDGED"
-                              and r["MATCH_LANE"] == "EXAMINATION_ID"),
-    }
+    bridge_by_lane = {lane: sum(int(r["n"]) for r in records
+                                if r["ACCOUNTING_CLASS"] == "BRIDGED" and r["MATCH_LANE"] == lane)
+                      for lane in MATCH_LANES}
+    version_rows = (rel.where(F.col("EVENT_ID").isNotNull())
+        .groupBy("EFFECTIVE_CURRENT_DECISION", "TEXT_INTEGRITY_STATUS")
+        .agg(F.countDistinct("EVENT_ID").cast("long").alias("n")).collect())
+    version_status = {f"{r['EFFECTIVE_CURRENT_DECISION']}/{r['TEXT_INTEGRITY_STATUS']}": int(r["n"])
+                      for r in version_rows}
     return {
         "records": records,
         "class_totals": class_totals,
         "lane_totals": lane_totals,
         "bridge_by_lane": bridge_by_lane,
         "unmatched_reasons": unmatched_reasons,
+        "candidate_event_version_status": version_status,
         "textless_reports": int(report_stats["textless_reports"]),
         "native_text_reports": int(report_stats["native_text_reports"]),
         "total_reports": int(report_stats["total_reports"]),
@@ -601,139 +695,196 @@ def collect_accounting(classified, report_stats):
 
 # COMMAND ----------
 
-if HAVE_STRIPRTF:
-    @F.udf(returnType=StringType())
-    def strip_rtf_v2(value):
-        if value is None:
-            return None
-        try:
-            parsed = _rtf_to_text(value, errors="ignore")
-            return parsed if parsed and parsed.strip() else None
-        except Exception:
-            return None
-else:
-    strip_rtf_v2 = None
-
-def build_candidate(classified, blob_stats):
-    bridged = classified.where(F.col("ACCOUNTING_CLASS") == "BRIDGED")
-    fmt = F.when(
-        F.lower(F.substring(F.ltrim("BRIDGED_TEXT_RAW"), 1, len(RTF_PREFIX))) == F.lit(RTF_PREFIX),
-        F.lit("RTF")
-    ).otherwise(F.lit("PLAIN"))
-
-    out = (bridged
+def build_candidate(state):
+    """Accepted current documents: one row per BRIDGED report, text from the resolved version."""
+    accepted = (spark.table(TARGET_REL)
+        .where(F.col("SOURCE_PRESENT_IND") & F.col("ACCEPTED_IND"))
+        .select("REPORT_ID", F.col("EVENT_ID").cast("long").alias("EVENT_ID"), "MATCH_LANE",
+                "REPORT_SRC_ADC_UPDT", "SOURCE_VERSION_ID", "BLOB_VERSION_ID", "RAW_SHA256",
+                "TEXT_SHA256", "EFFECTIVE_CURRENT_DECISION", "CURRENT_ROW_COUNT",
+                "CURRENT_BLOB_VERSION_IDS", "TEXT_INTEGRITY_STATUS"))
+    # Every current row of an accepted event carries the same text, so the text hash alone
+    # identifies it; the ordering only fixes which row's admin stamps are reported.
+    text = (current_blob_rows(state, accepted.select("EVENT_ID").distinct())
+        .select(F.col("EVENT_ID").alias("_T_EVENT_ID"), F.col("TEXT_SHA256").alias("_T_SHA"),
+                "BLOB_TEXT", "STATUS", "CONTENT_TYPE", "decompressor_version", "parser_version",
+                "post_processor_version", "VALID_FROM_DT_TM", "UPDT_DT_TM", "ADC_UPDT",
+                F.col("BLOB_VERSION_ID").alias("_T_BLOB_VERSION_ID")))
+    joined = accepted.join(
+        text,
+        (F.col("EVENT_ID") == F.col("_T_EVENT_ID")) & (F.col("TEXT_SHA256") == F.col("_T_SHA")),
+        "inner")
+    pick = Window.partitionBy("REPORT_ID").orderBy(
+        (F.col("_T_BLOB_VERSION_ID").eqNullSafe(F.col("BLOB_VERSION_ID"))).desc(),
+        F.col("VALID_FROM_DT_TM").desc_nulls_last(),
+        F.col("ADC_UPDT").desc_nulls_last(),
+        F.col("UPDT_DT_TM").desc_nulls_last())
+    out = (joined.withColumn("_RN", F.row_number().over(pick)).where(F.col("_RN") == 1)
+        .withColumn("BRIDGED_TEXT_FORMAT", F.when(
+            F.lower(F.substring(F.ltrim("BLOB_TEXT"), 1, len(RTF_PREFIX))) == F.lit(RTF_PREFIX),
+            F.lit("RTF")).otherwise(F.lit("PLAIN")))
         .select(
             F.col("REPORT_ID").cast("long").alias("REPORT_ID"),
             F.col("EVENT_ID").cast("string").alias("EVENT_ID"),
-            F.col("MATCH_LANE"),
-            F.col("BLOB_CONTENTS").alias("BRIDGED_TEXT_RAW"),
-            F.col("BLOB_EXTRACT_DT_TM"),
-            F.col("BLOB_UPDT_DT_TM"),
-            F.col("BLOB_ADC_UPDT"),
-            F.col("REPORT_SRC_ADC_UPDT"))
-        .withColumn("BRIDGED_TEXT_FORMAT", fmt))
-
-    if int(blob_stats["rtf_rows"]) > 0:
-        assert strip_rtf_v2 is not None
-        out = (out
-            .withColumn(
-                "BRIDGED_TEXT",
-                F.when(F.col("BRIDGED_TEXT_FORMAT") == "RTF",
-                       strip_rtf_v2(F.col("BRIDGED_TEXT_RAW")))
-                 .otherwise(F.col("BRIDGED_TEXT_RAW")))
-            .withColumn(
-                "BRIDGED_TEXT_PARSE_STATUS",
-                F.when((F.col("BRIDGED_TEXT_FORMAT") == "RTF")
-                       & F.col("BRIDGED_TEXT").isNull(), F.lit("STRIPRTF_ERROR"))
-                 .when(F.col("BRIDGED_TEXT_FORMAT") == "RTF", F.lit("STRIPRTF_V2"))
-                 .otherwise(F.lit("PLAIN_PASSTHROUGH")))
-            .withColumn(
-                "BRIDGED_TEXT_PARSER_VERSION",
-                F.when(F.col("BRIDGED_TEXT_FORMAT") == "RTF",
-                       F.lit(f"striprtf-{STRIPRTF_VERSION}"))
-                 .otherwise(F.lit("plain-passthrough"))))
-    else:
-        out = (out
-            .withColumn("BRIDGED_TEXT", F.col("BRIDGED_TEXT_RAW"))
-            .withColumn("BRIDGED_TEXT_PARSE_STATUS", F.lit("PLAIN_PASSTHROUGH"))
-            .withColumn("BRIDGED_TEXT_PARSER_VERSION", F.lit("plain-passthrough")))
-
-    out = out.select(
-        "REPORT_ID",
-        "EVENT_ID",
-        "MATCH_LANE",
-        "BRIDGED_TEXT_RAW",
-        "BRIDGED_TEXT",
-        "BRIDGED_TEXT_FORMAT",
-        "BRIDGED_TEXT_PARSE_STATUS",
-        "BRIDGED_TEXT_PARSER_VERSION",
-        "BLOB_EXTRACT_DT_TM",
-        "BLOB_UPDT_DT_TM",
-        "BLOB_ADC_UPDT",
-        "REPORT_SRC_ADC_UPDT",
-    )
+            "MATCH_LANE",
+            F.lit(None).cast("string").alias("BRIDGED_TEXT_RAW"),
+            F.col("BLOB_TEXT").alias("BRIDGED_TEXT"),
+            "BRIDGED_TEXT_FORMAT",
+            F.col("STATUS").alias("BRIDGED_TEXT_PARSE_STATUS"),
+            F.concat(
+                F.lit("mill_blob_text:d"), F.coalesce(F.col("decompressor_version").cast("string"), F.lit("?")),
+                F.lit("/p"), F.coalesce(F.col("parser_version").cast("string"), F.lit("?")),
+                F.lit("/pp"), F.coalesce(F.col("post_processor_version").cast("string"), F.lit("?")),
+            ).alias("BRIDGED_TEXT_PARSER_VERSION"),
+            F.lit(None).cast("timestamp").alias("BLOB_EXTRACT_DT_TM"),
+            F.col("UPDT_DT_TM").alias("BLOB_UPDT_DT_TM"),
+            F.col("ADC_UPDT").alias("BLOB_ADC_UPDT"),
+            "REPORT_SRC_ADC_UPDT",
+            "SOURCE_VERSION_ID",
+            "BLOB_VERSION_ID",
+            "RAW_SHA256",
+            "TEXT_SHA256",
+            F.col("CONTENT_TYPE").alias("BLOB_CONTENT_TYPE"),
+            "EFFECTIVE_CURRENT_DECISION",
+            "CURRENT_ROW_COUNT",
+            "CURRENT_BLOB_VERSION_IDS",
+            "TEXT_INTEGRITY_STATUS"))
     out, flagged = dq_all_clinical(out, ADMIN_STAMPS)
     assert flagged == [], f"unexpected clinical temporal columns: {flagged}"
     return (out
         .withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
-        .withColumn("ROW_HASH", row_hash_expr()))
+        .withColumn("ROW_HASH", row_hash_expr(BRIDGE_COLUMNS)))
 
 # COMMAND ----------
 
 COLUMN_COMMENTS = {
-    "REPORT_ID": "Sectra PACS report identifier. One current bridge row at most; primary key.",
-    "EVENT_ID": "Millennium RADRPT clinical-event identifier. Exactly one current report at most.",
-    "MATCH_LANE": "REQUEST_ID when REQUEST_ID_STRING matched MillAccessionNbr; EXAMINATION_ID is fallback only.",
-    "BRIDGED_TEXT_RAW": "Mill RADRPT blob text verbatim. Never replaces the native PACS report text.",
-    "BRIDGED_TEXT": "Plain text derived from BRIDGED_TEXT_RAW. RTF uses the established Blob Processing v2 striprtf parser; plain input passes through unchanged.",
-    "BRIDGED_TEXT_FORMAT": "RTF or PLAIN, classified from the raw text prefix.",
-    "BRIDGED_TEXT_PARSE_STATUS": "STRIPRTF_V2, STRIPRTF_ERROR, or PLAIN_PASSTHROUGH.",
-    "BRIDGED_TEXT_PARSER_VERSION": "Parser implementation/version used for BRIDGED_TEXT.",
-    "BLOB_EXTRACT_DT_TM": "Administrative source extract timestamp from pacs_blob_content.",
-    "BLOB_UPDT_DT_TM": "Administrative source update timestamp from pacs_blob_content.",
-    "BLOB_ADC_UPDT": "Administrative ADC load timestamp from pacs_blob_content.",
+    "REPORT_ID": "Sectra PACS report identifier (map_pacs_report.PACS_REPORT_ID). Primary key.",
+    "EVENT_ID": "Millennium RADRPT (class 224) clinical-event identifier whose decoded text is bridged. Unique among current rows.",
+    "MATCH_LANE": "PACS_EXAM_LINK when the RADRPT event's map_radiology_event PACS link resolves to the report's examination; ACCESSION_UNIQUE_EXAM when it carries the examination's Sectra accession and that accession names exactly one PACS examination.",
+    "BRIDGED_TEXT_RAW": "LEGACY / UNPOPULATED since v4. The retired pacs_blob_content source held pre-parse RTF here; v4 bridges the blob owner's decoded text only.",
+    "BRIDGED_TEXT": "Decoded report text from bronze.mill_blob_text (BLOB_TEXT) for the effective-current version. Never replaces native PACS report text.",
+    "BRIDGED_TEXT_FORMAT": "RTF when the decoded text still begins with an RTF header, otherwise PLAIN.",
+    "BRIDGED_TEXT_PARSE_STATUS": "mill_blob_text STATUS of the bridged version (the blob owner's decode outcome).",
+    "BRIDGED_TEXT_PARSER_VERSION": "mill_blob_text decompressor/parser/post-processor versions of the bridged row, as mill_blob_text:d<n>/p<n>/pp<n>.",
+    "BLOB_EXTRACT_DT_TM": "LEGACY / UNPOPULATED since v4 (pacs_blob_content extract timestamp; mill_blob_text has no equivalent).",
+    "BLOB_UPDT_DT_TM": "Administrative source update timestamp of the bridged mill_blob_text row.",
+    "BLOB_ADC_UPDT": "Administrative ADC load timestamp of the bridged mill_blob_text row.",
     "REPORT_SRC_ADC_UPDT": "Administrative source load timestamp from map_pacs_report.",
+    "SOURCE_VERSION_ID": "mill_blob_text SOURCE_VERSION_ID of the bridged version.",
+    "BLOB_VERSION_ID": "mill_blob_text BLOB_VERSION_ID of the bridged version.",
+    "RAW_SHA256": "mill_blob_text raw_sha256 (hash of the source binary) of the bridged version.",
+    "TEXT_SHA256": "SHA-256 of BRIDGED_TEXT; equals the hash of every open-current mill_blob_text row for EVENT_ID.",
+    "BLOB_CONTENT_TYPE": "mill_blob_text CONTENT_TYPE of the bridged version.",
+    "EFFECTIVE_CURRENT_DECISION": "single_current, or identical_text_collapsed when several open-current mill_blob_text rows carry byte-identical text. Ambiguous events are never bridged.",
+    "CURRENT_ROW_COUNT": "Number of open-current mill_blob_text rows for EVENT_ID (more than 1 is the upstream SCD2 defect).",
+    "CURRENT_BLOB_VERSION_IDS": "Sorted comma-separated BLOB_VERSION_IDs of all open-current rows when CURRENT_ROW_COUNT > 1 (collapse provenance); NULL otherwise.",
+    "TEXT_INTEGRITY_STATUS": "single_version_chunks (raw holds one row per chunk slot) or raw_chunks_absent (raw no longer holds the event). text_integrity_unknown events are never bridged.",
     "PIPELINE_UPDT_DT_TM": "Timestamp when this bridge row was rebuilt.",
-    "ROW_HASH": "SHA-256 over the stable business columns, excluding lifecycle and pipeline build stamps.",
-    "SOURCE_PRESENT_IND": "True for the current 1:1-proven bridge; false only for a carried-forward tombstone.",
+    "ROW_HASH": "SHA-256 over the business and source-stamp columns, excluding pipeline build stamps and lifecycle flags.",
+    "SOURCE_PRESENT_IND": "True for a current accepted bridge; false for a carried-forward tombstone. Consumers must filter to true.",
 }
 
-def apply_comments(accounting, blob_stats):
+REL_COMMENTS = {
+    "CANDIDATE_KEY": "Primary key: REPORT_ID|EVENT_ID, or REPORT_ID|NONE for a textless report with no candidate document.",
+    "REPORT_ID": "Textless Sectra PACS report identifier (map_pacs_report.PACS_REPORT_ID).",
+    "EVENT_ID": "Candidate Millennium RADRPT (class 224) clinical-event identifier; NULL when none was found.",
+    "PACS_EXAMINATION_ID": "PACS examination the report belongs to.",
+    "SECTRA_ACCESSION_NBR": "Sectra accession of the report's examination (map_pacs_examination.SECTRA_ACCESSION_NBR, upper-cased).",
+    "MATCH_LANE": "Strongest lane with any candidate for this report: PACS_EXAM_LINK or ACCESSION_UNIQUE_EXAM. NULL when there is no candidate.",
+    "REPORT_CANDIDATE_DOC_COUNT": "Distinct candidate RADRPT events for this report in its lane. More than 1 withholds the report (separate reports/addenda are never merged).",
+    "DOC_CANDIDATE_REPORT_COUNT": "Distinct textless reports claiming this RADRPT event. More than 1 withholds every claimant.",
+    "IDENTITY_CONFLICT_COUNT": "Candidate RADRPT events excluded because their PERSON_ID differs from the report's (or examination's) PERSON_ID.",
+    "ACCOUNTING_CLASS": "BRIDGED, MULTI_DOCUMENT, MULTI_REPORT, BOTH, TEXT_VERSION_AMBIGUOUS, TEXT_INTEGRITY_UNKNOWN or UNMATCHED. Uniform across a report's rows; the classes partition the textless reports.",
+    "UNMATCHED_REASON": "For UNMATCHED: NO_RESOLVED_EXAM, IDENTITY_CONFLICT, NO_MILL_DOCUMENT_ON_LINK_KEYS, NO_CURRENT_BLOB_TEXT or EMPTY_BLOB_TEXT.",
+    "EFFECTIVE_CURRENT_DECISION": "single_current, identical_text_collapsed, text_version_ambiguous (open-current rows disagree; nothing picked) or no_current_row.",
+    "CURRENT_ROW_COUNT": "Number of open-current mill_blob_text rows for EVENT_ID.",
+    "CURRENT_TEXT_VARIANT_COUNT": "Distinct texts (NULL text counted once) among the open-current mill_blob_text rows for EVENT_ID.",
+    "CURRENT_BLOB_VERSION_IDS": "Sorted comma-separated BLOB_VERSION_IDs of all open-current rows when there is more than one.",
+    "SOURCE_VERSION_ID": "mill_blob_text SOURCE_VERSION_ID of the effective-current version; NULL when ambiguous.",
+    "BLOB_VERSION_ID": "mill_blob_text BLOB_VERSION_ID of the effective-current version; NULL when ambiguous.",
+    "RAW_SHA256": "mill_blob_text raw_sha256 of the effective-current version; NULL when ambiguous.",
+    "TEXT_SHA256": "SHA-256 of the effective-current decoded text; NULL when ambiguous or the text is NULL or blank.",
+    "TEXT_INTEGRITY_STATUS": "single_version_chunks, raw_chunks_absent, text_integrity_unknown (raw holds several rows for a chunk slot, so the decode may mix document versions), not_assessed_version_ambiguous or no_current_text.",
+    "RAW_MAX_ROWS_PER_CHUNK_SEQ": "Largest number of raw.mill_ce_blob rows sharing one (EVENT_ID, BLOB_SEQ_NUM); NULL when raw holds no rows for the event.",
+    "ACCEPTED_IND": "True exactly when ACCOUNTING_CLASS is BRIDGED; such rows appear in map_pacs_report_text_bridge.",
+    "REPORT_SRC_ADC_UPDT": "Administrative source load timestamp from map_pacs_report.",
+    "PIPELINE_UPDT_DT_TM": "Timestamp when this row was rebuilt.",
+    "ROW_HASH": "SHA-256 over the business columns, excluding pipeline build stamps and lifecycle flags.",
+    "SOURCE_PRESENT_IND": "True for a current relationship; false for a carried-forward tombstone.",
+}
+
+BRIDGE_IG = {
+    "BRIDGED_TEXT_RAW": ("4", "2"),
+    "BRIDGED_TEXT": ("4", "2"),
+    "RAW_SHA256": ("1", "1"),
+    "TEXT_SHA256": ("1", "1"),
+    **{c: ("0", "0") for c in (
+        "MATCH_LANE", "BRIDGED_TEXT_FORMAT", "BRIDGED_TEXT_PARSE_STATUS",
+        "BRIDGED_TEXT_PARSER_VERSION", "BLOB_EXTRACT_DT_TM", "BLOB_UPDT_DT_TM", "BLOB_ADC_UPDT",
+        "REPORT_SRC_ADC_UPDT", "SOURCE_VERSION_ID", "BLOB_VERSION_ID", "BLOB_CONTENT_TYPE",
+        "EFFECTIVE_CURRENT_DECISION", "CURRENT_ROW_COUNT", "CURRENT_BLOB_VERSION_IDS",
+        "TEXT_INTEGRITY_STATUS", "PIPELINE_UPDT_DT_TM", "ROW_HASH", "SOURCE_PRESENT_IND")},
+}
+
+REL_IG = {
+    "SECTRA_ACCESSION_NBR": ("4", "2"),
+    "RAW_SHA256": ("1", "1"),
+    "TEXT_SHA256": ("1", "1"),
+    **{c: ("0", "0") for c in (
+        "CANDIDATE_KEY", "MATCH_LANE", "REPORT_CANDIDATE_DOC_COUNT", "DOC_CANDIDATE_REPORT_COUNT",
+        "IDENTITY_CONFLICT_COUNT", "ACCOUNTING_CLASS", "UNMATCHED_REASON",
+        "EFFECTIVE_CURRENT_DECISION", "CURRENT_ROW_COUNT", "CURRENT_TEXT_VARIANT_COUNT",
+        "CURRENT_BLOB_VERSION_IDS", "SOURCE_VERSION_ID", "BLOB_VERSION_ID",
+        "TEXT_INTEGRITY_STATUS", "RAW_MAX_ROWS_PER_CHUNK_SEQ", "ACCEPTED_IND",
+        "REPORT_SRC_ADC_UPDT", "PIPELINE_UPDT_DT_TM", "ROW_HASH", "SOURCE_PRESENT_IND")},
+}
+
+def apply_comments(accounting):
     ct = accounting["class_totals"]
     lanes = accounting["bridge_by_lane"]
     bridge = ct["BRIDGED"]
     combined = accounting["native_text_reports"] + bridge
     coverage = 100.0 * combined / max(1, accounting["total_reports"])
     comment = (
-        "PACS report-text SIDECAR. Grain: one row per bridged REPORT_ID, with both REPORT_ID "
-        "and EVENT_ID unique. It never updates or supersedes map_pacs_report. Match precedence is "
-        "report to resolved exam to REQUEST_ID_STRING equals MillAccessionNbr, then "
-        "EXAMINATION_ID_STRING fallback; MILL_LINK_REF is forbidden. Publish only accessions with "
-        "exactly one blob event and exactly one textless report. Current accounting: "
-        f"{bridge} bridged ({lanes['REQUEST_ID']} request lane; {lanes['EXAMINATION_ID']} exam lane); "
-        f"{ct['MULTI_BLOB_ACCESSION']} multi-blob withheld; "
-        f"{ct['MULTI_REPORT_ACCESSION']} multi-report withheld; {ct['BOTH']} both withheld; "
-        f"{ct['UNMATCHED']} unmatched. Native plus bridge coverage is {combined} of "
-        f"{accounting['total_reports']} reports ({coverage:.3f}%). Blob text spans "
-        f"{blob_stats['min_extract_dt_tm']} through {blob_stats['max_extract_dt_tm']} and is frozen "
-        f"at ADC_UPDT {blob_stats['max_adc_updt']}. Consumer contract: left join current bridge rows "
-        "on REPORT_ID with SOURCE_PRESENT_IND=true and use COALESCE(native REPORT_TEXT, "
-        "bridge BRIDGED_TEXT); native text always wins. Future durable end-state is a builder-owned "
-        "lane inside pacs_pipeline. Static product: no weekly Bronze_Pipeline step until either source "
-        "feed resumes."
+        "PACS report-text SIDECAR (v4). Grain: one row per bridged REPORT_ID; REPORT_ID unique, "
+        "EVENT_ID unique among current rows. Never updates or supersedes map_pacs_report. Text is "
+        "the effective-current bronze.mill_blob_text row of a Millennium RADRPT event linked to the "
+        "report's examination through map_radiology_event (PACS_EXAM_LINK) or a single-examination "
+        "Sectra accession (ACCESSION_UNIQUE_EXAM). Publishes only 1:1 report/document pairs whose "
+        "open-current text is unambiguous and whose raw chunks hold one version. Current accounting: "
+        f"{bridge} bridged ({lanes['PACS_EXAM_LINK']} exam-link lane; "
+        f"{lanes['ACCESSION_UNIQUE_EXAM']} accession lane); {ct['MULTI_DOCUMENT']} multi-document, "
+        f"{ct['MULTI_REPORT']} multi-report and {ct['BOTH']} both withheld; "
+        f"{ct['TEXT_VERSION_AMBIGUOUS']} text-version-ambiguous and {ct['TEXT_INTEGRITY_UNKNOWN']} "
+        f"integrity-unknown withheld; {ct['UNMATCHED']} unmatched. Native plus bridge coverage is "
+        f"{combined} of {accounting['total_reports']} reports ({coverage:.3f}%). All candidate "
+        "relationships and withheld reasons: map_pacs_report_text_candidate. Consumer contract: "
+        "left join rows with SOURCE_PRESENT_IND=true on REPORT_ID and use COALESCE(native "
+        "REPORT_TEXT, BRIDGED_TEXT); native text always wins."
     )
     spark.sql(f"COMMENT ON TABLE {qname(TARGET)} IS '{sql_text(comment)}'")
-    for col_name, col_comment in COLUMN_COMMENTS.items():
-        spark.sql(f"""ALTER TABLE {qname(TARGET)} ALTER COLUMN {qident(col_name)}
-                      COMMENT '{sql_text(col_comment)}'""")
+    rel_comment = (
+        "PACS report-text candidate relationships (v4). Grain: one row per textless PACS report and "
+        "candidate Millennium RADRPT event (CANDIDATE_KEY), or one REPORT_ID|NONE row when no "
+        "candidate exists. Records the lane, multiplicity, identity conflicts, the effective-current "
+        "decision over open-current mill_blob_text rows and raw chunk integrity evidence. "
+        "ACCEPTED_IND rows are exactly the current map_pacs_report_text_bridge rows. Rows with "
+        "EFFECTIVE_CURRENT_DECISION text_version_ambiguous or TEXT_INTEGRITY_STATUS "
+        "text_integrity_unknown identify events for the blob owner's automated repair."
+    )
+    spark.sql(f"COMMENT ON TABLE {qname(TARGET_REL)} IS '{sql_text(rel_comment)}'")
+    for table, comments in ((TARGET, COLUMN_COMMENTS), (TARGET_REL, REL_COMMENTS)):
+        for col_name, col_comment in comments.items():
+            spark.sql(f"""ALTER TABLE {qname(table)} ALTER COLUMN {qident(col_name)}
+                          COMMENT '{sql_text(col_comment)}'""")
 
-def dq_triplet_gate(table):
+def dq_triplet_gate(table, admin_stamps):
     fields = spark.table(table).schema.fields
     names = {f.name for f in fields}
     temporal = [f.name for f in fields if isinstance(f.dataType, (TimestampType, DateType))]
     missing = {}
     for c in temporal:
-        if c in ADMIN_STAMPS or c.endswith("_CLEAN"):
+        if c in admin_stamps or c.endswith("_CLEAN"):
             continue
         expected = {f"{c}_FUTURE_IND", f"{c}_SENTINEL_IND", f"{c}_CLEAN"}
         absent = sorted(expected - names)
@@ -742,65 +893,94 @@ def dq_triplet_gate(table):
     assert not missing, f"missing date-quality companions: {missing}"
     return temporal
 
-def run_gates(classified, accounting, report_version):
+def run_gates(state, report_stats):
     assert spark.catalog.tableExists(TARGET), f"G0 target absent: {TARGET}"
+    assert spark.catalog.tableExists(TARGET_REL), f"G0 relationship table absent: {TARGET_REL}"
     target = spark.table(TARGET)
     present = target.where(F.col("SOURCE_PRESENT_IND"))
+    rel = spark.table(TARGET_REL)
+    rel_present = rel.where(F.col("SOURCE_PRESENT_IND"))
+    accounting = collect_accounting(report_stats)
 
+    # G1 keys. Tombstones may legitimately share an EVENT_ID with a current row after a
+    # document moves between reports, so EVENT_ID uniqueness is asserted on current rows.
     key = target.agg(
         F.count(F.lit(1)).cast("long").alias("rows"),
         F.countDistinct("REPORT_ID").cast("long").alias("report_ids"),
-        F.countDistinct("EVENT_ID").cast("long").alias("event_ids"),
         F.sum(F.when(F.col("REPORT_ID").isNull(), 1).otherwise(0)).cast("long").alias("null_report"),
+    ).collect()[0]
+    present_key = present.agg(
+        F.count(F.lit(1)).cast("long").alias("rows"),
+        F.countDistinct("EVENT_ID").cast("long").alias("event_ids"),
         F.sum(F.when(F.col("EVENT_ID").isNull(), 1).otherwise(0)).cast("long").alias("null_event"),
+        F.count("BLOB_VERSION_ID").cast("long").alias("blob_versions"),
+        F.countDistinct("BLOB_VERSION_ID").cast("long").alias("distinct_blob_versions"),
     ).collect()[0]
     assert int(key["rows"]) == int(key["report_ids"]), "G1 REPORT_ID uniqueness failed"
-    assert int(key["rows"]) == int(key["event_ids"]), "G1 EVENT_ID uniqueness failed"
-    assert int(key["null_report"]) == 0 and int(key["null_event"]) == 0
+    assert int(key["null_report"]) == 0
+    assert int(present_key["rows"]) == int(present_key["event_ids"]), "G1 current EVENT_ID uniqueness failed"
+    assert int(present_key["null_event"]) == 0
+    assert int(present_key["blob_versions"]) == int(present_key["distinct_blob_versions"]), (
+        "G1 current BLOB_VERSION_ID uniqueness failed")
+    rel_key = rel.agg(F.count(F.lit(1)).alias("rows"),
+                      F.countDistinct("CANDIDATE_KEY").alias("keys")).collect()[0]
+    assert int(rel_key["rows"]) == int(rel_key["keys"]), "G1 CANDIDATE_KEY uniqueness failed"
 
+    # G2 accounting and the accepted/published key sets.
     target_lanes = {r["MATCH_LANE"]: int(r["n"]) for r in
                     present.groupBy("MATCH_LANE").agg(F.count(F.lit(1)).alias("n")).collect()}
-    expected_lanes = accounting["bridge_by_lane"]
-    assert int(present.count()) == accounting["class_totals"]["BRIDGED"], "G2 bridge count mismatch"
+    expected_lanes = {k: v for k, v in accounting["bridge_by_lane"].items() if v}
+    assert int(present_key["rows"]) == accounting["class_totals"]["BRIDGED"], "G2 bridge count mismatch"
     assert target_lanes == expected_lanes, f"G2 lane mismatch: {target_lanes} != {expected_lanes}"
-    assert sum(accounting["class_totals"].values()) == accounting["textless_reports"], (
-        "G2 textless accounting does not reconcile"
-    )
+    uniform = (rel_present.groupBy("REPORT_ID")
+        .agg(F.countDistinct("ACCOUNTING_CLASS").alias("n")).where("n > 1").limit(1).count())
+    assert uniform == 0, "G2 a report carries more than one ACCOUNTING_CLASS"
+    expected = rel_present.where(F.col("ACCEPTED_IND")).select(
+        "REPORT_ID", "EVENT_ID", "MATCH_LANE", "BLOB_VERSION_ID", "TEXT_SHA256")
+    actual = present.select("REPORT_ID", "EVENT_ID", "MATCH_LANE", "BLOB_VERSION_ID", "TEXT_SHA256")
+    mismatch = expected.exceptAll(actual).limit(1).count() + actual.exceptAll(expected).limit(1).count()
+    assert mismatch == 0, "G2 published rows differ from the accepted relationships"
 
-    expected = classified.where(F.col("ACCOUNTING_CLASS") == "BRIDGED").select(
-        "REPORT_ID", "EVENT_ID", "MATCH_LANE")
-    actual = present.select("REPORT_ID", "EVENT_ID", "MATCH_LANE")
-    mismatch = (expected.alias("e").join(
-        actual.alias("a"),
-        (F.col("e.REPORT_ID") == F.col("a.REPORT_ID"))
-        & (F.col("e.EVENT_ID") == F.col("a.EVENT_ID"))
-        & (F.col("e.MATCH_LANE") == F.col("a.MATCH_LANE")),
-        "full")
-        .where(F.col("e.REPORT_ID").isNull() | F.col("a.REPORT_ID").isNull())
-        .limit(1).count())
-    assert mismatch == 0, "G2 published key set differs from the 1:1 classification"
-
-    reports = pinned_table(SRC_REPORT, report_version).where(F.col("SOURCE_PRESENT_IND")).select(
+    # G3 native text always wins.
+    reports = pinned("report", state).where(F.col("SOURCE_PRESENT_IND")).select(
         F.col("PACS_REPORT_ID").cast("long").alias("REPORT_ID"), "REPORT_TEXT")
     native_collision = (present.select("REPORT_ID").join(reports, "REPORT_ID", "inner")
         .where(F.col("REPORT_TEXT").isNotNull() & (F.trim("REPORT_TEXT") != ""))
         .limit(1).count())
     assert native_collision == 0, "G3 bridge contains a report with native text"
 
-    temporal = dq_triplet_gate(TARGET)
+    # G4 version safety, re-proved against the pinned source rather than trusted from the build:
+    # zero bridged events with more than one effective-current text, and every bridged text
+    # hash is the text of the event's open-current rows.
+    bad_status = present.where(
+        ~F.col("EFFECTIVE_CURRENT_DECISION").isin(*ACCEPTED_DECISIONS)
+        | ~F.col("TEXT_INTEGRITY_STATUS").isin(*ACCEPTED_INTEGRITY)
+        | ~F.col("TEXT_SHA256").eqNullSafe(F.sha2(F.col("BRIDGED_TEXT"), 256))).limit(1).count()
+    assert bad_status == 0, "G4 bridged row with unaccepted version/integrity status or text hash"
+    ids = present.select(F.col("EVENT_ID").cast("long").alias("EVENT_ID")).distinct()
+    source_text = (current_blob_rows(state, ids)
+        .groupBy("EVENT_ID")
+        .agg(F.size(F.collect_set(F.coalesce(F.col("TEXT_SHA256"), F.lit("<NO_TEXT>")))).alias("_V"),
+             F.max("TEXT_SHA256").alias("_SHA")))
+    multi_current = source_text.where(F.col("_V") > 1).limit(1).count()
+    assert multi_current == 0, "G4 a bridged event has more than one effective-current document"
+    drifted = (present.select(F.col("EVENT_ID").cast("long").alias("EVENT_ID"), "TEXT_SHA256")
+        .join(source_text, "EVENT_ID", "left")
+        .where(~F.col("TEXT_SHA256").eqNullSafe(F.col("_SHA"))).limit(1).count())
+    assert drifted == 0, "G4 a bridged text is not the event's open-current text"
+
+    temporal = dq_triplet_gate(TARGET, ADMIN_STAMPS)
+    dq_triplet_gate(TARGET_REL, {"REPORT_SRC_ADC_UPDT", "PIPELINE_UPDT_DT_TM"})
     ig_tag_gate(TARGET)
+    ig_tag_gate(TARGET_REL)
 
     invalid = present.agg(
-        F.sum(F.when(~F.col("MATCH_LANE").isin("REQUEST_ID", "EXAMINATION_ID"), 1).otherwise(0))
-         .alias("bad_lane"),
-        F.sum(F.when(F.col("BRIDGED_TEXT_RAW").isNull() | (F.trim("BRIDGED_TEXT_RAW") == ""), 1)
-              .otherwise(0)).alias("blank_raw"),
+        F.sum(F.when(~F.col("MATCH_LANE").isin(*MATCH_LANES), 1).otherwise(0)).alias("bad_lane"),
         F.sum(F.when(F.col("BRIDGED_TEXT").isNull() | (F.trim("BRIDGED_TEXT") == ""), 1)
               .otherwise(0)).alias("blank_derived"),
-        F.sum(F.when(F.col("ROW_HASH") != row_hash_expr(), 1).otherwise(0)).alias("bad_hash"),
+        F.sum(F.when(F.col("ROW_HASH") != row_hash_expr(BRIDGE_COLUMNS), 1).otherwise(0)).alias("bad_hash"),
     ).collect()[0]
     assert int(invalid["bad_lane"] or 0) == 0
-    assert int(invalid["blank_raw"] or 0) == 0
     assert int(invalid["blank_derived"] or 0) == 0
     assert int(invalid["bad_hash"] or 0) == 0
 
@@ -811,6 +991,7 @@ def run_gates(classified, accounting, report_version):
         "target_present_rows": accounting["class_totals"]["BRIDGED"],
         "target_tombstones": int(key["rows"]) - accounting["class_totals"]["BRIDGED"],
         "target_lanes": target_lanes,
+        "relationship_rows": int(rel_key["rows"]),
         "accounting": accounting,
         "temporal_columns": temporal,
         "canonical_fingerprint": str(fingerprint),
@@ -821,19 +1002,19 @@ def run_gates(classified, accounting, report_version):
 # COMMAND ----------
 
 # Gates are deliberately invoked before the first build. On an absent target this must fail.
-TARGET_EXISTED_AT_START = spark.catalog.tableExists(TARGET)
+TARGET_EXISTED_AT_START = (spark.catalog.tableExists(TARGET)
+                           and spark.catalog.tableExists(TARGET_REL))
 if not TARGET_EXISTED_AT_START:
     try:
-        assert spark.catalog.tableExists(TARGET), f"G0 target absent: {TARGET}"
+        assert TARGET_EXISTED_AT_START, f"G0 target absent: {TARGET} / {TARGET_REL}"
         raise AssertionError("pre-build gate unexpectedly passed")
     except AssertionError as exc:
         print(f"[B12][GATES-FIRST] EXPECTED_PREBUILD_FAILURE: {exc}")
 
-state_start, source_signature, blob_stats = source_state()
-report_stats = report_snapshot_stats(state_start["report_version"])
-classified = build_classification(state_start["report_version"], state_start["exam_version"])
-accounting = collect_accounting(classified, report_stats)
-print("[B12][ACCOUNTING]", json.dumps(accounting, default=str, sort_keys=True))
+state_start, source_signature = source_state()
+assert_source_contract(state_start)
+report_stats = report_snapshot_stats(state_start)
+print("[B12][SOURCE_STATE]", json.dumps(state_start, sort_keys=True))
 
 props_before = target_properties()
 stored_signature = props_before.get("b12.source_signature")
@@ -841,7 +1022,7 @@ due = FORCE_REBUILD or not TARGET_EXISTED_AT_START or stored_signature != source
 
 if TARGET_EXISTED_AT_START:
     try:
-        prebuild_gate_result = run_gates(classified, accounting, state_start["report_version"])
+        prebuild_gate_result = run_gates(state_start, report_stats)
         print("[B12][GATES-FIRST] existing target gates passed")
     except Exception as exc:
         if not due and ACTION == "gates":
@@ -850,7 +1031,7 @@ if TARGET_EXISTED_AT_START:
               f"{type(exc).__name__}: {exc}")
 
 if ACTION == "gates":
-    result = run_gates(classified, accounting, state_start["report_version"])
+    result = run_gates(state_start, report_stats)
     control_versions = record_s6_source_versions(state_start)
     dbutils.notebook.exit(json.dumps({
         "pipeline": PIPELINE_NAME,
@@ -864,7 +1045,7 @@ if ACTION == "gates":
 
 if not due:
     version_before = table_version(TARGET)
-    result = run_gates(classified, accounting, state_start["report_version"])
+    result = run_gates(state_start, report_stats)
     control_versions = record_s6_source_versions(state_start)
     version_after = table_version(TARGET)
     assert version_before == version_after, (
@@ -887,20 +1068,23 @@ if not due:
 
 # COMMAND ----------
 
-candidate = build_candidate(classified, blob_stats)
-replace_with_tombstones(candidate, TARGET, ["REPORT_ID"])
+# The relationship table is the build's materialisation point: accounting and the accepted
+# bridge are both derived from it, so the classification runs once.
+replace_with_tombstones(build_relationships(state_start), TARGET_REL, ["CANDIDATE_KEY"])
+accounting = collect_accounting(report_stats)
+print("[B12][ACCOUNTING]", json.dumps(accounting, default=str, sort_keys=True))
 
-apply_comments(accounting, blob_stats)
-ig_tag_table(TARGET, {
-    "BRIDGED_TEXT_RAW": ("4", "2"),
-    "BRIDGED_TEXT": ("4", "2"),
-})
+replace_with_tombstones(build_candidate(state_start), TARGET, ["REPORT_ID"])
 
-result = run_gates(classified, accounting, state_start["report_version"])
+apply_comments(accounting)
+ig_tag_table(TARGET, BRIDGE_IG)
+ig_tag_table(TARGET_REL, REL_IG)
 
-# Recheck all source clocks after the build. The materialized view has no Delta history API,
-# so its strong consumed-column content fingerprint is checked at both ends of the run.
-state_end, signature_end, blob_stats_end = source_state()
+result = run_gates(state_start, report_stats)
+
+# Every source is Delta; recheck all versions after the build so a mid-run commit cannot be
+# recorded as the state this build reflects.
+state_end, signature_end = source_state()
 assert signature_end == source_signature, (
     f"source drift during build: {source_signature} -> {signature_end}; state not committed"
 )
@@ -908,10 +1092,7 @@ assert signature_end == source_signature, (
 set_target_properties({
     "b12.logic_version": LOGIC_VERSION,
     "b12.source_signature": source_signature,
-    "b12.report_source_version": state_start["report_version"],
-    "b12.exam_source_version": state_start["exam_version"],
-    "b12.blob_content_xor": state_start["blob_content_xor"],
-    "b12.striprtf_version": state_start["striprtf_version"],
+    **{f"b12.{name}_source_version": state_start[f"{name}_version"] for name in SOURCES},
     "b12.canonical_fingerprint": result["canonical_fingerprint"],
     "b12.present_rows": accounting["class_totals"]["BRIDGED"],
     "b12.accounting_json": json.dumps(accounting["class_totals"], sort_keys=True),
@@ -937,22 +1118,21 @@ dbutils.notebook.exit(json.dumps(summary, default=str, sort_keys=True))
 
 # PROMOTION RUNBOOK — HUMAN GATED; DO NOT EXECUTE AS PART OF THIS DEV TASK.
 #
-# 1. Obtain explicit human approval for a new production table. Confirm that
-#    4_prod.bronze.map_pacs_report_text_bridge is absent or is the approved prior release.
-# 2. Re-read the live production pacs_pipeline and Blob parser before promotion. Pin the same
-#    report/exam versions and the pacs_blob_content consumed-column fingerprint.
-# 3. In a promoter-owned copy, change only TARGET to
-#    4_prod.bronze.map_pacs_report_text_bridge and add an explicit approval-token assertion.
-#    Keep retries=0. Do not update 4_prod.bronze.map_pacs_report.
-# 4. Run gates before build, build once, then rerun all gates on production:
-#    REPORT_ID and EVENT_ID uniqueness; exact textless accounting; zero native-text collisions;
-#    date-quality coverage; row hashes; canonical fingerprint; both IG tags on every column.
-# 5. Run ig_tag_table with BRIDGED_TEXT_RAW and BRIDGED_TEXT fixed at ig_risk=4,
-#    ig_severity=2, then run ig_tag_gate. Review every printed default before approval.
-# 6. Consumer contract is a left join on REPORT_ID restricted to SOURCE_PRESENT_IND=true,
-#    followed by COALESCE(native REPORT_TEXT, bridge BRIDGED_TEXT). Native text always wins.
-# 7. Do not add a Bronze_Pipeline weekly step: both inputs are frozen. Re-open scheduling only
-#    if the PACS or blob feed resumes. Future durable ownership belongs inside pacs_pipeline.
-# 8. Capture the production run ID, source signature, counts, table version, and fingerprint.
-#    Promotion remains incomplete until a human signs off those artifacts.
+# 1. Deploy map_pacs_examination v3.2 (pacs_pipeline) and map_radiology_event v2 first;
+#    assert_source_contract refuses to run against older upstream schemas.
+# 2. Run once against the production sources with target_schema=8_dev.bronze and compare the
+#    accounting with the prior 4_prod bridge (4,159,098 rows on 2026-09-24): the old bridge was
+#    keyed on pacs_blob_content MillAccessionNbr, so a changed row set is expected; review the
+#    per-lane counts and the withheld classes, not parity.
+# 3. With explicit approval, run with target_schema=4_prod.bronze and allow_production_write=true.
+#    Keep task retries unchanged. The first production run tombstones every prior row whose
+#    REPORT_ID is no longer bridged; tombstones keep their old text, so consumers MUST filter
+#    SOURCE_PRESENT_IND=true (the staged silver_journey_shared does).
+# 4. Gates run before and after the build: key uniqueness, accounting, native-text collisions,
+#    version safety against the pinned source, date-quality coverage, row hashes, IG tags.
+# 5. Blob-owner repair feed (no curation queue): SELECT DISTINCT EVENT_ID, EFFECTIVE_CURRENT_DECISION,
+#    TEXT_INTEGRITY_STATUS FROM map_pacs_report_text_candidate WHERE SOURCE_PRESENT_IND AND
+#    (EFFECTIVE_CURRENT_DECISION='text_version_ambiguous' OR TEXT_INTEGRITY_STATUS='text_integrity_unknown').
+
+# PACS_TEXT_BRIDGE_V4_PATCHED
 

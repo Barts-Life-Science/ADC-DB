@@ -571,3 +571,4 @@ display(df)
 # MAGIC FROM 4_prod.pacs.intmd_pacs_examcode
 # MAGIC WHERE RawExamCode LIKE 'Z%'
 # MAGIC LIMIT 100
+

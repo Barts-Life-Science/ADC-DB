@@ -1,6 +1,7 @@
 # Databricks notebook source
+# BRONZE_PERF_946452877034658_V2
 # Generated Map split runner. Do not edit; regenerate from the validated source group.
-# MAGIC %pip install openai pyarrow
+%pip install openai pyarrow
 
 # COMMAND ----------
 
@@ -8,12 +9,27 @@
 
 # COMMAND ----------
 
-_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': ''}
+_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': '', 'perf_task_run_id': ''}
 for _map_split_name, _map_split_default in _MAP_SPLIT_WIDGET_DEFAULTS.items():
     try:
         dbutils.widgets.get(_map_split_name)
     except Exception:
         dbutils.widgets.text(_map_split_name, _map_split_default)
+
+import time as _perf_time
+_PERF_TASK_STARTED_AT = _perf_time.time()
+_PERF_TASK_START_BASIS = 'runner_preamble_after_python_restart'
+try:
+    from databricks.sdk import WorkspaceClient as _PerfWorkspaceClient
+    _perf_task_id = dbutils.widgets.get('perf_task_run_id')
+    if _perf_task_id:
+        _perf_task_run = _PerfWorkspaceClient().jobs.get_run(int(_perf_task_id))
+        if _perf_task_run.start_time:
+            _PERF_TASK_STARTED_AT = _perf_task_run.start_time / 1000.0
+            _PERF_TASK_START_BASIS = 'jobs_api_task_start'
+except Exception as _perf_exc:
+    print('[PERF] Task start unavailable; timing explicitly excludes earlier bootstrap: ' + str(_perf_exc)[:200])
+
 
 # COMMAND ----------
 
@@ -705,12 +721,21 @@ def _mne_target_events_for_changed_concepts(
     )
     return event_matches.unionByName(unit_matches).dropDuplicates()
 
+def _perf_scoped_event_changes(changed, source_universe, target):
+    # Source catches entrants (including EVENT_CLASS changes); target catches departures.
+    def keys(frame):
+        return frame.select(F.col('EVENT_ID').cast('long').alias('EVENT_ID')).where(F.col('EVENT_ID').isNotNull())
+    universe = keys(source_universe).unionByName(keys(target))
+    return keys(changed).join(universe, 'EVENT_ID', 'left_semi').dropDuplicates(['EVENT_ID'])
+
 def _mne_build_changed_event_keys(config: MapNumericEventsConfig, previous_versions: Dict[str, int], current_versions: Dict[str, int]) -> DataFrame:
     target = spark.table(config.target_table)
     string_meta = _mne_string_result_changed_metadata(config, previous_versions[config.string_result_table], current_versions[config.string_result_table])
     trigger_frames: List[DataFrame] = [string_meta.select('EVENT_ID').withColumn('TRIGGER_SOURCE', F.lit('STRING_RESULT'))]
     ce_ids = _mne_simple_cdf_keys(config.clinical_event_table, 'EVENT_ID', previous_versions[config.clinical_event_table], current_versions[config.clinical_event_table], key_is_double=False)
-    direct_ce = ce_ids.select(F.col('CHANGE_KEY').alias('EVENT_ID')).withColumn('TRIGGER_SOURCE', F.lit('CLINICAL_EVENT'))
+    direct_ce = _perf_scoped_event_changes(ce_ids.select(F.col('CHANGE_KEY').alias('EVENT_ID')),
+        _mne_read_snapshot(config.string_result_table, current_versions[config.string_result_table]), target
+    ).withColumn('TRIGGER_SOURCE', F.lit('CLINICAL_EVENT'))
     parent_ce = target.select('EVENT_ID', 'PARENT_EVENT_ID').join(ce_ids, F.col('PARENT_EVENT_ID') == F.col('CHANGE_KEY'), 'inner').select('EVENT_ID').withColumn('TRIGGER_SOURCE', F.lit('PARENT_CLINICAL_EVENT'))
     trigger_frames.extend([direct_ce, parent_ce])
     code_ids = _mne_semantic_snapshot_keys(config.code_value_table, 'CODE_VALUE', previous_versions[config.code_value_table], current_versions[config.code_value_table], key_is_double=True, semantic_columns=('CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'))
@@ -1355,39 +1380,9 @@ def _mte_numeric_base_is_scoped(config: MapTextEventsConfig) -> bool:
         return True
 
 
-def _mte_can_reuse_numeric_base(
-    config: MapTextEventsConfig,
-    source_versions: Dict[str, int],
-) -> bool:
-    """Decide whether the text lane may build from the materialized numeric canonical table.
-
-    Reuse is refused whenever the numeric base is scoped. map_numeric_events is built with
-    numeric_semantic_only=True, so its canonical table holds only IN_NUMERIC_SCOPE_IND rows,
-    while the text lane's own scope is the complement of numeric parse success. Reusing the
-    scoped numeric base would therefore truncate the text lane's input to almost nothing,
-    silently. State-version equality and a column superset cannot detect a row-scope
-    difference, which is exactly why this guard has to be explicit. Do not re-enable reuse
-    without also removing the numeric scope. The text lane then builds from version-pinned
-    sources, which is correct but slower.
-    """
-    if _mte_numeric_base_is_scoped(config):
-        print(
-            "[INFO] The numeric foundation "
-            f"{config.numeric_base_table} is semantically scoped; map_text_events will build "
-            "from version-pinned sources instead of reusing it."
-        )
-        return False
-    numeric_versions = _mte_read_numeric_base_state(config)
-    if not numeric_versions:
-        return False
-    if any(
-        numeric_versions[source] != source_versions.get(source)
-        for source in _mte_numeric_source_tables(config)
-    ):
-        return False
-    available = {field.name for field in spark.table(config.numeric_base_table).schema.fields}
-    required = {field.name for field in schema_map_numeric_events.fields}
-    return required.issubset(available)
+def _mte_can_reuse_numeric_base(config: MapTextEventsConfig, source_versions: Dict[str, int]) -> bool:
+    """The split text task always reads initializer-pinned sources, never a numeric sibling."""
+    return False
 
 
 def _mte_materialized_numeric_base(
@@ -3781,7 +3776,9 @@ def collect_affected_event_ids(batches: Dict[str, ChangeBatch], versions: Dict[s
     clinical_changes = batches[SRC_CLINICAL_EVENT].changes
     if clinical_changes is not None:
         changed_ce_ids = clinical_changes.select(F.col('EVENT_ID').cast('long').alias('CHANGED_EVENT_ID')).filter(F.col('CHANGED_EVENT_ID').isNotNull()).distinct()
-        frames.append(changed_ce_ids.select(F.col('CHANGED_EVENT_ID').alias('EVENT_ID')))
+        frames.append(_perf_scoped_event_changes(
+            changed_ce_ids.select(F.col('CHANGED_EVENT_ID').alias('EVENT_ID')),
+            _snapshot_table(SRC_CODED_RESULT, versions), target))
         frames.append(reduce(lambda left, right: left.unionByName(right), [target.alias('t').join(F.broadcast(changed_ce_ids).alias('c'), F.col('t.' + column) == F.col('c.CHANGED_EVENT_ID'), 'left_semi').select('EVENT_ID') for column in ('EVENT_ID', 'PARENT_EVENT_ID')]))
     nomen_changes = batches[SRC_NOMENCLATURE].changes
     if nomen_changes is not None:
@@ -3996,7 +3993,8 @@ def deploy_map_nomen_events_improvements(trust: str=DEFAULT_TRUST, validation_le
 
 if _map_split_component_selected('map_nomen_events'):
     try:
-        _pipeline_run_recoverable('map_nomen_events', _PIPELINE_FULL_REFRESH, lambda: process_nomen_events_incremental(), lambda: process_nomen_events_full_rebuild(apply=True, validation_level='FULL', configure_source_retention=False, create_backup=False))
+        _perf_nomen_metrics = _pipeline_run_recoverable('map_nomen_events', _PIPELINE_FULL_REFRESH, lambda: process_nomen_events_incremental(), lambda: process_nomen_events_full_rebuild(apply=True, validation_level='FULL', configure_source_retention=False, create_backup=False))
+        _pipeline_audit(None, 'COMPONENT_METRICS', dict(_perf_nomen_metrics or {}, component='map_nomen_events'))
         _PIPELINE_UPDATED_TARGETS.extend(['4_prod.bronze.map_nomen_events'])
         _pipeline_mark_component_complete('map_nomen_events', ['4_prod.bronze.map_nomen_events'])
         _pipeline_audit(None, 'COMPONENT_END', {'component': 'map_nomen_events'})
@@ -4466,6 +4464,10 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
     if clinical_event_ids is not None and (not _is_empty(clinical_event_ids)):
         changed_parents = clinical_event_ids.distinct().select(F.col('EVENT_ID').alias('_CHANGED_PARENT_EVENT_ID'))
         child_event_ids = spark.table(config.target_table).join(F.broadcast(changed_parents), F.col('PARENT_EVENT_ID') == F.col('_CHANGED_PARENT_EVENT_ID'), 'left_semi').select('EVENT_ID')
+    if clinical_event_ids is not None:
+        clinical_event_ids = _perf_scoped_event_changes(clinical_event_ids,
+            spark.read.format('delta').option('versionAsOf', current_versions[config.coded_result_source]).table(config.coded_result_source),
+            spark.table(config.target_table))
     changed_code_events = None
     if code_changed is not None:
         changed_codes = _mne_semantic_snapshot_keys(config.code_value_source, 'CODE_VALUE', checkpoints[config.code_value_source], current_versions[config.code_value_source], key_is_double=True, semantic_columns=('CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND')).select(F.col('CHANGE_KEY').alias('CODE_VALUE'))
@@ -4503,7 +4505,7 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
             refreshed_rows = _pipeline_builtins.max(refreshed_rows, mapping_stats['target_rows'])
             refreshed_bridge_rows = _pipeline_builtins.max(refreshed_bridge_rows, mapping_stats['bridge_rows'])
         write_map_checkpoints(current_versions, run_id, config)
-        return {'status': 'SUCCESS', 'run_id': run_id, 'changed_ranges': changed_ranges, 'affected_event_count': affected_event_count, 'refreshed_target_rows': refreshed_rows, 'refreshed_bridge_rows': refreshed_bridge_rows, 'full_mapping_refresh': bool(maps_changed or concepts_changed), 'checkpoint_versions': current_versions}
+        return {'status': 'SUCCESS', 'run_id': run_id, 'changed_ranges': changed_ranges, 'affected_event_count': affected_event_count, 'broadcast_event_id_limit': config.broadcast_event_id_limit, 'use_broadcast': (affected_event_count <= config.broadcast_event_id_limit if affected_event_count else None), 'refreshed_target_rows': refreshed_rows, 'refreshed_bridge_rows': refreshed_bridge_rows, 'full_mapping_refresh': bool(maps_changed or concepts_changed), 'checkpoint_versions': current_versions}
     finally:
         _mp30_persist_stage_drop(final)
         _mp30_persist_stage_drop(bridge)
@@ -4522,7 +4524,8 @@ def deploy_map_coded_events_improvements(config: MapCodedEventsConfig=DEFAULT_CO
 
 if _map_split_component_selected('map_coded_events'):
     try:
-        _pipeline_run_recoverable('map_coded_events', _PIPELINE_FULL_REFRESH, lambda: process_coded_events_incremental(), lambda: rebuild_map_coded_events_v2(create_backup=False, configure_source_retention=False))
+        _perf_coded_metrics = _pipeline_run_recoverable('map_coded_events', _PIPELINE_FULL_REFRESH, lambda: process_coded_events_incremental(), lambda: rebuild_map_coded_events_v2(create_backup=False, configure_source_retention=False))
+        _pipeline_audit(None, 'COMPONENT_METRICS', dict(_perf_coded_metrics or {}, component='map_coded_events'))
         _PIPELINE_UPDATED_TARGETS.extend(['4_prod.bronze.map_coded_events'])
         _pipeline_mark_component_complete('map_coded_events', ['4_prod.bronze.map_coded_events'])
         _pipeline_audit(None, 'COMPONENT_END', {'component': 'map_coded_events'})
@@ -4582,7 +4585,6 @@ _map_split_result = {
 }
 print(_map_split_json.dumps(_map_split_result, sort_keys=True, default=str))
 
-# Databricks notebook source
 # ANON_TEXT_STATE_REATTACH_V3_3_TEXT_EVENT
 # Restores anonymous text + engine state after a FULL_REBUILD of map_text_events, which
 # writes with overwriteSchema and drops the anon_* columns. Incremental runs keep them

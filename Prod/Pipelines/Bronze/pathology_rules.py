@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Iterable, Mapping, Sequence
 
 
-PARSER_VERSION = "2.0.0"  # FINDING_HEADING coverage widened, S1 2026-09-03
+PARSER_VERSION = "3.0.0"  # content-anchored result zones, row-level VAF/tier, 2026-09-24
 
 
 def stable_id(namespace: str, *parts: object) -> str:
@@ -137,319 +137,627 @@ def lifecycle_status(
     return "unknown"
 
 
-FINDING_HEADING = re.compile(
-    r"(?im)^\s*(?:"
-    r"findings?"
-    r"|results?"
-    r"|detected variants?"
-    r"|detected fusions?"
-    r"|variants? identified"
-    r"|variants? detected"
-    r"|variant\(s\) detected"
-    r"|molecular findings?"
-    r"|genomic findings?"
-    r"|(?:flt3|npm1)\s*:[^\r\n]*(?:mutations?|variants?|deletions?)[^\r\n]*(?:detected|identified)[^\r\n]*"
-    r"|(?:no\s+)?bcr[-_ ]?abl1?\s+transcript\s+detected\.?"
-    r")\s*:?[ \t]*$"
-)
-NON_FINDING_HEADING = re.compile(
-    r"(?im)^\s*(?:"
-    r"---+"
-    r"|technical information"
-    r"|method(?:ology)?"
-    r"|clinical interpretation"
-    r"|interpretation"
-    r"|genes? (?:tested|covered)"
-    r"|panel content"
-    r"|regions with insufficient coverage"
-    r"|definition of tier i and ii variants"
-    r"|fusion genes included in rna assay"
-    r"|additional assessed regions of interest"
-    r"|limitations?"
-    r")\s*:?[ \t]*$"
-)
-ANY_HEADING = re.compile(r"(?m)^\s*(?:---+|[A-Za-z][A-Za-z /_-]{2,60}:?[ \t]*|(?:FLT3|NPM1)\s*:[^\r\n]{2,80})$")
-
-
-def finding_sections(text: str) -> tuple[tuple[int, int, str], ...]:
-    """Return conservative finding sections and their source offsets."""
-
-    matches = list(FINDING_HEADING.finditer(text))
-    sections: list[tuple[int, int, str]] = []
-    for match in matches:
-        start = match.start()  # include result-bearing headings such as FLT3: ... DETECTED
-        end = len(text)
-        for heading in ANY_HEADING.finditer(text, start):
-            if heading.start() <= start:
-                continue
-            if NON_FINDING_HEADING.fullmatch(heading.group(0).strip()):
-                end = heading.start()
-                break
-            if FINDING_HEADING.fullmatch(heading.group(0).strip()):
-                end = heading.start()
-                break
-        content = text[start:end]
-        if content.strip():
-            sections.append((start, end, content))
-    return tuple(sections)
-
-
-HGVS_C_RE = re.compile(r"(?<![A-Za-z0-9_])(?:c\.|g\.|m\.|n\.)[^\s,;()]+", re.I)
-HGVS_P_RE = re.compile(r"(?<![A-Za-z0-9_])p\.\(?[A-Za-z*?=0-9_]+\)?", re.I)
-TRANSCRIPT_RE = re.compile(r"\b(?:NM|NR|ENST)_?\d+(?:\.\d+)?\b", re.I)
-VAF_RE = re.compile(r"\b(?:VAF|variant allele frequency)\s*[:=]?\s*(<?\d+(?:\.\d+)?)\s*%", re.I)
-CLASS_RE = re.compile(
-    r"\b(pathogenic|likely pathogenic|variant of uncertain significance|VUS|likely benign|benign|tier\s*[1-4IV]+)\b",
-    re.I,
-)
-NEGATIVE_RE = re.compile(
-    r"\b(?:"
-    r"no[^\r\n]{0,80}(?:variant|mutation|fusion|transcript)s?[^\r\n]{0,30}(?:identified|detected|found)"
-    r"|there (?:was|is) no evidence of[^\r\n]{0,80}(?:variant|mutation|fusion)"
-    r"|negative for"
-    r"|not detected"
-    r")\b",
-    re.I,
-)
-FUSION_RE = re.compile(r"\b([A-Z0-9]{2,15})(?:\(\d+\))?\s*(?:-|::|/)\s*([A-Z0-9]{2,15})(?:\(\d+\))?\b")
-
 
 def parse_genetic_report_json_worker(
     text: object,
-    gene_symbols: Sequence[str],
+    gene_symbols,
     _parser_version: str = PARSER_VERSION,
-    _state: dict[str, object] = {},
+    _state: dict = {},
 ) -> str:
     """Return parser JSON from a worker-self-contained implementation.
 
-    The alias index and static regular expressions are initialized once per
-    deserialized Python worker function, rather than rebuilding and compiling
-    roughly 100,000 alias expressions for every report row.
+    Parsing is anchored on report content rather than on headings that stand
+    alone on a line: many reports arrive flattened to one line with cells
+    separated by runs of spaces. Result zones run from a result marker
+    (Detected Variants:, a GENE/VARIANT/VAF table header, DNA/RNA panel:,
+    Detected Fusions:, Additional assessed regions of interest) to the next
+    narrative or technical marker. Within a zone every coding/protein HGVS
+    anchors one finding; its gene is the nearest preceding exact-uppercase HGNC
+    token and VAF/tier/classification are read from the same table row. Reports
+    without a result zone (FLT3/NPM1 fragment analysis) are read as gene
+    status statements. Interpretation narrative and technical panel lists never
+    create findings. The alias index and regular expressions are built once per
+    deserialized Python worker function.
     """
 
     import json as _json
     import re as _re
 
     if _state.get("gene_symbols_owner") is not gene_symbols:
-        symbols = frozenset(str(s).upper() for s in gene_symbols if s)
-        lengths_by_first: dict[str, tuple[int, ...]] = {}
-        mutable_lengths: dict[str, set[int]] = {}
-        for symbol in symbols:
-            mutable_lengths.setdefault(symbol[0], set()).add(len(symbol))
-        for first, lengths in mutable_lengths.items():
-            lengths_by_first[first] = tuple(sorted(lengths))
-
+        # HGNC aliases that collide with report vocabulary (table headers,
+        # Roman tiers, diagnoses, sample labels, assay names). Only exact
+        # uppercase tokens are considered genes, so this list only needs the
+        # uppercase words these report families actually use.
+        noise = {
+            "ALL", "AML", "AND", "CLL", "CML", "CMML", "COSMIC", "DNA", "ET", "GENE",
+            "GENES", "HGVS", "I", "II", "III", "ID", "IV", "ITD", "MDS", "MPN", "NGS",
+            "NO", "NONE", "NOT", "PCR", "PMF", "PV", "RES", "RESULT", "RNA", "TKD",
+            "VAF", "VARIANT", "VUS",
+        }
+        symbols = frozenset(
+            str(s).upper() for s in gene_symbols if s and str(s).upper() not in noise
+        )
         _state.clear()
         _state.update(
             {
                 "gene_symbols_owner": gene_symbols,
                 "symbols": symbols,
-                "lengths_by_first": lengths_by_first,
-                "boundary_char_re": _re.compile(r"[A-Z0-9]", _re.I),
-                "finding_heading": _re.compile(
-                    r"(?im)^\s*(?:"
-                    r"findings?"
-                    r"|results?"
-                    r"|detected variants?"
-                    r"|detected fusions?"
-                    r"|variants? identified"
-                    r"|variants? detected"
-                    r"|variant\(s\) detected"
-                    r"|molecular findings?"
-                    r"|genomic findings?"
-                    r"|(?:flt3|npm1)\s*:[^\r\n]*(?:mutations?|variants?|deletions?)[^\r\n]*(?:detected|identified)[^\r\n]*"
-                    r"|(?:no\s+)?bcr[-_ ]?abl1?\s+transcript\s+detected\.?"
-                    r")\s*:?[ \t]*$"
+                "token_re": _re.compile(r"(?<![A-Za-z0-9_.])[A-Z][A-Z0-9]{1,14}(?![A-Za-z0-9_])"),
+                "zone_start_re": _re.compile(
+                    r"(?i)(?:"
+                    r"\bdetected\s+variants?\s*:"
+                    r"|\bvariants?\s+(?:identified|detected)\s*:"
+                    r"|\bdetected\s+fusions?\s*:"
+                    r"|\b(?:DNA|RNA)\s+panel\s*:"
+                    r"|\badditional\s+assessed\s+regions?\s+of\s+interest"
+                    r"|\bresults?\s*:"
+                    r"|\bmutation\s+result\b"
+                    r"|\bgenes?\s+(?:res(?:ult)?s?|variants?|mutations?|hgvs)\s+"
+                    r"(?:vaf|res(?:ult)?|variants?|cosmic|classification|hgvs)\b"
+                    r")"
                 ),
-                "non_finding_heading": _re.compile(
-                    r"(?im)^\s*(?:"
-                    r"---+"
-                    r"|technical information"
-                    r"|method(?:ology)?"
-                    r"|clinical interpretation"
-                    r"|interpretation"
-                    r"|genes? (?:tested|covered)"
-                    r"|panel content"
-                    r"|regions with insufficient coverage"
-                    r"|definition of tier i and ii variants"
-                    r"|fusion genes included in rna assay"
-                    r"|additional assessed regions of interest"
-                    r"|limitations?"
-                    r")\s*:?[ \t]*$"
+                "zone_stop_re": _re.compile(
+                    r"(?im)(?:"
+                    r"\bclinical\s+interpretation"
+                    r"|\binterpretation\s*:"
+                    r"|\bclinical\s+(?:details|information)\s*:"
+                    r"|\bregions?\s+with\s+insufficient\s+coverage"
+                    r"|\btechnical\s+information"
+                    r"|\bgenes?\s*\(exons?\)\s+included"
+                    r"|\bfusion\s+genes?\s+included"
+                    r"|\bmethod(?:ology)?\s*:"
+                    r"|\bdefinition\s+of\s+tier"
+                    r"|\*\s*variant\s+allele\s+frequency"
+                    r"|^[ \t]*-{2,}"
+                    r"|\s-{2,}\s"
+                    r")"
                 ),
-                "any_heading": _re.compile(r"(?m)^\s*(?:---+|[A-Za-z][A-Za-z /_-]{2,60}:?[ \t]*|(?:FLT3|NPM1)\s*:[^\r\n]{2,80})$"),
-                "hgvs_c_re": _re.compile(
-                    r"(?<![A-Za-z0-9_])(?:c\.|g\.|m\.|n\.)[^\s,;()]+", _re.I
+                "body_stop_re": _re.compile(
+                    r"(?im)(?:"
+                    r"\bregions?\s+with\s+insufficient\s+coverage"
+                    r"|\btechnical\s+information"
+                    r"|\bgenes?\s*\(exons?\)\s+included"
+                    r"|\bmethod(?:ology)?\s*:"
+                    r"|^[ \t]*-{2,}"
+                    r"|\s-{2,}\s"
+                    r")"
                 ),
+                "panel_list_re": _re.compile(
+                    r"(?i)(?:"
+                    r"\bgenes?\s*\(exons?\)\s+included\s+in\s+[A-Za-z]+\s+assay"
+                    r"|\bfusion\s+genes?\s+included\s+in\s+[A-Za-z]+\s+assay"
+                    r"|\bhotspot\s+regions?\s+within\s+the\s+following\s+genes"
+                    r"|\bgenes?\s+(?:tested|covered)\s*:"
+                    r"|\bpanel\s+content\s*:"
+                    r")"
+                ),
+                "hgvs_c_re": _re.compile(r"(?<![A-Za-z0-9_])c\.(?=[0-9*(?_+-])(?:\[[^\]\s]{1,80}\]|(?!p\.)[^\s,;])+"),
+                "hgvs_p_near_re": _re.compile(r"p\.(?:\([^\s()]{1,60}\)|[A-Za-z*=?][^\s,;()]{0,60})"),
                 "hgvs_p_re": _re.compile(
-                    r"(?<![A-Za-z0-9_])p\.\(?[A-Za-z*?=0-9_]+\)?", _re.I
+                    r"(?<![A-Za-z0-9_])p\.(?:\([^\s()]{1,60}\)|[A-Za-z*=?][^\s,;()]{0,60})"
                 ),
-                "transcript_re": _re.compile(
-                    r"\b(?:NM|NR|ENST)_?\d+(?:\.\d+)?\b", _re.I
+                "hgvs_c_syntax_re": _re.compile(
+                    r"c\.(?:[-*]?\d+(?:[+-]\d+)?)(?:_[-*]?\d+(?:[+-]\d+)?)?"
+                    r"(?:[ACGT]+>[ACGT]+|del[ACGT]*ins[ACGT]+|del[ACGT]*|dup[ACGT]*|ins(?:[ACGT]+|\[[^\]\s]+\])|inv|[ACGT]*\[\d+\]|=)"
                 ),
-                "vaf_re": _re.compile(
-                    r"\b(?:VAF|variant allele frequency)\s*[:=]?\s*(<?\d+(?:\.\d+)?)\s*%",
-                    _re.I,
+                "hgvs_p_syntax_re": _re.compile(
+                    r"p\.(?:\(?(?:=|\?|0)\)?"
+                    r"|\(?[A-Z][a-z]{2}\d+(?:_[A-Z][a-z]{2}\d+)?"
+                    r"(?:[A-Z][a-z]{2}|Ter|\*|=|\?|del|dup|ins(?:[A-Z][a-z]{2}|\*)+|delins(?:[A-Z][a-z]{2}|\*)+"
+                    r"|(?:[A-Z][a-z]{2})?fs(?:(?:Ter|\*)(?:\d+|\?)?)?|(?:[A-Z][a-z]{2})?ext(?:Ter|\*)?(?:-?\d+|\?)?)\)?)"
                 ),
+                "transcript_re": _re.compile(r"\b(?:NM_\d+(?:\.\d+)?|LRG_\d+(?:t\d+)?|ENST\d+(?:\.\d+)?)\b"),
+                "vaf_re": _re.compile(r"(?<![\w.])([<>]?\s*\d{1,3}(?:\.\d+)?)\s*%"),
+                "tier_re": _re.compile(r"(?i)\btier\s*(IV|III|II|I|[1-4])\b"),
                 "class_re": _re.compile(
-                    r"\b(pathogenic|likely pathogenic|variant of uncertain significance|VUS|likely benign|benign|tier\s*[1-4IV]+)\b",
-                    _re.I,
+                    r"(?i)\b(likely\s+pathogenic|pathogenic|variant\s+of\s+uncertain\s+significance"
+                    r"|uncertain\s+significance|VUS|likely\s+benign|benign)\b"
+                ),
+                "zygosity_re": _re.compile(r"(?i)\b(heterozygous|homozygous|hemizygous)\b"),
+                "fusion_re": _re.compile(
+                    r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]{1,14})(?:\([A-Za-z0-9]{1,6}\))?\s*(?:::|-|–|/)\s*"
+                    r"([A-Z][A-Z0-9]{1,14})(?:\([A-Za-z0-9]{1,6}\))?(?![A-Za-z0-9_])"
+                ),
+                "noise": noise,
+                # Tissue block labels ("Block A4:", "Blocks A4 and A10") look like
+                # symbols (A10 is an HGNC alias) and separate per-block results.
+                "block_label_re": _re.compile(
+                    r"(?:(?i:\bblocks?\b)[\s:\u00a0]*[A-Z]\d{1,3}(?:[\s\u00a0]*(?:and|&|,)[\s\u00a0]*[A-Z]\d{1,3})*"
+                    r"|(?<![A-Za-z0-9_])[A-Z]\d{1,3}(?=[\s\u00a0]*(?::|c\.[0-9*(?_+-])))[\s:\u00a0]*"
+                ),
+                "separator_label_re": _re.compile(r"(?:(?i:\bblocks?\b)[\s:\u00a0]*)?\b[A-Z]\d{1,3}\b[\s:\u00a0]*"),
+                "row_gene_re": _re.compile(
+                    r"(?<![A-Za-z0-9_.])(?!COSM\d)([A-Z][A-Z0-9]{2,9})\*?(?:[\s\u00a0]+(?:NM_\d+(?:\.\d+)?|LRG_\d+(?:t\d+)?))?"
+                    r"[\s\u00a0]+(?=c\.[0-9*(?_+-]|p\.\(|(?i:no\s+(?:variants?|mutations?)\s+detected))"
+                ),
+                "zone_statement_re": _re.compile(
+                    r"(?i:(?:mutation|variant)s?\s+(?:detected|identified)\s+in\s+(?:the\s+)?)([A-Z][A-Z0-9]{1,14})\b"
+                    r"|\b([A-Z][A-Z0-9]{1,14})\s*:?\s*(?i:(?:mutation|variant)s?\s+(?:detected|identified))"
+                ),
+                "negated_clause_re": _re.compile(r"(?i)\b(?:no|not|negative|without)\b"),
+                "row_negative_re": _re.compile(
+                    r"(?i)^[\s:;,.\-\u00a0]*(?:not\s+detected|absent|negative)\b"
                 ),
                 "negative_re": _re.compile(
-                    r"\b(?:"
-                    r"no[^\r\n]{0,80}(?:variant|mutation|fusion|transcript)s?[^\r\n]{0,30}(?:identified|detected|found)"
-                    r"|there (?:was|is) no evidence of[^\r\n]{0,80}(?:variant|mutation|fusion)"
-                    r"|negative for"
-                    r"|not detected"
-                    r")\b",
-                    _re.I,
+                    r"(?i)(?:"
+                    r"\bno\s+[^.\r\n]{0,60}?\b(?:variants?|mutations?|fusions?|transcripts?|insertions?)\b"
+                    r"[^.\r\n]{0,30}?\b(?:detected|identified|found)\b"
+                    r"|\bwild[- ]type\b"
+                    r"|\bnot\s+detected\b"
+                    r"|\bnegative\s+for\b"
+                    r"|\bno\s+(?:abnormality|abnormalities|copy\s+number\s+(?:change|variation|abnormality)s?)\s+(?:was\s+|were\s+)?detected\b"
+                    r")"
                 ),
-                "fusion_re": _re.compile(
-                    r"\b([A-Z0-9]{2,15})(?:\(\d+\))?\s*(?:-|::|/)\s*([A-Z0-9]{2,15})(?:\(\d+\))?\b"
+                "failed_re": _re.compile(
+                    r"(?i)(?:\bfail(?:ed|ure)\b|\binsufficient\s+(?:DNA|quality|material|sample)"
+                    r"|\bpoor\s+quality\s+DNA|\bof\s+insufficient\s+(?:quality|quantity)|\blow\s+DNA\s+concentration"
+                    r"|\bcould\s+not\s+be\s+(?:analysed|analyzed|tested)\b|\bunable\s+to\s+(?:successfully\s+)?amplify)"
+                ),
+                "indeterminate_re": _re.compile(
+                    r"(?i)\b(?:inconclusive|equivocal|indeterminate|could\s+not\s+be\s+determined)\b"
+                ),
+                "statement_re": _re.compile(
+                    r"(?i)\b(FLT3|NPM1)(?:[ \t]*[-\u2011]?[ \t]*(ITD|TKD))?[ \t]*:?[ \t]*"
+                    r"(?:(ITD|TKD)[ \t]+)?"
+                    r"(no[ \t]+(?:(?:ITD|TKD)[ \t]+)?mutations?[ \t]+detected"
+                    r"|mutations?[ \t]+detected|wild[- ]type|positive|not[ \t]+required"
+                    r"|not[ \t]+detected|failed)\b"
+                ),
+                # Legacy BCR-ABL RT-PCR: "BCR-ABL transcript detected with a size
+                # compatible with B2A2 translocation"; "No BCR-ABL1 transcript detected".
+                "bcr_abl_re": _re.compile(
+                    r"(?i)\b(no[ \t]+)?BCR[ \t]*(?:::|[-/\u2011])[ \t]*ABL1?[ \t]+(?:fusion[ \t]+)?transcripts?"
+                    r"\s+(?:(?:was|were|is)\s+)?detected\b"
+                ),
+                "joint_negative_re": _re.compile(r"(?i)\bFLT3\s+and\s+NPM1\s+not\s+detected\b"),
+                "subtype_re": _re.compile(
+                    r"(?i)(?:detected|positive|peak\s+corresponding\s+to\s+an?)[^.\r\n]{0,40}?\b(ITD|TKD)\b"
+                    r"|\bFLT3[-\s](ITD|TKD)\s+positive"
+                ),
+                "ratio_re": _re.compile(
+                    r"(?i)\((high|low)\s+allelic\s+ratio\)|allelic\s+ratio\s+(?:was\s+)?(?:estimated|calculated)"
+                    r"\s+to\s+be\s+([<>]?\s*\d+(?:\.\d+)?)"
                 ),
             }
         )
 
-    source = "" if text is None else str(text)
-    symbols = _state["symbols"]
-    lengths_by_first = _state["lengths_by_first"]
-    boundary_char_re = _state["boundary_char_re"]
-    finding_heading = _state["finding_heading"]
-    non_finding_heading = _state["non_finding_heading"]
-    any_heading = _state["any_heading"]
-    hgvs_c_re = _state["hgvs_c_re"]
-    hgvs_p_re = _state["hgvs_p_re"]
-    transcript_re = _state["transcript_re"]
-    vaf_re = _state["vaf_re"]
-    class_re = _state["class_re"]
-    negative_re = _state["negative_re"]
-    fusion_re = _state["fusion_re"]
+    s = _state
+    symbols = s["symbols"]
+    raw = "" if text is None else str(text)
 
-    def _upper_preserving_offsets(value: str) -> str:
-        chars: list[str] = []
-        for char in value:
-            upper = char.upper()
-            chars.append(upper if len(upper) == 1 else char)
-        return "".join(chars)
-
-    def gene_matches(value: str) -> list[tuple[int, int, str]]:
-        if not value:
-            return []
-        upper_value = _upper_preserving_offsets(value)
-        found: list[tuple[int, int, str]] = []
-        last_end_by_symbol: dict[str, int] = {}
-        value_len = len(value)
-        for start in range(value_len):
-            if start and boundary_char_re.fullmatch(value[start - 1]):
+    # RTF: strip control words to plain text but keep a map back to raw offsets
+    # so evidence_start/evidence_end always address the stored report text.
+    if raw.lstrip().startswith("{\\rtf"):
+        out_chars: list[str] = []
+        offsets: list[int] = []
+        i = 0
+        depth = 0
+        skip_depth = None
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch == "{":
+                depth += 1
+                i += 1
                 continue
-            lengths = lengths_by_first.get(upper_value[start], ())
-            for width in lengths:
-                end = start + width
-                if end > value_len:
-                    break
-                if end < value_len and boundary_char_re.fullmatch(value[end]):
+            if ch == "}":
+                if skip_depth is not None and depth <= skip_depth:
+                    skip_depth = None
+                depth -= 1
+                i += 1
+                continue
+            if ch == "\\":
+                m = _re.match(r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\(.)", raw[i:i + 40])
+                if not m:
+                    i += 1
                     continue
-                symbol = upper_value[start:end]
-                if symbol not in symbols:
-                    continue
-                if start < last_end_by_symbol.get(symbol, -1):
-                    continue
-                found.append((start, end, symbol))
-                last_end_by_symbol[symbol] = end
-        return sorted(found)
+                word, hexcode, symbol = m.group(1), m.group(3), m.group(4)
+                if skip_depth is None:
+                    if word in ("fonttbl", "colortbl", "stylesheet", "info", "pict", "listtable",
+                                "listoverridetable", "rsidtbl", "generator", "xmlnstbl"):
+                        skip_depth = depth
+                    elif symbol == "*":
+                        skip_depth = depth
+                    elif word in ("par", "line", "row", "sect", "page"):
+                        out_chars.append("\n")
+                        offsets.append(i)
+                    elif word in ("tab", "cell"):
+                        out_chars.append("  ")
+                        offsets.extend((i, i))
+                    elif hexcode:
+                        out_chars.append(bytes([int(hexcode, 16)]).decode("cp1252", "replace"))
+                        offsets.append(i)
+                    elif symbol in ("\\", "{", "}"):
+                        out_chars.append(symbol)
+                        offsets.append(i)
+                    elif symbol == "~":
+                        out_chars.append(" ")
+                        offsets.append(i)
+                i += m.end()
+                continue
+            if skip_depth is None and ch not in "\r\n":
+                out_chars.append(ch)
+                offsets.append(i)
+            i += 1
+        source = "".join(out_chars)
+        offsets.append(n)
+    else:
+        source = raw
+        offsets = None
 
-    genes_tested: set[str] = set()
-    for heading in non_finding_heading.finditer(source):
-        if not _re.search(
-            r"genes? (?:tested|covered)|panel content|technical", heading.group(0), _re.I
-        ):
+    def raw_span(start: int, end: int) -> tuple[int, int]:
+        if offsets is None:
+            return start, end
+        return offsets[start], (offsets[end - 1] + 1) if end > start else offsets[start]
+
+    def genes_in(start: int, end: int) -> list[tuple[int, int, str]]:
+        text = source[start:end]
+        labels = [(m.start(), m.end()) for m in s["block_label_re"].finditer(text)]
+        return [
+            (start + m.start(), start + m.end(), m.group(0))
+            for m in s["token_re"].finditer(text)
+            if m.group(0) in symbols and not any(a <= m.start() < b for a, b in labels)
+        ]
+
+    body_stop = s["body_stop_re"].search(source)
+    body_end = body_stop.start() if body_stop else len(source)
+
+    stops = [m.start() for m in s["zone_stop_re"].finditer(source)]
+    starts = [(m.start(), m.end()) for m in s["zone_start_re"].finditer(source)]
+    zones: list[tuple[int, int]] = []
+    for index, (start, marker_end) in enumerate(starts):
+        if zones and start < zones[-1][1] and start - zones[-1][0] < 3:
             continue
-        start = heading.end()
-        next_heading = any_heading.search(source, start)
-        end = next_heading.start() if next_heading else min(len(source), start + 5000)
-        genes_tested.update(symbol for _, _, symbol in gene_matches(source[start:end]))
+        bounds = [p for p in stops if p > marker_end][:1] + [st for st, _ in starts[index + 1:index + 2]]
+        end = min(bounds) if bounds else len(source)
+        if zones and zones[-1][1] > start:
+            zones[-1] = (zones[-1][0], start)
+        zones.append((start, end))
 
-    sections: list[tuple[int, str]] = []
-    for heading in finding_heading.finditer(source):
-        start = heading.start()  # include result-bearing headings such as FLT3: ... DETECTED
-        end = len(source)
-        for next_heading in any_heading.finditer(source, start):
-            if next_heading.start() <= start:
-                continue
-            candidate = next_heading.group(0).strip()
-            if non_finding_heading.fullmatch(candidate) or finding_heading.fullmatch(candidate):
-                end = next_heading.start()
-                break
-        section = source[start:end]
-        if section.strip():
-            sections.append((start, section))
+    panel_genes: set[str] = set()
+    for m in s["panel_list_re"].finditer(source):
+        nxt = next((p for p in stops if p > m.end() + 1 and p > m.start() + 40), None)
+        end = min(nxt if nxt is not None else len(source), m.end() + 6000)
+        # A later "Fusion Genes included" heading is itself a stop, so each list ends there.
+        later = s["panel_list_re"].search(source, m.end())
+        if later and later.start() < end:
+            end = later.start()
+        panel_genes.update(g for _, _, g in genes_in(m.end(), end))
 
-    findings: list[dict[str, object]] = []
-    for section_start, section in sections:
-        for sentence_match in _re.finditer(r"[^\n]+", section):
-            sentence = sentence_match.group(0)
-            context_start = max(0, sentence_match.start() - 160)
-            negative_context = section[context_start:sentence_match.end()]
-            if negative_re.search(negative_context):
+    findings: list[dict] = []
+    reported: set[str] = set()
+    negative_evidence = False
+
+    def tail_fields(tail: str) -> dict:
+        vaf = s["vaf_re"].search(tail)
+        tier = s["tier_re"].search(tail)
+        klass = s["class_re"].search(tail)
+        zyg = s["zygosity_re"].search(tail)
+        vaf_raw = vaf.group(0).strip() if vaf else None
+        vaf_value = None
+        if vaf and not vaf.group(1).lstrip().startswith(("<", ">")):
+            vaf_value = round(float(vaf.group(1)) / 100.0, 6)
+            if vaf_value > 1.0:
+                vaf_raw, vaf_value = None, None
+        tier_value = None
+        if tier:
+            tier_value = {"1": "I", "2": "II", "3": "III", "4": "IV"}.get(tier.group(1), tier.group(1).upper())
+        classification = None
+        if tier and klass:
+            classification = tail[min(tier.start(), klass.start()):max(tier.end(), klass.end())]
+        elif tier or klass:
+            classification = (tier or klass).group(0)
+        return {
+            "vaf_raw": vaf_raw,
+            "vaf": vaf_value,
+            "reported_tier": tier_value,
+            "reported_classification": _re.sub(r"\s+", " ", classification).strip() if classification else None,
+            "zygosity": zyg.group(1).lower() if zyg else None,
+        }
+
+    def hgvs_checked(value, syntax_re):
+        if value is None:
+            return None, None
+        cleaned = value.rstrip(".,;:")
+        if cleaned.count(")") > cleaned.count("("):
+            cleaned = cleaned[: cleaned.rfind(")")] + cleaned[cleaned.rfind(")") + 1:]
+        return cleaned, (cleaned if syntax_re.fullmatch(cleaned) else None)
+
+    def add_finding(evidence_start, evidence_end, **fields):
+        while evidence_end > evidence_start and source[evidence_end - 1] in " \t\r\n\u00a0":
+            evidence_end -= 1
+        while evidence_start < evidence_end and source[evidence_start] in " \t\r\n\u00a0":
+            evidence_start += 1
+        raw_start, raw_end = raw_span(evidence_start, evidence_end)
+        finding = {
+            "reported_gene_symbol": None,
+            "partner_gene_symbol": None,
+            "alteration_type": "other",
+            "detection_status": "detected",
+            "hgvs_c_raw": None,
+            "hgvs_c_parsed": None,
+            "hgvs_p_raw": None,
+            "hgvs_p_parsed": None,
+            "hgvs_validation_status": "not_validated",
+            "transcript": None,
+            "vaf_raw": None,
+            "vaf": None,
+            "reported_classification": None,
+            "reported_tier": None,
+            "zygosity": None,
+            "ratio_raw": None,
+            "evidence_text": source[evidence_start:evidence_end],
+            "evidence_start": raw_start,
+            "evidence_end": raw_end,
+        }
+        finding.update(fields)
+        findings.append(finding)
+
+    for zone_start, zone_end in zones:
+        zone = source[zone_start:zone_end]
+        if s["negative_re"].search(zone):
+            negative_evidence = True
+        genes = genes_in(zone_start, zone_end)
+
+        anchors: list[tuple[int, int, str, object]] = []
+        c_matches = [(zone_start + m.start(), zone_start + m.end(), m.group(0)) for m in s["hgvs_c_re"].finditer(zone)]
+        p_matches = [(zone_start + m.start(), zone_start + m.end(), m.group(0)) for m in s["hgvs_p_re"].finditer(zone)]
+        used_p: set[int] = set()
+        for c_start, c_end, c_text in c_matches:
+            pair = None
+            fused = s["hgvs_p_near_re"].match(source, c_end)  # c.818G>Ap.(Arg273His)
+            if fused:
+                pair = (fused.start(), fused.end(), fused.group(0))
+            else:
+                for p in p_matches:
+                    if p[0] >= c_end and p[0] - c_end <= 40 and p[0] not in used_p:
+                        between = source[c_end:p[0]]
+                        if "c." not in between and not any(c_end <= g[0] < p[0] for g in genes):
+                            pair = p
+                        break
+            if pair:
+                used_p.add(pair[0])
+            anchors.append((c_start, pair[1] if pair else c_end, c_text, pair))
+        for p in p_matches:
+            if p[0] not in used_p:
+                anchors.append((p[0], p[1], None, p))
+        anchors.sort()
+
+        # The gene cell is the uppercase token immediately before a variant or a
+        # per-gene negative, even when it is a laboratory typo (SRFS2, DNTM3A);
+        # such symbols stay unresolved in the HGNC join rather than being guessed.
+        row_genes = {g[0]: g for g in genes}
+        for m in s["row_gene_re"].finditer(zone):
+            if m.group(1) not in s["noise"]:
+                row_genes.setdefault(zone_start + m.start(1), (zone_start + m.start(1), zone_start + m.end(1), m.group(1)))
+        genes = sorted(row_genes.values())
+        reported.update(g[2] for g in genes if g[2] in symbols)
+        gene_starts = [g[0] for g in genes]
+
+        rows = []
+        for index, (a_start, a_end, c_text, p) in enumerate(anchors):
+            later_bounds = [g for g in gene_starts if g > a_end]
+            if index + 1 < len(anchors):
+                later_bounds.append(anchors[index + 1][0])
+            row_end = min(later_bounds) if later_bounds else zone_end
+            preceding = [g for g in genes if g[1] <= a_start]
+            rows.append([a_start, a_end, c_text, p, row_end, source[a_end:row_end], preceding[-1] if preceding else None])
+
+        # Stacked cells: a table cell may list several variants, with the VAF and
+        # classification cells following in the same order ("c.1 p.1 c.2 p.2
+        # 33% 22% Tier I Tier I"). Some tables are wholly column-major: k gene
+        # cells, then k variant cells, then k VAF cells. Pair them by position.
+        fields_by_row: dict[int, dict] = {}
+        column_major: set[int] = set()
+        index = 0
+        previous_end = zone_start
+        while index < len(rows):
+            group = [index]
+            while group[-1] + 1 < len(rows) and not s["separator_label_re"].sub("", source[
+                rows[group[-1]][1]:rows[group[-1] + 1][0]
+            ]).strip(" \t\r\n\u00a0"):
+                group.append(group[-1] + 1)
+            last_tail = rows[group[-1]][5]
+            if len(group) > 1:
+                block_genes = [g for g in genes if previous_end <= g[0] < rows[group[0]][0]]
+                stacked = all(
+                    not s["separator_label_re"].sub("", source[a[1]:b[0]]).strip(" \t\r\n\u00a0*")
+                    for a, b in zip(block_genes, block_genes[1:] + [(rows[group[0]][0],)])
+                )
+                if stacked and len(block_genes) == len(group) and len({g[2] for g in block_genes}) > 1:
+                    for position, row_index in enumerate(group):
+                        rows[row_index][6] = block_genes[position]
+                        column_major.add(row_index)
+                vafs = list(s["vaf_re"].finditer(last_tail))
+                tiers = list(s["tier_re"].finditer(last_tail))
+                if len(vafs) == len(group) and len(tiers) in (0, len(group)):
+                    for position, row_index in enumerate(group):
+                        piece_end = vafs[position + 1].start() if position + 1 < len(vafs) else len(last_tail)
+                        piece = last_tail[vafs[position].start():piece_end]
+                        if tiers:
+                            piece = vafs[position].group(0) + " " + tiers[position].group(0)
+                        fields_by_row[row_index] = tail_fields(piece)
+            for row_index in group:
+                fields_by_row.setdefault(row_index, tail_fields(rows[row_index][5]))
+            previous_end = rows[group[-1]][4]
+            index = group[-1] + 1
+
+        for index, (a_start, a_end, c_text, p, row_end, tail, gene) in enumerate(rows):
+            if s["row_negative_re"].search(tail):
                 continue
-            # Short HGNC symbols overlap ordinary English words. Within a finding
-            # section, only an exact uppercase source token may supply the gene.
-            genes = [
-                match
-                for match in gene_matches(sentence)
-                if sentence[match[0]:match[1]] == match[2]
-            ]
-            fusion = fusion_re.search(sentence)
-            if fusion and (
-                fusion.group(1).upper() not in symbols
-                or fusion.group(2).upper() not in symbols
-            ):
-                fusion = None
-            hgvs_c = hgvs_c_re.search(sentence)
-            hgvs_p = hgvs_p_re.search(sentence)
-            transcript = transcript_re.search(sentence)
-            vaf = vaf_re.search(sentence)
-            classification = class_re.search(sentence)
-            positive_detection = _re.search(
-                r"\b(?:"
-                r"(?:mutation|variant|fusion|transcript|insertion|duplication)[^\r\n]{0,50}(?:detected|identified|present)"
-                r"|(?:detected|identified)[^\r\n]{0,50}(?:mutation|variant|fusion|transcript|insertion|duplication)"
-                r")\b",
-                sentence,
-                _re.I,
+            evidence_start = a_start
+            if index in column_major:
+                row_end = a_end  # the row's cells are not contiguous; cite the variant cell
+            elif gene and not any(gene[1] <= a[0] < a_start for a in anchors):
+                evidence_start = gene[0]
+            prefix = "" if index in column_major else source[gene[1] if gene else a_start:a_start]
+            transcript = s["transcript_re"].search(prefix) or s["transcript_re"].search(tail)
+            c_raw, c_parsed = hgvs_checked(c_text, s["hgvs_c_syntax_re"])
+            p_raw, p_parsed = hgvs_checked(p[2] if p else None, s["hgvs_p_syntax_re"])
+            if (c_raw and not c_parsed) or (p_raw and not p_parsed):
+                validation = "invalid"
+            else:
+                validation = "partial"  # syntactically valid; not checked against a reference
+            probe = c_raw or p_raw or ""
+            if c_raw and _re.search(r"\d[ACGT]>[ACGT](?![ACGT])", c_raw):
+                alteration = "SNV"
+            elif _re.search(r"del|ins|dup|fs", probe):
+                alteration = "indel"
+            elif p_raw and _re.fullmatch(r"p\.\(?[A-Z][a-z]{2}\d+[A-Z][a-z]{2}\)?", p_raw) and not c_raw:
+                alteration = "SNV"
+            else:
+                alteration = "other"
+            add_finding(
+                evidence_start,
+                row_end,
+                reported_gene_symbol=gene[2] if gene else None,
+                alteration_type=alteration,
+                hgvs_c_raw=c_raw,
+                hgvs_c_parsed=c_parsed,
+                hgvs_p_raw=p_raw,
+                hgvs_p_parsed=p_parsed,
+                hgvs_validation_status=validation,
+                transcript=transcript.group(0) if transcript else None,
+                **fields_by_row[index],
             )
-            if not (fusion or hgvs_c or hgvs_p or (genes and positive_detection)):
+
+        # Positive statements without HGVS ("MUTATION DETECTED IN BRAF CODON 600").
+        anchored = {f["reported_gene_symbol"] for f in findings}
+        for m in s["zone_statement_re"].finditer(zone):
+            gene = m.group(1) or m.group(2)
+            if gene not in symbols or gene in anchored:
                 continue
-            primary = genes[0][2] if genes else (fusion.group(1).upper() if fusion else None)
-            partner = fusion.group(2).upper() if fusion else None
-            findings.append(
-                {
-                    "reported_gene_symbol": primary,
-                    "partner_gene_symbol": partner,
-                    "alteration_type": "fusion"
-                    if fusion
-                    else ("sequence_variant" if hgvs_c or hgvs_p else "other"),
-                    "detection_status": "detected",
-                    "hgvs_c_raw": hgvs_c.group(0) if hgvs_c else None,
-                    "hgvs_p_raw": hgvs_p.group(0) if hgvs_p else None,
-                    "transcript": transcript.group(0) if transcript else None,
-                    "vaf_raw": vaf.group(0) if vaf else None,
-                    "vaf": float(vaf.group(1)) / 100.0 if vaf else None,
-                    "reported_classification": classification.group(0)
-                    if classification
-                    else None,
-                    "evidence_text": sentence,
-                    "evidence_start": section_start + sentence_match.start(),
-                    "evidence_end": section_start + sentence_match.end(),
-                }
+            clause_start = max(zone.rfind(".", 0, m.start()), zone.rfind(":", 0, m.start()))
+            if s["negated_clause_re"].search(zone[clause_start + 1:m.start()]):
+                continue
+            row_end = min([g for g in gene_starts if g > zone_start + m.end()] + [zone_end])
+            anchored.add(gene)
+            reported.add(gene)
+            add_finding(zone_start + m.start(), row_end, reported_gene_symbol=gene)
+
+        for m in s["fusion_re"].finditer(zone):
+            first, second = m.group(1), m.group(2)
+            if first not in symbols or second not in symbols or first == second:
+                continue
+            clause_start = max(
+                zone.rfind(".", 0, m.start()), zone.rfind(":", 0, m.start()), zone.rfind("\n", 0, m.start())
             )
+            clause = zone[clause_start + 1:m.start()]
+            after = zone[m.end():m.end() + 40]
+            if s["negated_clause_re"].search(clause) or _re.match(r"(?i)[^.\r\n]{0,25}\bnot\s+detected", after):
+                continue
+            line_end = _re.search(r"\s{2,}|[\r\n]|$", zone[m.end():])
+            end = zone_start + m.end() + (line_end.start() if line_end else 0)
+            reported.update((first, second))
+            add_finding(
+                zone_start + m.start(),
+                end,
+                reported_gene_symbol=first,
+                partner_gene_symbol=second,
+                alteration_type="fusion",
+            )
+
+    statements = []
+    if not zones:
+        joint = s["joint_negative_re"].search(source[:body_end])
+        if joint:
+            negative_evidence = True
+            reported.update(("FLT3", "NPM1"))
+        bcr_abl = [m for m in s["bcr_abl_re"].finditer(source[:body_end])]
+        for m in bcr_abl:
+            reported.update(("BCR", "ABL1"))
+            if m.group(1):
+                negative_evidence = True
+        positive = next((m for m in bcr_abl if not m.group(1)), None)
+        if positive:
+            stop = source.find(".", positive.end(), body_end)
+            add_finding(
+                positive.start(),
+                stop + 1 if stop >= 0 else body_end,
+                reported_gene_symbol="BCR",
+                partner_gene_symbol="ABL1",
+                alteration_type="fusion",
+            )
+        heads = list(s["statement_re"].finditer(source[:body_end]))
+        for index, m in enumerate(heads):
+            gene = m.group(1).upper()
+            status = _re.sub(r"\s+", " ", m.group(4).lower())
+            end = heads[index + 1].start() if index + 1 < len(heads) else body_end
+            statements.append((gene, status, m, end))
+        positives: dict[str, list] = {}
+        for gene, status, m, end in statements:
+            if status in ("not required",):
+                continue
+            reported.add(gene)
+            if status.startswith("no ") or status in ("wild-type", "wild type", "not detected"):
+                negative_evidence = True
+                continue
+            if status == "failed":
+                continue
+            # "FLT3 mutation detected (FLT3-ITD positive)" is one finding stated twice.
+            if gene in positives:
+                positives[gene][2] = end
+                if not positives[gene][3]:
+                    positives[gene][3] = m.group(2) or m.group(3)
+                continue
+            positives[gene] = [gene, m, end, m.group(2) or m.group(3)]
+        for gene, m, end, subtype in positives.values():
+            body = source[m.start():end]
+            if not subtype:
+                sub = s["subtype_re"].search(body)
+                if sub:
+                    subtype = sub.group(1) or sub.group(2)
+            subtype = subtype.upper() if subtype else None
+            if gene == "NPM1" or subtype == "ITD" or _re.search(r"(?i)\b(?:insertion|duplication)s?\b", body):
+                alteration = "indel"
+            elif subtype == "TKD" and _re.search(r"(?i)\bpoint\s+mutation\b", body):
+                alteration = "SNV"
+            else:
+                alteration = "other"
+            ratio = s["ratio_re"].search(body)
+            ratio_raw = None
+            if ratio:
+                ratio_raw = (ratio.group(1).lower() + " allelic ratio") if ratio.group(1) else ratio.group(2).replace(" ", "")
+            # Evidence is the first sentence after the statement heading, which
+            # carries the subtype, size and ratio without the methodology tail.
+            sentence = _re.search(r"[\s\S]*?[.](?=\s|$)", source[m.end():end])
+            ev_end = m.end() + (sentence.end() if sentence else len(source[m.end():end]))
+            add_finding(
+                m.start(),
+                min(end, ev_end),
+                reported_gene_symbol=gene,
+                alteration_type=alteration,
+                reported_classification=None,
+                ratio_raw=ratio_raw,
+            )
+
+    body = source[:body_end]
+    if not zones and not statements and s["negative_re"].search(body):
+        negative_evidence = True
+    failed = bool(s["failed_re"].search(body))
+    indeterminate = bool(s["indeterminate_re"].search(body))
+    if findings:
+        overall = "detected"
+    elif failed and negative_evidence:
+        overall = "indeterminate"  # part of the assay failed; the rest was negative
+    elif failed:
+        overall = "failed"
+    elif indeterminate:
+        overall = "indeterminate"
+    elif negative_evidence:
+        overall = "not_detected"
+    else:
+        overall = "unknown"
+
+    for finding in findings:
+        if finding["reported_gene_symbol"]:
+            reported.add(finding["reported_gene_symbol"])
 
     return _json.dumps(
         {
-            "overall_result_status": "detected"
-            if findings
-            else ("not_detected" if negative_re.search(source) else "unknown"),
-            "genes_tested": sorted(genes_tested),
+            "overall_result_status": overall,
+            "genes_tested": sorted(reported | panel_genes),
+            "genes_reported": sorted(reported),
             "findings": findings,
             "parser_version": _parser_version,
         },
@@ -469,11 +777,17 @@ class GeneticFinding:
     alteration_type: str
     detection_status: str
     hgvs_c_raw: str | None
+    hgvs_c_parsed: str | None
     hgvs_p_raw: str | None
+    hgvs_p_parsed: str | None
+    hgvs_validation_status: str
     transcript: str | None
     vaf_raw: str | None
     vaf: float | None
     reported_classification: str | None
+    reported_tier: str | None
+    zygosity: str | None
+    ratio_raw: str | None
     evidence_text: str
     evidence_start: int
     evidence_end: int
@@ -488,12 +802,14 @@ class GeneticParse:
     genes_tested: tuple[str, ...]
     findings: tuple[GeneticFinding, ...]
     parser_version: str = PARSER_VERSION
+    genes_reported: tuple[str, ...] = ()
 
     def to_json(self) -> str:
         return json.dumps(
             {
                 "overall_result_status": self.overall_result_status,
                 "genes_tested": self.genes_tested,
+                "genes_reported": self.genes_reported,
                 "findings": [finding.as_dict() for finding in self.findings],
                 "parser_version": self.parser_version,
             },
@@ -501,28 +817,8 @@ class GeneticParse:
         )
 
 
-def _gene_matches(text: str, gene_symbols: Sequence[str]) -> list[tuple[int, int, str]]:
-    matches: list[tuple[int, int, str]] = []
-    for symbol in sorted({s.upper() for s in gene_symbols if s}, key=len, reverse=True):
-        pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])", re.I)
-        matches.extend((m.start(), m.end(), symbol) for m in pattern.finditer(text))
-    return sorted(matches)
-
-
-def _technical_gene_list(text: str, gene_symbols: Sequence[str]) -> tuple[str, ...]:
-    genes: set[str] = set()
-    for heading in NON_FINDING_HEADING.finditer(text):
-        if not re.search(r"genes? (?:tested|covered)|panel content|technical", heading.group(0), re.I):
-            continue
-        start = heading.end()
-        next_heading = ANY_HEADING.search(text, start)
-        end = next_heading.start() if next_heading else min(len(text), start + 5000)
-        genes.update(symbol for _, _, symbol in _gene_matches(text[start:end], gene_symbols))
-    return tuple(sorted(genes))
-
-
 def parse_genetic_report(text: object, gene_symbols: Sequence[str]) -> GeneticParse:
-    """Parse only explicit finding sections; technical gene lists are denominators."""
+    """Parse result zones; technical panel lists are panel content, never findings."""
 
     payload = json.loads(parse_genetic_report_json_worker(text, gene_symbols))
     return GeneticParse(
@@ -530,6 +826,7 @@ def parse_genetic_report(text: object, gene_symbols: Sequence[str]) -> GeneticPa
         tuple(payload["genes_tested"]),
         tuple(GeneticFinding(**finding) for finding in payload["findings"]),
         payload["parser_version"],
+        tuple(payload["genes_reported"]),
     )
 
 

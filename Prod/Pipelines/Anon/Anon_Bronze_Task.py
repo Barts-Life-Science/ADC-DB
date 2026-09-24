@@ -3,6 +3,8 @@
 
 # COMMAND ----------
 
+# BRONZE_FIX_946452877034658_V1
+
 # ANON_B1_PERF_20260904_V1
 """Bronze-job task wrapper for the anonymous-text engine.
 
@@ -55,6 +57,7 @@ STATE_TYPES = {
     "anon_redactor_version": "STRING",
     "anon_source_text_sha": "STRING",
     "anon_identity_fingerprint": "STRING",
+    "anon_context_fingerprint": "STRING",
     "anon_redaction_count": "BIGINT",
     "anon_processed_at": "TIMESTAMP",
 }
@@ -89,9 +92,15 @@ ALL_FEEDS = [
     "order_comment",
     "pacs_report",
     "pacs_report_bridge",
+    "pacs_request",
     "mill_blob_text",
     "text_event",
     "pathology_report",
+    "safety_text_fragment",
+    "prearrival",
+    "tracking_location_stay",
+    "pending_movement",
+    "location_attribute_history",
 ]
 if REPORT_FEEDS_RAW:
     try:
@@ -151,7 +160,7 @@ def _run_engine(action, feed, suffix, skip_fingerprint_refresh, max_runtime_seco
             "work_cap_rows": str(WORK_CAP_ROWS),
             "skip_fingerprint_refresh": "true" if skip_fingerprint_refresh else "false",
             "run_id": f"{RUN_ID}_{suffix}",
-            "production_confirmation": "RUN_PRODUCTION_ANON_V3_2" if TARGET_SCHEMA == "4_prod.bronze" else "",
+            "production_confirmation": "RUN_PRODUCTION_ANON_V3_3" if TARGET_SCHEMA == "4_prod.bronze" else "",
         },
     )
     try:
@@ -193,6 +202,17 @@ def _sync_replace_state(feed):
     if not spark.catalog.tableExists(target):
         spark.table(stage).write.mode("overwrite").saveAsTable(target)
     else:
+        # Evolve the state contract before MERGE and column tagging.
+        existing = {field.name.lower(): field for field in spark.table(target).schema.fields}
+        for field in selected.schema.fields:
+            actual = existing.get(field.name.lower())
+            if actual is None:
+                if field.name in cfg["keys"]:
+                    raise RuntimeError(f"{target}: missing state key {field.name}")
+                column = field.name.replace("`", "``")
+                spark.sql(f"ALTER TABLE {_qtable(target)} ADD COLUMNS (`{column}` {field.dataType.simpleString()})")
+            elif actual.dataType != field.dataType:
+                raise RuntimeError(f"{target}: incompatible state type for {field.name}")
         join_clause = " AND ".join(
             f"t.`{column}` <=> s.`{column}`" for column in cfg["keys"]
         )

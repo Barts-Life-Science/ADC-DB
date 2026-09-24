@@ -37,6 +37,18 @@
 # MAGIC Distinct from the legacy 4_prod.pacs_dlt/4_prod.pacs lane (Mill-spine imaging_metadata).
 # MAGIC Report text here is net-new (legacy imaging_report text columns are 100% NULL).
 # MAGIC
+# MAGIC v3.2 (2026-09-24, PACS integration S1): additive only - no key, grain or scope change.
+# MAGIC Sectra extraction accession (SECTRA_ACCESSION_NBR = trimmed REQUEST_ID_STRING) with
+# MAGIC format/rule provenance and per-accession candidate counts; the raw examination
+# MAGIC accession is now published verbatim; clean examination/arrival/performed dates
+# MAGIC (future and the 2099-01-01 sentinel NULLed, raw kept); resolved vs referenced report
+# MAGIC counts (a dangling bridge ReportId never sets REPORT_AVAILABLE_IND); exam-specific
+# MAGIC request-text segments only on a unique code match; a new relational table
+# MAGIC `map_pacs_exam_request_report_link` (bridge grain, dangling links retained and
+# MAGIC flagged). The dormant S4-C2 NICIP/SNOMED/OMOP branch is removed: concept assignment
+# MAGIC belongs to silver (3_lookup.trud.nicip_snomed_map, applied once); the seven concept
+# MAGIC columns stay NULL for schema compatibility.
+# MAGIC
 # MAGIC v3 TRANSITION NOTE: the v2.1 layout (7 native-grain tables) is schema-incompatible;
 # MAGIC before the first v3 run, DROP the old map_pacs_* tables and delete their
 # MAGIC pacs_pipeline_state rows (see the plan's migration step).
@@ -44,6 +56,10 @@
 # COMMAND ----------
 
 # MAGIC %run ./_bronze_common
+
+# COMMAND ----------
+
+# MAGIC %run ./_pacs_accession_rules
 
 # COMMAND ----------
 
@@ -93,6 +109,7 @@ MILL_PERSON      = f"{RAW}.mill_person"
 TGT_PATIENT_LINK = f"{TARGET_SCHEMA}.map_pacs_patient_link"
 TGT_EXAMINATION  = f"{TARGET_SCHEMA}.map_pacs_examination"
 TGT_REPORT       = f"{TARGET_SCHEMA}.map_pacs_report"
+TGT_LINK         = f"{TARGET_SCHEMA}.map_pacs_exam_request_report_link"
 STATE_TABLE      = f"{bronze_control_schema(TARGET_SCHEMA)}.pacs_pipeline_state"
 AUDIT_TABLE      = f"{bronze_control_schema(TARGET_SCHEMA)}.pacs_pipeline_audit"
 
@@ -102,10 +119,16 @@ MRN_ALIAS_TYPE, NHS_ALIAS_TYPE = 10, 18
 # are booking/cancelled ghosts (<1-16% report linkage; status 40 holds the post-halt
 # pre-booked rows) and are published only when another evidence signal fires.
 PERFORMED_STATUS_CDS = (100, 110, 75, 83)
+# Clinical-date quality (v3.2). Raw timestamps are preserved; *_CLEAN is NULL for values
+# after the build clock (future bookings), before 1901, or at/after the 2099-01-01 estate
+# sentinel. No scheduled/request/report/load time is ever substituted.
+DATE_SENTINEL_FLOOR = "1901-01-01"
+DATE_SENTINEL_CEILING = "2099-01-01"
 # Bump when transformation logic changes (renames, linkage rules, cleaners, scope
 # filters): it is folded into every target's gate fingerprint, so a code change forces
 # a re-gate even when sources are unchanged. Mode widgets are folded in the same way.
-PIPELINE_LOGIC_VERSION = "2026.08.v3.1"
+PIPELINE_LOGIC_VERSION = "2026.09.v3.2"
+# PACS_PIPELINE_V3_2_PATCHED
 
 # Raw PACS sources are gated on content fingerprint (count|max ADC_UPDT), not Delta
 # version: the upstream IncrUpdtV2_Upsert job commits delete-flag-only MERGEs that
@@ -419,9 +442,13 @@ def assert_unique_non_null(df, keys, label):
 
 
 def ensure_cdf(table):
+    """Ensure the reader-facing Delta features silver depends on: change data feed AND
+    row tracking. A missing row-tracking flag fails every incremental MV reading this
+    table, so it is repaired on every run rather than left to a one-off ALTER."""
     props = spark.sql(f"DESCRIBE DETAIL {qname(table)}").collect()[0]["properties"] or {}
-    if str(props.get("delta.enableChangeDataFeed", "false")).lower() != "true":
-        spark.sql(f"ALTER TABLE {qname(table)} SET TBLPROPERTIES ('delta.enableChangeDataFeed'='true')")
+    for _prop in ("delta.enableChangeDataFeed", "delta.enableRowTracking"):
+        if str(props.get(_prop, "false")).lower() != "true":
+            spark.sql(f"ALTER TABLE {qname(table)} SET TBLPROPERTIES ('{_prop}'='true')")
 
 
 def record_checkpoints(target, gates, output_rows):
@@ -447,6 +474,26 @@ def record_checkpoints(target, gates, output_rows):
     )
 
 
+def evolve_additive_schema(target, staged):
+    """_bronze_common disables Delta schema auto-merge, so columns added by a logic
+    version are added explicitly here. Additive only: a staged column missing from the
+    target is added; a target column absent from the stage, or a type change, aborts
+    before any write (no drops, renames or retypes on the steady-state path)."""
+    have = {f.name.lower(): f.dataType.simpleString() for f in spark.table(target).schema.fields}
+    want = {f.name.lower(): (f.name, f.dataType.simpleString()) for f in staged.schema.fields}
+    retyped = sorted(c for c, (_, t) in want.items() if c in have and have[c] != t)
+    dropped = sorted(c for c in have if c not in want and not c.startswith("anon_"))
+    assert not retyped and not dropped, (
+        f"{target}: non-additive schema change - retyped={retyped} dropped={dropped}; "
+        "stage an explicit migration instead")
+    added = [(n, t) for c, (n, t) in want.items() if c not in have]
+    if added:
+        spark.sql(f"ALTER TABLE {qname(target)} ADD COLUMNS ("
+                  + ", ".join(f"{qident(n)} {t}" for n, t in added) + ")")
+        audit(target, "SCHEMA_ADDITIVE", {"added": [n for n, _ in added]})
+    return [n for n, _ in added]
+
+
 def pacs_update_table(df, target, keys, gates):
     """Full-snapshot upsert: row hashes, change-gated update + resurrection,
     SOURCE_PRESENT_IND soft-deletes, checkpoint recording.
@@ -466,10 +513,12 @@ def pacs_update_table(df, target, keys, gates):
     staged = spark.table(staging_table)
     output_rows = staged.count()
     if not bronze_table_exists(target):
-        staged.write.format("delta").option("delta.enableChangeDataFeed", "true").saveAsTable(target)
+        (staged.write.format("delta").option("delta.enableChangeDataFeed", "true")
+         .option("delta.enableRowTracking", "true").saveAsTable(target))
         metrics = {"operation": "CREATE", "rows": int(output_rows)}
     else:
         ensure_cdf(target)
+        evolve_additive_schema(target, staged)
         # Soft-delete tripwire BEFORE the merge: present target rows whose keys are
         # absent from the staged snapshot are exactly the rows the merge WOULD
         # soft-delete. A mass disappearance (e.g. an empty upstream extract slice)
@@ -872,6 +921,78 @@ print("[PACS] accession cleaner tests passed")
 
 # COMMAND ----------
 
+# v3.2: shared Sectra/Cerner accession rules (from _pacs_accession_rules) - fail fast.
+assert_accession_rules()
+
+REQUEST_SEGMENT_HEADER = "-{3,}[ ]*([A-Za-z0-9_]+)[ ]*-{3,}"
+
+
+def request_segment_sql(text_col, code_col, request_code_count_col):
+    """(segment, status) SQL for one request-text field.
+
+    Request text is request-wide; multi-exam requests carry '----- <EXAMCODE> ------'
+    headers. A segment is exam-specific ONLY when the exam code heads exactly one
+    segment AND exactly one examination on the request carries that code. Otherwise the
+    segment is NULL and the status says why - request-wide text is never relabelled."""
+    hdr = "'" + REQUEST_SEGMENT_HEADER + "'"
+    headers = f"transform(regexp_extract_all({text_col}, {hdr}, 1), x -> upper(x))"
+    code = f"upper(trim({code_col}))"
+    n_match = f"size(filter({headers}, x -> x = {code}))"
+    status = (f"CASE WHEN {text_col} IS NULL OR trim({text_col}) = '' THEN 'NO_TEXT' "
+              f"WHEN size({headers}) = 0 THEN 'NOT_SEGMENTED' "
+              f"WHEN {code} IS NULL OR {code} = '' THEN 'NO_EXAM_CODE' "
+              f"WHEN {n_match} = 0 THEN 'CODE_NOT_IN_SEGMENTS' "
+              f"WHEN {n_match} > 1 THEN 'DUPLICATE_SEGMENT_CODE' "
+              f"WHEN {request_code_count_col} > 1 THEN 'DUPLICATE_EXAM_CODE_ON_REQUEST' "
+              f"ELSE 'EXAM_SEGMENT' END")
+    # Strip surrounding whitespace incl. CR/LF (SQL trim() strips spaces only).
+    segment = (f"CASE WHEN ({status}) = 'EXAM_SEGMENT' THEN nullif(regexp_replace(element_at("
+               f"split({text_col}, {hdr}), CAST(array_position({headers}, {code}) + 1 AS INT)), "
+               "'^[ \t\r\n]+|[ \t\r\n]+$', ''), '') END")
+    return segment, status
+
+
+# (text, exam code, exams on the request with that code, expected segment, expected status)
+REQUEST_SEGMENT_FIXTURE = [
+    ("----- XCHES ------\nClinical Question: cough\n----- XHIPR ------\nClinical Question: fall",
+     "XCHES", 1, "Clinical Question: cough", "EXAM_SEGMENT"),
+    ("----- XCHES ------\nClinical Question: cough\n----- XHIPR ------\nClinical Question: fall",
+     "xhipr", 1, "Clinical Question: fall", "EXAM_SEGMENT"),
+    ("----- XCHES ------\nq1\n----- XHIPR ------\nq2", "XKNER", 1, None, "CODE_NOT_IN_SEGMENTS"),
+    ("----- XCHES ------\nq1\n----- XCHES ------\nq2", "XCHES", 1, None, "DUPLICATE_SEGMENT_CODE"),
+    ("----- XCHES ------\nq1\n----- XHIPR ------\nq2", "XCHES", 2, None, "DUPLICATE_EXAM_CODE_ON_REQUEST"),
+    ("Clinical Question: whole request text", "XCHES", 1, None, "NOT_SEGMENTED"),
+    ("----- XCHES ------\nq1", None, 1, None, "NO_EXAM_CODE"),
+    ("   ", "XCHES", 1, None, "NO_TEXT"),
+    (None, "XCHES", 1, None, "NO_TEXT"),
+    ("----- CNCAPC ------\r\nline one\r\nline two\r\n", "CNCAPC", 1, "line one\r\nline two", "EXAM_SEGMENT"),
+]
+_seg_sql, _seg_status_sql = request_segment_sql("t", "c", "n")
+_seg_rows = (spark.createDataFrame([(i,) + r[:3] for i, r in enumerate(REQUEST_SEGMENT_FIXTURE)],
+                                   "i int, t string, c string, n int")
+             .select("i", F.expr(_seg_sql).alias("seg"), F.expr(_seg_status_sql).alias("st"))
+             .orderBy("i").collect())
+for _r, _exp in zip(_seg_rows, REQUEST_SEGMENT_FIXTURE):
+    assert (_r["seg"], _r["st"]) == (_exp[3], _exp[4]), f"request segment case {_r['i']}: {(_r['seg'], _r['st'])}"
+print(f"[PACS] request segment tests passed ({len(REQUEST_SEGMENT_FIXTURE)} cases)")
+
+
+def with_clean_dates(df, cols):
+    """C_FUTURE_IND / C_SENTINEL_IND / C_CLEAN per timestamp column (raw retained).
+    FUTURE is judged against the build clock; the fingerprint gate means a future row is
+    re-judged on the next source change (weekly), and silver re-applies its own as-of."""
+    for c in cols:
+        fut = F.col(c) > F.current_timestamp()
+        sen = ((F.col(c) < F.lit(DATE_SENTINEL_FLOOR).cast("timestamp"))
+               | (F.col(c) >= F.lit(DATE_SENTINEL_CEILING).cast("timestamp")))
+        df = (df.withColumn(f"{c}_FUTURE_IND", F.when(F.col(c).isNotNull(), fut))
+                .withColumn(f"{c}_SENTINEL_IND", F.when(F.col(c).isNotNull(), sen))
+                .withColumn(f"{c}_CLEAN", F.when(fut | sen, F.lit(None).cast("timestamp"))
+                                           .otherwise(F.col(c))))
+    return df
+
+# COMMAND ----------
+
 def build_examinations(gates) -> DataFrame:
     e = read_pinned(SRC_EXAMS, gates).select(
         F.col("ExaminationId").cast("long").alias("PACS_EXAMINATION_ID"),
@@ -898,7 +1019,9 @@ def build_examinations(gates) -> DataFrame:
         F.col("ADC_UPDT").alias("SRC_ADC_UPDT"),
     )
     e = with_mill_link_ref(e, "_accn_raw", "EXAMINATION_ID_STRING", "_exam_text1")
-    e = e.drop("_accn_raw", "_exam_text1")
+    # v3.2: the raw examination accession is published verbatim as evidence (it is an
+    # identifier - IG-tagged 4/2 - and never a join key: 59.4% VALUE_TOO_LONG).
+    e = e.withColumnRenamed("_accn_raw", "EXAMINATION_ACCESSION_NBR_RAW").drop("_exam_text1")
 
     # Request context folded on (94.0% of requests have exactly one exam; multi-exam
     # requests legitimately repeat their question/anamnesis on each exam row).
@@ -913,7 +1036,31 @@ def build_examinations(gates) -> DataFrame:
     assert verify_unique_key(req, ["PACS_REQUEST_ID"]) == 0
     e = e.join(req, "PACS_REQUEST_ID", "left")
 
-    # Report rollup via the bridge. REPORT_COUNT counts ALL linked ReportIds (incl.
+    # v3.2 Sectra extraction accession: the trimmed REQUEST_ID_STRING, classified by the
+    # shared rules. MILL_LINK_REF keeps its meaning (a Mill join aid, not the accession).
+    _acc_sql, _fmt_sql = sectra_accession_sql("REQUEST_ID_STRING")
+    e = (e.withColumn("SECTRA_ACCESSION_NBR", F.expr(_acc_sql))
+          .withColumn("ACCESSION_FORMAT", F.expr(_fmt_sql))
+          .withColumn("ACCESSION_PARSE_METHOD",
+                      F.when(F.col("SECTRA_ACCESSION_NBR").isNotNull(), F.lit("REQUEST_ID_STRING_TRIMMED"))
+                       .otherwise(F.lit("NO_REQUEST_ID_STRING")))
+          .withColumn("ACCESSION_RULE_VERSION", F.lit(ACCESSION_RULE_VERSION)))
+
+    # Exam-specific request-text segments. The code multiplicity is counted over ALL raw
+    # exams on the request (before the evidence filter) so a booked twin still blocks.
+    _req_code_n = (e.where(F.col("PACS_REQUEST_ID").isNotNull())
+                   .groupBy("PACS_REQUEST_ID",
+                            F.upper(F.trim(F.col("EXAMINATION_CODE"))).alias("_REQ_CODE"))
+                   .agg(F.count(F.lit(1)).alias("_REQ_CODE_N")))
+    e = (e.withColumn("_REQ_CODE", F.upper(F.trim(F.col("EXAMINATION_CODE"))))
+          .join(_req_code_n, ["PACS_REQUEST_ID", "_REQ_CODE"], "left"))
+    for _src, _out in (("CLINICAL_QUESTION", "CLINICAL_QUESTION_EXAM_SEGMENT"),
+                       ("CLINICAL_ANAMNESIS", "CLINICAL_ANAMNESIS_EXAM_SEGMENT")):
+        _seg, _st = request_segment_sql(_src, "EXAMINATION_CODE", "coalesce(_REQ_CODE_N, 1)")
+        e = e.withColumn(_out, F.expr(_seg)).withColumn(f"{_src}_SEGMENT_STATUS", F.expr(_st))
+    e = e.drop("_REQ_CODE", "_REQ_CODE_N")
+
+    # Report rollup via the bridge. REPORT_COUNT (= REPORT_REF_COUNT) counts ALL linked ReportIds (incl.
     # ~1.05M ids dangling against the frozen reports mirror - a dangling link still
     # evidences the exam was reported); LATEST_* resolve only against real report rows.
     br = (read_pinned(SRC_EXAM_REPORTS, gates)
@@ -930,15 +1077,22 @@ def build_examinations(gates) -> DataFrame:
     rollup = (br.join(rep, "_rid", "left")
               .groupBy("PACS_EXAMINATION_ID")
               .agg(F.countDistinct("_rid").cast("int").alias("REPORT_COUNT"),
+                   F.countDistinct(F.when(F.col("_resolved"), F.col("_rid"))).cast("int")
+                    .alias("REPORT_COUNT_RESOLVED"),
                    F.max(F.when(F.col("_resolved"), F.struct(
                        F.coalesce(F.col("_rdate"), F.to_timestamp(F.lit("1000-01-01"))).alias("d"),
                        F.col("_rid").alias("i")))).alias("_latest"),
                    F.max(F.when(F.col("_resolved"), F.col("_rdate"))).alias("LATEST_REPORT_DT_TM")))
-    rollup = rollup.select("PACS_EXAMINATION_ID", "REPORT_COUNT",
+    rollup = rollup.select("PACS_EXAMINATION_ID", "REPORT_COUNT", "REPORT_COUNT_RESOLVED",
                            F.col("_latest.i").alias("LATEST_REPORT_ID"),
                            "LATEST_REPORT_DT_TM")
     e = (e.join(rollup, "PACS_EXAMINATION_ID", "left")
-          .withColumn("REPORT_COUNT", F.coalesce(F.col("REPORT_COUNT"), F.lit(0)).cast("int")))
+          .withColumn("REPORT_COUNT", F.coalesce(F.col("REPORT_COUNT"), F.lit(0)).cast("int"))
+          .withColumn("REPORT_REF_COUNT", F.col("REPORT_COUNT"))
+          .withColumn("REPORT_COUNT_RESOLVED",
+                      F.coalesce(F.col("REPORT_COUNT_RESOLVED"), F.lit(0)).cast("int"))
+          # A dangling bridge id is reporting evidence but never report availability.
+          .withColumn("REPORT_AVAILABLE_IND", F.col("REPORT_COUNT_RESOLVED") > 0))
 
     # Series rollup: measured counts from the object-grain table (multiple rows per
     # SeriesInstanceUid). Coverage ends at the 2024-11-02 series freeze - NULL for
@@ -978,181 +1132,63 @@ def build_examinations(gates) -> DataFrame:
         "PERFORMED_EVIDENCE",
         F.concat_ws(",", *[F.when(cond, F.lit(tag)) for cond, tag in _signals]))
     e = e.where(F.col("PERFORMED_EVIDENCE") != "")
-    # S4-C2 BEGIN
-    # NHSI is unconditional. NICIP stays schema-stable but NULL until the canonical
-    # TRUD lookup exists; once present, active NICIP rows resolve through SNOMED and
-    # the deterministic OMOP standard-concept contract.
-    _s4_exam_code_norm = "_S4_EXAMINATION_CODE_NORM"
-    e = e.withColumn(
-        _s4_exam_code_norm,
-        F.upper(F.trim(F.col("EXAMINATION_CODE"))),
-    )
+    # v3.2: the publication filter is unchanged. PERFORMED_EVIDENCE_VERIFIED_IND is the
+    # stricter signal silver's default eligibility uses: a dangling-only report link is
+    # NOT verified, and status 40 (booking) is never performed evidence on its own.
+    e = e.withColumn("PERFORMED_EVIDENCE_VERIFIED_IND",
+                     F.col("EXAMINATION_STATUS_CD").isin(*PERFORMED_STATUS_CDS)
+                     | (F.col("REPORT_COUNT_RESOLVED") > 0)
+                     | (F.coalesce(F.col("IMAGE_COUNT"), F.lit(0)) > 0)
+                     | (F.coalesce(F.col("SERIES_OBJECT_COUNT"), F.lit(0)) > 0))
 
-    _s4_nhsi = (
-        spark.table("3_lookup.dwh.nhsi_exam_mapping")
-        .select(
-            F.col("EXAM_TYPE_CODE").alias(_s4_exam_code_norm),
-            F.col("NHSI_MAPPING").alias("NHSI_MODALITY_CATEGORY"),
-        )
-    )
-    e = e.join(F.broadcast(_s4_nhsi), _s4_exam_code_norm, "left")
+    # Clinical dates: raw kept; CLEAN NULLs future/sentinel values. The performed time is
+    # the clean examination time, else the clean arrival time (silver's existing fallback),
+    # with provenance; nothing else is substituted.
+    e = with_clean_dates(e, ["EXAMINATION_DT_TM", "ARRIVAL_DT_TM"])
+    e = (e.withColumn("PERFORMED_DT_TM_CLEAN",
+                      F.coalesce(F.col("EXAMINATION_DT_TM_CLEAN"), F.col("ARRIVAL_DT_TM_CLEAN")))
+          .withColumn("PERFORMED_DT_TM_SOURCE",
+                      F.when(F.col("EXAMINATION_DT_TM_CLEAN").isNotNull(), F.lit("EXAMINATION_DT_TM"))
+                       .when(F.col("ARRIVAL_DT_TM_CLEAN").isNotNull(), F.lit("ARRIVAL_DT_TM"))))
+    # NHSI modality category (unconditional, unchanged).
+    _exam_code_norm = "_EXAMINATION_CODE_NORM"
+    _nhsi = (spark.table("3_lookup.dwh.nhsi_exam_mapping")
+             .select(F.col("EXAM_TYPE_CODE").alias(_exam_code_norm),
+                     F.col("NHSI_MAPPING").alias("NHSI_MODALITY_CATEGORY")))
+    e = (e.withColumn(_exam_code_norm, F.upper(F.trim(F.col("EXAMINATION_CODE"))))
+          .join(F.broadcast(_nhsi), _exam_code_norm, "left")
+          .drop(_exam_code_norm))
+    # v3.2: the dormant S4-C2 NICIP/SNOMED/OMOP branch (it read the absent
+    # 3_lookup.trud.maps_nicipsctmap) is removed. Bronze does not assign concepts: silver
+    # applies 3_lookup.trud.nicip_snomed_map once. These legacy columns stay NULL so the
+    # schema and every consumer's column list are unchanged.
+    for _legacy, _type in (("NICIP_SNOMED_CODE", "string"), ("SNOMED_CONCEPT_ID", "long"),
+                           ("OMOP_STANDARD_CONCEPT_ID", "long"), ("OMOP_STANDARD_CONCEPT_NAME", "string"),
+                           ("OMOP_STANDARD_CANDIDATE_COUNT", "long"),
+                           ("OMOP_STANDARD_MAPPING_METHOD", "string"),
+                           ("PROCEDURE_MAPPING_METHOD", "string")):
+        e = e.withColumn(_legacy, F.lit(None).cast(_type))
 
-    _s4_nicip_table = "3_lookup.trud.maps_nicipsctmap"
-    if bronze_table_exists(_s4_nicip_table):
-        _s4_nicip = (
-            spark.table(_s4_nicip_table)
-            .where(F.col("IS_ACTIVE") == F.lit(True))
-            .select(
-                F.col("NICIP_CODE_NORM").alias(_s4_exam_code_norm),
-                F.col("SNOMED_CODE").alias("NICIP_SNOMED_CODE"),
-                F.lit(True).alias("_S4_NICIP_MATCHED"),
-            )
-        )
-        e = e.join(F.broadcast(_s4_nicip), _s4_exam_code_norm, "left")
+    e = join_person(e, "PACS_PATIENT_ID", gates)
 
-        _s4_snomed_concepts = (
-            spark.table("4_prod.omop.concept")
-            .where(F.col("vocabulary_id") == F.lit("SNOMED"))
-            .select(
-                F.col("concept_code").alias("NICIP_SNOMED_CODE"),
-                F.col("concept_id").cast("long").alias("SNOMED_CONCEPT_ID"),
-                F.col("standard_concept").alias("_S4_SNOMED_STANDARD"),
-            )
-        )
-        e = e.join(_s4_snomed_concepts, "NICIP_SNOMED_CODE", "left")
-
-        _s4_source_concepts = (
-            e.select("SNOMED_CONCEPT_ID")
-            .where(F.col("SNOMED_CONCEPT_ID").isNotNull())
-            .distinct()
-        )
-        _s4_maps_to = (
-            _s4_source_concepts.alias("src")
-            .join(
-                spark.table("4_prod.omop.concept_relationship").alias("cr"),
-                F.col("src.SNOMED_CONCEPT_ID") == F.col("cr.concept_id_1"),
-                "left",
-            )
-            .join(
-                spark.table("4_prod.omop.concept").alias("dst"),
-                (F.col("cr.concept_id_2") == F.col("dst.concept_id"))
-                & (F.col("dst.standard_concept") == F.lit("S")),
-                "left",
-            )
-            .where(
-                (F.col("cr.relationship_id") == F.lit("Maps to"))
-                & F.col("cr.invalid_reason").isNull()
-                & F.col("dst.concept_id").isNotNull()
-            )
-            .select(
-                F.col("src.SNOMED_CONCEPT_ID").alias("SNOMED_CONCEPT_ID"),
-                F.col("dst.concept_id").cast("long").alias("_S4_STANDARD_CANDIDATE_ID"),
-            )
-            .distinct()
-            .groupBy("SNOMED_CONCEPT_ID")
-            .agg(
-                F.countDistinct("_S4_STANDARD_CANDIDATE_ID").cast("long").alias(
-                    "_S4_STANDARD_CANDIDATE_COUNT"
-                ),
-                F.min("_S4_STANDARD_CANDIDATE_ID").cast("long").alias(
-                    "_S4_ONLY_STANDARD_CONCEPT_ID"
-                ),
-            )
-        )
-        e = e.join(_s4_maps_to, "SNOMED_CONCEPT_ID", "left")
-        e = (
-            e.withColumn(
-                "OMOP_STANDARD_CONCEPT_ID",
-                F.when(
-                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
-                    F.col("SNOMED_CONCEPT_ID"),
-                )
-                .when(
-                    F.col("_S4_STANDARD_CANDIDATE_COUNT") == F.lit(1),
-                    F.col("_S4_ONLY_STANDARD_CONCEPT_ID"),
-                )
-                .cast("long"),
-            )
-            .withColumn(
-                "OMOP_STANDARD_CANDIDATE_COUNT",
-                F.when(
-                    F.col("SNOMED_CONCEPT_ID").isNull(),
-                    F.lit(None).cast("long"),
-                )
-                .when(
-                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
-                    F.lit(1).cast("long"),
-                )
-                .otherwise(
-                    F.coalesce(
-                        F.col("_S4_STANDARD_CANDIDATE_COUNT"),
-                        F.lit(0).cast("long"),
-                    )
-                ),
-            )
-            .withColumn(
-                "OMOP_STANDARD_MAPPING_METHOD",
-                F.when(
-                    F.col("SNOMED_CONCEPT_ID").isNull(),
-                    F.lit(None).cast("string"),
-                )
-                .when(
-                    F.col("_S4_SNOMED_STANDARD") == F.lit("S"),
-                    F.lit("ALREADY_STANDARD"),
-                )
-                .when(
-                    F.col("_S4_STANDARD_CANDIDATE_COUNT") == F.lit(1),
-                    F.lit("MAPS_TO_EXACT"),
-                )
-                .when(
-                    F.col("_S4_STANDARD_CANDIDATE_COUNT") > F.lit(1),
-                    F.lit("MAPS_TO_MULTI"),
-                )
-                .otherwise(F.lit("NO_STANDARD_MAP")),
-            )
-            .withColumn(
-                "PROCEDURE_MAPPING_METHOD",
-                F.when(
-                    F.col(_s4_exam_code_norm).isNull(),
-                    F.lit("NONE_NO_CODE"),
-                )
-                .when(F.col("_S4_NICIP_MATCHED"), F.lit("NICIP_TRUD"))
-                .otherwise(F.lit("NONE_NO_NICIP_MATCH")),
-            )
-        )
-
-        _s4_standard_names = (
-            spark.table("4_prod.omop.concept")
-            .where(F.col("standard_concept") == F.lit("S"))
-            .select(
-                F.col("concept_id").cast("long").alias("OMOP_STANDARD_CONCEPT_ID"),
-                F.col("concept_name").alias("OMOP_STANDARD_CONCEPT_NAME"),
-            )
-        )
-        e = e.join(_s4_standard_names, "OMOP_STANDARD_CONCEPT_ID", "left")
-        e = e.drop(
-            "_S4_NICIP_MATCHED",
-            "_S4_SNOMED_STANDARD",
-            "_S4_STANDARD_CANDIDATE_COUNT",
-            "_S4_ONLY_STANDARD_CONCEPT_ID",
-        )
-    else:
-        e = (
-            e.withColumn("NICIP_SNOMED_CODE", F.lit(None).cast("string"))
-            .withColumn("SNOMED_CONCEPT_ID", F.lit(None).cast("long"))
-            .withColumn("OMOP_STANDARD_CONCEPT_ID", F.lit(None).cast("long"))
-            .withColumn("OMOP_STANDARD_CONCEPT_NAME", F.lit(None).cast("string"))
-            .withColumn("OMOP_STANDARD_CANDIDATE_COUNT", F.lit(None).cast("long"))
-            .withColumn("OMOP_STANDARD_MAPPING_METHOD", F.lit(None).cast("string"))
-            .withColumn("PROCEDURE_MAPPING_METHOD", F.lit(None).cast("string"))
-        )
-
-    # pacs_update_table derives staged INSERT/UPDATE values from df.columns, so these
-    # eight columns flow through its existing write/MERGE path without another list.
-    e = e.drop(_s4_exam_code_norm)
-    # S4-C2 END
-
-    return join_person(e, "PACS_PATIENT_ID", gates)
+    # Per-accession candidate counts over PUBLISHED exams: one accession can hold several
+    # examinations/studies; a multi-person accession is an identity conflict (queryable,
+    # ineligible by default in silver). Never resolved by picking a row.
+    _acc = (e.where(F.col("SECTRA_ACCESSION_NBR").isNotNull())
+            .groupBy("SECTRA_ACCESSION_NBR")
+            .agg(F.count(F.lit(1)).cast("int").alias("ACCESSION_EXAM_COUNT"),
+                 F.countDistinct("STUDY_INSTANCE_UID").cast("int").alias("ACCESSION_STUDY_UID_COUNT"),
+                 F.countDistinct("PERSON_ID").cast("int").alias("_ACC_PERSONS"),
+                 F.max(F.col("PERSON_ID").isNull().cast("int")).alias("_ACC_UNMATCHED")))
+    e = (e.join(_acc, "SECTRA_ACCESSION_NBR", "left")
+          .withColumn("ACCESSION_IDENTITY_STATUS",
+                      F.when(F.col("SECTRA_ACCESSION_NBR").isNull(), F.lit("NO_ACCESSION"))
+                       .when(F.col("_ACC_PERSONS") > 1, F.lit("CONFLICTING_PERSONS"))
+                       .when(F.col("_ACC_PERSONS") == 0, F.lit("NO_PERSON"))
+                       .when(F.col("_ACC_UNMATCHED") == 1, F.lit("SINGLE_PERSON_PARTIAL"))
+                       .otherwise(F.lit("SINGLE_PERSON")))
+          .drop("_ACC_PERSONS", "_ACC_UNMATCHED"))
+    return e
 
 
 EXAMINATION_COMMENTS = {
@@ -1163,10 +1199,27 @@ EXAMINATION_COMMENTS = {
     "PERSON_MATCH_STATUS": "Crosswalk status for PACS_PATIENT_ID (MATCHED/AMBIGUOUS/NO_ALIAS_MATCH/ANONYMIZED/NO_IDENTIFIER; NULL = patient row absent).",
     "EXAMINATION_ID_STRING": "Sectra exam id string (UK+site+11 digits on 9.67M rows; legacy numerics otherwise). NOT unique.",
     "REQUEST_ID_STRING": "Sectra request id string - the request-side Mill accession join key (pacs_dlt-proven: RequestIdString = parsed Mill accession).",
-    "MILL_LINK_REF": "Cleaned best-effort reference for joining Mill radiology events (BLT_TIE_RAD accession domain); see MILL_LINK_REF_METHOD. Raw ExaminationAccessionNumber is NOT published (59.4% literal VALUE_TOO_LONG, 12.5% doubled legacy).",
+    "MILL_LINK_REF": "Cleaned best-effort reference for joining Mill radiology events (BLT_TIE_RAD accession domain); see MILL_LINK_REF_METHOD. NOT the Sectra extraction accession - use SECTRA_ACCESSION_NBR. Raw value in EXAMINATION_ACCESSION_NBR_RAW.",
+    "EXAMINATION_ACCESSION_NBR_RAW": "Raw Sectra ExaminationAccessionNumber, VERBATIM (v3.2). Evidence only - 59.4% literal VALUE_TOO_LONG, 12.5% doubled legacy; never a join key. Identifier.",
+    "SECTRA_ACCESSION_NBR": "Sectra extraction accession = trimmed REQUEST_ID_STRING (DICOM 0008,0050 of the Sectra export; v3.2). Scopes an extraction REQUEST: one accession can hold several examinations and STUDY_INSTANCE_UIDs. Leading zeros preserved. NULL when REQUEST_ID_STRING is blank/VALUE_TOO_LONG.",
+    "ACCESSION_FORMAT": "Shared accession classifier (_pacs_accession_rules): SECTRA_16 | SITE_16 | RNH_14 | OTHER_SITE_14 | NUMERIC_16 | LEGACY_7_8 | LEGACY_6 | NUMERIC_OTHER | OTHER (value not wholly one format) | NULL (no accession).",
+    "ACCESSION_PARSE_METHOD": "REQUEST_ID_STRING_TRIMMED | NO_REQUEST_ID_STRING - provenance of SECTRA_ACCESSION_NBR.",
+    "ACCESSION_RULE_VERSION": "Version of the shared accession rules that classified this row.",
+    "ACCESSION_EXAM_COUNT": "Published examinations sharing SECTRA_ACCESSION_NBR (candidate count; >1 = multi-exam request).",
+    "ACCESSION_STUDY_UID_COUNT": "Distinct STUDY_INSTANCE_UIDs among published examinations sharing SECTRA_ACCESSION_NBR.",
+    "ACCESSION_IDENTITY_STATUS": "SINGLE_PERSON | SINGLE_PERSON_PARTIAL (some members unmatched) | CONFLICTING_PERSONS (>1 PERSON_ID - identity conflict, never resolved by choice) | NO_PERSON | NO_ACCESSION.",
     "MILL_LINK_REF_METHOD": "ACCESSION_CLEANED | ID_STRING | EXAM_TEXT1 | NONE - provenance of MILL_LINK_REF.",
     "STUDY_INSTANCE_UID": "DICOM StudyInstanceUID (near-unique; the PACS image-retrieval key).",
-    "EXAMINATION_DT_TM": "Examination timestamp. Source carries junk extremes (1753-01-03..2099-01-01) - preserved, not cleaned.",
+    "EXAMINATION_DT_TM": "Examination timestamp, RAW. Source carries future bookings and junk extremes (1753-01-03..2099-01-01 sentinel) - preserved; see EXAMINATION_DT_TM_CLEAN.",
+    "EXAMINATION_DT_TM_FUTURE_IND": "EXAMINATION_DT_TM after the pipeline build clock (booking). NULL when the raw value is NULL.",
+    "EXAMINATION_DT_TM_SENTINEL_IND": "EXAMINATION_DT_TM before 1901-01-01 or at/after the 2099-01-01 estate sentinel.",
+    "EXAMINATION_DT_TM_CLEAN": "EXAMINATION_DT_TM, NULL when future or sentinel. Never substituted from another clock.",
+    "ARRIVAL_DT_TM_FUTURE_IND": "ARRIVAL_DT_TM after the pipeline build clock.",
+    "ARRIVAL_DT_TM_SENTINEL_IND": "ARRIVAL_DT_TM before 1901-01-01 or at/after 2099-01-01.",
+    "ARRIVAL_DT_TM_CLEAN": "ARRIVAL_DT_TM, NULL when future or sentinel.",
+    "PERFORMED_DT_TM_CLEAN": "Valid performed time: EXAMINATION_DT_TM_CLEAN, else ARRIVAL_DT_TM_CLEAN (the documented fallback). NULL = no valid performed time (excluded from default selection in silver).",
+    "PERFORMED_DT_TM_SOURCE": "EXAMINATION_DT_TM | ARRIVAL_DT_TM | NULL - which clean clock PERFORMED_DT_TM_CLEAN came from.",
+    "PERFORMED_EVIDENCE_VERIFIED_IND": "Performed status (100/110/75/83) OR >=1 RESOLVED report OR ImageCount>0 OR series objects. A dangling-only report link and status 40 (booking) are NOT verified evidence.",
     "ARRIVAL_DT_TM": "Patient arrival time where recorded.",
     "EXAMINATION_STATUS_CD": "Sectra lifecycle status. Performed set = 100/110/75/83; other codes appear only when another evidence signal fired (see PERFORMED_EVIDENCE).",
     "PERFORMED_EVIDENCE": "Why this row is published: comma-set of STATUS (performed status code), REPORT (>=1 bridge report link), IMAGES (native ImageCount>0), SERIES (series objects exist). Booking/cancelled ghosts with no signal are excluded from bronze (raw retains them).",
@@ -1174,9 +1227,16 @@ EXAMINATION_COMMENTS = {
     "DOSE_INFORMATION": "Radiation dose free text, verbatim.",
     "REFERRING_UNIT": "Referring unit of the originating request (referring physician NAME excluded - staff PII).",
     "RIS_HOST_ID": "Originating RIS feed of the request: BROKER-RISe 8.7M | MDI-WHIPPS-MIGRATION 2.5M | NBSS 1.0M | NEWHAM | BLT | others.",
-    "CLINICAL_QUESTION": "Request clinical question blob, VERBATIM (multi-exam requests repeat it on each exam row; sections delimited by '----- <examcode> ------').",
-    "CLINICAL_ANAMNESIS": "Request clinical information blob, VERBATIM (same repetition/delimiter convention).",
-    "REPORT_COUNT": "Distinct ReportIds linked via the exam-report bridge (incl. ids dangling vs the frozen reports mirror - reporting evidence). >1 = addenda/amendments; only the latest is pointed to here - full m:n history stays in raw.",
+    "CLINICAL_QUESTION": "Request clinical question blob, VERBATIM and REQUEST-WIDE (multi-exam requests repeat it on each exam row; sections delimited by '----- <examcode> ------'). Identifiable free text (ig_risk 4); no approved anonymised form yet.",
+    "CLINICAL_ANAMNESIS": "Request clinical information blob, VERBATIM and REQUEST-WIDE (same repetition/delimiter convention). Identifiable free text (ig_risk 4).",
+    "CLINICAL_QUESTION_EXAM_SEGMENT": "The CLINICAL_QUESTION section headed by this exam's code - set ONLY when CLINICAL_QUESTION_SEGMENT_STATUS = EXAM_SEGMENT. Identifiable free text (ig_risk 4).",
+    "CLINICAL_QUESTION_SEGMENT_STATUS": "EXAM_SEGMENT | NOT_SEGMENTED (no section headers - text is request-wide) | CODE_NOT_IN_SEGMENTS | DUPLICATE_SEGMENT_CODE | DUPLICATE_EXAM_CODE_ON_REQUEST | NO_EXAM_CODE | NO_TEXT.",
+    "CLINICAL_ANAMNESIS_EXAM_SEGMENT": "The CLINICAL_ANAMNESIS section headed by this exam's code - set ONLY when CLINICAL_ANAMNESIS_SEGMENT_STATUS = EXAM_SEGMENT. Identifiable free text (ig_risk 4).",
+    "CLINICAL_ANAMNESIS_SEGMENT_STATUS": "Same vocabulary as CLINICAL_QUESTION_SEGMENT_STATUS.",
+    "REPORT_COUNT": "Distinct ReportIds linked via the exam-report bridge (incl. dangling ids - reporting evidence). Retained for compatibility; identical to REPORT_REF_COUNT.",
+    "REPORT_REF_COUNT": "Distinct ReportIds REFERENCED by the bridge, including ids with no report row (~1.05M dangling ids historically). Never implies a report is available.",
+    "REPORT_COUNT_RESOLVED": "Distinct bridge ReportIds that resolve to a real report row. Full links: map_pacs_exam_request_report_link.",
+    "REPORT_AVAILABLE_IND": "REPORT_COUNT_RESOLVED > 0. A dangling bridge id never sets this.",
     "LATEST_REPORT_ID": "RESOLVED-ONLY FK to map_pacs_report: the linked report row with the latest ReportDate (ties -> highest id). NULL when no linked ReportId resolves to a report row (REPORT_COUNT may still be >0 via dangling links).",
     "LATEST_REPORT_DT_TM": "Latest ReportDate among RESOLVED linked reports.",
     "SERIES_COUNT": "Native Sectra series count (sparsely populated; see SERIES_COUNT_MEASURED).",
@@ -1192,6 +1252,14 @@ EXAMINATION_COMMENTS = {
     "SOURCE_PRESENT_IND": "False when the exam disappeared from the raw mirror or lost all performed-evidence (soft delete).",
     "ROW_HASH": "SHA-256 over business columns (excl. ROW_HASH/SOURCE_PRESENT_IND/ADC_UPDT).",
     "ADC_UPDT": "Timestamp this row was last inserted or changed by pacs_pipeline.",
+    "NHSI_MODALITY_CATEGORY": "NHSI modality category from 3_lookup.dwh.nhsi_exam_mapping on the upper-trimmed EXAMINATION_CODE.",
+    "NICIP_SNOMED_CODE": "LEGACY / UNPOPULATED (always NULL since v3.2). Concept assignment is done once in silver from 3_lookup.trud.nicip_snomed_map; do not use as a mapping input.",
+    "SNOMED_CONCEPT_ID": "LEGACY / UNPOPULATED (always NULL). See silver clinical_imaging_exam concept columns.",
+    "OMOP_STANDARD_CONCEPT_ID": "LEGACY / UNPOPULATED (always NULL). See silver clinical_imaging_exam.",
+    "OMOP_STANDARD_CONCEPT_NAME": "LEGACY / UNPOPULATED (always NULL).",
+    "OMOP_STANDARD_CANDIDATE_COUNT": "LEGACY / UNPOPULATED (always NULL).",
+    "OMOP_STANDARD_MAPPING_METHOD": "LEGACY / UNPOPULATED (always NULL).",
+    "PROCEDURE_MAPPING_METHOD": "LEGACY / UNPOPULATED (always NULL). Silver records mapping method/rule/version/status.",
 }
 
 _exam_gates = resolve_gates([SRC_EXAMS, SRC_REQUESTS, SRC_EXAM_REPORTS, SRC_REPORTS,
@@ -1211,7 +1279,9 @@ apply_comments(TGT_EXAMINATION, EXAMINATION_COMMENTS,
     "(measured counts, coverage to 2024-11-02) and archive rollup are folded on - no "
     "separate request/bridge/folder/series bronze tables. Excludes staff name strings "
     "and unreliable ingest metadata (ADC_Deleted - see 2026-08-01 mass-flag incident). "
-    "Upstream feed halted ~2026-04-18. Soft deletes via SOURCE_PRESENT_IND.")
+    "Sectra extraction accession = SECTRA_ACCESSION_NBR (v3.2); clean dates NULL future/"
+    "2099 sentinel values; concept columns are legacy/unpopulated (silver maps once). "
+    "Feed live again through Sep 2026. Soft deletes via SOURCE_PRESENT_IND.")
 
 # COMMAND ----------
 
@@ -1293,7 +1363,9 @@ def build_reports(gates) -> DataFrame:
                   F.col("EXAMINATION_DT_TM").alias("EXAM_DT_TM"),
                   F.col("EXAMINATION_CODE").alias("EXAM_CODE"),
                   F.col("MODALITY").alias("EXAM_MODALITY"),
-                  F.col("MILL_LINK_REF")))
+                  F.col("MILL_LINK_REF"),
+                  F.col("SECTRA_ACCESSION_NBR"),
+                  F.col("ACCESSION_FORMAT")))
     assert verify_unique_key(ex, ["PACS_EXAMINATION_ID"]) == 0
     r = r.join(ex, "PACS_EXAMINATION_ID", "left")
 
@@ -1313,6 +1385,8 @@ REPORT_COMMENTS = {
     "EXAM_CODE": "Denormalized from the resolved exam.",
     "EXAM_MODALITY": "Denormalized from the resolved exam.",
     "MILL_LINK_REF": "Denormalized from the resolved exam - cleaned Mill radiology-event join reference.",
+    "SECTRA_ACCESSION_NBR": "Denormalized from the resolved exam (single-exam reports only; v3.2). Multi-exam/request-level links: map_pacs_exam_request_report_link.",
+    "ACCESSION_FORMAT": "Denormalized from the resolved exam.",
     "PACS_PATIENT_ID": "Derived: the single distinct RequestPatientId across ALL linked requests; NULL when they disagree or none resolve.",
     "PERSON_ID": "Millennium person via map_pacs_patient_link over the derived patient; NULL when unmatched (row retained).",
     "PERSON_MATCH_STATUS": "Crosswalk status for PACS_PATIENT_ID.",
@@ -1344,6 +1418,150 @@ apply_comments(TGT_REPORT, REPORT_COMMENTS,
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Examination-request-report links (v3.2)
+# MAGIC Bridge grain: one row per (ReportId, ExaminationId-or-NONE) in pacs_examinationreports
+# MAGIC - the many-to-many relation map_pacs_report/map_pacs_examination only summarise.
+# MAGIC Links with missing counterparts are RETAINED and flagged: a dangling ReportId has
+# MAGIC REPORT_RESOLVED_IND=false (it never makes a report available); an exam absent from
+# MAGIC the curated exam table has EXAMINATION_PUBLISHED_IND=false.
+
+# COMMAND ----------
+
+def build_exam_report_links(gates) -> DataFrame:
+    br = read_pinned(SRC_EXAM_REPORTS, gates).select(
+        F.col("ExaminationReportReportId").cast("long").alias("PACS_REPORT_ID"),
+        F.col("ExaminationReportRequestId").cast("long").alias("PACS_REQUEST_ID"),
+        F.col("ExaminationReportExaminationId").cast("long").alias("PACS_EXAMINATION_ID"))
+    rep_rows = read_pinned(SRC_REPORTS, gates).select(
+        F.col("ReportId").cast("long").alias("PACS_REPORT_ID"),
+        F.col("ReportDate").alias("REPORT_DT_TM"),
+        F.col("ReportStatus").cast("int").alias("REPORT_STATUS_CD"),
+        F.lit(True).alias("REPORT_RESOLVED_IND"))
+    req = read_pinned(SRC_REQUESTS, gates).select(
+        F.col("RequestId").cast("long").alias("PACS_REQUEST_ID"),
+        F.col("RequestIdString").alias("_REQ_ID_STRING"))
+    ex = (read_pinned(TGT_EXAMINATION, gates).where(F.col("SOURCE_PRESENT_IND"))
+          .select("PACS_EXAMINATION_ID", F.lit(True).alias("EXAMINATION_PUBLISHED_IND"),
+                  F.col("SECTRA_ACCESSION_NBR").alias("_EXAM_ACCESSION"),
+                  F.col("PERSON_ID").alias("EXAMINATION_PERSON_ID")))
+    _acc_sql, _ = sectra_accession_sql("_REQ_ID_STRING")
+    out = (br.join(rep_rows, "PACS_REPORT_ID", "left")
+             .join(req, "PACS_REQUEST_ID", "left")
+             .join(ex, "PACS_EXAMINATION_ID", "left")
+             .withColumn("REPORT_RESOLVED_IND", F.coalesce(F.col("REPORT_RESOLVED_IND"), F.lit(False)))
+             .withColumn("EXAMINATION_PUBLISHED_IND",
+                         F.coalesce(F.col("EXAMINATION_PUBLISHED_IND"), F.lit(False)))
+             .withColumn("LINK_SCOPE", F.when(F.col("PACS_EXAMINATION_ID").isNotNull(), F.lit("EXAMINATION"))
+                                        .when(F.col("PACS_REQUEST_ID").isNotNull(), F.lit("REQUEST"))
+                                        .otherwise(F.lit("REPORT_ONLY")))
+             # The request's accession; the exam's accession wins when both exist (identical
+             # by construction - the exam's accession IS its request's RequestIdString).
+             .withColumn("SECTRA_ACCESSION_NBR",
+                         F.coalesce(F.col("_EXAM_ACCESSION"), F.expr(_acc_sql)))
+             .withColumn("LINK_KEY", F.concat_ws("|", F.col("PACS_REPORT_ID").cast("string"),
+                                                 F.coalesce(F.col("PACS_EXAMINATION_ID").cast("string"),
+                                                            F.lit("NONE"))))
+             .drop("_REQ_ID_STRING", "_EXAM_ACCESSION"))
+    return out
+
+
+LINK_COMMENTS = {
+    "LINK_KEY": "ReportId|ExaminationId (or |NONE for request-level attachments). MERGE key; the bridge grain is verified unique at preflight.",
+    "PACS_REPORT_ID": "Sectra ReportId as referenced by the bridge. May be DANGLING (REPORT_RESOLVED_IND=false).",
+    "PACS_REQUEST_ID": "Sectra RequestId on the bridge row.",
+    "PACS_EXAMINATION_ID": "Sectra ExaminationId on the bridge row; NULL = request-level attachment (LINK_SCOPE=REQUEST).",
+    "LINK_SCOPE": "EXAMINATION (report attached to one exam) | REQUEST (attached to the request only) | REPORT_ONLY.",
+    "REPORT_RESOLVED_IND": "True when PACS_REPORT_ID resolves to a real report row. False = dangling id: never report availability.",
+    "REPORT_DT_TM": "ReportDate of the resolved report (NULL when dangling).",
+    "REPORT_STATUS_CD": "ReportStatus of the resolved report (NULL when dangling).",
+    "EXAMINATION_PUBLISHED_IND": "True when the exam is present in map_pacs_examination (performed-evidence scope).",
+    "EXAMINATION_PERSON_ID": "PERSON_ID of the linked published exam.",
+    "SECTRA_ACCESSION_NBR": "Sectra extraction accession of the linked exam, else of the linked request.",
+    "SOURCE_PRESENT_IND": "False when the bridge row disappeared from the raw mirror (soft delete).",
+    "ROW_HASH": "SHA-256 over business columns (excl. ROW_HASH/SOURCE_PRESENT_IND/ADC_UPDT).",
+    "ADC_UPDT": "Timestamp this row was last inserted or changed by pacs_pipeline.",
+}
+
+_link_gates = resolve_gates([SRC_EXAM_REPORTS, SRC_REPORTS, SRC_REQUESTS, TGT_EXAMINATION])
+_link_metrics = {"operation": "SKIP"}
+if needs_run(TGT_LINK, _link_gates):
+    _lk = build_exam_report_links(_link_gates)
+    assert_unique_non_null(_lk, ["LINK_KEY"], "map_pacs_exam_request_report_link")
+    _link_metrics = pacs_update_table(_lk, TGT_LINK, keys=["LINK_KEY"], gates=_link_gates)
+else:
+    print("[PACS] map_pacs_exam_request_report_link: sources unchanged, skipping")
+apply_comments(TGT_LINK, LINK_COMMENTS,
+    "PACS examination-request-report links (v3.2): one row per exam-report bridge row "
+    "(pacs_examinationreports grain), many-to-many preserved. Dangling report ids and "
+    "unpublished exams are RETAINED and flagged (REPORT_RESOLVED_IND / "
+    "EXAMINATION_PUBLISHED_IND); only resolved links evidence report availability. "
+    "Soft deletes via SOURCE_PRESENT_IND.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## IG tags for v3.2 columns
+# MAGIC Diff-aware: only columns whose ig_risk/ig_severity differ are (re)tagged. Request
+# MAGIC text and its segments are identifiable free text (4/2) - raised from 3/2 on
+# MAGIC CLINICAL_QUESTION / CLINICAL_ANAMNESIS. Columns not listed keep their existing tags;
+# MAGIC a column left untagged fails the check below.
+
+# COMMAND ----------
+
+_IG_V32 = {
+    TGT_EXAMINATION: {
+        "CLINICAL_QUESTION": ("4", "2"), "CLINICAL_ANAMNESIS": ("4", "2"),
+        "CLINICAL_QUESTION_EXAM_SEGMENT": ("4", "2"), "CLINICAL_ANAMNESIS_EXAM_SEGMENT": ("4", "2"),
+        "CLINICAL_QUESTION_SEGMENT_STATUS": ("0", "0"), "CLINICAL_ANAMNESIS_SEGMENT_STATUS": ("0", "0"),
+        "EXAMINATION_ACCESSION_NBR_RAW": ("4", "2"), "SECTRA_ACCESSION_NBR": ("4", "2"),
+        "ACCESSION_FORMAT": ("0", "0"), "ACCESSION_PARSE_METHOD": ("0", "0"),
+        "ACCESSION_RULE_VERSION": ("0", "0"), "ACCESSION_EXAM_COUNT": ("0", "0"),
+        "ACCESSION_STUDY_UID_COUNT": ("0", "0"), "ACCESSION_IDENTITY_STATUS": ("0", "0"),
+        "EXAMINATION_DT_TM_FUTURE_IND": ("0", "0"), "EXAMINATION_DT_TM_SENTINEL_IND": ("0", "0"),
+        "EXAMINATION_DT_TM_CLEAN": ("1", "1"), "ARRIVAL_DT_TM_FUTURE_IND": ("0", "0"),
+        "ARRIVAL_DT_TM_SENTINEL_IND": ("0", "0"), "ARRIVAL_DT_TM_CLEAN": ("1", "1"),
+        "PERFORMED_DT_TM_CLEAN": ("1", "1"), "PERFORMED_DT_TM_SOURCE": ("0", "0"),
+        "PERFORMED_EVIDENCE_VERIFIED_IND": ("0", "0"), "REPORT_REF_COUNT": ("0", "0"),
+        "REPORT_COUNT_RESOLVED": ("0", "0"), "REPORT_AVAILABLE_IND": ("0", "0"),
+    },
+    TGT_REPORT: {"SECTRA_ACCESSION_NBR": ("4", "2"), "ACCESSION_FORMAT": ("0", "0")},
+    TGT_LINK: {
+        "LINK_KEY": ("0", "0"), "PACS_REPORT_ID": ("0", "0"), "PACS_REQUEST_ID": ("0", "0"),
+        "PACS_EXAMINATION_ID": ("0", "0"), "LINK_SCOPE": ("0", "0"),
+        "REPORT_RESOLVED_IND": ("0", "0"), "REPORT_DT_TM": ("1", "1"),
+        "REPORT_STATUS_CD": ("0", "0"), "EXAMINATION_PUBLISHED_IND": ("0", "0"),
+        "EXAMINATION_PERSON_ID": ("0", "1"), "SECTRA_ACCESSION_NBR": ("4", "2"),
+        "SOURCE_PRESENT_IND": ("0", "0"), "ROW_HASH": ("0", "0"), "ADC_UPDT": ("0", "0"),
+    },
+}
+
+
+def apply_ig_tags(table, tags):
+    catalog, schema, tbl = table.split(".")
+    have = {}
+    for r in spark.sql(
+            f"SELECT column_name, tag_name, tag_value FROM {qident(catalog)}.information_schema.column_tags "
+            f"WHERE schema_name = '{schema}' AND table_name = '{tbl}' "
+            f"AND tag_name IN ('ig_risk', 'ig_severity')").collect():
+        have.setdefault(r["column_name"], {})[r["tag_name"]] = r["tag_value"]
+    live = set(spark.table(table).columns)
+    changed = 0
+    for column, (risk, severity) in tags.items():
+        if column in live and have.get(column, {}) != {"ig_risk": risk, "ig_severity": severity}:
+            spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN {qident(column)} "
+                      f"SET TAGS ('ig_risk' = '{risk}', 'ig_severity' = '{severity}')")
+            changed += 1
+    untagged = sorted(c for c in live if c not in tags and set(have.get(c, {})) != {"ig_risk", "ig_severity"})
+    assert not untagged, f"{table}: columns missing ig_risk/ig_severity: {untagged}"
+    return changed
+
+
+for _t, _tags in _IG_V32.items():
+    print(f"[PACS] IG tags {_t}: {apply_ig_tags(_t, _tags)} changed")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Validation and run summary
 
 # COMMAND ----------
@@ -1354,12 +1572,14 @@ _summary = {"pipeline": "pacs_pipeline", "status": "SUCCESS", "run_id": PACS_RUN
             "link_group_backfill": ENABLE_LINK_GROUP,
             "metrics": {"patient_link": _patient_metrics,
                         "examination": _exam_metrics,
-                        "report": _report_metrics}}
+                        "report": _report_metrics,
+                        "exam_report_link": _link_metrics}}
 
 _ALL_TARGETS = {
     TGT_PATIENT_LINK: ("PACS_PATIENT_ID", SRC_PATIENTS),
     TGT_EXAMINATION: ("PACS_EXAMINATION_ID", SRC_EXAMS),
     TGT_REPORT: ("PACS_REPORT_ID", SRC_REPORTS),
+    TGT_LINK: ("LINK_KEY", SRC_EXAM_REPORTS),
 }
 # Curated-scope floors (~5-8% under expected published counts; a collapse below means
 # a scope/join defect even when parity passes).
@@ -1367,6 +1587,7 @@ PUBLISHED_FLOORS = {
     TGT_PATIENT_LINK: 2_800_000,   # expected ~3.03M referenced patient records
     TGT_EXAMINATION: 14_000_000,   # safety floor; 2026-08-08 v3 evidence union produced 16.36M
     TGT_REPORT: 14_100_000,        # expected 14.57M (all reports kept)
+    TGT_LINK: 16_400_000,          # bridge grain; raw floor 16.9M (every bridge row kept)
 }
 
 # 1. Banned-column leak audit: excluded identifier/staff/bookkeeping columns must be absent.
@@ -1477,6 +1698,33 @@ _summary["report_exam_link"] = {
                   .otherwise("MULTIPLE").alias("b"))
         .agg(F.count(F.lit(1)).alias("n")).collect()}
 
+# 5b. v3.2 accession/report/date accounting (informational; one aggregate pass each).
+_ex_v32 = (spark.table(TGT_EXAMINATION).where(F.col("SOURCE_PRESENT_IND")).agg(
+    F.count(F.lit(1)).alias("present"),
+    F.sum(F.col("SECTRA_ACCESSION_NBR").isNull().cast("long")).alias("no_accession"),
+    F.sum((F.col("ACCESSION_IDENTITY_STATUS") == "CONFLICTING_PERSONS").cast("long")).alias("conflicting_accession_rows"),
+    F.sum((F.col("ACCESSION_EXAM_COUNT") > 1).cast("long")).alias("multi_exam_accession_rows"),
+    F.sum(F.col("REPORT_AVAILABLE_IND").cast("long")).alias("report_available"),
+    F.sum(((F.col("REPORT_REF_COUNT") > 0) & ~F.col("REPORT_AVAILABLE_IND")).cast("long")).alias("dangling_only_reported"),
+    F.sum(F.col("EXAMINATION_DT_TM_SENTINEL_IND").cast("long")).alias("exam_dt_sentinel"),
+    F.sum(F.col("EXAMINATION_DT_TM_FUTURE_IND").cast("long")).alias("exam_dt_future"),
+    F.sum(F.col("PERFORMED_DT_TM_CLEAN").isNull().cast("long")).alias("no_valid_performed_time"),
+    F.sum((~F.col("PERFORMED_EVIDENCE_VERIFIED_IND")).cast("long")).alias("unverified_evidence"),
+    F.sum((F.col("CLINICAL_QUESTION_SEGMENT_STATUS") == "EXAM_SEGMENT").cast("long")).alias("question_exam_segment"),
+    F.sum(F.col("NICIP_SNOMED_CODE").isNotNull().cast("long")).alias("legacy_concept_populated"),
+).collect()[0].asDict())
+assert _ex_v32["legacy_concept_populated"] == 0, "legacy bronze concept columns must stay NULL"
+# A dangling bridge id must never make a report available.
+assert (spark.table(TGT_EXAMINATION)
+        .where(F.col("SOURCE_PRESENT_IND") & F.col("REPORT_AVAILABLE_IND") & (F.col("REPORT_COUNT_RESOLVED") == 0))
+        .limit(1).count() == 0), "REPORT_AVAILABLE_IND set without a resolved report"
+_summary["v32_examination"] = {k: int(v or 0) for k, v in _ex_v32.items()}
+_summary["v32_links"] = {
+    f"{r['LINK_SCOPE']}|resolved={r['REPORT_RESOLVED_IND']}|exam_published={r['EXAMINATION_PUBLISHED_IND']}": r["n"]
+    for r in spark.table(TGT_LINK).where(F.col("SOURCE_PRESENT_IND"))
+        .groupBy("LINK_SCOPE", "REPORT_RESOLVED_IND", "EXAMINATION_PUBLISHED_IND")
+        .agg(F.count(F.lit(1)).alias("n")).collect()}
+
 # 6. Referential integrity (informational - orphans are expected and PRESERVED, never
 #    asserted). Both sides filtered to present rows.
 def _orphan_count(child_tbl, child_col, parent_tbl, parent_col):
@@ -1509,6 +1757,10 @@ import json as _anon_json
 from pyspark.sql import functions as _anon_F
 
 _ANON_REATTACH_SPECS = _anon_json.loads('[{"feed": "pacs_report", "keys": ["PACS_REPORT_ID"], "outputs": ["anon_report_text"], "state_table": "6_mgmt.anon.state_pacs_report", "table": "4_prod.bronze.map_pacs_report"}]')
+# v3.2: the reattach specs name 4_prod tables; any other target skips them entirely.
+if TARGET_SCHEMA != "4_prod.bronze":
+    print(f"[PACS] anon reattach skipped: specs name 4_prod, target is {TARGET_SCHEMA}")
+    _ANON_REATTACH_SPECS = []
 _ANON_STATE_TYPES = {'anon_status': 'STRING', 'anon_redactor_version': 'STRING', 'anon_source_text_sha': 'STRING', 'anon_identity_fingerprint': 'STRING', 'anon_redaction_count': 'BIGINT', 'anon_processed_at': 'TIMESTAMP'}
 
 def _anon_qtable(name):
@@ -1581,4 +1833,3 @@ for _anon_spec in _ANON_REATTACH_SPECS:
 
 
 dbutils.notebook.exit(bronze_json(_summary))
-

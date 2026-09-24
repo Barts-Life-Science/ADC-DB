@@ -1,6 +1,7 @@
 # Databricks notebook source
+# BRONZE_PERF_946452877034658_V2
 # Generated Map split runner. Do not edit; regenerate from the validated source group.
-# MAGIC %pip install openai pyarrow
+%pip install openai pyarrow
 
 # COMMAND ----------
 
@@ -8,12 +9,27 @@
 
 # COMMAND ----------
 
-_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': ''}
+_MAP_SPLIT_WIDGET_DEFAULTS = {'pipeline_run_id': '', 'force_full_refresh': 'false', 'create_cutover_backups': 'false', 'run_post_deployment_checks': 'true', 'map_common_bootstrap': 'false', 'map_component': '', 'source_manifest_json': '', 'source_manifest_hash': '', 'effective_full_refresh': '', 'perf_task_run_id': ''}
 for _map_split_name, _map_split_default in _MAP_SPLIT_WIDGET_DEFAULTS.items():
     try:
         dbutils.widgets.get(_map_split_name)
     except Exception:
         dbutils.widgets.text(_map_split_name, _map_split_default)
+
+import time as _perf_time
+_PERF_TASK_STARTED_AT = _perf_time.time()
+_PERF_TASK_START_BASIS = 'runner_preamble_after_python_restart'
+try:
+    from databricks.sdk import WorkspaceClient as _PerfWorkspaceClient
+    _perf_task_id = dbutils.widgets.get('perf_task_run_id')
+    if _perf_task_id:
+        _perf_task_run = _PerfWorkspaceClient().jobs.get_run(int(_perf_task_id))
+        if _perf_task_run.start_time:
+            _PERF_TASK_STARTED_AT = _perf_task_run.start_time / 1000.0
+            _PERF_TASK_START_BASIS = 'jobs_api_task_start'
+except Exception as _perf_exc:
+    print('[PERF] Task start unavailable; timing explicitly excludes earlier bootstrap: ' + str(_perf_exc)[:200])
+
 
 # COMMAND ----------
 
@@ -175,7 +191,7 @@ FULL_BUILD_RAW_BUCKETS = 8
 FULL_BUILD_STAGE_RETRIES = 2
 INCREMENTAL_SCHEMA_VERSION = '3.1.0'
 INCREMENTAL_LINKED_BUCKETS = 8
-INCREMENTAL_RAW_BUCKETS = 32
+INCREMENTAL_RAW_BUCKETS = 4
 INCREMENTAL_STAGE_RETRIES = 2
 FULL_BUILD_INPUTS = {**{source_name: table_name for source_name, (table_name, _) in SOURCE_TABLES.items()}, 'pathology_result_value_exclusions': EXCL_TBL, 'omop_concept': CONCEPT}
 FULL_BUILD_GLOBAL_SOURCES = {'CE': 'mill_clinical_event', 'ORDERS': 'mill_orders', 'PERSON_ALIAS': 'mill_person_alias', 'RESULT_LEVEL': 'path_patient_resultlevel', 'SAMPLE_LEVEL': 'path_patient_samplelevel', 'MASTER_RESULT': 'path_master_resultable', 'ORDER_CATALOG': 'mill_order_catalog', 'CODE_VALUE': 'mill_code_value', 'TEST_MAP': 'pathology_test_concept_map', 'RESULT_MAP': 'pathology_result_concept_map', 'UNIT_MAP': 'pathology_unit_map', 'EXCL_TBL': 'pathology_result_value_exclusions', 'CONCEPT': 'omop_concept'}
@@ -599,6 +615,7 @@ def _incremental_state_matches(
 
 
 def _load_or_start_incremental(state: dict[str, dict]) -> dict:
+    global INCREMENTAL_RAW_BUCKETS
     expected_config = _incremental_config_json()
     active = (
         spark.table(MP_INCREMENTAL_MANIFEST)
@@ -621,10 +638,15 @@ def _load_or_start_incremental(state: dict[str, dict]) -> dict:
                 'abandon_map_pathology_incremental() before changing the execution contract.'
             )
         if manifest['config_json'] != expected_config:
-            raise RuntimeError(
-                'The active pathology incremental manifest is incompatible with the '
-                'current bucket configuration; abandon it explicitly rather than mixing stages.'
-            )
+            prior_config = json.loads(manifest['config_json'])
+            desired_config = json.loads(expected_config)
+            legacy_compatible = dict(prior_config, raw_bucket_count=desired_config['raw_bucket_count'])
+            if prior_config.get('raw_bucket_count') == 32 and legacy_compatible == desired_config:
+                INCREMENTAL_RAW_BUCKETS = 32
+                expected_config = manifest['config_json']
+                print('[PERF] Resuming pinned 32-bucket legacy manifest; fresh manifests use four.')
+            else:
+                raise RuntimeError('Pathology resume configuration differs beyond the supported raw-bucket migration')
         if not _incremental_state_matches(state, manifest['state']):
             raise RuntimeError(
                 'The pathology pipeline state advanced after this incremental manifest '
@@ -919,9 +941,9 @@ def _apply_table_metadata() -> None:
         spark.sql(f"ALTER TABLE {_qn(MP_TARGET)} ALTER COLUMN {_qn(column_name)} COMMENT '{escaped}'")
     if ENABLE_LIQUID_CLUSTERING and {'source_table', 'source_parent_key'}.issubset(existing):
         try:
-            spark.sql(f'ALTER TABLE {_qn(MP_TARGET)} CLUSTER BY (source_table, source_parent_key)')
+            spark.sql(f'ALTER TABLE {_qn(MP_TARGET)} CLUSTER BY (source_table)')
         except Exception as exc:
-            print(f'[map_pathology_v3] clustering note: {str(exc).splitlines()[0]}')
+            raise RuntimeError('Pathology liquid clustering could not be enabled; no silent fallback') from exc
 
 def _target_is_v2() -> bool:
     required = {
@@ -1698,7 +1720,7 @@ def _build_incremental_inputs(manifest: dict, scope_table: str) -> dict[str, str
                 F.col('source_event_id').cast('long').alias('_scope_event_id')
             )
         )
-        source = _incremental_snapshot_df(manifest, 'mill_clinical_event')
+        source = _incremental_snapshot_df(manifest, 'mill_clinical_event').select(*['CLINICAL_EVENT_ID', 'EVENT_ID', 'PERSON_ID', 'ENCNTR_ID', 'ORDER_ID', 'CATALOG_CD', 'EVENT_CD', 'PARENT_EVENT_ID', 'EVENT_RELTN_CD', 'VALID_FROM_DT_TM', 'VALID_UNTIL_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM', 'VERIFIED_DT_TM', 'RESULT_VAL', 'RESULT_UNITS_CD', 'NORMAL_LOW', 'NORMAL_HIGH', 'NORMALCY_CD', 'RECORD_STATUS_CD', 'RESULT_STATUS_CD', 'AUTHENTIC_FLAG', 'CLINSIG_UPDT_DT_TM', 'UPDT_CNT', 'CONTRIBUTOR_SYSTEM_CD', 'REFERENCE_NBR', 'EVENT_TITLE_TEXT', 'EVENT_TAG', 'ADC_UPDT', 'EVENT_CLASS_CD'])
         return (
             source.alias('s')
             .join(

@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC Contract decisions verified 2026-08-08:
 # MAGIC - Pharmacy domain is decoded `ACTIVITY_TYPE_CD=705` (`Pharmacy`); Pharmacy Consults are excluded.
-# MAGIC - `mill_order_action` is a declared HISTORICAL lane capped at 2024-09-17. A later watermark
+# MAGIC - `mill_order_action` is a declared HISTORICAL lane capped at 2024-09-17. A later clinical update/action timestamp
 # MAGIC   deliberately fails until a controlled history backfill is approved.
 # MAGIC - `map_medication_order_detail` is latest-`ACTION_SEQUENCE` long format. Historical action-level
 # MAGIC   order detail is an explicit bronze-contract exclusion, not an implicit downstream raw read.
@@ -23,6 +23,9 @@
 # MAGIC   contributor stamps are cut while each child keeps its own source-row `SOURCE_ADC_UPDT`.
 
 # COMMAND ----------
+
+# BRONZE_FIX_857469999366132_V1
+# BRONZE_REPAIR_272860676151023_V1
 
 for _name, _default in {
     "target_schema": "8_dev.bronze",
@@ -858,6 +861,22 @@ _action_ceiling = datetime.fromisoformat("2024-09-17 23:59:59.999999")
 
 # COMMAND ----------
 
+_ACTION_HISTORY_PROOFS = {}
+
+def assert_action_history_ceiling():
+    version = int(SOURCE_VERSIONS[SRC_ACTION])
+    if version not in _ACTION_HISTORY_PROOFS:
+        row = (spark.read.option("versionAsOf", version).table(SRC_ACTION)
+               .agg(F.max("UPDT_DT_TM").alias("source_updated"),
+                    F.max("ACTION_DT_TM").alias("action_time")).first())
+        values = [v.replace(tzinfo=None) for v in row if v is not None]
+        assert values, "mill_order_action: no clinical source timestamp"
+        assert builtins.max(values) <= _action_ceiling, (
+            "mill_order_action clinical history advanced beyond 2024-09-17; controlled backfill required"
+        )
+        _ACTION_HISTORY_PROOFS[version] = {k: str(v) for k, v in row.asDict().items()}
+    return _ACTION_HISTORY_PROOFS[version]
+
 def pharmacy_orders(order_ids: DataFrame | None = None) -> DataFrame:
     orders = apply_order_id_slice(spark.table(SRC_ORDER))
     orders = scope_by_order_ids(orders, order_ids)
@@ -1316,8 +1335,9 @@ def run_incremental_suite(modes: dict[str, str], metrics: dict[str, dict]) -> di
         max_action_source = spark.table(f"{ACTION}_stg").agg(
             F.max("SOURCE_ADC_UPDT").alias("watermark")
         ).collect()[0]["watermark"]
-        assert max_action_source is None or max_action_source.replace(tzinfo=None) <= _action_ceiling
-        result["action_history_ceiling"] = str(max_action_source)
+        assert_action_history_ceiling()
+        result["action_ingestion_watermark"] = str(max_action_source)
+        result["action_history_proof"] = assert_action_history_ceiling()
     return result
 
 
@@ -1370,11 +1390,12 @@ def run_full_parity_suite(modes: dict[str, str]) -> dict:
         max_action_source = spark.table(ACTION).agg(
             F.max("SOURCE_ADC_UPDT").alias("watermark")
         ).collect()[0]["watermark"]
-        assert max_action_source.replace(tzinfo=None) <= _action_ceiling
+        assert_action_history_ceiling()
         result["targets"][ACTION] = {
             "present_rows": int(present_action),
             "expected_rows": int(expected_action),
-            "action_history_ceiling": str(max_action_source),
+            "action_ingestion_watermark": str(max_action_source),
+            "action_history_proof": assert_action_history_ceiling(),
         }
 
     if modes[INGREDIENT] in FULL_MODES:
@@ -1448,7 +1469,7 @@ def apply_output_comments() -> None:
         "S10 medication_order state-history feeder. The source is historical and hard-capped at 2024-09-17; S3-A11 retains parent-order contributor stamps and source counters.",
         {
             "HISTORICAL_FEED_IND": "S10 provenance flag; true while mill_order_action remains frozen.",
-            "SOURCE_ADC_UPDT": "S10 action-history source timestamp; must not exceed the declared ceiling.",
+            "SOURCE_ADC_UPDT": "S10 ingestion timestamp, including trust enrichment. The historical ceiling applies to raw UPDT_DT_TM and ACTION_DT_TM.",
         },
         "S10 medication_order ordered status history",
     )
@@ -1489,10 +1510,7 @@ def run_pipeline() -> dict:
             if freshness_mode == "LIVE":
                 raise AssertionError(message)
             print(f"[WARN] {message}")
-    if SOURCE_HEALTH[SRC_ACTION]["scan"] == "FULL":
-        assert SOURCE_HEALTH[SRC_ACTION]["watermark"].replace(tzinfo=None) <= _action_ceiling, (
-            "mill_order_action advanced beyond the declared historical ceiling; stop and plan a controlled backfill"
-        )
+    action_history_proof = assert_action_history_ceiling()
     RUN_FUTURE_HORIZON = builtins.max(
         health["watermark"] for health in SOURCE_HEALTH.values() if health["watermark"] is not None
     ) + timedelta(days=2)
@@ -1644,5 +1662,4 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 

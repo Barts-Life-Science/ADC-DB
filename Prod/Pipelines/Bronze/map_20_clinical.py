@@ -6,6 +6,8 @@
 
 # COMMAND ----------
 
+# BRONZE_PERF_946452877034658_V2
+
 if "_PIPELINE_RUN_ID" not in globals():
     raise RuntimeError("Run this component through map_pipeline so shared contracts, checkpoints and audit state are initialized.")
 
@@ -1061,18 +1063,24 @@ def _prepare_code_maps() -> DataFrame:
     prepared = raw.select(_checked_long(F.col('CODE_VALUE'), 'CODE_VALUE', required=True).alias('CODE_VALUE'), F.coalesce(_nonblank(F.col('DESCRIPTION')), _nonblank(F.col('DISPLAY')), _nonblank(F.col('CDF_MEANING')), _nonblank(F.col('DEFINITION'))).alias('CODE_LABEL'), F.col('ADC_UPDT').cast('timestamp').alias('CODE_ADC_UPDT'), _checked_long(F.col('UPDT_CNT'), 'CODE_VALUE.UPDT_CNT').alias('UPDT_CNT'), F.col('UPDT_DT_TM').cast('timestamp').alias('UPDT_DT_TM'))
     latest_window = Window.partitionBy('CODE_VALUE').orderBy(F.col('CODE_ADC_UPDT').desc_nulls_last(), F.col('UPDT_CNT').desc_nulls_last(), F.col('UPDT_DT_TM').desc_nulls_last())
     current = prepared.withColumn('_RANK', F.row_number().over(latest_window)).filter(F.col('_RANK') == 1).drop('_RANK', 'UPDT_CNT', 'UPDT_DT_TM')
-    return current.agg(F.map_from_entries(F.collect_list(F.struct(F.col('CODE_VALUE'), F.col('CODE_LABEL')))).alias('_CODE_LABEL_MAP'), F.map_from_entries(F.collect_list(F.struct(F.col('CODE_VALUE'), F.col('CODE_ADC_UPDT')))).alias('_CODE_ADC_MAP'))
+    return current
 
 def _enrich_code_descriptions(problems: DataFrame, code_maps: DataFrame) -> DataFrame:
-    result = problems.crossJoin(F.broadcast(code_maps))
-    update_expressions: List[F.Column] = []
-    description_columns: List[str] = []
-    for code_column, description_column in CODE_DESCRIPTION_COLUMNS.items():
-        result = result.withColumn(description_column, F.element_at(F.col('_CODE_LABEL_MAP'), F.col(code_column).cast('long')))
-        update_expressions.append(F.element_at(F.col('_CODE_ADC_MAP'), F.col(code_column).cast('long')))
-        description_columns.append(description_column)
-    result = result.withColumn('CODE_VALUE_ADC_UPDT', F.greatest(*update_expressions)).withColumn('CODE_VALUE_LOOKUP_HASH', _stable_hash(description_columns))
-    return result.drop('_CODE_LABEL_MAP', '_CODE_ADC_MAP')
+    # A keyed dimension avoids a single-row 469k-entry MAP and linear element_at probes.
+    result = problems
+    timestamps = []
+    descriptions = []
+    for index, (code_column, description_column) in enumerate(CODE_DESCRIPTION_COLUMNS.items()):
+        key, label, stamp = (f'_problem_cv_{index}_{suffix}' for suffix in ('key', 'label', 'stamp'))
+        dimension = code_maps.select(F.col('CODE_VALUE').alias(key),
+                                     F.col('CODE_LABEL').alias(label),
+                                     F.col('CODE_ADC_UPDT').alias(stamp))
+        result = (result.join(F.broadcast(dimension), F.col(code_column).cast('long') == F.col(key), 'left')
+                  .withColumn(description_column, F.col(label)).drop(key, label))
+        timestamps.append(stamp)
+        descriptions.append(description_column)
+    return (result.withColumn('CODE_VALUE_ADC_UPDT', F.greatest(*[F.col(c) for c in timestamps]))
+            .withColumn('CODE_VALUE_LOOKUP_HASH', _stable_hash(descriptions)).drop(*timestamps))
 
 def _add_problem_dates_and_display(problems: DataFrame) -> DataFrame:
     calc_source = F.when(F.col('ONSET_DT_TM').isNotNull(), F.lit('ONSET_DT_TM')).when(F.col('ASSERTED_DT_TM').isNotNull(), F.lit('ASSERTED_DT_TM')).when(F.col('STATUS_UPDT_DT_TM').isNotNull(), F.lit('STATUS_UPDT_DT_TM')).when(F.col('LIFE_CYCLE_DT_TM').isNotNull(), F.lit('LIFE_CYCLE_DT_TM')).when(F.col('BEG_EFFECTIVE_DT_TM').isNotNull(), F.lit('BEG_EFFECTIVE_DT_TM')).when(F.col('ACTIVE_STATUS_DT_TM').isNotNull(), F.lit('ACTIVE_STATUS_DT_TM')).when(F.col('DATA_STATUS_DT_TM').isNotNull(), F.lit('DATA_STATUS_DT_TM')).when(F.col('PROBLEM_ADC_UPDT').isNotNull(), F.lit('PROBLEM_ADC_UPDT'))
@@ -1105,9 +1113,18 @@ def _attach_encounter_associations(problems: DataFrame) -> DataFrame:
     result = result.withColumn('CALC_ENCNTR_DISTANCE_SECONDS', F.when(F.col('_DIRECT_ENCNTR_ID').isNotNull(), direct_distance).when(F.col('CALC_ENC_WITHIN').isNotNull(), F.lit(0)).when(F.col('CALC_ENC_BEFORE').isNotNull(), F.unix_timestamp(F.col('CALC_DT_TM')) - F.unix_timestamp(F.col('_BEFORE_MATCH.EVENT_DT_TM'))).when(F.col('CALC_ENC_AFTER').isNotNull(), F.unix_timestamp(F.col('_AFTER_MATCH.EVENT_DT_TM')) - F.unix_timestamp(F.col('CALC_DT_TM'))).cast('long'))
     return result.drop('_ENCOUNTERS', '_DIRECT_ENCNTR_ID', '_DIRECT_ENCNTR_SOURCE', '_DIRECT_MATCH', '_WITHIN_MATCH', '_BEFORE_MATCH', '_AFTER_MATCH')
 
+def _problem_published_hash_columns(frame, target_table, declared_schema):
+    # Hash only fields surviving the actual contract, with the existing clock exclusions.
+    declared = {field.name for field in declared_schema.fields}
+    allowed = bronze_contract_column_set(target_table) if bronze_is_primary_table(target_table) else {c.lower() for c in declared}
+    excluded = {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'PROBLEM_ADC_UPDT',
+                'NOMENCLATURE_ADC_UPDT', 'CODE_VALUE_ADC_UPDT', 'CALC_ENCNTR_ADC_UPDT'}
+    return sorted(c for c in frame.columns if c in declared and c.lower() in allowed
+                  and c not in excluded and not c.startswith('_'))
+
 def _finalize_problem_rows(problems: DataFrame) -> DataFrame:
     result = problems.withColumn('ADC_UPDT', F.greatest(F.col('PROBLEM_ADC_UPDT'), F.col('NOMENCLATURE_ADC_UPDT'), F.col('CODE_VALUE_ADC_UPDT'), F.col('CALC_ENCNTR_ADC_UPDT')))
-    hash_columns = sorted((column_name for column_name in result.columns if column_name not in {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'PROBLEM_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'CODE_VALUE_ADC_UPDT', 'CALC_ENCNTR_ADC_UPDT'} and (not column_name.startswith('_'))))
+    hash_columns = _problem_published_hash_columns(result, MAP_PROBLEM_HISTORY, schema_map_problem_history_v3)
     return result.withColumn('MAP_ROW_HASH', _stable_hash(hash_columns)).withColumn('MAP_REFRESH_DT_TM', F.current_timestamp())
 
 def _build_enriched_problem_rows(source_rows: DataFrame, complete_problem_snapshot: DataFrame, nomenclature: DataFrame, code_maps: DataFrame, earliest_dates: Optional[DataFrame]=None) -> DataFrame:
@@ -1199,10 +1216,7 @@ def _s4_c1b_problem_current_rows(frame: DataFrame) -> DataFrame:
         'ABSENCE_ASSERTION_IND',
         F.coalesce(F.col('CONCEPT_CKI_IDENTIFIER') == F.lit('NKP'), F.lit(False)),
     )
-    hash_columns = sorted(
-        column_name for column_name in enriched.columns
-        if column_name not in {'MAP_ROW_HASH', 'MAP_REFRESH_DT_TM', 'ADC_UPDT', 'PROBLEM_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'CODE_VALUE_ADC_UPDT', 'CALC_ENCNTR_ADC_UPDT'} and not column_name.startswith('_')
-    )
+    hash_columns = _problem_published_hash_columns(enriched, MAP_PROBLEM_TARGET, schema_map_problem_v3)
     return enriched.withColumn('MAP_ROW_HASH', _stable_hash(hash_columns))
 
 def _history_and_current_rows(source_rows: DataFrame, complete_problem_snapshot: DataFrame, nomenclature: DataFrame, code_maps: DataFrame, earliest_dates: Optional[DataFrame]=None) -> Tuple[DataFrame, DataFrame]:
@@ -2285,6 +2299,13 @@ class MedAdminReferenceTables:
         self.rxnconso = spark.table(config.rxnconso_table)
         self.medication_lookup = spark.table(config.medication_lookup_table)
 
+def _perf_scoped_event_changes(changed, source_universe, target):
+    # Source catches entrants (including EVENT_CLASS changes); target catches departures.
+    def keys(frame):
+        return frame.select(F.col('EVENT_ID').cast('long').alias('EVENT_ID')).where(F.col('EVENT_ID').isNotNull())
+    universe = keys(source_universe).unionByName(keys(target))
+    return keys(changed).join(universe, 'EVENT_ID', 'left_semi').dropDuplicates(['EVENT_ID'])
+
 def _ma_trigger_rows(frame: DataFrame, source: str) -> DataFrame:
     return frame.select(F.col('EVENT_ID').cast('long').alias('EVENT_ID')).where(F.col('EVENT_ID').isNotNull()).withColumn('_TRIGGER_SOURCE', F.lit(source))
 
@@ -2300,12 +2321,18 @@ def _ma_changed_cdf(table_name: str, state: Dict[str, int], source_versions: Dic
         MAP_MED_ADMIN_CONFIG.concept_table: ['concept_id'],
         MAP_MED_ADMIN_CONFIG.concept_relationship_table: ['concept_id_1', 'concept_id_2', 'relationship_id'],
     }
+    semantic_columns_by_table = {
+        MAP_MED_ADMIN_CONFIG.order_synonym_table: ['MNEMONIC', 'CKI', 'CONCEPT_CKI', 'UPDT_DT_TM'],
+        MAP_MED_ADMIN_CONFIG.medication_lookup_table: ['EMBEDDING_MODEL_VERSION', 'HNA_ORDER_MNEMONIC', 'MAPPED_OMOP_CONCEPT_ID', 'MAPPED_OMOP_CONCEPT_TERM', 'MULTUM_CODE', 'RAW_SIMILARITY_OMOP_CONCEPT_ID', 'RAW_SIMILARITY_OMOP_CONCEPT_TERM', 'RXNORM_CODE', 'SIMILARITY_OMOP_CONCEPT_ID', 'SIMILARITY_OMOP_CONCEPT_TERM', 'SIMILARITY_SCORE', 'SIMILARITY_STATUS', 'SIMILARITY_THRESHOLD', 'SNOMED_CODE', 'SNOMED_FROM_OMOP', 'SOURCE_CHANGE_TS', 'SOURCE_ROW_HASH', 'STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID', 'STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM'],
+        MAP_MED_ADMIN_CONFIG.code_value_table: ['DISPLAY', 'CDF_MEANING'],
+    }
     if table_name in semantic_reference_keys:
         return _m20_semantic_snapshot_keys(
             table_name,
             int(state[table_name]),
             int(source_versions[table_name]),
             semantic_reference_keys[table_name],
+            semantic_columns=semantic_columns_by_table.get(table_name),
         )
     return _ma_read_cdf(table_name, int(state[table_name]) + 1, int(source_versions[table_name]))
 
@@ -2325,6 +2352,8 @@ def _ma_incremental_trigger_rows(state: Dict[str, int], source_versions: Dict[st
     for table_name, source_name in ((config.clinical_event_table, 'CLINICAL_EVENT'), (config.med_admin_event_table, 'MED_ADMIN_EVENT'), (config.med_result_table, 'CE_MED_RESULT')):
         cdf = _ma_changed_cdf(table_name, state, source_versions)
         if cdf is not None:
+            if table_name == config.clinical_event_table:
+                cdf = _perf_scoped_event_changes(cdf, _ma_read_snapshot(config.med_admin_event_table, source_versions[config.med_admin_event_table]), target)
             frames.append(_ma_trigger_rows(cdf, source_name))
     orders_cdf = _ma_changed_cdf(config.orders_table, state, source_versions)
     if orders_cdf is not None:
@@ -2342,6 +2371,11 @@ def _ma_incremental_trigger_rows(state: Dict[str, int], source_versions: Dict[st
             changed_synonyms = cdf.select(F.col('SYNONYM_ID').cast('long').alias('_CHANGED_SYNONYM_ID')).where(F.col('_CHANGED_SYNONYM_ID').isNotNull()).dropDuplicates(['_CHANGED_SYNONYM_ID'])
             affected = target.select('EVENT_ID', 'ORDER_SYNONYM_ID').join(changed_synonyms, F.col('ORDER_SYNONYM_ID') == F.col('_CHANGED_SYNONYM_ID'), 'inner')
             frames.append(_ma_trigger_rows(affected, source_name))
+            if table_name == config.medication_lookup_table and _ma_table_exists(config.ingredient_target_table):
+                child_events = (spark.table(config.ingredient_target_table).select('EVENT_ID', 'SYNONYM_ID')
+                                .join(changed_synonyms, F.col('SYNONYM_ID') == F.col('_CHANGED_SYNONYM_ID'), 'left_semi')
+                                .select('EVENT_ID').join(target.select('EVENT_ID'), 'EVENT_ID', 'left_semi'))
+                frames.append(_ma_trigger_rows(child_events, 'INGREDIENT_MAP_MED_LOOKUP'))
     code_cdf = _ma_changed_cdf(config.code_value_table, state, source_versions)
     if code_cdf is not None and (not _ma_is_empty(code_cdf)):
         changed_codes = code_cdf.select(F.col('CODE_VALUE').cast('long').alias('_CHANGED_CODE_VALUE')).where(F.col('_CHANGED_CODE_VALUE').isNotNull()).dropDuplicates(['_CHANGED_CODE_VALUE'])
@@ -2414,7 +2448,8 @@ def create_base_medication_administrations_incr(force_full_rebuild: bool=False, 
     else:
         assert event_keys is not None
         upserts = target_rows.withColumn('_source_change_type', F.lit('upsert'))
-        delete_keys = event_keys.join(target_rows.select('EVENT_ID'), 'EVENT_ID', 'left_anti')
+        delete_keys = (event_keys.join(target_rows.select('EVENT_ID'), 'EVENT_ID', 'left_anti')
+                       .join(spark.table(config.target_table).select('EVENT_ID'), 'EVENT_ID', 'left_semi'))
         deletes = _ma_schema_select(delete_keys, schema_map_med_admin).withColumn('_source_change_type', F.lit('delete'))
         changes = upserts.unionByName(deletes)
         affected_event_keys = event_keys
@@ -2462,10 +2497,39 @@ def _ma_refresh_ingredient_events(child_rows: DataFrame, affected_event_keys: Da
         _ma_overwrite_ingredient_target(child_rows, config)
         return
     keys = affected_event_keys.select('EVENT_ID').dropDuplicates(['EVENT_ID'])
-    if not _ma_is_empty(keys):
-        DeltaTable.forName(spark, config.ingredient_target_table).alias('t').merge(keys.alias('s'), 't.EVENT_ID = s.EVENT_ID').whenMatchedDelete().execute()
-    if not _ma_is_empty(child_rows):
-        _ma_schema_select(child_rows, schema_map_med_admin_ingredient).write.format('delta').mode('append').saveAsTable(config.ingredient_target_table)
+    if _ma_is_empty(keys):
+        return
+    # Exactly the identity used by _ma_build_ingredient_child_rows, including source revision.
+    # Do not collapse legitimate ingredient revisions or include run-generated metadata.
+    grain = ['EVENT_ID', 'INGREDIENT_ORDER_ID', 'ACTION_SEQUENCE', 'COMP_SEQUENCE', 'SYNONYM_ID', 'ADC_UPDT']
+    fresh = _ma_schema_select(child_rows, schema_map_med_admin_ingredient)
+    if not _ma_is_empty(fresh.join(keys, 'EVENT_ID', 'left_anti')):
+        raise ValueError('Ingredient rows escape the affected-event scope')
+    if not _ma_is_empty(fresh.groupBy(*grain).count().where(F.col('count') > 1)):
+        raise ValueError('Ingredient source has duplicate revision keys; no rows were deleted')
+    prior = spark.table(config.ingredient_target_table).join(keys, 'EVENT_ID', 'left_semi')
+    # Null-safe anti-join is necessary: action, component and synonym can legitimately be null.
+    same_key = ' AND '.join(f't.`{c}` <=> s.`{c}`' for c in grain)
+    removed = prior.alias('t').join(fresh.select(*grain).alias('s'), F.expr(same_key), 'left_anti')
+    removed = _ma_schema_select(removed, schema_map_med_admin_ingredient).dropDuplicates(grain)
+    changes = fresh.withColumn('_ingredient_delete', F.lit(False)).unionByName(
+        removed.withColumn('_ingredient_delete', F.lit(True)))
+    # Durable, narrowly named per-invocation source: stable MERGE retries, no self-read race.
+    stage = None
+    try:
+        changes = _ma_persist(changes)
+        stage = _PENDING_MED_ADMIN_CACHES[-1]
+        assignments = {c: F.col(f's.`{c}`') for c in fresh.columns}
+        (DeltaTable.forName(spark, config.ingredient_target_table).alias('t')
+         .merge(changes.alias('s'), same_key)
+         .whenMatchedDelete(condition='s._ingredient_delete')
+         .whenMatchedUpdate(condition='NOT s._ingredient_delete AND NOT (t.ROW_HASH <=> s.ROW_HASH)', set=assignments)
+         .whenNotMatchedInsert(condition='NOT s._ingredient_delete', values=assignments).execute())
+    finally:
+        if stage is not None:
+            # Keep failed cleanup registered for the existing outer finally/retry sweep.
+            _ma_drop_stage(stage)
+            _PENDING_MED_ADMIN_CACHES.remove(stage)
 
 def _ma_measure_and_validate_change_set(changes: DataFrame, full_rebuild: bool) -> Dict[str, int]:
     """Validate action/key grain and collect counts in one shuffled pass."""
@@ -4010,4 +4074,5 @@ finally:
         has_cdf_enabled = _pipeline_shared_has_cdf_enabled
     if _pipeline_shared_get_incremental is not None:
         get_incremental_data_with_cdf = _pipeline_shared_get_incremental
+
 

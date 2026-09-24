@@ -100,7 +100,7 @@ def _deadline_reached():
     )
 
 
-REDACTOR_VERSION = "v3.2"
+REDACTOR_VERSION = "v3.3"
 FINGERPRINT_OVERLAP_DAYS = 7
 # person_identifier_current.refreshed_at is assigned when the 7-day-overlapped
 # source refresh actually changes a bundle, so a second overlap here would replay
@@ -197,10 +197,10 @@ def _accept_verified_merge_metric_mismatch(label, merge_result, verification):
 if TARGET_SCHEMA == "4_prod.bronze":
     if CONTROL_SCHEMA != "6_mgmt.anon":
         raise RuntimeError("production target requires control_schema=6_mgmt.anon")
-    if PRODUCTION_CONFIRMATION != "RUN_PRODUCTION_ANON_V3_2":
+    if PRODUCTION_CONFIRMATION != "RUN_PRODUCTION_ANON_V3_3":
         raise RuntimeError(
             "Production execution is disabled without "
-            "production_confirmation=RUN_PRODUCTION_ANON_V3_2"
+            "production_confirmation=RUN_PRODUCTION_ANON_V3_3"
         )
 elif TARGET_SCHEMA.startswith("8_dev."):
     if not CONTROL_SCHEMA.startswith("8_dev."):
@@ -215,6 +215,7 @@ STATE_COLS = [
     "anon_redactor_version",
     "anon_source_text_sha",
     "anon_identity_fingerprint",
+    "anon_context_fingerprint",
     "anon_redaction_count",
     "anon_processed_at",
 ]
@@ -236,7 +237,7 @@ FEED_REGISTRY = {
         eligibility="STATUS = 'Decoded' AND BLOB_TEXT IS NOT NULL AND BLOB_TEXT != ''",
         person_routes=[("mill_event", "EVENT_ID"), ("encounter", "ENCNTR_ID")],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2", "v2-prod-legacy"},
+        accepted_versions={"v3.2", "v3.3", "v2-prod-legacy"},
         unresolved_retry_days=28,
         batch_persons=10000,
         batch_resolved_rows=100000,
@@ -266,7 +267,7 @@ FEED_REGISTRY = {
         ]),
         person_routes=[("direct_person", "BABY_PERSON_ID")],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence="A1 registry grain EntityID; A3 twin validates non-null uniqueness",
@@ -278,7 +279,7 @@ FEED_REGISTRY = {
         eligibility="coalesce(trim(COMMENTS), '') != ''",
         person_routes=[("direct_person", "PERSON_ID")],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence="A1 composite grain; A3 twin validates non-null uniqueness",
@@ -299,7 +300,7 @@ FEED_REGISTRY = {
             }),
         ],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence=(
@@ -323,7 +324,7 @@ FEED_REGISTRY = {
             }),
         ],
         priority_col="PIPELINE_UPDT_DT_TM",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence=(
@@ -338,7 +339,7 @@ FEED_REGISTRY = {
         eligibility="coalesce(trim(REPORT_TEXT), '') != ''",
         person_routes=[("direct_person", "PERSON_ID")],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True, grain_evidence="Bronze PACS report grain PACS_REPORT_ID",
     ),
@@ -349,10 +350,35 @@ FEED_REGISTRY = {
         eligibility="coalesce(trim(BRIDGED_TEXT), '') != ''",
         person_routes=[("mill_event", "EVENT_ID")],
         priority_col="PIPELINE_UPDT_DT_TM",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence="Bronze PACS bridge grain REPORT_ID; identity routes through EVENT_ID",
+    ),
+    "pacs_request": dict(
+        table="4_prod.bronze.map_pacs_examination",
+        key_cols=["PACS_EXAMINATION_ID"],
+        text_cols={
+            "CLINICAL_QUESTION": "anon_clinical_question",
+            "CLINICAL_ANAMNESIS": "anon_clinical_anamnesis",
+            "CLINICAL_QUESTION_EXAM_SEGMENT": "anon_clinical_question_exam_segment",
+            "CLINICAL_ANAMNESIS_EXAM_SEGMENT": "anon_clinical_anamnesis_exam_segment",
+        },
+        eligibility=(
+            "coalesce(trim(CLINICAL_QUESTION), '') != '' "
+            "OR coalesce(trim(CLINICAL_ANAMNESIS), '') != '' "
+            "OR coalesce(trim(CLINICAL_QUESTION_EXAM_SEGMENT), '') != '' "
+            "OR coalesce(trim(CLINICAL_ANAMNESIS_EXAM_SEGMENT), '') != ''"
+        ),
+        person_routes=[("direct_person", "PERSON_ID")],
+        priority_col="ADC_UPDT",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence=(
+            "Bronze PACS examination grain PACS_EXAMINATION_ID (MERGE key of "
+            "pacs_update_table); request text registered pacs_integration_20260924"
+        ),
     ),
     "text_event": dict(
         table="4_prod.bronze.map_text_events",
@@ -361,7 +387,7 @@ FEED_REGISTRY = {
         eligibility="length(nullif(trim(TEXT_RESULT), '')) > 100",
         person_routes=[("direct_person", "PERSON_ID"), ("encounter", "ENCNTR_ID")],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=100000, batch_unresolved_rows=100000,
         grain_validated=True,
         grain_evidence=(
@@ -385,7 +411,7 @@ FEED_REGISTRY = {
             }),
         ],
         priority_col="ADC_UPDT",
-        accepted_versions={"v3.2"}, unresolved_retry_days=28,
+        accepted_versions={"v3.2", "v3.3"}, unresolved_retry_days=28,
         batch_persons=250000, batch_resolved_rows=250000,
         batch_unresolved_rows=250000, batch_text_chars=40000000,
         grain_validated=True,
@@ -393,6 +419,108 @@ FEED_REGISTRY = {
             "A1 report-version grain; eligible accession person via "
             "map_pathology_accession (151,143,528 eligible of 172,518,977)"
         ),
+    ),
+    "safety_text_fragment": dict(
+        table="4_prod.bronze.map_safety_text_fragment",
+        key_cols=["FRAGMENT_ID"],
+        text_cols={"TEXT": "anon_text"},
+        eligibility="coalesce(SOURCE_PRESENT_IND, true) AND length(trim(TEXT)) > 0",
+        person_routes=[("document_context", {
+            "context_key": "INC_ID",
+            "record_identifiers": {
+                "table": "4_prod.bronze.map_safety_incident", "key": "RECORDID",
+                "names": ["INC_NAME", "INC_REPNAME", "INC_INVESTIGATOR", "INC_MGR"],
+                "dobs": ["INC_DOB"], "postcodes": ["INC_POSTCODE"],
+            },
+            "linked_contacts": {
+                "table": "4_prod.bronze.map_safety_incident_participant", "key": "INC_ID",
+                "names": ["CON_SURNAME", "CON_FORENAMES", "CON_TITLE"],
+                "dobs": ["CON_DOB", "LINK_DOD"],
+                "identifiers": ["CON_NHSNO", "CON_MRN"],
+                "postcodes": ["CON_POSTCODE"], "addresses": ["CON_ADDRESS"],
+                "person_col": "PERSON_ID",
+            },
+            "pattern_recognisers": ["nhs_number", "uk_postcode", "phone", "dob_in_context"],
+            "context_fingerprint_col": "CONTEXT_FINGERPRINT_CURRENT",
+        })],
+        priority_col="PRIORITY_DT_TM",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence="TDX Task 4 fragment identity acceptance 2026-09-13",
+    ),
+    "prearrival": dict(
+        table="4_prod.bronze.map_prearrival",
+        key_cols=["TRACKING_PREARRIVAL_ID"],
+        text_cols={"CHIEF_COMPLAINT": "anon_chief_complaint"},
+        eligibility="length(trim(CHIEF_COMPLAINT)) > 0",
+        person_routes=[("document_context", {
+            "context_key": "TRACKING_PREARRIVAL_ID",
+            "record_identifiers": {
+                "table": "4_prod.bronze.map_prearrival", "key": "TRACKING_PREARRIVAL_ID",
+                "names": ["FIRST_NAME", "LAST_NAME", "PCP_PROVIDER_NAME", "REG_PRSNL_NAME"],
+                "dobs": ["BIRTH_DT_TM"],
+            },
+            "resolved_person_col": "LINKED_PERSON_ID",
+            "pattern_recognisers": ["nhs_number", "uk_postcode", "phone", "dob_in_context"],
+        })],
+        priority_col="SOURCE_ADC_UPDT",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence="TDX Task 1 TRACKING_PREARRIVAL_ID acceptance 2026-09-13",
+    ),
+    "tracking_location_stay": dict(
+        table="4_prod.bronze.map_tracking_location_stay",
+        key_cols=["TRACKING_LOCATOR_ID"],
+        text_cols={"TRACKING_REASON_COMMENT": "anon_tracking_reason_comment"},
+        eligibility="length(trim(TRACKING_REASON_COMMENT)) > 0",
+        person_routes=[
+            ("direct_person", "PERSON_ID"),
+            ("document_context", {
+                "context_key": "TRACKING_LOCATOR_ID",
+                "pattern_recognisers": ["nhs_number", "uk_postcode", "phone"],
+            }),
+        ],
+        priority_col="SOURCE_ADC_UPDT",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence="TDX Task 1 TRACKING_LOCATOR_ID acceptance 2026-09-13",
+    ),
+    "pending_movement": dict(
+        table="4_prod.bronze.map_pending_movement",
+        key_cols=["ENCNTR_PENDING_ID"],
+        text_cols={"TRANSACTION_REASON": "anon_transaction_reason"},
+        eligibility="length(trim(TRANSACTION_REASON)) > 0",
+        person_routes=[
+            ("direct_person", "PERSON_ID"),
+            ("encounter", "ENCNTR_ID"),
+            ("document_context", {
+                "context_key": "ENCNTR_PENDING_ID",
+                "pattern_recognisers": ["nhs_number", "uk_postcode", "phone"],
+            }),
+        ],
+        priority_col="SOURCE_ADC_UPDT",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence="TDX Task 1 ENCNTR_PENDING_ID acceptance 2026-09-13",
+    ),
+    "location_attribute_history": dict(
+        table="4_prod.bronze.map_location_attribute_history",
+        key_cols=["ATTRIBUTE_ROW_ID"],
+        text_cols={"VALUE_STRING": "anon_value_string", "DESCRIPTION": "anon_description"},
+        eligibility="length(trim(VALUE_STRING)) > 0 OR length(trim(DESCRIPTION)) > 0",
+        person_routes=[("document_context", {
+            "context_key": "ATTRIBUTE_ROW_ID",
+            "pattern_recognisers": ["nhs_number", "uk_postcode", "phone", "any_dob_shaped_date"],
+        })],
+        priority_col="SOURCE_ADC_UPDT",
+        accepted_versions={"v3.3"}, unresolved_retry_days=28,
+        batch_persons=100000, batch_unresolved_rows=100000,
+        grain_validated=True,
+        grain_evidence="TDX Task 1 ATTRIBUTE_ROW_ID acceptance 2026-09-13",
     ),
 }
 
@@ -409,6 +537,20 @@ def _apply_target_schema(registry, target_schema):
         cfg = dict(cfg)
         if cfg["table"].startswith("4_prod.bronze."):
             cfg["table"] = target_schema + cfg["table"][len("4_prod.bronze"):]
+        routes = []
+        for route_kind, route_spec in cfg.get("person_routes", []):
+            if route_kind == "document_context":
+                route_spec = dict(route_spec)
+                for source_name in ("record_identifiers", "linked_contacts"):
+                    if route_spec.get(source_name):
+                        source_spec = dict(route_spec[source_name])
+                        if source_spec["table"].startswith("4_prod.bronze."):
+                            source_spec["table"] = (
+                                target_schema + source_spec["table"][len("4_prod.bronze"):]
+                            )
+                        route_spec[source_name] = source_spec
+            routes.append((route_kind, route_spec))
+        cfg["person_routes"] = routes
         repointed[feed] = cfg
     return repointed
 
@@ -802,6 +944,8 @@ def eligible_rows(feed):
     _assert_feed_grain_approved(feed)
     cfg = FEED_REGISTRY[feed]
     source = spark.table(cfg["table"]).where(F.expr(cfg["eligibility"]))
+    if _document_context_spec(cfg) is not None:
+        return source.where(_document_candidate_predicate(cfg))
     source = resolve_persons(source, cfg["person_routes"])
     fingerprints = spark.table(f"{CONTROL_SCHEMA}.person_identifier_current").select(
         F.col("person_id").alias("_fingerprint_person_id"),
@@ -910,6 +1054,7 @@ def initialize_legacy_blob_state():
                 F.col("_current_source_text_sha").alias("anon_source_text_sha"),
                 F.col("_current_identity_fingerprint")
                  .alias("anon_identity_fingerprint"),
+                F.lit(None).cast("string").alias("anon_context_fingerprint"),
                 F.lit(None).cast("long").alias("anon_redaction_count"),
                 F.current_timestamp().alias("anon_processed_at"),
             )
@@ -1046,6 +1191,7 @@ def _prepare_resolved(feed, rows):
         F.lit(REDACTOR_VERSION).alias("anon_redactor_version"),
         F.col("_current_source_text_sha").alias("anon_source_text_sha"),
         F.col("identity_fingerprint").alias("anon_identity_fingerprint"),
+        F.lit(None).cast("string").alias("anon_context_fingerprint"),
         F.col("_redacted.redaction_count").cast("long").alias("anon_redaction_count"),
         F.current_timestamp().alias("anon_processed_at"),
         F.col("_redacted.error_detail").alias("_error_detail"),
@@ -1064,6 +1210,7 @@ def _prepare_unresolved(feed, rows):
         F.lit(REDACTOR_VERSION).alias("anon_redactor_version"),
         F.col("_current_source_text_sha").alias("anon_source_text_sha"),
         F.lit(None).cast("string").alias("anon_identity_fingerprint"),
+        F.lit(None).cast("string").alias("anon_context_fingerprint"),
         F.lit(0).cast("long").alias("anon_redaction_count"),
         F.current_timestamp().alias("anon_processed_at"),
         F.lit(None).cast("string").alias("_error_detail"),
@@ -1400,10 +1547,521 @@ def _bucket_cursor(bucket_ids):
     }, sort_keys=True)
 
 
+def _document_context_spec(cfg):
+    for route_kind, route_spec in cfg.get("person_routes", []):
+        if route_kind == "document_context":
+            return route_spec
+    return None
+
+
+def _empty_string_array():
+    return F.expr("cast(array() as array<string>)")
+
+
+def _empty_date_array():
+    return F.expr("cast(array() as array<date>)")
+
+
+def _clean_string_array(columns):
+    if not columns:
+        return _empty_string_array()
+    return F.array_distinct(
+        F.filter(
+            F.array(*[F.trim(F.col(column).cast("string")) for column in columns]),
+            lambda value: value.isNotNull() & (value != F.lit("")),
+        )
+    )
+
+
+def _clean_date_array(columns):
+    if not columns:
+        return _empty_date_array()
+    return F.array_distinct(
+        F.filter(
+            F.array(*[F.to_date(F.col(column)) for column in columns]),
+            lambda value: value.isNotNull(),
+        )
+    )
+
+
+def _union_arrays(expressions, empty):
+    result = empty
+    for expression in expressions:
+        result = F.array_union(result, F.coalesce(expression, empty))
+    return result
+
+
+def _context_source_aggregate(source_spec, prefix):
+    source = spark.table(source_spec["table"])
+    names = _clean_string_array(source_spec.get("names", []))
+    aliases = _clean_string_array(
+        source_spec.get("identifiers", [])
+        + source_spec.get("postcodes", [])
+        + source_spec.get("addresses", [])
+    )
+    dobs = _clean_date_array(source_spec.get("dobs", []))
+    selected = source.select(
+        F.col(source_spec["key"]).cast("string").alias("_context_key"),
+        names.alias(f"_{prefix}_names"),
+        aliases.alias(f"_{prefix}_aliases"),
+        dobs.alias(f"_{prefix}_dobs"),
+        *(
+            [F.col(source_spec["person_col"]).cast("long").alias(f"_{prefix}_person_id")]
+            if source_spec.get("person_col")
+            else []
+        ),
+    )
+    aggregates = [
+        F.array_distinct(F.flatten(F.collect_list(f"_{prefix}_names"))).alias(
+            f"_{prefix}_names"
+        ),
+        F.array_distinct(F.flatten(F.collect_list(f"_{prefix}_aliases"))).alias(
+            f"_{prefix}_aliases"
+        ),
+        F.array_distinct(F.flatten(F.collect_list(f"_{prefix}_dobs"))).alias(
+            f"_{prefix}_dobs"
+        ),
+    ]
+    if source_spec.get("person_col"):
+        aggregates.append(
+            F.array_sort(F.collect_set(f"_{prefix}_person_id")).alias(
+                f"_{prefix}_person_ids"
+            )
+        )
+    return selected.groupBy("_context_key").agg(*aggregates)
+
+
+def _build_document_context(cfg, rows):
+    """Build one fail-closed context bundle per document key without role filtering."""
+    spec = _document_context_spec(cfg)
+    if spec is None:
+        raise ValueError("document_context route missing")
+    context_key = spec["context_key"]
+    ordinary_routes = [
+        route for route in cfg.get("person_routes", []) if route[0] != "document_context"
+    ]
+    if ordinary_routes:
+        base = resolve_persons(rows, ordinary_routes)
+        base = base.withColumn(
+            "_route_person_ids",
+            F.when(
+                F.col("person_id").isNotNull(), F.array(F.col("person_id").cast("long"))
+            ).otherwise(F.expr("cast(array() as array<bigint>)")),
+        )
+    else:
+        base = (
+            rows.withColumn("person_id", F.lit(None).cast("long"))
+            .withColumn("resolution_status", F.lit("unresolved"))
+            .withColumn("_route_person_ids", F.expr("cast(array() as array<bigint>)"))
+        )
+    base = base.withColumn("_context_key", F.col(context_key).cast("string"))
+    if spec.get("resolved_person_col"):
+        base = base.withColumn(
+            "_route_person_ids",
+            F.array_union(
+                F.col("_route_person_ids"),
+                F.when(
+                    F.col(spec["resolved_person_col"]).isNotNull(),
+                    F.array(F.col(spec["resolved_person_col"]).cast("long")),
+                ).otherwise(F.expr("cast(array() as array<bigint>)")),
+            ),
+        )
+
+    if spec.get("record_identifiers"):
+        record = _context_source_aggregate(spec["record_identifiers"], "record")
+        base = base.join(record, "_context_key", "left")
+    else:
+        base = (
+            base.withColumn("_record_names", _empty_string_array())
+            .withColumn("_record_aliases", _empty_string_array())
+            .withColumn("_record_dobs", _empty_date_array())
+        )
+
+    if spec.get("linked_contacts"):
+        contacts = _context_source_aggregate(spec["linked_contacts"], "contact")
+        base = base.join(contacts, "_context_key", "left")
+    else:
+        base = (
+            base.withColumn("_contact_names", _empty_string_array())
+            .withColumn("_contact_aliases", _empty_string_array())
+            .withColumn("_contact_dobs", _empty_date_array())
+            .withColumn("_contact_person_ids", F.expr("cast(array() as array<bigint>)"))
+        )
+
+    base = base.withColumn(
+        "_context_person_ids",
+        F.array_distinct(
+            F.array_union(
+                F.coalesce("_route_person_ids", F.expr("cast(array() as array<bigint>)")),
+                F.coalesce("_contact_person_ids", F.expr("cast(array() as array<bigint>)")),
+            )
+        ),
+    )
+    context_people = (
+        base.select(
+            "_context_key",
+            F.explode_outer("_context_person_ids").alias("person_id"),
+        )
+        .where(F.col("person_id").isNotNull())
+        .distinct()
+    )
+    if not SKIP_FINGERPRINT_REFRESH:
+        refresh_person_fingerprints(
+            context_people.select("person_id"),
+            include_source_deltas=True,
+        )
+    identity = spark.table(f"{CONTROL_SCHEMA}.person_identifier_current").select(
+        "person_id", *IDENTITY_VALUE_COLUMNS
+    )
+    empty_strings = _empty_string_array()
+    people = (
+        context_people.join(identity, "person_id", "inner")
+        .groupBy("_context_key")
+        .agg(
+            *[
+                F.array_distinct(
+                    F.flatten(F.collect_list(F.coalesce(F.col(column), empty_strings)))
+                ).alias(f"_person_{column}")
+                for column in [
+                    "first_names", "middle_names", "last_names", "nickname_tokens",
+                    "aliases", "relatives", "informants",
+                ]
+            ],
+            F.array_distinct(F.collect_list("dob")).alias("_person_dobs"),
+            F.sha2(
+                F.to_json(F.array_sort(F.collect_set("identity_fingerprint"))), 256
+            ).alias("_context_identity_fingerprint"),
+        )
+    )
+    base = base.join(people, "_context_key", "left")
+    names = _union_arrays(
+        [F.col("_record_names"), F.col("_contact_names"),
+         F.col("_person_first_names"), F.col("_person_last_names")],
+        _empty_string_array(),
+    )
+    aliases = _union_arrays(
+        [F.col("_record_aliases"), F.col("_contact_aliases"),
+         F.col("_person_aliases"), F.col("_person_relatives"),
+         F.col("_person_informants"), names],
+        _empty_string_array(),
+    )
+    dobs = _union_arrays(
+        [F.col("_record_dobs"), F.col("_contact_dobs"), F.col("_person_dobs")],
+        _empty_date_array(),
+    )
+    base = (
+        base.withColumn("first_names", names)
+        .withColumn("middle_names", F.coalesce("_person_middle_names", _empty_string_array()))
+        .withColumn("last_names", names)
+        .withColumn("nickname_tokens", F.coalesce("_person_nickname_tokens", _empty_string_array()))
+        .withColumn("aliases", aliases)
+        .withColumn("relatives", F.coalesce("_person_relatives", _empty_string_array()))
+        .withColumn("informants", F.coalesce("_person_informants", _empty_string_array()))
+        .withColumn(
+            "addresses",
+            F.lit(None).cast(
+                "array<struct<STREET_ADDR:string,STREET_ADDR2:string,STREET_ADDR3:string,"
+                "STREET_ADDR4:string,CITY:string,COUNTY:string,STATE:string,"
+                "COUNTRY:string,ZIPCODE:string,POSTAL_IDENTIFIER:string>>"
+            ),
+        )
+        .withColumn("dobs", dobs)
+        .withColumn("dob", F.expr("try_element_at(dobs, 1)"))
+        .withColumn(
+            "identity_fingerprint",
+            F.col("_context_identity_fingerprint"),
+        )
+        .withColumn(
+            "person_id",
+            F.expr("try_element_at(_context_person_ids, 1)").cast("long"),
+        )
+    )
+    has_identifiers = (
+        (F.size(names) > 0)
+        | (F.size(aliases) > 0)
+        | (F.size(dobs) > 0)
+        | (F.size(F.col("_context_person_ids")) > 0)
+    )
+    recogniser_only = (
+        not spec.get("record_identifiers")
+        and not spec.get("linked_contacts")
+        and not spec.get("resolved_person_col")
+        and not ordinary_routes
+        and bool(spec.get("pattern_recognisers"))
+    )
+    base = base.withColumn(
+        "_context_has_data", has_identifiers | F.lit(recogniser_only)
+    ).withColumn(
+        "resolution_status",
+        F.when(F.col("_context_has_data"), F.lit("resolved")).otherwise(
+            F.lit("no_context")
+        ),
+    )
+    derived_fingerprint = F.sha2(
+        F.to_json(
+            F.struct(
+                F.array_sort(names).alias("names"),
+                F.array_sort(aliases).alias("aliases"),
+                F.array_sort(dobs).alias("dobs"),
+                F.array_sort(F.col("_context_person_ids")).alias("person_ids"),
+                F.array(*[F.lit(value) for value in spec.get("pattern_recognisers", [])])
+                .alias("recognisers"),
+            )
+        ),
+        256,
+    )
+    current_context = (
+        F.col(spec["context_fingerprint_col"]).cast("string")
+        if spec.get("context_fingerprint_col")
+        else derived_fingerprint
+    )
+    return base.withColumn("_current_context_fingerprint", current_context)
+
+
+def _valid_nhs_number(value):
+    digits = re.sub(r"\s", "", value or "")
+    if len(digits) != 10 or not digits.isdigit():
+        return False
+    total = sum(int(digit) * weight for digit, weight in zip(digits[:9], range(10, 1, -1)))
+    check = 11 - (total % 11)
+    check = 0 if check == 11 else check
+    return check != 10 and check == int(digits[-1])
+
+
+def _apply_pattern_recognisers(value, recognisers, dobs):
+    if value is None:
+        return value, 0
+    output = value
+    count = 0
+    enabled = set(recognisers or [])
+    if "nhs_number" in enabled:
+        pattern = re.compile(r"\b\d{3}\s?\d{3}\s?\d{4}\b")
+        output, matched = pattern.subn(
+            lambda match: "[REDACTED NHS NUMBER]"
+            if _valid_nhs_number(match.group(0)) else match.group(0),
+            output,
+        )
+        count += matched
+    if "uk_postcode" in enabled:
+        output, matched = re.subn(
+            r"(?i)\b(?:GIR ?0AA|[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2})\b",
+            "[REDACTED POSTCODE]",
+            output,
+        )
+        count += matched
+    if "phone" in enabled:
+        output, matched = re.subn(
+            r"(?<!\d)(?:(?:\+44\s?|\(?0)(?:\d[\s().-]?){8,11}\d)(?!\d)",
+            "[REDACTED PHONE]",
+            output,
+        )
+        count += matched
+    dob_values = set()
+    for value_dob in dobs or []:
+        if value_dob is not None:
+            dob_values.update({
+                value_dob.strftime("%Y-%m-%d"),
+                value_dob.strftime("%d/%m/%Y"),
+                value_dob.strftime("%d-%m-%Y"),
+            })
+    date_pattern = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b")
+    if "any_dob_shaped_date" in enabled:
+        output, matched = date_pattern.subn("[REDACTED DATE]", output)
+        count += matched
+    elif "dob_in_context" in enabled and dob_values:
+        output, matched = date_pattern.subn(
+            lambda match: "[REDACTED DOB]" if match.group(0) in dob_values else match.group(0),
+            output,
+        )
+        count += matched
+    return output, count
+
+
+def _redact_document_row(
+    texts, text_modes, first_names, middle_names, last_names, nickname_tokens,
+    aliases, relatives, informants, addresses, dob, dobs, pattern_recognisers,
+):
+    try:
+        output, total = [], 0
+        dates = [value for value in (dobs or []) if value is not None]
+        if dob is not None and dob not in dates:
+            dates.insert(0, dob)
+        dates = dates or [None]
+        for value, text_mode in zip(texts or [], text_modes or []):
+            current = value
+            for current_dob in dates:
+                redact_fn = (
+                    redact_variant_json
+                    if text_mode == "json_string_leaves"
+                    else redact_with_count
+                )
+                current, matched = redact_fn(
+                    current,
+                    list(first_names or []) + list(nickname_tokens or []),
+                    middle_names or [],
+                    last_names or [],
+                    current_dob,
+                    addresses or [],
+                    aliases or [],
+                    relatives or [],
+                    informants or [],
+                    DEFAULT_WHITELIST,
+                )
+                total += matched
+            current, matched = _apply_pattern_recognisers(
+                current, pattern_recognisers, dates
+            )
+            total += matched
+            output.append(current)
+        return output, total, True, None
+    except Exception as exc:
+        return None, 0, False, f"{type(exc).__name__}: {exc}"[:4000]
+
+
+redact_document_row_udf = F.udf(_redact_document_row, REDACTION_RESULT_SCHEMA)
+
+
+def _prepare_document_context(feed, rows):
+    cfg = FEED_REGISTRY[feed]
+    spec = _document_context_spec(cfg)
+    texts = F.array(*[F.col(column).cast("string") for column in cfg["text_cols"]])
+    text_modes = F.array(*[
+        F.lit(cfg.get("text_modes", {}).get(column, "scalar"))
+        for column in cfg["text_cols"]
+    ])
+    output = rows.withColumn(
+        "_redacted",
+        redact_document_row_udf(
+            texts, text_modes, "first_names", "middle_names", "last_names",
+            "nickname_tokens", "aliases", "relatives", "informants", "addresses",
+            "dob", "dobs",
+            F.array(*[F.lit(value) for value in spec.get("pattern_recognisers", [])]),
+        ),
+    )
+    for index, anon_column in enumerate(cfg["text_cols"].values(), 1):
+        output = output.withColumn(
+            anon_column,
+            F.when(
+                F.col("_context_has_data") & F.col("_redacted.success"),
+                F.element_at("_redacted.texts", index),
+            ),
+        )
+    return output.select(
+        *cfg["key_cols"],
+        *cfg["text_cols"].values(),
+        F.when(~F.col("_context_has_data"), F.lit("no_context"))
+        .when(F.col("_redacted.success"), F.lit("anonymized"))
+        .otherwise(F.lit("failed")).alias("anon_status"),
+        F.lit(REDACTOR_VERSION).alias("anon_redactor_version"),
+        F.col("_current_source_text_sha").alias("anon_source_text_sha"),
+        F.col("identity_fingerprint").alias("anon_identity_fingerprint"),
+        F.col("_current_context_fingerprint").alias("anon_context_fingerprint"),
+        F.when(F.col("_context_has_data"), F.col("_redacted.redaction_count"))
+        .otherwise(F.lit(0)).cast("long").alias("anon_redaction_count"),
+        F.current_timestamp().alias("anon_processed_at"),
+        F.when(
+            F.col("_context_has_data") & ~F.col("_redacted.success"),
+            F.col("_redacted.error_detail"),
+        ).alias("_error_detail"),
+    )
+
+
+def _document_candidate_predicate(cfg):
+    spec = _document_context_spec(cfg)
+    accepted = list(cfg["accepted_versions"])
+    retry_cutoff = F.current_timestamp() - F.expr(
+        f"INTERVAL {int(cfg['unresolved_retry_days'])} DAYS"
+    )
+    predicate = (
+        F.col("anon_status").isNull()
+        | F.col("anon_processed_at").isNull()
+        | ~F.col("anon_source_text_sha").eqNullSafe(_text_hash(cfg))
+        | F.col("anon_redactor_version").isNull()
+        | ~F.col("anon_redactor_version").isin(*accepted)
+        | ((F.col("anon_status") == "anonymized") & _anon_output_missing_for_present_source(cfg))
+        | (
+            F.col("anon_status").isin("unresolved_person", "no_context", "failed")
+            & (F.col("anon_processed_at") < retry_cutoff)
+        )
+        | (F.col(cfg["priority_col"]).cast("timestamp") > F.col("anon_processed_at"))
+    )
+    if spec.get("context_fingerprint_col"):
+        predicate = predicate | ~F.col("anon_context_fingerprint").eqNullSafe(
+            F.col(spec["context_fingerprint_col"]).cast("string")
+        )
+    return predicate
+
+
+def _run_document_context_feed(feed):
+    """Bounded document-context path; one deterministic batch per invocation."""
+    cfg = FEED_REGISTRY[feed]
+    started = datetime.now(timezone.utc)
+    source = spark.table(cfg["table"]).where(F.expr(cfg["eligibility"]))
+    candidates = source.where(_document_candidate_predicate(cfg))
+    eligible_total = int(candidates.count())
+    if eligible_total == 0:
+        return {
+            "status": "success", "stop_reason": None, "processed": 0, "touched": 0,
+            "batches": 0, "total_groups": 0, "eligible_total": 0,
+            "remaining_estimate": 0, "elapsed_seconds": _elapsed_seconds(),
+        }
+    batch_cap = min(
+        int(WORK_CAP_ROWS) if WORK_CAP_ROWS else int(cfg.get("batch_resolved_rows", 100000)),
+        int(cfg.get("batch_unresolved_rows", 100000)),
+    )
+    batch = candidates.orderBy(
+        F.col(cfg["priority_col"]).desc_nulls_last(),
+        *[F.col(column).asc_nulls_last() for column in cfg["key_cols"]],
+    ).limit(batch_cap)
+    context = _build_document_context(cfg, batch).withColumn(
+        "_current_source_text_sha", _text_hash(cfg)
+    )
+    output = _prepare_document_context(feed, context)
+    processed = merge_batch(feed, output, "document_context", None, started)
+    remaining = max(eligible_total - processed, 0)
+    return {
+        "status": "partial" if remaining else "success",
+        "stop_reason": "work_cap" if remaining else None,
+        "processed": processed, "touched": 0, "batches": 1, "total_groups": 1,
+        "eligible_total": eligible_total, "remaining_estimate": remaining,
+        "elapsed_seconds": _elapsed_seconds(),
+    }
+
+
+def ensure_feed_output_columns(cfg):
+    """Re-establish governed output columns after a producer replaces its table."""
+    table = cfg["table"]
+    quoted = ".".join("`" + part.replace("`", "``") + "`" for part in table.split("."))
+    expected = {name: "string" for name in cfg["text_cols"].values()}
+    expected.update({
+        "anon_status": "string", "anon_redactor_version": "string",
+        "anon_source_text_sha": "string", "anon_identity_fingerprint": "string",
+        "anon_context_fingerprint": "string",
+        "anon_redaction_count": "bigint", "anon_processed_at": "timestamp",
+    })
+    existing = {field.name: field.dataType.simpleString() for field in spark.table(table).schema}
+    wrong = {name: existing[name] for name, kind in expected.items()
+             if name in existing and existing[name] != kind}
+    if wrong:
+        raise RuntimeError(f"{table}: incompatible anonymous-output types: {wrong}")
+    missing = {name: kind for name, kind in expected.items() if name not in existing}
+    if missing:
+        columns = ", ".join(f"`{name}` {kind}" for name, kind in missing.items())
+        spark.sql(f"ALTER TABLE {quoted} ADD COLUMNS ({columns})")
+    # Replay tags on existing columns too, to recover a failed partial DDL attempt.
+    for name in expected:
+        risk, severity = ("3", "2") if name in cfg["text_cols"].values() else ("1", "1")
+        spark.sql(f"ALTER TABLE {quoted} ALTER COLUMN `{name}` SET TAGS "
+                  f"('ig_risk'='{risk}', 'ig_severity'='{severity}')")
+
+
 def run_feed(feed):
     ensure_control_tables(spark)
     _assert_feed_grain_approved(feed)
     cfg = FEED_REGISTRY[feed]
+    ensure_feed_output_columns(cfg)
+    if _document_context_spec(cfg) is not None:
+        return _run_document_context_feed(feed)
     text_columns = list(cfg["text_cols"])
     planned = datetime.now(timezone.utc)
     source = spark.table(cfg["table"]).where(F.expr(cfg["eligibility"]))
@@ -1674,32 +2332,41 @@ def run_feed(feed):
         spark.sql(f"DROP TABLE IF EXISTS {work_stage}")
 
 ensure_control_tables(spark)
-if ACTION == "init_controls":
-    tag_control_tables(spark)
-    result = {"status": "success", "elapsed_seconds": _elapsed_seconds()}
-elif ACTION == "refresh_fingerprints":
-    refresh_person_fingerprints()
-    result = {"status": "success", "elapsed_seconds": _elapsed_seconds()}
-elif ACTION == "eligible_count":
-    count = eligible_rows(FEED).count()
+try:
+    if ACTION == "init_controls":
+        tag_control_tables(spark)
+        result = {"status": "success", "elapsed_seconds": _elapsed_seconds()}
+    elif ACTION == "refresh_fingerprints":
+        refresh_person_fingerprints()
+        result = {"status": "success", "elapsed_seconds": _elapsed_seconds()}
+    elif ACTION == "eligible_count":
+        count = eligible_rows(FEED).count()
+        spark.createDataFrame(
+            [(FEED, "eligible_count", None, count, RUN_ID, datetime.now(timezone.utc),
+              datetime.now(timezone.utc), None, "success", None)],
+            "feed string, lane string, cursor string, batch_rows long, run_id string, started_at timestamp, "
+            "finished_at timestamp, last_refresh_ts timestamp, status string, detail string",
+        ).write.mode("append").saveAsTable(f"{CONTROL_SCHEMA}.engine_progress")
+        result = {
+            "status": "success", "eligible_count": int(count),
+            "elapsed_seconds": _elapsed_seconds(),
+        }
+    elif ACTION == "initialize_legacy_blob_state":
+        result = initialize_legacy_blob_state()
+    elif ACTION == "run":
+        result = run_feed(FEED)
+    else:
+        raise ValueError(f"unknown action: {ACTION}")
+except Exception as exc:
+    detail = f"{type(exc).__name__}: {exc}"[:4000]
     spark.createDataFrame(
-        [(FEED, "eligible_count", None, count, RUN_ID, datetime.now(timezone.utc),
-          datetime.now(timezone.utc), None, "success", None)],
-        "feed string, lane string, cursor string, batch_rows long, run_id string, started_at timestamp, "
-        "finished_at timestamp, last_refresh_ts timestamp, status string, detail string",
-    ).write.mode("append").saveAsTable(f"{CONTROL_SCHEMA}.engine_progress")
-    result = {
-        "status": "success", "eligible_count": int(count),
-        "elapsed_seconds": _elapsed_seconds(),
-    }
-elif ACTION == "initialize_legacy_blob_state":
-    result = initialize_legacy_blob_state()
-elif ACTION == "run":
-    result = run_feed(FEED)
-else:
-    raise ValueError(f"unknown action: {ACTION}")
+        [(FEED, RUN_ID, "__run__", detail, datetime.now(timezone.utc))],
+        "feed string, run_id string, row_key string, error_detail string, recorded_at timestamp",
+    ).write.mode("append").saveAsTable(f"{CONTROL_SCHEMA}.engine_errors")
+    raise
 
 payload = {"action": ACTION, "feed": FEED, "run_id": RUN_ID, **result}
 print(json.dumps(payload, default=str, sort_keys=True))
 dbutils.notebook.exit(json.dumps(payload, default=str, sort_keys=True))
+
 

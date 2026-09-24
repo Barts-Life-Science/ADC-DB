@@ -64,3 +64,4 @@ def test_transformExamAccessionNumber():
 # MAGIC %sh
 # MAGIC
 # MAGIC pytest test_pacs_data_transformation.py
+

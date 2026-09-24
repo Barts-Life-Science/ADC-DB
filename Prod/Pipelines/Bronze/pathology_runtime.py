@@ -17,6 +17,7 @@ RUNTIME_MODULES = (
     "pathology_genetics.py",
     "pathology_indications.py",
     "pathology_amr.py",
+    "pathology_antibiogram.py",
     "pathology_incremental.py",
     "pathology_validation.py",
 )

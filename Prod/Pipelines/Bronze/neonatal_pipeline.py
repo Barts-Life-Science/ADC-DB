@@ -1,4 +1,5 @@
 # Databricks notebook source
+# BRONZE_FIX_946452877034658_V1
 # neonatal_pipeline - S2/A5. Design decisions: plan 2026-08-12 v2 Task 4.
 # True source grains are retained: EntityID for episode/narrative/exam and
 # (EntityID, ActivityDate) for NCCMDS. Identifiers resolve at build time and are excluded.
@@ -129,20 +130,22 @@ def dq_all_clinical(df, admin_stamps):
     return dq_columns(df, cols), cols
 
 def replace_with_tombstones(df, target, key_cols):
-    """Deterministic replace with NO silent hard deletes (S2.2 lifecycle): rows present in
-    the prior published version but absent from the fresh build are re-appended with
-    SOURCE_PRESENT_IND=false, retaining their previous column values and stamps.
-    A key that reappears at source is resurrected as present (its tombstone drops out)."""
+    """Publish fresh rows and historical tombstones in one atomic Delta commit.
+
+    The schema union preserves prior-only columns, including anonymisation state.
+    A failed write leaves the previous publication intact; retries retain tombstones.
+    """
     fresh = df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
-    v_prev = table_version(target) if spark.catalog.tableExists(target) else None
-    (fresh.write.format("delta").mode("overwrite")
-          .option("overwriteSchema", "true").saveAsTable(target))
-    if v_prev is not None:
+    if spark.catalog.tableExists(target):
+        v_prev = table_version(target)
         prior = spark.read.option("versionAsOf", v_prev).table(target)
-        gone = (prior.join(spark.table(target).select(*key_cols).distinct(),
-                           key_cols, "left_anti")
-                     .withColumn("SOURCE_PRESENT_IND", F.lit(False)))
-        gone.write.format("delta").mode("append").saveAsTable(target)
+        gone = (prior.join(fresh.select(*key_cols).distinct(), key_cols, "left_anti")
+                .withColumn("SOURCE_PRESENT_IND", F.lit(False)))
+        publication = fresh.unionByName(gone, allowMissingColumns=True)
+    else:
+        publication = fresh
+    (publication.write.format("delta").mode("overwrite")
+     .option("overwriteSchema", "true").saveAsTable(target))
 
 def table_fingerprint(tbl, exclude=("PIPELINE_UPDT_DT_TM",)):
     """Canonical whole-row fingerprint: order-independent sum of xxhash64 over the JSON of

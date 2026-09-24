@@ -6,6 +6,8 @@
 
 # COMMAND ----------
 
+# BRONZE_PERF_946452877034658_V2
+
 from pyspark.sql.functions import max as spark_max
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
@@ -5712,11 +5714,50 @@ def _pipeline_commit_all_checkpoints():
         )
 
 
+if '_PERF_TASK_STARTED_AT' not in globals():
+    import time as _perf_time
+    _PERF_TASK_STARTED_AT = _perf_time.time()
+    _PERF_TASK_START_BASIS = 'shared_runtime_before_component_start'
+    try:
+        from databricks.sdk import WorkspaceClient as _PerfWorkspaceClient
+        _perf_task_id = dbutils.widgets.get('perf_task_run_id')
+        if _perf_task_id:
+            _perf_task_run = _PerfWorkspaceClient().jobs.get_run(int(_perf_task_id))
+            if _perf_task_run.start_time:
+                _PERF_TASK_STARTED_AT = _perf_task_run.start_time / 1000.0
+                _PERF_TASK_START_BASIS = 'jobs_api_task_start'
+    except Exception as _perf_exc:
+        print('[PERF] Task start unavailable; timing explicitly excludes earlier bootstrap: ' + str(_perf_exc)[:200])
+
+
+def _perf_audit_details(event_type, details):
+    import time as perf_time
+    details = dict(details or {})
+    component = details.get('component') or globals().get('_PIPELINE_CURRENT_COMPONENT')
+    now = perf_time.time()
+    if event_type == 'COMPONENT_START':
+        globals().setdefault('_PERF_COMPONENT_STARTS', {})[component] = now
+        started = globals().get('_PERF_TASK_STARTED_AT')
+        if started is not None:
+            details['bootstrap_seconds'] = _pipeline_builtins.max(0.0, now - started)
+    elif event_type in {'COMPONENT_TASK_SUCCESS', 'COMPONENT_END'}:
+        started = globals().get('_PERF_TASK_STARTED_AT')
+        work_start = globals().get('_PERF_COMPONENT_STARTS', {}).get(component)
+        if started is not None and work_start is not None:
+            wall = _pipeline_builtins.max(0.001, now - started)
+            work = _pipeline_builtins.max(0.0, now - work_start)
+            details['COMPONENT_EFFICIENCY'] = {'task_seconds': wall, 'component_seconds': work,
+                'ratio': work / wall, 'below_20_percent': work / wall < 0.2,
+                'start_basis': globals().get('_PERF_TASK_START_BASIS', 'unknown')}
+            print('[COMPONENT_EFFICIENCY] ' + _pipeline_json.dumps(details['COMPONENT_EFFICIENCY']))
+    return details
+
 def _pipeline_audit(
     target_table: str,
     event_type: str,
     details=None,
 ):
+    details = _perf_audit_details(event_type, details)
     runtime_spark = _pipeline_active_spark()
     if not _PIPELINE_AUDIT_ENABLED:
         return

@@ -23,11 +23,17 @@ def _parsed_schema(T):
             T.StructField("alteration_type", T.StringType()),
             T.StructField("detection_status", T.StringType()),
             T.StructField("hgvs_c_raw", T.StringType()),
+            T.StructField("hgvs_c_parsed", T.StringType()),
             T.StructField("hgvs_p_raw", T.StringType()),
+            T.StructField("hgvs_p_parsed", T.StringType()),
+            T.StructField("hgvs_validation_status", T.StringType()),
             T.StructField("transcript", T.StringType()),
             T.StructField("vaf_raw", T.StringType()),
             T.StructField("vaf", T.DoubleType()),
             T.StructField("reported_classification", T.StringType()),
+            T.StructField("reported_tier", T.StringType()),
+            T.StructField("zygosity", T.StringType()),
+            T.StructField("ratio_raw", T.StringType()),
             T.StructField("evidence_text", T.StringType()),
             T.StructField("evidence_start", T.IntegerType()),
             T.StructField("evidence_end", T.IntegerType()),
@@ -37,6 +43,7 @@ def _parsed_schema(T):
         [
             T.StructField("overall_result_status", T.StringType()),
             T.StructField("genes_tested", T.ArrayType(T.StringType())),
+            T.StructField("genes_reported", T.ArrayType(T.StringType())),
             T.StructField("findings", T.ArrayType(finding)),
             T.StructField("parser_version", T.StringType()),
         ]
@@ -86,13 +93,35 @@ def _match_report_profiles(spark, config: PipelineConfig, include_proposed: bool
 
 
 def _gene_aliases(spark, config: PipelineConfig):
-    _, F, _ = _imports()
-    aliases = spark.table(f"{config.lookup_schema}.pathology_hgnc_alias")
-    return aliases.filter(F.col("ambiguous_ind") == False).select(
+    """One HGNC row per symbol string.
+
+    A current approved symbol always resolves to its own gene, even when the
+    same string is also another gene's alias (SF3B1, MET and SMO are flagged
+    ambiguous for that reason). Previous symbols and aliases resolve only when
+    unambiguous.
+    """
+
+    Window, F, _ = _imports()
+    aliases = spark.table(f"{config.lookup_schema}.pathology_hgnc_alias").select(
         F.upper(F.trim("alias_symbol")).alias("alias_symbol"),
         "hgnc_id",
         "approved_symbol",
         "alias_type",
+        "ambiguous_ind",
+    )
+    aliases = aliases.filter(
+        (F.col("alias_type") == "approved_symbol") | (F.col("ambiguous_ind") == False)
+    )
+    preference = Window.partitionBy("alias_symbol").orderBy(
+        F.when(F.col("alias_type") == "approved_symbol", 0)
+        .when(F.col("alias_type") == "previous_symbol", 1)
+        .otherwise(2),
+        F.col("hgnc_id").asc_nulls_last(),
+    )
+    return (
+        aliases.withColumn("_alias_rn", F.row_number().over(preference))
+        .filter(F.col("_alias_rn") == 1)
+        .select("alias_symbol", "hgnc_id", "approved_symbol", "alias_type")
     )
 
 
@@ -144,7 +173,7 @@ def build_genetic_frames(
     gene_symbols = [row["alias_symbol"] for row in aliases.select("alias_symbol").distinct().collect()]
     if not gene_symbols:
         raise RuntimeError(
-            "No unambiguous HGNC aliases are loaded in 8_dev.lookup.pathology_hgnc_alias"
+            f"No HGNC symbols are loaded in {config.lookup_schema}.pathology_hgnc_alias"
         )
 
     matched = _match_report_profiles(spark, config, include_proposed_profiles).select(
@@ -239,6 +268,8 @@ def build_genetic_frames(
             "is_current",
             F.lit(True).alias("research_qi_only"),
             F.col("_parsed.genes_tested").alias("_genes_tested"),
+            F.col("_parsed.genes_reported").alias("_genes_reported"),
+            F.col("_parsed.parser_version").alias("_parser_version"),
             F.col("_parsed.findings").alias("_findings"),
             F.col("dedicated_gene_symbol").alias("_dedicated_gene_symbol"),
             F.upper(F.col("profile_status")).alias("_profile_status"),
@@ -257,15 +288,26 @@ def build_genetic_frames(
         _drop_stage_table(spark, stage_table)
         raise
 
+    # Tumour and myeloid NGS reports state that genes outside the result table
+    # were "NOT assessed or reported", so only result-row genes are known to
+    # have been assessed; the technical gene list is the panel's content.
     report_genes = (
         tests.select(
             "genetic_test_id",
             "panel_version_inferred",
+            "_genes_reported",
             F.explode_outer("_genes_tested").alias("reported_gene_symbol"),
         )
         .filter(F.col("reported_gene_symbol").isNotNull())
         .withColumn("evidence_type", F.lit("report_gene_list"))
-        .withColumn("test_scope", F.lit(None).cast("string"))
+        .withColumn(
+            "test_scope",
+            F.when(
+                F.array_contains(F.coalesce("_genes_reported", F.array()), F.col("reported_gene_symbol")),
+                F.lit("reported_result"),
+            ).otherwise(F.lit("panel_content")),
+        )
+        .drop("_genes_reported")
         .withColumn("confidence", F.lit(1.0))
     )
     dedicated_genes = (
@@ -328,6 +370,7 @@ def build_genetic_frames(
             "is_current",
             "_profile_status",
             "_lifecycle_status",
+            "_parser_version",
             F.explode_outer("_findings").alias("finding"),
         )
         .filter(F.col("finding").isNotNull())
@@ -338,6 +381,7 @@ def build_genetic_frames(
             "is_current",
             "_profile_status",
             "_lifecycle_status",
+            "_parser_version",
             "finding.*",
         )
     )
@@ -361,22 +405,16 @@ def build_genetic_frames(
         .withColumn("hgnc_id", F.col("gene_hgnc_id"))
         .withColumn("normalized_gene_symbol", F.col("gene_normalized_symbol"))
         .withColumn("partner_hgnc_id", F.col("partner_hgnc_id"))
-        .withColumn("hgvs_c_parsed", F.lit(None).cast("string"))
-        .withColumn("hgvs_p_parsed", F.lit(None).cast("string"))
-        .withColumn("hgvs_validation_status", F.lit("not_validated"))
         .withColumn("genome_build", F.lit(None).cast("string"))
         .withColumn("chromosome", F.lit(None).cast("string"))
         .withColumn("position_start", F.lit(None).cast("long"))
         .withColumn("position_end", F.lit(None).cast("long"))
-        .withColumn("zygosity", F.lit(None).cast("string"))
-        .withColumn("reported_tier", F.lit(None).cast("string"))
         .withColumn("copy_number", F.lit(None).cast("double"))
-        .withColumn("ratio_raw", F.lit(None).cast("string"))
         .withColumn("iscn_raw", F.lit(None).cast("string"))
         .withColumn("clinvar_concept_id", F.lit(None).cast("long"))
         .withColumn("omop_genomic_concept_id", F.lit(None).cast("long"))
         .withColumn("snomed_code", F.lit(None).cast("string"))
-        .withColumn("parser_version", F.lit(PARSER_VERSION))
+        .withColumn("parser_version", F.coalesce(F.col("_parser_version"), F.lit(PARSER_VERSION)))
         .withColumn(
             "review_status",
             F.when(F.col("_profile_status") == "APPROVED", "auto_validated").otherwise("proposed"),
@@ -387,6 +425,47 @@ def build_genetic_frames(
     return tests, gene_tested, findings, stage_table
 
 
+def _version_key(value: str) -> tuple[int, ...]:
+    return tuple(int(part) if part.isdigit() else 0 for part in str(value).split("."))
+
+
+def _guard_full_reconcile(spark, config: PipelineConfig, findings, *, allow_result_shrink: bool):
+    """Refuse a reconcile that would delete findings a stale parser cannot see.
+
+    A full reconcile deletes every target row the stage lacks. On 2026-09-11 a
+    bundled copy of parser 1.0.0 produced no findings and the reconcile deleted
+    all 2,842 rows written by 2.0.0.
+    """
+
+    _, F, _ = _imports()
+    target = f"{config.bronze_schema}.map_pathology_genetic_result"
+    if not table_exists(spark, target):
+        return
+    existing = spark.table(target).agg(
+        F.count(F.lit(1)).alias("row_count"),
+        F.collect_set("parser_version").alias("parser_versions"),
+    ).first()
+    newer = sorted(
+        version
+        for version in (existing["parser_versions"] or [])
+        if version and _version_key(version) > _version_key(PARSER_VERSION)
+    )
+    if newer:
+        raise RuntimeError(
+            f"{target} holds rows from parser {newer}, newer than the running "
+            f"parser {PARSER_VERSION}; refusing full reconcile (stale module on sys.path?)"
+        )
+    if allow_result_shrink or not existing["row_count"]:
+        return
+    staged = findings.count()
+    if staged < existing["row_count"] * 0.5:
+        raise RuntimeError(
+            f"Parser {PARSER_VERSION} staged {staged} findings against {existing['row_count']} "
+            f"in {target}; refusing a full reconcile that would delete over half. "
+            "Pass allow_result_shrink=True if the reduction is intended."
+        )
+
+
 def run_genetics(
     spark,
     config: PipelineConfig | None = None,
@@ -394,6 +473,7 @@ def run_genetics(
     include_proposed_profiles: bool = False,
     full_reconcile: bool = True,
     validate_stage_keys: bool = True,
+    allow_result_shrink: bool = False,
 ):
     config = config or PipelineConfig()
     ensure_contracts(spark, config)
@@ -406,6 +486,8 @@ def run_genetics(
         "map_pathology_genetic_result": findings,
     }
     try:
+        if full_reconcile:
+            _guard_full_reconcile(spark, config, findings, allow_result_shrink=allow_result_shrink)
         return {
             name: merge_contract(
                 spark,

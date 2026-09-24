@@ -352,6 +352,7 @@ def bronze_merge_assignments(frame, table_name: str, source_alias: str = "s"):
     return projected, assignments
 
 
+# BRONZE_REPAIR_272860676151023_R2
 _BRONZE_APPROVED_ADDITIVE_COLUMNS = {
     "map_text_events": {
         "anon_text_result": "string",
@@ -359,6 +360,7 @@ _BRONZE_APPROVED_ADDITIVE_COLUMNS = {
         "anon_redactor_version": "string",
         "anon_source_text_sha": "string",
         "anon_identity_fingerprint": "string",
+        "anon_context_fingerprint": "string",
         "anon_redaction_count": "bigint",
         "anon_processed_at": "timestamp",
     },
@@ -421,5 +423,4 @@ try:
     bronze_active_spark().conf.set("spark.databricks.delta.schema.autoMerge.enabled", "false")
 except Exception:
     pass
-
 

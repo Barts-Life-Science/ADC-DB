@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
-CONTRACT_VERSION = "1.0.0-dev"
+CONTRACT_VERSION = "1.1.0-dev"
 
 
 @dataclass(frozen=True)
@@ -489,6 +489,13 @@ AMR_CONTRACTS: tuple[Contract, ...] = (
             c("organism_omop_concept_id", "BIGINT", "Approved standard OMOP organism concept."),
             c("suspected_ind", "BOOLEAN", "Whether the organism identification is hedged or suspected."),
             c("growth_grade", "STRING", "Reported growth grade."),
+            c("organism_code", "STRING", "WinPath organism code exactly as packed in the antibiogram (e.g. ESCOL)."),
+            c("panel_code", "STRING", "WinPath susceptibility panel code following the organism (e.g. GU5, 3P); null when blank."),
+            c("isolate_ordinal", "INT", "Zero-based position of this isolate block within the source result value."),
+            c("isolate_comment", "STRING", "Text of the [~ annotation lines attached to this isolate, joined with single spaces; null when none."),
+            c("lims_no", "INT", "TFC/LIMS instance number the source row came from; dictionaries are keyed per instance."),
+            c("parse_status", "STRING", "ok, or unterminated_block when this isolate block had no terminator before the next opener; the row-level orphan_continuation diagnostic is recorded in pathology_validation_result, not here."),
+            c("parser_version", "STRING", "pathology_antibiogram.ANTIBIOGRAM_PARSER_VERSION that produced the row."),
             c("lifecycle_status", "STRING", "Inherited result/report lifecycle."),
             c("is_current", "BOOLEAN", "Whether the isolate remains current."),
             c("research_qi_only", "BOOLEAN", "True in the research/QI release."),
@@ -507,11 +514,14 @@ AMR_CONTRACTS: tuple[Contract, ...] = (
             c("antimicrobial_code", "STRING", "Source antimicrobial result/test code."),
             c("antimicrobial_omop_concept_id", "BIGINT", "Approved standard antimicrobial concept."),
             c("interpretation_raw", "STRING", "Raw susceptibility result."),
-            c("interpretation", "STRING", "S, I, R, or indeterminate."),
+            c("interpretation", "STRING", "S, I, R or indeterminate for antimicrobials; positive, negative or indeterminate for mechanism markers. Case of the source flag is preserved in interpretation_raw and is not interpreted."),
             c("mic_raw", "STRING", "Raw MIC text."),
             c("mic", "DOUBLE", "Parsed MIC numeric value."),
             c("unit_source_value", "STRING", "Raw MIC unit."),
             c("method", "STRING", "Reported susceptibility method."),
+            c("token_class", "STRING", "antimicrobial, mechanism (resistance-mechanism marker such as ESB/NDM/KPC) or unparsed (token not four characters wide; raw kept in interpretation_raw)."),
+            c("token_ordinal", "INT", "Zero-based position of this token within its isolate block."),
+            c("parser_version", "STRING", "pathology_antibiogram.ANTIBIOGRAM_PARSER_VERSION that produced the row."),
             c("link_status", "STRING", "unique_isolate, ambiguous_isolate, or no_isolate."),
             c("lifecycle_status", "STRING", "Inherited result/report lifecycle."),
             c("is_current", "BOOLEAN", "Whether the susceptibility result remains current."),
@@ -542,14 +552,33 @@ AMR_LOOKUP_CONTRACTS: tuple[Contract, ...] = (
         "Governed source test-code to antimicrobial concept map.",
         ("code_system", "code"),
         (
-            c("code_system", "STRING", "TFC or CERNER_TESTCODE."),
+            c("code_system", "STRING", "TFC, CERNER_TESTCODE, or WINPATH_LIMS<n> for packed-antibiogram agent codes of LIMS instance n."),
             c("code", "STRING", "Source susceptibility test code."),
             c("antimicrobial_text", "STRING", "Approved antimicrobial display."),
             c("antimicrobial_omop_concept_id", "BIGINT", "Approved standard antimicrobial concept."),
             c("method", "STRING", "Configured susceptibility method."),
-            c("status", "STRING", "PROPOSED, APPROVED, REJECTED, or RETIRED."),
+            c("mapping_method", "STRING", "How the mapping was produced: knowledge_seed_v1, concept_exact_name, embedding_nn; never a review verdict."),
+            c("mapping_rule_id", "STRING", "Rule or seed identifier that produced the row."),
+            c("mapping_similarity", "DOUBLE", "Similarity score when an embedding lane produced the row; null for exact/seed rows."),
+            c("status", "STRING", "Provenance state (PROPOSED, APPROVED, REJECTED, RETIRED); PROPOSED rows are published — status is never a gate."),
             c("reviewed_by", "STRING", "Human reviewer."),
             c("reviewed_at", "TIMESTAMP", "Review time."),
+        ) + COMMON,
+    ),
+    Contract(
+        "pathology_micro_organism_map",
+        "Best-effort WinPath organism code to organism concept map, published with provenance.",
+        ("code_system", "code"),
+        (
+            c("code_system", "STRING", "WINPATH_LIMS<n> for packed-antibiogram organism codes of LIMS instance n."),
+            c("code", "STRING", "WinPath organism code (e.g. ESCOL)."),
+            c("organism_text", "STRING", "Display name; equals the code when unmapped."),
+            c("organism_snomed_code", "STRING", "SNOMED CT organism concept code, null when unmapped."),
+            c("organism_omop_concept_id", "BIGINT", "Standard OMOP organism concept, null when unmapped."),
+            c("mapping_method", "STRING", "knowledge_seed_v1, concept_exact_name, embedding_nn or unmapped."),
+            c("mapping_rule_id", "STRING", "Seed or rule identifier."),
+            c("mapping_similarity", "DOUBLE", "Embedding similarity when applicable."),
+            c("status", "STRING", "Provenance state; PROPOSED rows are published."),
         ) + COMMON,
     ),
 )
