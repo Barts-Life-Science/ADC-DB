@@ -436,29 +436,33 @@ def _replace_table(
     create_backup: bool = False,
     backup_suffix: Optional[str] = None,
 ) -> Optional[str]:
+    """Atomically overwrite data while preserving an existing Delta table protocol and features."""
     aligned = _align_to_schema(df, schema)
-    staging_table = f"{table_name}__staging_{uuid4().hex}"
+    backup_table = None
+    if create_backup and _table_exists(table_name):
+        suffix = backup_suffix or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_table = f"{table_name}__pre_v2_{suffix}"
+        spark.sql(
+            f"CREATE TABLE {_sql_name(backup_table)} "
+            f"SHALLOW CLONE {_sql_name(table_name)}"
+        )
+
+    # Overwrite the existing table in place. Unlike CREATE OR REPLACE ... DEEP CLONE,
+    # this retains columnMapping=name, row tracking, deletion vectors, type widening,
+    # grants, table identity and Delta history.
     (
         aligned.write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
         .option("delta.enableChangeDataFeed", "true")
-        .saveAsTable(staging_table)
+        .saveAsTable(table_name)
     )
-    backup_table = None
-    if create_backup and _table_exists(table_name):
-        suffix = backup_suffix or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_table = f"{table_name}__pre_v2_{suffix}"
-        spark.sql(f"CREATE TABLE {_sql_name(backup_table)} SHALLOW CLONE {_sql_name(table_name)}")
-    spark.sql(f"CREATE OR REPLACE TABLE {_sql_name(table_name)} DEEP CLONE {_sql_name(staging_table)}")
     spark.sql(
         f"ALTER TABLE {_sql_name(table_name)} SET TBLPROPERTIES "
         "('delta.enableChangeDataFeed'='true', 'delta.appendOnly'='false')"
     )
     _apply_comments(table_name, schema, table_comment)
-    spark.sql(f"DROP TABLE IF EXISTS {_sql_name(staging_table)}")
     return backup_table
-
 
 def _merge_changed_rows(
     source: DataFrame,
@@ -814,7 +818,6 @@ SOURCE_HASH_COLUMNS = [
     "SOURCE_HIBCC_DEVICE_ID",
     "EFFECTIVE_SERIAL_NUMBER",
     "EFFECTIVE_EXPIRY_DATE",
-    "SOURCE_ADC_UPDT",
 ]
 
 
@@ -3315,6 +3318,38 @@ def _source_rows_requiring_remap(
     return changed_ids, deleted_ids
 
 
+def _device_reference_semantically_changed(
+    table_name: str,
+    previous_version: int,
+    current_version: int,
+) -> bool:
+    """Detect actual reference payload changes, not overwrite/version churn."""
+    if int(current_version) <= int(previous_version):
+        return False
+    before = _read_snapshot(table_name, {table_name: int(previous_version)})
+    after = _read_snapshot(table_name, {table_name: int(current_version)})
+    technical = {
+        'ADC_UPDT', 'LOAD_DT_TM', 'LOADED_AT', 'INGESTED_AT', 'UPDATED_AT',
+        'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', '_CHANGE_TYPE',
+        '_COMMIT_VERSION', '_COMMIT_TIMESTAMP',
+    }
+    semantic_columns = sorted({
+        name for name in before.columns
+        if name in after.columns
+        and name.upper() not in technical
+        and not name.upper().endswith('_ADC_UPDT')
+        and not name.upper().endswith('_SOURCE_VERSION')
+    })
+    if not semantic_columns:
+        raise RuntimeError(f'No semantic columns available for {table_name}')
+    before_rows = before.select(*semantic_columns)
+    after_rows = after.select(*semantic_columns)
+    return bool(
+        before_rows.exceptAll(after_rows).limit(1).count()
+        or after_rows.exceptAll(before_rows).limit(1).count()
+    )
+
+
 def process_device_mapping_incremental_v2(
     config: DeviceMappingConfig = DEFAULT_DEVICE_MAPPING_CONFIG,
     refresh_implant_details: bool = True,
@@ -3364,7 +3399,13 @@ def process_device_mapping_incremental_v2(
         }
 
     reference_changes = [
-        table for table in config.reference_tables if table in changed_ranges
+        table for table in config.reference_tables
+        if table in changed_ranges
+        and _device_reference_semantically_changed(
+            table,
+            checkpoints[table],
+            current_versions[table],
+        )
     ]
     if reference_changes:
         if not config.auto_full_sync_on_reference_change:
@@ -3886,4 +3927,3 @@ except Exception as _device_error:
         })
     )
     raise
-

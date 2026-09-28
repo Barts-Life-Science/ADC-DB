@@ -1,4 +1,5 @@
 # Databricks notebook source
+# BRONZE_PERF_946452877034658_V2
 import json
 import uuid
 
@@ -1630,6 +1631,34 @@ def run_finalize_section():
 
 # COMMAND ----------
 
+def _med_content_source_clock(source, previous):
+    """Keep SOURCE_CHANGE_TS stable when its exact source-payload hash is unchanged.
+
+    Raw landing/update clocks remain on the raw sources. Lookup provenance remains
+    published and changes when the lookup's source content changes.
+    """
+    prior = previous.select(F.col('SYNONYM_ID').alias('_prior_id'),
+                            F.col('SOURCE_ROW_HASH').alias('_prior_hash'),
+                            F.col('SOURCE_CHANGE_TS').alias('_prior_stamp'))
+    same = (F.col('_prior_id').isNotNull() & F.col('SOURCE_ROW_HASH').isNotNull()
+            & F.col('SOURCE_ROW_HASH').eqNullSafe(F.col('_prior_hash'))
+            & F.col('_prior_stamp').isNotNull())
+    return (source.join(prior, F.col('SYNONYM_ID') == F.col('_prior_id'), 'left')
+            .withColumn('SOURCE_CHANGE_TS', F.when(same, F.col('_prior_stamp')).otherwise(F.col('SOURCE_CHANGE_TS')))
+            .drop('_prior_id', '_prior_hash', '_prior_stamp'))
+
+def _med_content_output_clock(source, previous):
+    """Advance ADC only on a real published-payload change, including provenance/score/model."""
+    columns = [c for c in source.columns if c != 'ADC_UPDT']
+    old = previous.select(*[F.col(c).alias('_old_' + c) for c in source.columns])
+    same = F.col('_old_SYNONYM_ID').isNotNull()
+    for c in columns:
+        same = same & F.col(c).eqNullSafe(F.col('_old_' + c))
+    return (source.join(old, F.col('SYNONYM_ID') == F.col('_old_SYNONYM_ID'), 'left')
+            .withColumn('ADC_UPDT', F.when(same, F.col('_old_ADC_UPDT')).otherwise(
+                F.greatest(F.col('ADC_UPDT'), F.col('_old_ADC_UPDT'), F.current_timestamp())))
+            .select(*source.columns))
+
 def run_medication_section():
     import hashlib
     import json
@@ -1812,6 +1841,10 @@ def run_medication_section():
         .drop("_rank")
     )
     assert_unique(drug_universe, "SYNONYM_ID", "drug universe")
+    if table_exists(TARGET_TABLE) and {'SOURCE_ROW_HASH', 'SOURCE_CHANGE_TS'}.issubset(set(spark.table(TARGET_TABLE).columns)):
+        assert_unique(spark.table(TARGET_TABLE), 'SYNONYM_ID', 'existing medication lookup')
+        drug_universe = _med_content_source_clock(drug_universe, spark.table(TARGET_TABLE))
+
 
 
     previous_fingerprint = None
@@ -2217,6 +2250,8 @@ def run_medication_section():
         .filter(F.col("_rank") == 1)
         .drop("_rank")
     )
+    if table_exists(TARGET_TABLE) and set(final_df.columns).issubset(set(spark.table(TARGET_TABLE).columns)):
+        final_df = _med_content_output_clock(final_df, spark.table(TARGET_TABLE))
     assert_unique(final_df, "SYNONYM_ID", "medication output")
 
 
@@ -2235,7 +2270,7 @@ def run_medication_section():
                 DeltaTable.forName(spark, TARGET_TABLE)
                 .alias("t")
                 .merge(final_df.alias("s"), "t.SYNONYM_ID = s.SYNONYM_ID")
-                .whenMatchedUpdate(set=updates)
+                .whenMatchedUpdate(condition=' OR '.join(f'NOT (t.`{c}` <=> s.`{c}`)' for c in final_df.columns if c != 'SYNONYM_ID'), set=updates)
                 .whenNotMatchedInsert(values=inserts)
                 .execute()
             )
@@ -2313,3 +2348,4 @@ pipeline_result = {
 }
 print(json.dumps(pipeline_result, default=str))
 dbutils.notebook.exit(json.dumps(pipeline_result, default=str))
+

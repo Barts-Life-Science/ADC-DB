@@ -1,0 +1,47 @@
+name: Protect pipeline files
+on:
+  pull_request:
+    paths:
+      - 'Prod/Pipelines/**'
+      - '.github/workflows/pipeline-deletion-guard.yml'
+permissions:
+  contents: read
+jobs:
+  check-deletions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require an explicit ALLOW-DELETE trailer for pipeline deletions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: python
+        run: |
+          import os
+          import subprocess
+
+          def git(*args, input=None):
+              return subprocess.check_output(['git', *args], input=input, text=True)
+
+          base, head = os.environ['BASE_SHA'], os.environ['HEAD_SHA']
+          deleted = set(filter(None, git('diff', '--no-renames', '--diff-filter=D',
+              '--name-only', base, head, '--', 'Prod/Pipelines/').splitlines()))
+          approved = set()
+          for commit in git('rev-list', f'{base}..{head}').splitlines():
+              message = git('show', '-s', '--format=%B', commit)
+              trailers = git('interpret-trailers', '--parse', input=message)
+              allowed = any(line.partition(':')[0].strip().upper() == 'ALLOW-DELETE'
+                            and line.partition(':')[2].strip() for line in trailers.splitlines())
+              if allowed:
+                  # Compare merge commits with each parent as well: their resolution
+                  # can delete files without a normal combined diff showing the loss.
+                  parents = git('show', '-s', '--format=%P', commit).split()
+                  for parent in parents:
+                      approved.update(git('diff', '--no-renames', '--diff-filter=D',
+                          '--name-only', parent, commit, '--', 'Prod/Pipelines/').splitlines())
+          unapproved = sorted(deleted - approved)
+          if unapproved:
+              raise SystemExit('FAIL: pipeline deletions need ALLOW-DELETE trailers:\n' + '\n'.join(unapproved))
+          print(f'PASS: {len(deleted)} pipeline deletions, all explicitly acknowledged')

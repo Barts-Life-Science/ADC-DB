@@ -247,7 +247,17 @@ def _nonblank(column: F.Column) -> F.Column:
     return F.when(F.length(F.trim(column.cast('string'))) > 0, column)
 
 def _stable_row_hash(df: DataFrame, excluded: Sequence[str]) -> F.Column:
-    columns = [F.col(name).alias(name) for name in sorted(df.columns) if name not in set(excluded)]
+    excluded_names = set(excluded)
+    excluded_names.update({
+        name for name in df.columns
+        if name.upper() == 'ADC_UPDT'
+        or name.upper().endswith('_ADC_UPDT')
+        or name.upper().endswith('_SOURCE_VERSION')
+        or name.upper().endswith('_CDF_COMMIT_VERSION')
+        or name.upper().endswith('_CDF_COMMIT_TIMESTAMP')
+        or name.upper() in {'MAPPED_AT', 'TRIGGER_SOURCES'}
+    })
+    columns = [F.col(name).alias(name) for name in sorted(df.columns) if name not in excluded_names]
     return F.xxhash64(F.to_json(F.struct(*columns)))
 
 def _parsed_gestation(text_column: F.Column) -> Tuple[F.Column, F.Column, F.Column]:
@@ -362,15 +372,10 @@ def _merge_current_snapshot(snapshot: DataFrame, table_name: str, schema: T.Stru
         column_name: F.col(f's.{column_name}')
         for column_name in snapshot.columns
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-        for column_name in snapshot.columns
-        if column_name not in {'Person_ID', 'Pregnancy_ID', 'UNMATCHED_KEY'}
-    )
     merge = target.alias('t').merge(
         snapshot.alias('s'), key_condition
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
         set=assignments,
     ).whenNotMatchedInsert(values=assignments)
     if not mark_missing_mat_rows:
@@ -681,7 +686,7 @@ def _mmb_build_target_rows(birth_snapshot: DataFrame, pregnancy_snapshot: DataFr
     row_adc_updt = F.greatest(birth_source_adc, pregnancy_source_adc, nnu_source_adc)
     run_timestamp_column = F.lit(run_timestamp).cast('timestamp')
     base = joined.select(b('BirthRow_ID').cast('string').alias('BirthRow_ID'), p('_MOTHER_PERSON_ID').cast('long').alias('MotherPerson_ID'), b('PREGNANCY_ID').cast('long').alias('Pregnancy_ID'), b('PREGNANCY_CHILD_ID').cast('long').alias('PregnancyChild_ID'), b('PREGNANCY_CHILD_SEQ_ID').cast('long').alias('PregnancyChildSeq_ID'), b('BABY_PERSON_ID').cast('long').alias('BabyPerson_ID'), b('MRN').cast('string').alias('Baby_MRN'), normalized_nhs.cast('string').alias('Baby_NHS'), b('NHS').cast('string').alias('Baby_NHS_Raw'), b('BIRTH_ODR_NBR').cast('int').alias('BirthOrder'), b('BIRTH_NBR').cast('int').alias('BirthNumber'), n('_NNU_FETUS_NUMBER').cast('int').alias('FetusNumber'), b('BIRTH_LOC_NM_ID').cast('int').alias('BirthLocation_CD'), b('BIRTH_LOC_DESC').cast('string').alias('BirthLocation_DESC'), birth_datetime.alias('BirthDateTime'), b('DEL_METHOD_CD').cast('int').alias('DeliveryMethod_CD'), b('DEL_METHOD_DESC').cast('string').alias('DeliveryMethod_DESC'), b('DEL_OUTCOME_CD').cast('int').alias('DeliveryOutcome_CD'), b('DEL_OUTCOME_DESC').cast('string').alias('DeliveryOutcome_DESC'), b('NEO_OUTCOME_CD').cast('int').alias('NeonatalOutcome_CD'), b('NEO_OUTCOME_DESC').cast('string').alias('NeonatalOutcome_DESC'), b('PREG_OUTCOME_CD').cast('int').alias('PregOutcome_CD'), b('PREG_OUTCOME_DESC').cast('string').alias('PregOutcome_DESC'), b('PRES_DEL_NM_ID').cast('int').alias('PresDel_CD'), b('PRES_DEL_DESC').cast('string').alias('PresDel_DESC'), gestation_weeks.alias('GestationWeeks'), gestation_days.alias('GestationDays'), b('BIRTH_WT').cast('string').alias('BirthWeight'), birth_weight_grams.alias('BirthWeightGrams'), birth_sex.alias('BirthSex'), b('NB_SEX_CD').cast('int').alias('BirthSex_CD'), apgar_1.alias('APGAR1Min'), apgar_5.alias('APGAR5Min'), n('_NNU_APGAR_10').cast('int').alias('APGAR10Min'), b('FEEDING_METHOD_DESC').cast('string').alias('FeedingMethod'), b('FEEDING_METHOD_NM_ID').cast('int').alias('FeedingMethod_CD'), n('_NNU_CONGENITAL_ANOMALIES').cast('string').alias('CongenitalAnomalies'), b('MOTHER_COMPLICATION_DESC').cast('string').alias('MotherComplications'), b('MOTHER_COMPLICATION_SCT_CD').cast('string').alias('MotherComplications_SCT_CD'), b('FETAL_COMPLICATION_DESC').cast('string').alias('FetalComplications'), b('FETAL_COMPLICATION_SCT_CD').cast('string').alias('FetalComplications_SCT_CD'), b('NEONATAL_COMPLICATION_DESC').cast('string').alias('NeonatalComplications'), b('NEONATAL_COMPLICATION_SCT_CD').cast('string').alias('NeonatalComplications_SCT_CD'), resuscitation.alias('ResMethod'), b('RESUS_METHOD_NM_ID').cast('string').alias('ResMethod_CD'), n('_NNU_MARITAL_STATUS_MOTHER').cast('string').alias('MaritalStatusMother'), neonatal_death.alias('NeonatalDeathDateTime'), row_adc_updt.alias('ADC_UPDT'), mat_birth_datetime.alias('MAT_BirthDateTime'), nnu_birth_datetime.alias('NNU_BirthDateTime'), birth_datetime_source.alias('BirthDateTimeSource'), _mmb_boolean_conflict(mat_birth_datetime, nnu_birth_datetime).alias('BirthDateTimeConflict_IND'), F.when(birth_datetime.isNull(), F.lit(None).cast('boolean')).otherwise(birth_datetime > run_timestamp_column).alias('BirthDateTimeFuture_IND'), gestation_raw.alias('GestationRaw'), mat_gestation_weeks.alias('MAT_GestationWeeks'), mat_gestation_days.alias('MAT_GestationDays'), nnu_gestation_weeks.alias('NNU_GestationWeeks'), nnu_gestation_days.alias('NNU_GestationDays'), nnu_gestation_weeks_calculated.alias('NNU_GestationWeeksCalculated'), nnu_gestation_days_calculated.alias('NNU_GestationDaysCalculated'), gestation_source.alias('GestationSource'), gestation_conflict.alias('GestationConflict_IND'), mat_birth_weight_grams.alias('MAT_BirthWeightGrams'), nnu_birth_weight_grams.alias('NNU_BirthWeightGrams'), birth_weight_source.alias('BirthWeightSource'), birth_weight_parseable.alias('BirthWeightParseable_IND'), birth_weight_implausible.alias('BirthWeightImplausible_IND'), _mmb_boolean_conflict(mat_birth_weight_grams, nnu_birth_weight_grams).alias('BirthWeightConflict_IND'), mat_birth_sex.alias('MAT_BirthSex'), nnu_birth_sex.alias('NNU_BirthSex'), birth_sex_source.alias('BirthSexSource'), birth_sex_conflict.alias('BirthSexConflict_IND'), mat_apgar_1.alias('MAT_APGAR1Min'), nnu_apgar_1.alias('NNU_APGAR1Min'), apgar_1_source.alias('APGAR1MinSource'), _mmb_boolean_conflict(mat_apgar_1, nnu_apgar_1).alias('APGAR1Conflict_IND'), mat_apgar_5.alias('MAT_APGAR5Min'), nnu_apgar_5.alias('NNU_APGAR5Min'), apgar_5_source.alias('APGAR5MinSource'), _mmb_boolean_conflict(mat_apgar_5, nnu_apgar_5).alias('APGAR5Conflict_IND'), mat_resuscitation.alias('MAT_ResMethod'), nnu_resuscitation.alias('NNU_ResMethod'), resuscitation_source.alias('ResMethodSource'), mat_neonatal_death.alias('MAT_NeonatalDeathDateTime'), nnu_neonatal_death.alias('NNU_NeonatalDeathDateTime'), neonatal_death_source.alias('NeonatalDeathDateTimeSource'), b('BABY_ALIVE_LABOUR_ONSET_NM_ID').cast('int').alias('BabyAliveLabourOnset_CD'), b('BABY_ALIVE_LABOUR_ONSET_DESC').cast('string').alias('BabyAliveLabourOnset_DESC'), b('BIRTH_LOC_DETAIL_NM_ID').cast('int').alias('BirthLocationDetail_CD'), b('BIRTH_LOC_DETAIL_DESC').cast('string').alias('BirthLocationDetail_DESC'), b('MEM_RUPTURE_DT_TM').cast('timestamp').alias('MembraneRuptureDateTime'), b('GRADE_OF_URGENCY_OF_THE_CAESAREAN_NM_ID').cast('int').alias('CaesareanUrgency_CD'), b('GRADE_OF_URGENCY_OF_THE_CAESAREAN_DESC').cast('string').alias('CaesareanUrgency_DESC'), b('CORD_PH_RESULT').cast('double').alias('CordPHResult'), b('WATERBIRTH_NM_ID').cast('int').alias('WaterBirth_CD'), b('WATERBIRTH_DESC').cast('string').alias('WaterBirth_DESC'), b('BBA_NM_ID').cast('int').alias('BornBeforeArrival_CD'), b('BBA_DESC').cast('string').alias('BornBeforeArrival_DESC'), b('LAB_START_DT_TM').cast('timestamp').alias('LabourStartDateTime'), b('LENGTH_LABOUR_TOT').cast('string').alias('LabourLengthRaw'), b('C_SECT_INDICATION_NM_ID').cast('int').alias('CaesareanIndication_CD'), b('C_SECT_INDICATION_DESC').cast('string').alias('CaesareanIndication_DESC'), b('NEO_CARE_LEVEL_NM_ID').cast('int').alias('NeonatalCareLevel_CD'), b('NEO_CARE_LEVEL_DESC').cast('string').alias('NeonatalCareLevel_DESC'), b('NB_GEST_ASSESS_NM_ID').cast('int').alias('NewbornGestationalAssessment_CD'), b('NB_GEST_ASSESS_DESC').cast('string').alias('NewbornGestationalAssessment_DESC'), n('_NNU_FINAL_OUTCOME').cast('string').alias('NNU_FinalOutcome'), n('_NNU_BIRTH_LENGTH').cast(T.DecimalType(10, 2)).alias('NNU_BirthLength'), n('_NNU_BIRTH_HEAD_CIRCUMFERENCE').cast(T.DecimalType(10, 2)).alias('NNU_BirthHeadCircumference'), n('_NNU_PLACE_OF_BIRTH_NAME').cast('string').alias('NNU_PlaceOfBirthName'), F.when(raw_nhs.isNull(), F.lit(None).cast('boolean')).otherwise(F.trim(raw_nhs) != normalized_nhs).alias('Baby_NHS_NormalizationChanged_IND'), F.when(normalized_nhs.isNull(), F.lit(None).cast('boolean')).otherwise(F.length(normalized_nhs) == 10).alias('Baby_NHS_ValidLength_IND'), b('_BUSINESS_KEY_COLLISION_COUNT').cast('long').alias('BusinessKeyCollisionCount'), (b('_BUSINESS_KEY_COLLISION_COUNT') > 1).alias('BusinessKeyCollision_IND'), b('BIRTH_ODR_NBR').isNull().alias('BirthOrderMissing_IND'), (b('PREGNANCY_CHILD_ID') == 0).alias('PregnancyChildIDZero_IND'), p('_PREGNANCY_ID_JOIN').isNotNull().alias('PregnancyJoinMatched_IND'), p('_PREG_SOURCE_ROW_COUNT').cast('long').alias('PregnancySourceRowCount'), n('_NHS_NORMALIZED').isNotNull().alias('NNUJoinMatched_IND'), n('_NNU_EPISODE_COUNT').cast('long').alias('NNUEpisodeCount'), b('DELETE_IND').cast('int').alias('BirthSource_DELETE_IND'), p('_PREGNANCY_DELETE_IND').cast('int').alias('PregnancySource_DELETE_IND'), b('Ctrl_Id').cast('int').alias('BirthSourceCtrl_ID'), b('Record_Updated_Dt').cast('timestamp').alias('BirthSourceRecordUpdatedDateTime'), birth_source_adc.alias('BirthSourceADC_UPDT'), p('_PREGNANCY_CTRL_ID').cast('int').alias('PregnancySourceCtrl_ID'), p('_PREGNANCY_RECORD_UPDATED').cast('timestamp').alias('PregnancySourceRecordUpdatedDateTime'), pregnancy_source_adc.alias('PregnancySourceADC_UPDT'), n('_NNU_SOURCE_LAST_UPDATE').cast('timestamp').alias('NNUSourceLastUpdate'), n('_NNU_SOURCE_RECORD_TIMESTAMP').cast('timestamp').alias('NNUSourceRecordTimestamp'), nnu_source_adc.alias('NNUSourceADC_UPDT'), F.lit(source_versions[config.birth_source_table]).cast('long').alias('BirthSourceVersion'), F.lit(source_versions[config.pregnancy_source_table]).cast('long').alias('PregnancySourceVersion'), F.lit(source_versions[config.nnu_source_table]).cast('long').alias('NNUSourceVersion'))
-    hash_exclusions = {'BirthSourceVersion', 'PregnancySourceVersion', 'NNUSourceVersion', 'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM'}
+    hash_exclusions = {'BirthSourceVersion', 'PregnancySourceVersion', 'NNUSourceVersion', 'ROW_HASH', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'ADC_UPDT', 'BirthSourceADC_UPDT', 'PregnancySourceADC_UPDT', 'NNUSourceADC_UPDT', 'NNUSourceLastUpdate', 'NNUSourceRecordTimestamp'}
     hash_columns = [F.col(name) for name in base.columns if name not in hash_exclusions]
     final_df = base.withColumn('ROW_HASH', _mmb_stable_hash(hash_columns)).withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_UPDT_DT_TM', run_timestamp_column)
     return _mmb_align_to_schema(final_df)
@@ -816,16 +821,11 @@ def update_map_mat_birth_table(source_df: DataFrame, config: MapMatBirthConfig=M
                 column_name: F.col(f's.{column_name}')
                 for column_name in source_df.columns
             }
-            comparisons = ' OR '.join(
-                f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-                for column_name in source_df.columns
-                if column_name != 'BirthRow_ID'
-            )
             DeltaTable.forName(spark, config.target_table).alias('t').merge(
                 source_df.alias('s'),
                 't.BirthRow_ID = s.BirthRow_ID',
             ).whenMatchedUpdate(
-                condition=comparisons or 'false',
+                condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
                 set=assignments,
             ).whenNotMatchedInsert(
                 values=assignments
@@ -1005,6 +1005,65 @@ def _mmvte_capture_source_versions(config: MapMatVTEConfig) -> Dict[str, int]:
 
 def _mmvte_read_snapshot(table_name: str, version: int) -> DataFrame:
     return _m40_hardening_read_pinned_snapshot(table_name, int(version))
+
+def _m40_semantic_snapshot_keys(
+    table_name: str,
+    previous_version: int,
+    current_version: int,
+    key_columns: Sequence[str],
+    semantic_columns: Optional[Sequence[str]]=None,
+) -> DataFrame:
+    from functools import reduce as _m40_reduce
+
+    current = _m40_hardening_read_pinned_snapshot(table_name, int(current_version))
+    if int(current_version) <= int(previous_version):
+        return current.select(*[F.col(name) for name in key_columns]).limit(0)
+    previous = _m40_hardening_read_pinned_snapshot(table_name, int(previous_version))
+    technical = {
+        'ADC_UPDT', 'LOAD_DT_TM', 'LOADED_AT', 'INGESTED_AT', 'UPDATED_AT',
+        'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', '_CHANGE_TYPE',
+        '_COMMIT_VERSION', '_COMMIT_TIMESTAMP',
+    }
+
+    def prepared(frame: DataFrame, payload_name: str) -> DataFrame:
+        requested = list(semantic_columns) if semantic_columns is not None else list(frame.columns)
+        available = [
+            name for name in requested
+            if name in frame.columns
+            and name not in key_columns
+            and name.upper() not in technical
+            and not name.upper().endswith('_ADC_UPDT')
+            and not name.upper().endswith('_SOURCE_VERSION')
+        ]
+        if not available:
+            raise RuntimeError(f'No semantic columns available for {table_name}')
+        payload = F.sha2(
+            F.to_json(F.struct(*[F.col(name).alias(name) for name in available]), {'ignoreNullFields': 'false'}),
+            256,
+        )
+        return (
+            frame.select(*[F.col(name) for name in key_columns], payload.alias('_PAYLOAD'))
+            .where(_m40_reduce(lambda left, right: left & right, [F.col(name).isNotNull() for name in key_columns]))
+            .groupBy(*key_columns)
+            .agg(F.sort_array(F.collect_set('_PAYLOAD')).alias(payload_name))
+        )
+
+    before = prepared(previous, '_BEFORE').alias('b')
+    after = prepared(current, '_AFTER').alias('a')
+    condition = _m40_reduce(
+        lambda left, right: left & right,
+        [F.col(f'b.{name}').eqNullSafe(F.col(f'a.{name}')) for name in key_columns],
+    )
+    return (
+        before.join(after, condition, 'full')
+        .where(~F.col('b._BEFORE').eqNullSafe(F.col('a._AFTER')))
+        .select(*[
+            F.coalesce(F.col(f'b.{name}'), F.col(f'a.{name}')).alias(name)
+            for name in key_columns
+        ])
+        .dropDuplicates(list(key_columns))
+    )
+
 
 def _mmvte_read_cdf(table_name: str, previous_version: int, current_version: int) -> Optional[DataFrame]:
     if current_version <= previous_version:
@@ -1290,7 +1349,7 @@ def _mmvte_link_pregnancy(base: DataFrame, source_versions: Dict[str, int], conf
     return candidates.withColumn('PregnancyMatchCandidateCount', F.count(F.col('_candidate_pregnancy_id')).over(candidate_window).cast('long')).withColumn('_candidate_rank', F.row_number().over(rank_window)).filter(F.col('_candidate_rank') == 1).withColumn('Pregnancy_ID', F.col('_candidate_pregnancy_id').cast('long')).withColumn('PregnancyMatched_IND', F.col('_candidate_pregnancy_id').isNotNull()).withColumn('PregnancyMatchAmbiguous_IND', F.col('PregnancyMatchCandidateCount') > 1).withColumn('PregnancyMatchMethod', F.col('_candidate_method')).withColumn('PregnancyMatchStartDate', F.col('_candidate_start_date')).withColumn('PregnancyMatchEndDate', F.col('_candidate_end_date')).withColumn('PregnancyReferenceDate', F.col('_candidate_reference_date')).withColumn('PregnancyMatchDistanceDays', F.col('_candidate_distance_days').cast('int')).drop('_response_partition_key', '_candidate_pregnancy_id', '_candidate_start_date', '_candidate_end_date', '_candidate_reference_date', '_candidate_method', '_candidate_priority', '_candidate_interval_days', '_candidate_distance_days', '_candidate_rank')
 
 def _mmvte_finalize_snapshot(linked: DataFrame, trigger_sources: str, run_id: str, run_timestamp: datetime, config: MapMatVTEConfig) -> DataFrame:
-    source_columns = [field.name for field in schema_map_mat_vte.fields if field.name not in _MMVTE_PIPELINE_COLUMNS]
+    source_columns = [field.name for field in schema_map_mat_vte.fields if field.name not in _MMVTE_PIPELINE_COLUMNS and field.name.upper() != 'ADC_UPDT' and not field.name.upper().endswith('_ADC_UPDT') and not field.name.upper().endswith('_SOURCE_VERSION') and not field.name.upper().endswith('_EXTRACT_DT_TM') and not field.name.upper().endswith('_RECORD_UPDATED_DT')]
     with_hash = linked.withColumn('ROW_HASH', F.sha2(F.to_json(F.struct(*[F.col(name).alias(name) for name in source_columns])), 256))
     final = with_hash.withColumn('TRIGGER_SOURCES', F.lit(trigger_sources)).withColumn('PIPELINE_RUN_ID', F.lit(run_id)).withColumn('PIPELINE_UPDT_DT_TM', F.lit(run_timestamp).cast('timestamp')).withColumn('SCHEMA_VERSION', F.lit(config.schema_version))
     return _mmvte_align_to_schema(final, schema_map_mat_vte)
@@ -1372,7 +1431,7 @@ def _mmvte_build_incremental_snapshot(previous_versions: Dict[str, int], source_
     pregnancy_snapshot = _mmvte_read_snapshot(config.pregnancy_table, source_versions[config.pregnancy_table])
     reference = _mmvte_build_reference_snapshot(source_versions[config.reference_source_table], config)
     response_cdf = _mmvte_read_cdf(config.response_source_table, previous_versions[config.response_source_table], source_versions[config.response_source_table])
-    reference_cdf = _mmvte_read_cdf(config.reference_source_table, previous_versions[config.reference_source_table], source_versions[config.reference_source_table])
+    reference_cdf = _m40_semantic_snapshot_keys(config.reference_source_table, previous_versions[config.reference_source_table], source_versions[config.reference_source_table], ['DOC_INPUT_KEY'])
     pregnancy_cdf = _mmvte_read_cdf(config.pregnancy_table, previous_versions[config.pregnancy_table], source_versions[config.pregnancy_table])
     birth_cdf = _mmvte_read_cdf(config.birth_table, previous_versions[config.birth_table], source_versions[config.birth_table])
     if response_cdf is not None:
@@ -1430,16 +1489,11 @@ def _mmvte_merge_incremental(snapshot: DataFrame, delete_keys: DataFrame, config
             column_name: F.col(f's.{column_name}')
             for column_name in snapshot.columns
         }
-        comparisons = ' OR '.join(
-            f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-            for column_name in snapshot.columns
-            if column_name != 'DOC_RESPONSE_KEY'
-        )
         target.alias('t').merge(
             snapshot.alias('s'),
             't.DOC_RESPONSE_KEY <=> s.DOC_RESPONSE_KEY',
         ).whenMatchedUpdate(
-            condition=comparisons or 'false',
+            condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
             set=assignments,
         ).whenNotMatchedInsert(values=assignments).execute()
         operations['upsert_metrics'] = _mmvte_latest_operation_metrics(config.target_table)
@@ -1814,13 +1868,20 @@ def update_table(source_df: DataFrame, target_table: str, index_column, target_s
             condition=update_condition, set=assignments
         )
     else:
-        comparisons = ' OR '.join(
-            f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-            for column_name in source_df.columns
-            if column_name not in index_keys
+        semantic_condition = (
+            'NOT (t.ROW_HASH <=> s.ROW_HASH)'
+            if 'ROW_HASH' in source_df.columns
+            else ' OR '.join(
+                f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
+                for column_name in source_df.columns
+                if column_name not in index_keys
+                and column_name.upper() not in {'MAPPED_AT', 'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'ADC_UPDT'}
+                and not column_name.upper().endswith('_ADC_UPDT')
+                and not column_name.upper().endswith('_SOURCE_VERSION')
+            ) or 'false'
         )
         merge_builder = merge_builder.whenMatchedUpdate(
-            condition=comparisons or 'false', set=assignments
+            condition=semantic_condition, set=assignments
         )
     merge_builder = merge_builder.whenNotMatchedInsert(values=assignments)
     if delete_not_matched_by_source:
@@ -1937,7 +1998,7 @@ def create_family_history_mapping_incr() -> DataFrame:
     free_text_present = free_text_value.isNotNull()
     lookup_update_columns = [F.col(f'{prefix}_CODE_ADC_UPDT') for _, prefix in decode_columns]
     result = enriched.select('FHX_ACTIVITY_ID', 'PERSON_ID', 'MRN', 'NHS_Number', 'RELATED_PERSON_ID', F.col('PPR_PERSON_RELTN_CD').cast('double').alias('RELATION_CD'), F.col('RELATION_DECODE').alias('RELATION_DESC'), F.col('PPR_PERSON_RELTN_TYPE_CD').cast('double').alias('RELATION_TYPE_CD'), F.col('RELATION_TYPE_DECODE').alias('RELATION_TYPE_DESC'), 'GENETIC_IND', 'PERSON_PERSON_RELTN_ID', 'NOMENCLATURE_ID', F.col('SOURCE_STRING').alias('CONDITION_DESC_CODED'), F.col('CONDITION_COMMENT').alias('CONDITION_DESC_FREETEXT'), F.coalesce(coded_value, free_text_value).alias('CONDITION_DESC'), F.when(coded_present & free_text_present, F.lit('BOTH')).when(coded_present, F.lit('CODED')).when(free_text_present, F.lit('FREE_TEXT')).otherwise(F.lit('NONE')).alias('CONDITION_SOURCE'), 'SOURCE_IDENTIFIER', F.col('NOM_SOURCE_VOCABULARY_CD').cast('double').alias('SOURCE_VOCABULARY_CD'), F.col('SOURCE_VOCABULARY_DECODE').alias('SOURCE_VOCABULARY_DESC'), F.col('NOM_VOCAB_AXIS_CD').cast('double').alias('VOCAB_AXIS_CD'), F.col('VOCAB_AXIS_DECODE').alias('VOCAB_AXIS_DESC'), F.col('CONCEPT_CKI_PROCESSED').alias('CONCEPT_CKI'), 'OMOP_CONCEPT_ID', 'OMOP_CONCEPT_NAME', F.col('IS_STANDARD_OMOP_CONCEPT').alias('OMOP_STANDARD_CONCEPT'), F.col('NUMBER_OF_OMOP_MATCHES').alias('OMOP_MATCH_NUMBER'), 'OMOP_SIMILARITY', F.col('CONCEPT_DOMAIN').alias('OMOP_CONCEPT_DOMAIN'), 'SNOMED_CODE', 'SNOMED_TYPE', F.col('SNOMED_MATCH_COUNT').alias('SNOMED_MATCH_NUMBER'), 'SNOMED_SIMILARITY', 'SNOMED_TERM', 'ICD10_CODE', F.col('ICD10_CODE_TYPE').alias('ICD10_TYPE'), F.col('ICD10_CODE_MATCH_COUNT').alias('ICD10_MATCH_NUMBER'), 'ICD10_SIMILARITY', 'ICD10_TERM', 'FHX_TYPE', 'FHX_VALUE_FLAG', 'ONSET_AGE', F.col('ONSET_AGE_UNIT_DECODE').alias('ONSET_AGE_UNIT'), F.col('SEVERITY_DECODE').alias('SEVERITY'), F.col('COURSE_DECODE').alias('COURSE'), F.col('LIFECYCLE_DECODE').alias('LIFE_CYCLE_STATUS'), 'BEG_EFFECTIVE_DT_TM', 'END_EFFECTIVE_DT_TM', F.greatest(F.col('FHX_ADC_UPDT'), F.col('PPR_ADC_UPDT'), F.col('NOMENCLATURE_ADC_UPDT'), F.col('FHX_LONG_TEXT_ADC_UPDT'), F.col('LONG_TEXT_ADC_UPDT'), F.col('MRN_ADC_UPDT'), F.col('NHS_ADC_UPDT'), *lookup_update_columns).alias('ADC_UPDT'), 'FHX_ACTIVITY_GROUP_ID', 'ORGANIZATION_ID', 'ORIGINATING_ENCNTR_ID', 'TRUST', 'FHX_ACTIVE_IND', 'FHX_ACTIVE_STATUS_CD', F.col('FHX_ACTIVE_STATUS_DECODE').alias('FHX_ACTIVE_STATUS_DESC'), 'FHX_ACTIVE_STATUS_DT_TM', 'FHX_UPDT_DT_TM', 'FHX_UPDT_CNT', 'FHX_UPDT_ID', 'FHX_LAST_UTC_TS', F.when(F.col('FHX_VALUE_FLAG') == 0, F.lit('Negative')).when(F.col('FHX_VALUE_FLAG') == 1, F.lit('Positive')).when(F.col('FHX_VALUE_FLAG') == 2, F.lit('Unknown')).when(F.col('FHX_VALUE_FLAG') == 3, F.lit('Unable to Obtain')).when(F.col('FHX_VALUE_FLAG') == 4, F.lit('Patient Adopted')).alias('FHX_VALUE_DESC'), 'ONSET_AGE_PREC_CD', F.col('ONSET_AGE_PREC_DECODE').alias('ONSET_AGE_PREC_DESC'), 'ONSET_AGE_UNIT_CD', 'SEVERITY_CD', 'COURSE_CD', 'LIFE_CYCLE_STATUS_CD', 'RELATED_PERSON_NAME', 'RELATED_PERSON_RELTN_CD', F.col('RELATED_PERSON_RELTN_DECODE').alias('RELATED_PERSON_RELTN_DESC'), 'FAMILY_RELTN_SUB_TYPE_CD', F.col('FAMILY_RELTN_SUB_TYPE_DECODE').alias('FAMILY_RELTN_SUB_TYPE_DESC'), 'RELATION_PRIORITY_SEQ', 'PPR_ACTIVE_IND', 'PPR_DATA_STATUS_CD', F.col('PPR_DATA_STATUS_DECODE').alias('PPR_DATA_STATUS_DESC'), 'PPR_BEG_EFFECTIVE_DT_TM', 'PPR_END_EFFECTIVE_DT_TM', 'PPR_UPDT_DT_TM', 'FHX_LONG_TEXT_R_ID', 'LONG_TEXT_ID', 'CONDITION_COMMENT', 'COMMENT_DT_TM', 'COMMENT_PRSNL_ID', 'CONDITION_COMMENT_COUNT', 'CONDITION_COMMENTS', 'MRN_GENERIC', 'MRN_RF4', 'MRN_RNJ_5C4', 'CMRN_5C4', 'MRN_PERSON_ALIAS_ID', 'MRN_ALIAS_POOL_CD', 'MRN_ALIAS_POOL_DESC', 'MRN_BEG_EFFECTIVE_DT_TM', 'MRN_END_EFFECTIVE_DT_TM', 'NHS_PERSON_ALIAS_ID', 'NHS_ALIAS_POOL_CD', F.col('NHS_ALIAS_POOL_DECODE').alias('NHS_ALIAS_POOL_DESC'), 'NHS_BEG_EFFECTIVE_DT_TM', 'NHS_END_EFFECTIVE_DT_TM', 'MRN_ALIASES', 'NHS_ALIASES', 'CONCEPT_CKI_RAW', 'CONCEPT_CLASS', 'FOUND_CUI', 'NOMENCLATURE_IS_ACTIVE', 'NOMENCLATURE_SOURCE_CHANGE_TS', 'OPCS4_CODE', F.col('OPCS4_CODE_TYPE').alias('OPCS4_TYPE'), F.col('OPCS4_CODE_MATCH_COUNT').alias('OPCS4_MATCH_NUMBER'), 'OPCS4_SIMILARITY', 'OPCS4_TERM', 'FHX_ADC_UPDT', 'PPR_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'FHX_LONG_TEXT_ADC_UPDT', 'LONG_TEXT_ADC_UPDT', 'MRN_ADC_UPDT', 'NHS_ADC_UPDT', F.greatest(*lookup_update_columns).alias('LOOKUP_ADC_UPDT'), F.current_timestamp().alias('MAPPED_AT'))
-    hash_columns = [field.name for field in schema_map_family_history.fields if field.name not in {'MAPPED_AT', 'ROW_HASH'}]
+    hash_columns = [field.name for field in schema_map_family_history.fields if field.name not in {'MAPPED_AT', 'ROW_HASH', 'ADC_UPDT', 'FHX_ADC_UPDT', 'PPR_ADC_UPDT', 'NOMENCLATURE_ADC_UPDT', 'FHX_LONG_TEXT_ADC_UPDT', 'LONG_TEXT_ADC_UPDT', 'MRN_ADC_UPDT', 'NHS_ADC_UPDT', 'LOOKUP_ADC_UPDT', 'NOMENCLATURE_SOURCE_CHANGE_TS'}]
     result = result.withColumn('ROW_HASH', F.sha2(F.to_json(F.struct(*[F.col(column) for column in hash_columns]), options={'ignoreNullFields': 'false'}), 256))
     return _align_df_to_schema(result, schema_map_family_history)
 
@@ -2068,7 +2129,7 @@ ELH_CODE_DESCRIPTION_COLUMNS: Dict[str, str] = {'LOC_FACILITY_CD': 'FACILITY_DES
 ENC_CODE_DESCRIPTION_COLUMNS: Dict[str, str] = {'ENCNTR_TYPE_CD': 'ENCNTR_TYPE_DESC', 'ENCNTR_TYPE_CLASS_CD': 'ENCNTR_TYPE_CLASS_DESC', 'ENCNTR_STATUS_CD': 'ENCNTR_STATUS_DESC', 'ADMIT_SRC_CD': 'ADMIT_SRC_DESC', 'ENCOUNTER_ADMIT_TYPE_CD': 'ENCOUNTER_ADMIT_TYPE_DESC', 'ADMIT_MODE_CD': 'ADMIT_MODE_DESC', 'REFERRAL_SOURCE_CD': 'REFERRAL_SOURCE_DESC', 'READMIT_CD': 'READMIT_DESC', 'DISCH_DISPOSITION_CD': 'DISCH_DISPOSITION_DESC', 'DISCH_TO_LOCTN_CD': 'DISCH_TO_LOCTN_DESC', 'TRIAGE_CD': 'TRIAGE_DESC', 'TRAUMA_CD': 'TRAUMA_DESC', 'AMBULATORY_COND_CD': 'AMBULATORY_COND_DESC', 'FINANCIAL_CLASS_CD': 'FINANCIAL_CLASS_DESC', 'VIP_CD': 'VIP_DESC', 'CONFID_LEVEL_CD': 'CONFID_LEVEL_DESC'}
 ELH_RAW_CODE_COLUMNS: Sequence[str] = ('LOCATION_CD', 'LOC_FACILITY_CD', 'LOC_BUILDING_CD', 'LOC_NURSE_UNIT_CD', 'LOC_ROOM_CD', 'LOC_BED_CD', 'ENCNTR_TYPE_CD', 'ENCNTR_TYPE_CLASS_CD', 'MED_SERVICE_CD', 'ADMIT_TYPE_CD', 'TRANSFER_REASON_CD', 'ACCOMMODATION_CD', 'ACCOMMODATION_REASON_CD', 'ALT_LVL_CARE_CD', 'ALC_REASON_CD', 'SERVICE_CATEGORY_CD', 'PROGRAM_SERVICE_CD', 'SPECIALTY_UNIT_CD', 'ISOLATION_CD')
 ENC_RAW_CODE_COLUMNS: Sequence[str] = ('ENCNTR_TYPE_CD', 'ENCNTR_TYPE_CLASS_CD', 'ENCNTR_STATUS_CD', 'ADMIT_SRC_CD', 'ADMIT_TYPE_CD', 'ADMIT_MODE_CD', 'REFERRAL_SOURCE_CD', 'READMIT_CD', 'DISCH_DISPOSITION_CD', 'DISCH_TO_LOCTN_CD', 'TRIAGE_CD', 'TRAUMA_CD', 'AMBULATORY_COND_CD', 'FINANCIAL_CLASS_CD', 'VIP_CD', 'CONFID_LEVEL_CD')
-_MPJ_VOLATILE_HASH_COLUMNS = {'ROW_HASH', 'PIPELINE_UPDT_DT_TM', 'CURRENT_AS_OF_DT_TM'}
+_MPJ_VOLATILE_HASH_COLUMNS = {'ROW_HASH', 'PIPELINE_UPDT_DT_TM', 'CURRENT_AS_OF_DT_TM', 'ADC_UPDT', 'ELH_ADC_UPDT', 'ENC_ADC_UPDT', 'CODE_LOOKUP_ADC_UPDT', 'PERSON_ALIAS_ADC_UPDT', 'SOURCE_VERSION', 'ELH_SOURCE_VERSION', 'ENCOUNTER_SOURCE_VERSION', 'CODE_VALUE_SOURCE_VERSION', 'PERSON_ALIAS_SOURCE_VERSION'}
 
 class _MPJFullRebuildRequired(RuntimeError):
     pass
@@ -2769,7 +2830,7 @@ def _mpj_collect_affected_encounters(config: MapPatientJourneyConfig, state: Dic
     elh_cdf = _mpj_read_cdf(config.elh_table, starts[config.elh_table], source_versions[config.elh_table])
     enc_cdf = _mpj_read_cdf(config.encounter_table, starts[config.encounter_table], source_versions[config.encounter_table])
     alias_cdf = _mpj_read_cdf(config.person_alias_table, starts[config.person_alias_table], source_versions[config.person_alias_table])
-    code_cdf = _mpj_read_cdf(config.code_value_table, starts[config.code_value_table], source_versions[config.code_value_table])
+    code_cdf = _m40_semantic_snapshot_keys(config.code_value_table, starts[config.code_value_table] - 1, source_versions[config.code_value_table], ['CODE_VALUE'], ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'])
     elh_keys = elh_cdf.select(F.col('ENCNTR_ID').cast('long').alias('ENCNTR_ID')) if elh_cdf is not None else None
     enc_keys = enc_cdf.select(F.col('ENCNTR_ID').cast('long').alias('ENCNTR_ID')) if enc_cdf is not None else None
     alias_keys: Optional[DataFrame] = None
@@ -2837,16 +2898,11 @@ def _mpj_merge_target(changes: DataFrame, config: MapPatientJourneyConfig) -> No
             column_name: F.col(f's.{column_name}')
             for column_name in upserts.columns
         }
-        comparisons = ' OR '.join(
-            f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-            for column_name in upserts.columns
-            if column_name != 'ENCNTR_LOC_HIST_ID'
-        )
         target.alias('t').merge(
             upserts.alias('s'),
             't.ENCNTR_LOC_HIST_ID = s.ENCNTR_LOC_HIST_ID',
         ).whenMatchedUpdate(
-            condition=comparisons or 'false',
+            condition='NOT (t.ROW_HASH <=> s.ROW_HASH)',
             set=assignments,
         ).whenNotMatchedInsert(values=assignments).execute()
 
@@ -3330,7 +3386,7 @@ def build_implant_details_base(implant_events_df: DataFrame, affected_encounters
     result = result.withColumn('SOURCE_MAX_ADC_UPDT', F.greatest(F.col('BASE_EVENT_ADC_UPDT'), F.col('_ATTRIBUTE_MAX_ADC_UPDT'), F.col('_PROCEDURE_MAX_ADC_UPDT'))).withColumn('ADC_UPDT', F.col('SOURCE_MAX_ADC_UPDT')).drop('_ATTRIBUTE_MAX_ADC_UPDT', '_PROCEDURE_MAX_ADC_UPDT')
     for field_name, data_type in [('SNOMED_DEVICE_CONCEPT_ID', LongType()), ('SNOMED_DEVICE_CONCEPT_NAME', StringType()), ('DEVICE_TYPE', StringType()), ('MAPPING_CONFIDENCE', DoubleType()), ('GMDN_CODE', LongType()), ('GMDN_NAME', StringType()), ('MAPPING_LAYER', StringType()), ('CONFIDENCE_TIER', StringType()), ('MAPPING_SOURCE', StringType()), ('MAPPING_CANDIDATE_COUNT', IntegerType()), ('MAPPING_CONFLICT_IND', BooleanType()), ('MAPPING_ROW_HASH', StringType())]:
         result = result.withColumn(field_name, F.lit(None).cast(data_type))
-    base_hash_columns = [field.name for field in schema_map_implant_details_v2.fields if field.name not in MAPPING_COLUMNS + ['SOURCE_ROW_HASH']]
+    base_hash_columns = [field.name for field in schema_map_implant_details_v2.fields if field.name not in MAPPING_COLUMNS + ['SOURCE_ROW_HASH', 'ADC_UPDT', 'SOURCE_MAX_ADC_UPDT', 'BASE_EVENT_ADC_UPDT', 'CLINSIG_UPDT_DT_TM']]
     result = _hash_columns(result, base_hash_columns, 'SOURCE_ROW_HASH')
     return _align_to_schema(result, schema_map_implant_details_v2)
 
@@ -3494,4 +3550,3 @@ finally:
         has_cdf_enabled = _pipeline_shared_has_cdf_enabled
     if _pipeline_shared_get_incremental is not None:
         get_incremental_data_with_cdf = _pipeline_shared_get_incremental
-

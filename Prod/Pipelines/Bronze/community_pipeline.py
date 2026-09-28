@@ -1,4 +1,8 @@
 # Databricks notebook source
+# release: bronze_completeness_20260816_v1 — production-safe combined drop-in
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # BH Community (CSDS) Bronze Pipeline
 # MAGIC
@@ -8,8 +12,8 @@
 # MAGIC - `map_community_care_contact` — one row per `CDB + CCI + SRI`.
 # MAGIC - `map_community_care_activity` — one row per distinct source activity row.
 # MAGIC
-# MAGIC Direct patient identifiers are used transiently for deterministic linkage and are not
-# MAGIC published, except the restricted source `PatientNumber` required for source reconciliation.
+# MAGIC Source patient identifiers and identifying demographics are retained in Bronze and IG-tagged;
+# MAGIC de-identification is applied only in downstream serve-time products.
 # MAGIC Exact SNOMED name/synonym matches are explicitly candidate enrichment, not approved coding.
 
 # COMMAND ----------
@@ -63,6 +67,13 @@ ORGANIZATION_ALIAS = f"{RAW}.mill_organization_alias"
 ORGANIZATION = f"{RAW}.mill_organization"
 OMOP_CONCEPT = "3_lookup.omop.concept"
 OMOP_CONCEPT_SYNONYM = "3_lookup.omop.concept_synonym"
+# S4-C8 BEGIN
+COMMUNITY_ACTIVITY_TERM_MAP = (
+    "3_lookup.omop.community_activity_term_map"
+    if TARGET_SCHEMA == "4_prod.bronze"
+    else "8_dev.s5_omop.community_activity_term_map_s5"
+)
+# S4-C8 END
 
 PATIENT_TABLE = f"{TARGET_SCHEMA}.map_community_patient_link"
 CONTACT_TABLE = f"{TARGET_SCHEMA}.map_community_care_contact"
@@ -70,9 +81,9 @@ ACTIVITY_TABLE = f"{TARGET_SCHEMA}.map_community_care_activity"
 STATE_TABLE = f"{bronze_control_schema(TARGET_SCHEMA)}.community_pipeline_state"
 AUDIT_TABLE = f"{bronze_control_schema(TARGET_SCHEMA)}.community_pipeline_audit"
 
-PATIENT_CONTRACT_VERSION = "community_patient_v1"
-CONTACT_CONTRACT_VERSION = "community_contact_v1"
-ACTIVITY_CONTRACT_VERSION = "community_activity_v1"
+PATIENT_CONTRACT_VERSION = "community_patient_v3_identifiers_20260820"
+CONTACT_CONTRACT_VERSION = "community_contact_v3_identifiers_20260820"
+ACTIVITY_CONTRACT_VERSION = "community_activity_v3_identifiers_20260820"
 CSDS_MAPPING_VERSION = "CSDS_ETOS_1.6.10"
 CONSULTATION_TERM_MAPPING_VERSION = "COMMUNITY_CONTACT_TERM_CANDIDATE_V1"
 UCUM_MAPPING_VERSION = "COMMUNITY_UCUM_ALIAS_V1"
@@ -93,6 +104,9 @@ PHYSICAL_DEPENDENCIES = [
     ORGANIZATION,
     OMOP_CONCEPT,
     OMOP_CONCEPT_SYNONYM,
+    # S4-C8 BEGIN
+    COMMUNITY_ACTIVITY_TERM_MAP,
+    # S4-C8 END
 ]
 ROW_COUNT_DEPENDENCIES = {SRC_PATIENT, SRC_CONTACT, SRC_ACTIVITY}
 
@@ -287,12 +301,15 @@ UCUM_ALIAS_MAP = {
 
 EXPECTED_COLUMNS = {
     SRC_PATIENT: {
-        "PatientNumber", "NHSNumber", "NHSNumberStatus", "RegCDB",
-        "RegOrganisationName", "RegOrganisationId", "PersonBirthDate",
-        "DateofRegistration", "PracticeCode", "PracticeParentCode",
-        "InChildrenService", "archived", "IsConfidential", "IsPatientArchive",
-        "CaseloadPatientStatusId", "CaseloadPatientStatusDescription", "eMRN",
-        "ADC_UPDT",
+        "Patid", "LocalPatientid", "PatientNumber", "NHSNumber",
+        "NHSNumberStatus", "RegCDB", "RegOrganisationName", "RegOrganisationId",
+        "PersonBirthDate", "DateDeath", "DateofRegistration", "PracticeCode",
+        "PracticeParentCode", "HouseNameFlatNumber", "NumberAndStreet", "Village",
+        "Town", "Postcode", "PostcodeNoSpace", "eAddressId", "ExternalUsualGPId",
+        "RegisteredGpUserInRoleId", "InChildrenService", "archived",
+        "IsConfidential", "IsPatientArchive", "CaseloadPatientStatusId",
+        "CaseloadPatientStatusDescription", "PatientId", "mPatientId", "eMRN",
+        "GivenName", "Surname", "ADC_UPDT",
     },
     SRC_CONTACT: {
         "CCI", "SRI", "LPI", "PatientNumber", "TeamLocalID", "CContactDate",
@@ -310,6 +327,14 @@ EXPECTED_COLUMNS = {
         "LegacyCodeOriginalTerm", "CareActivityDate", "CDB", "ObservationType",
         "CodeCategoryId", "InReport_Period", "ADC_UPDT",
     },
+    # S4-C8 BEGIN
+    COMMUNITY_ACTIVITY_TERM_MAP: {
+        "SOURCE_TERM_KEY", "SOURCE_TERM_EXAMPLE",
+        "SNOMED_CANDIDATE_CONCEPT_ID", "SNOMED_CANDIDATE_NAME",
+        "SNOMED_CANDIDATE_METHOD", "ROW_VOLUME", "MAPPING_STATUS",
+        "CURATED_CONCEPT_ID", "CURATED_BY", "CURATED_AT", "NOTES",
+    },
+    # S4-C8 END
 }
 
 
@@ -655,8 +680,12 @@ def update_snapshot_table(
     target: str,
     key: str,
 ) -> dict:
+    staged_input = (
+        df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
+          .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
+    )
     staged = bronze_project_contract(
-        with_row_hash(df),
+        with_row_hash(staged_input),
         target,
     )
     if not bronze_table_exists(target):
@@ -669,10 +698,9 @@ def update_snapshot_table(
 
     ensure_cdf(target)
     values = {column: f"s.{qident(column)}" for column in staged.columns}
-    comparisons = " OR ".join(
-        f"NOT (t.{qident(column)} <=> s.{qident(column)})"
-        for column in staged.columns
-        if column != key
+    comparisons = (
+        "NOT (t.ROW_HASH <=> s.ROW_HASH) "
+        "OR NOT (t.SOURCE_PRESENT_IND <=> s.SOURCE_PRESENT_IND)"
     )
     (
         DeltaTable.forName(spark, target)
@@ -682,10 +710,17 @@ def update_snapshot_table(
             f"t.{qident(key)} = s.{qident(key)}",
         )
         .whenMatchedUpdate(
-            condition=comparisons or "false",
+            condition=comparisons,
             set=values,
         )
         .whenNotMatchedInsert(values=values)
+        .whenNotMatchedBySourceUpdate(
+            condition="t.SOURCE_PRESENT_IND",
+            set={
+                "SOURCE_PRESENT_IND": "false",
+                "SOURCE_ABSENT_DETECTED_TS": "current_timestamp()",
+            },
+        )
         .execute()
     )
     return latest_delta_metrics(target)
@@ -1078,6 +1113,27 @@ def build_patient_stage(
         ).alias("community_patient_key"),
         F.col("RegCDB").cast("long").alias("source_database_id"),
         F.col("PatientNumber").cast("long").alias("source_patient_number"),
+        blank_to_null(F.col("Patid")).alias("source_patid"),
+        blank_to_null(F.col("LocalPatientid")).alias("source_local_patient_id"),
+        blank_to_null(F.col("NHSNumber")).alias("source_nhs_number"),
+        blank_to_null(F.col("PatientId")).alias("source_patient_id"),
+        blank_to_null(F.col("mPatientId")).alias("source_master_patient_id"),
+        blank_to_null(F.col("eMRN")).alias("source_emrn"),
+        blank_to_null(F.col("GivenName")).alias("given_name"),
+        blank_to_null(F.col("Surname")).alias("surname"),
+        F.col("PersonBirthDate").alias("person_birth_date"),
+        F.col("DateDeath").alias("date_of_death"),
+        blank_to_null(F.col("HouseNameFlatNumber")).alias("house_name_flat_number"),
+        blank_to_null(F.col("NumberAndStreet")).alias("number_and_street"),
+        blank_to_null(F.col("Village")).alias("village"),
+        blank_to_null(F.col("Town")).alias("town"),
+        blank_to_null(F.col("Postcode")).alias("postcode"),
+        blank_to_null(F.col("PostcodeNoSpace")).alias("postcode_no_space"),
+        F.col("eAddressId").cast("long").alias("source_address_id"),
+        F.col("ExternalUsualGPId").cast("long").alias("external_usual_gp_id"),
+        F.col("RegisteredGpUserInRoleId").cast("long").alias(
+            "registered_gp_user_in_role_id"
+        ),
         F.col("RegOrganisationId").cast("long").alias("source_service_id"),
         blank_to_null(F.col("RegOrganisationName")).alias("source_service_name"),
         F.col("DateofRegistration").alias("community_registration_date"),
@@ -1322,6 +1378,8 @@ def build_contact_stage(
             "community_care_contact_key"
         ),
         F.col("CDB").cast("long").alias("source_database_id"),
+        F.col("PatientNumber").cast("long").alias("source_patient_number"),
+        blank_to_null(F.col("LPI")).alias("source_local_patient_id"),
         blank_to_null(F.col("CCI")).alias("care_contact_id"),
         blank_to_null(F.col("SRI")).alias("service_request_id"),
         F.col("community_patient_key"),
@@ -1701,6 +1759,78 @@ def build_activity_distinct(activity_source: DataFrame) -> DataFrame:
         F.count(F.lit(1)).cast("long").alias("source_activity_id_variant_count")
     )
     return distinct_rows.join(variants, ["CDB", "CAI"], "left")
+# S4-C8 BEGIN
+
+def apply_approved_community_term_map(
+    base: DataFrame,
+    term_map: DataFrame,
+    omop_concept: DataFrame,
+) -> DataFrame:
+    approved = (
+        term_map.where(
+            F.upper(F.trim(F.col("MAPPING_STATUS"))) == F.lit("APPROVED")
+        )
+        .select(
+            F.col("SOURCE_TERM_KEY").cast("string").alias(
+                "source_clinical_term_key"
+            ),
+            F.col("CURATED_CONCEPT_ID").cast("long").alias(
+                "_s4_curated_concept_id"
+            ),
+            F.col("SNOMED_CANDIDATE_CONCEPT_ID").cast("long").alias(
+                "_s4_candidate_concept_id"
+            ),
+            F.col("SNOMED_CANDIDATE_NAME").cast("string").alias(
+                "_s4_candidate_name"
+            ),
+        )
+        .withColumn(
+            "_s4_snomed_concept_id",
+            F.coalesce(
+                F.col("_s4_curated_concept_id"),
+                F.col("_s4_candidate_concept_id"),
+            ),
+        )
+        .where(
+            F.col("source_clinical_term_key").isNotNull()
+            & F.col("_s4_snomed_concept_id").isNotNull()
+        )
+    )
+    duplicate_keys = verify_unique_key(approved, ["source_clinical_term_key"])
+    assert duplicate_keys == 0, (
+        "community_activity_term_map has duplicate APPROVED source keys: "
+        f"{duplicate_keys}"
+    )
+
+    concept_names = omop_concept.select(
+        F.col("concept_id").cast("long").alias("_s4_snomed_concept_id"),
+        F.col("concept_name").cast("string").alias("_s4_lookup_concept_name"),
+    )
+    approved = (
+        F.broadcast(approved).join(
+            concept_names,
+            "_s4_snomed_concept_id",
+            "left",
+        )
+        .select(
+            "source_clinical_term_key",
+            F.col("_s4_snomed_concept_id").alias("SNOMED_CONCEPT_ID"),
+            F.coalesce(
+                F.col("_s4_lookup_concept_name"),
+                F.when(
+                    F.col("_s4_curated_concept_id").isNull(),
+                    F.col("_s4_candidate_name"),
+                ),
+            ).alias("SNOMED_CONCEPT_NAME"),
+            F.lit("APPROVED").alias("SNOMED_MAPPING_STATUS"),
+        )
+    )
+    return base.join(
+        F.broadcast(approved),
+        "source_clinical_term_key",
+        "left",
+    )
+# S4-C8 END
 
 
 def build_activity_stage(
@@ -1709,6 +1839,9 @@ def build_activity_stage(
     patient_stage: DataFrame,
     omop_concept: DataFrame,
     omop_synonym: DataFrame,
+    # S4-C8 BEGIN
+    community_activity_term_map: DataFrame,
+    # S4-C8 END
 ) -> DataFrame:
     activity_distinct = build_activity_distinct(activity_source)
     patient_join = patient_stage.select(
@@ -1847,6 +1980,13 @@ def build_activity_stage(
             ).otherwise(F.lit("UNMAPPED")),
         ),
     )
+    # S4-C8 BEGIN
+    base = apply_approved_community_term_map(
+        base,
+        community_activity_term_map,
+        omop_concept,
+    )
+    # S4-C8 END
 
     activity_code = blank_to_null(F.col("ActivityCode"))
     activity_description = mapping_value(activity_code, ACTIVITY_TYPE_MAP)
@@ -1860,6 +2000,7 @@ def build_activity_stage(
             F.col("source_activity_business_hash"),
         ).alias("community_care_activity_key"),
         F.col("CDB").cast("long").alias("source_database_id"),
+        F.col("PatientNumber").cast("long").alias("source_patient_number"),
         blank_to_null(F.col("CAI")).alias("care_activity_id"),
         F.col("source_activity_business_hash"),
         F.col("source_exact_duplicate_count"),
@@ -1926,6 +2067,13 @@ def build_activity_stage(
         F.col("snomed_candidate_standard_concept"),
         F.col("snomed_candidate_method"),
         F.col("snomed_candidate_status"),
+        # S4-C8 BEGIN
+        F.col("SNOMED_CONCEPT_ID").cast("long").alias("SNOMED_CONCEPT_ID"),
+        F.col("SNOMED_CONCEPT_NAME").cast("string").alias("SNOMED_CONCEPT_NAME"),
+        F.col("SNOMED_MAPPING_STATUS").cast("string").alias(
+            "SNOMED_MAPPING_STATUS"
+        ),
+        # S4-C8 END
         F.lit(CSDS_MAPPING_VERSION).alias("csds_mapping_version"),
         F.lit(UCUM_MAPPING_VERSION).alias("ucum_mapping_version"),
         F.lit(SNOMED_MAPPING_VERSION).alias("snomed_mapping_version"),
@@ -2126,7 +2274,26 @@ def validate_activity_stage(
 PATIENT_COMMENTS = {
     "community_patient_key": "SHA-256 source registration key from BH_COMMUNITY, RegCDB and PatientNumber.",
     "source_database_id": "Community database/service instance identifier.",
-    "source_patient_number": "Restricted local patient number; unique only within source_database_id.",
+    "source_patient_number": "Source patient number; unique only within source_database_id.",
+    "source_patid": "Source community patient record identifier.",
+    "source_local_patient_id": "Source local patient identifier.",
+    "source_nhs_number": "Source NHS number retained in Bronze; de-identify at serve time.",
+    "source_patient_id": "Source row-level patient identifier.",
+    "source_master_patient_id": "Source master-patient linkage identifier.",
+    "source_emrn": "Source electronic medical record number.",
+    "given_name": "Source patient given name.",
+    "surname": "Source patient surname.",
+    "person_birth_date": "Source patient date of birth.",
+    "date_of_death": "Source patient date of death.",
+    "house_name_flat_number": "Source patient address house or flat.",
+    "number_and_street": "Source patient address number and street.",
+    "village": "Source patient address village or locality.",
+    "town": "Source patient address town or city.",
+    "postcode": "Source patient postcode.",
+    "postcode_no_space": "Source patient postcode without spaces.",
+    "source_address_id": "Source patient address record identifier.",
+    "external_usual_gp_id": "Source usual-GP identifier.",
+    "registered_gp_user_in_role_id": "Source registered-GP user-in-role identifier.",
     "person_id": "Canonical Millennium PERSON_ID from strict NHS/MRN alias linkage.",
     "person_match_status": "MATCHED, UNMATCHED, AMBIGUOUS, CONFLICT or CANONICAL_PERSON_MISSING.",
     "person_match_method": "NHS_MRN_AGREE, NHS_ONLY, MRN_ONLY or NONE.",
@@ -2140,6 +2307,8 @@ CONTACT_COMMENTS = {
     "community_care_contact_key": "SHA-256 key from BH_COMMUNITY, CDB, CCI and SRI.",
     "care_contact_id": "Source CYP201 Care Contact Identifier; not unique by itself.",
     "service_request_id": "Source CYP201 Service Request Identifier.",
+    "source_patient_number": "Source patient number within source_database_id.",
+    "source_local_patient_id": "Source local patient identifier submitted on the contact.",
     "care_contact_datetime_local": "Source local wall-clock contact timestamp (TIMESTAMP_NTZ).",
     "care_contact_id_variant_count": "Rows sharing source_database_id and care_contact_id.",
     "normalized_consultation_mechanism_method": "SUBMITTED_CODE, EXACT_SOURCE_TERM_CANDIDATE, SUBMITTED_OTHER_OR_UNMAPPED or UNMAPPED.",
@@ -2152,12 +2321,18 @@ CONTACT_COMMENTS = {
 ACTIVITY_COMMENTS = {
     "community_care_activity_key": "Content-addressed SHA-256 key retaining distinct variants of repeated source activity identifiers.",
     "source_activity_business_hash": "Hash of the complete source activity payload excluding ADC_UPDT.",
+    "source_patient_number": "Source patient number within source_database_id.",
     "source_exact_duplicate_count": "Number of byte-equivalent source rows collapsed into this row.",
     "source_activity_id_variant_count": "Distinct rows sharing source_database_id and care_activity_id.",
     "contact_match_status": "UNIQUE_ID_DATE_MATCH, UNIQUE_ID_DATE_MISMATCH, DUPLICATE_ID_RESOLVED_BY_DATE, AMBIGUOUS_SAME_DATE, DUPLICATE_ID_NO_DATE_MATCH or NO_CONTACT.",
     "source_care_professional_local_id": "CSDS Care Professional Local Identifier; not a Millennium personnel ID.",
     "snomed_candidate_concept_id": "Unreviewed deterministic exact-name/synonym candidate; not an approved resolved mapping.",
     "snomed_candidate_status": "CANDIDATE_UNREVIEWED, AMBIGUOUS, UNMAPPED, NO_SOURCE_TERM or DISABLED.",
+    # S4-C8 BEGIN
+    "SNOMED_CONCEPT_ID": "Human-approved SNOMED OMOP concept identifier from the S4/C8 Community term-map workflow.",
+    "SNOMED_CONCEPT_NAME": "OMOP concept name for the human-approved SNOMED concept.",
+    "SNOMED_MAPPING_STATUS": "APPROVED when the S4/C8 Community term map supplies a resolved concept.",
+    # S4-C8 END
     "normalized_ucum_code": "Exact or approved-alias normalized UCUM code.",
     "source_snapshot_loaded_ts": "Raw source ADC_UPDT snapshot timestamp.",
     "ROW_HASH": "SHA-256 of pipeline-managed business fields.",
@@ -2213,6 +2388,9 @@ def target_fingerprints(metadata: dict[str, dict]) -> dict[str, dict[str, str]]:
         PERSON_CANONICAL: physical[PERSON_CANONICAL],
         OMOP_CONCEPT: physical[OMOP_CONCEPT],
         OMOP_CONCEPT_SYNONYM: physical[OMOP_CONCEPT_SYNONYM],
+        # S4-C8 BEGIN
+        COMMUNITY_ACTIVITY_TERM_MAP: physical[COMMUNITY_ACTIVITY_TERM_MAP],
+        # S4-C8 END
         "__CONTRACT__": hash_object(ACTIVITY_CONTRACT_VERSION),
         "__CSDS_MAP__": csds_map_fingerprint,
         "__UCUM_ALIAS_MAP__": hash_object(
@@ -2250,6 +2428,91 @@ def assert_dependencies_unchanged(
     )
 
 
+DIRECT_IDENTIFIER_COLUMNS = {
+    "SOURCE_PATID",
+    "SOURCE_LOCAL_PATIENT_ID",
+    "SOURCE_PATIENT_NUMBER",
+    "SOURCE_NHS_NUMBER",
+    "SOURCE_PATIENT_ID",
+    "SOURCE_MASTER_PATIENT_ID",
+    "SOURCE_EMRN",
+    "GIVEN_NAME",
+    "SURNAME",
+    "PERSON_BIRTH_DATE",
+    "DATE_OF_DEATH",
+    "HOUSE_NAME_FLAT_NUMBER",
+    "NUMBER_AND_STREET",
+    "VILLAGE",
+    "TOWN",
+    "POSTCODE",
+    "POSTCODE_NO_SPACE",
+    "SOURCE_ADDRESS_ID",
+    "EXTERNAL_USUAL_GP_ID",
+    "REGISTERED_GP_USER_IN_ROLE_ID",
+}
+
+
+def ensure_complete_ig_tags(table: str) -> None:
+    catalog, schema_name, table_name = table.split(".")
+    existing_rows = spark.sql(
+        f"""
+        SELECT column_name,
+               MAX(CASE WHEN tag_name='ig_risk' THEN tag_value END) AS risk,
+               MAX(CASE WHEN tag_name='ig_severity' THEN tag_value END) AS severity
+        FROM {qident(catalog)}.information_schema.column_tags
+        WHERE schema_name = '{sql_escape(schema_name)}'
+          AND table_name = '{sql_escape(table_name)}'
+          AND tag_name IN ('ig_risk', 'ig_severity')
+        GROUP BY column_name
+        """
+    ).collect()
+    existing = {
+        row["column_name"]: (
+            None if row["risk"] is None else str(row["risk"]),
+            None if row["severity"] is None else str(row["severity"]),
+        )
+        for row in existing_rows
+    }
+    for column in spark.table(table).columns:
+        current = existing.get(column, (None, None))
+        if column.upper() in DIRECT_IDENTIFIER_COLUMNS:
+            desired = ("4", "2")
+        elif current[0] is not None and current[1] is not None:
+            desired = current
+        else:
+            desired = ("0", "0")
+        if current != desired:
+            spark.sql(
+                f"ALTER TABLE {qname(table)} ALTER COLUMN {qident(column)} "
+                f"SET TAGS ('ig_risk'='{desired[0]}', 'ig_severity'='{desired[1]}')"
+            )
+    tagged = spark.sql(
+        f"""
+        WITH columns AS (
+          SELECT column_name
+          FROM {qident(catalog)}.information_schema.columns
+          WHERE table_schema = '{sql_escape(schema_name)}'
+            AND table_name = '{sql_escape(table_name)}'
+        ),
+        tags AS (
+          SELECT column_name,
+                 MAX(CASE WHEN tag_name='ig_risk' THEN 1 ELSE 0 END) AS has_risk,
+                 MAX(CASE WHEN tag_name='ig_severity' THEN 1 ELSE 0 END) AS has_severity
+          FROM {qident(catalog)}.information_schema.column_tags
+          WHERE schema_name = '{sql_escape(schema_name)}'
+            AND table_name = '{sql_escape(table_name)}'
+            AND tag_name IN ('ig_risk', 'ig_severity')
+          GROUP BY column_name
+        )
+        SELECT COUNT(*) AS missing
+        FROM columns c
+        LEFT JOIN tags t USING (column_name)
+        WHERE COALESCE(t.has_risk, 0) = 0 OR COALESCE(t.has_severity, 0) = 0
+        """
+    ).first()["missing"]
+    assert int(tagged) == 0, f"{table}: {tagged} columns lack complete IG tags"
+
+
 def verify_target(
     target: str,
     key: str,
@@ -2266,6 +2529,7 @@ def verify_target(
     duplicate_keys = verify_unique_key(spark.table(target), [key])
     assert duplicate_keys == 0, f"{target}: {duplicate_keys} duplicate target keys"
     bronze_assert_primary_contract(target)
+    ensure_complete_ig_tags(target)
     return {
         "target_rows": target_rows,
         "current_source_rows": expected_present_rows,
@@ -2278,7 +2542,7 @@ def _write_target_comments(target: str) -> None:
     if target == PATIENT_TABLE:
         apply_comments(
             target,
-            "BH Community patient/service registration bridge. Direct identifiers and duplicate demographics are excluded.",
+            "BH Community patient/service registration bridge retaining source identifiers with complete IG tags.",
             PATIENT_COMMENTS,
         )
     elif target == CONTACT_TABLE:
@@ -2375,6 +2639,9 @@ try:
             patient_stage,
             pinned[OMOP_CONCEPT],
             pinned[OMOP_CONCEPT_SYNONYM],
+            # S4-C8 BEGIN
+            pinned[COMMUNITY_ACTIVITY_TERM_MAP],
+            # S4-C8 END
         )
         validation["activity"] = validate_activity_stage(
             activity_stage,
@@ -2403,6 +2670,7 @@ try:
         )
         rebuilt_targets.append(PATIENT_TABLE)
         _write_target_comments(PATIENT_TABLE)
+        ensure_complete_ig_tags(PATIENT_TABLE)
     else:
         merge_metrics["patient"] = {"operation": "SKIP_UNCHANGED"}
 
@@ -2414,6 +2682,7 @@ try:
         )
         rebuilt_targets.append(CONTACT_TABLE)
         _write_target_comments(CONTACT_TABLE)
+        ensure_complete_ig_tags(CONTACT_TABLE)
     else:
         merge_metrics["contact"] = {"operation": "SKIP_UNCHANGED"}
 
@@ -2425,6 +2694,7 @@ try:
         )
         rebuilt_targets.append(ACTIVITY_TABLE)
         _write_target_comments(ACTIVITY_TABLE)
+        ensure_complete_ig_tags(ACTIVITY_TABLE)
     else:
         merge_metrics["activity"] = {"operation": "SKIP_UNCHANGED"}
 
@@ -2511,4 +2781,5 @@ except Exception as community_error:
     raise
 
 dbutils.notebook.exit(bronze_json(result_payload))
+
 

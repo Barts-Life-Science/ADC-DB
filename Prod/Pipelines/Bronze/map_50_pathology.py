@@ -1,10 +1,14 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Map 50 — Pathology
+# MAGIC # Map 50 — Pathology v3.1 restartable incremental replacement
 # MAGIC
-# MAGIC Components: pathology foundation and mapping reconciliation. This notebook is executed by `map_pipeline` in the shared map runtime.
+# MAGIC Drop-in `map_pipeline` component retaining the existing pathology contract.
+# MAGIC Incremental runs commit their parent scope once, land pinned source inputs once,
+# MAGIC and process 8 linked plus 32 raw restartable buckets before one stale-row pass.
 
 # COMMAND ----------
+
+# BRONZE_PERF_946452877034658_V2
 
 if "_PIPELINE_RUN_ID" not in globals():
     raise RuntimeError("Run this component through map_pipeline so shared contracts, checkpoints and audit state are initialized.")
@@ -47,7 +51,7 @@ from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, LongType, StringType, StructField, StructType, TimestampType
-MP_VERSION = '3.0.0'
+MP_VERSION = '3.1.0'
 TARGET_SCHEMA = '4_prod.bronze'
 MAP_SCHEMA = '3_lookup.omop'
 MP_TARGET = f'{TARGET_SCHEMA}.map_pathology'
@@ -60,6 +64,8 @@ MP_NATIVE_TEST = f'{MAP_SCHEMA}.pathology_native_test_crosswalk'
 MP_NATIVE_RESULT = f'{MAP_SCHEMA}.pathology_native_result_crosswalk'
 MP_FULL_BUILD_MANIFEST = f'{MP_CONTROL_SCHEMA}.map_pathology_full_build_manifest'
 MP_FULL_BUILD_PROGRESS = f'{MP_CONTROL_SCHEMA}.map_pathology_full_build_progress'
+MP_INCREMENTAL_MANIFEST = f'{MP_CONTROL_SCHEMA}.map_pathology_incremental_manifest'
+MP_INCREMENTAL_PROGRESS = f'{MP_CONTROL_SCHEMA}.map_pathology_incremental_progress'
 TEST_MAP = f'{MAP_SCHEMA}.pathology_test_concept_map'
 RESULT_MAP = f'{MAP_SCHEMA}.pathology_result_concept_map'
 UNIT_MAP = f'{MAP_SCHEMA}.pathology_unit_map'
@@ -82,6 +88,10 @@ FULL_BUILD_SCHEMA_VERSION = '3.0.0'
 FULL_BUILD_LINKED_BUCKETS = 8
 FULL_BUILD_RAW_BUCKETS = 8
 FULL_BUILD_STAGE_RETRIES = 2
+INCREMENTAL_SCHEMA_VERSION = '3.1.0'
+INCREMENTAL_LINKED_BUCKETS = 8
+INCREMENTAL_RAW_BUCKETS = 4
+INCREMENTAL_STAGE_RETRIES = 2
 FULL_BUILD_INPUTS = {**{source_name: table_name for source_name, (table_name, _) in SOURCE_TABLES.items()}, 'pathology_result_value_exclusions': EXCL_TBL, 'omop_concept': CONCEPT}
 FULL_BUILD_GLOBAL_SOURCES = {'CE': 'mill_clinical_event', 'ORDERS': 'mill_orders', 'PERSON_ALIAS': 'mill_person_alias', 'RESULT_LEVEL': 'path_patient_resultlevel', 'SAMPLE_LEVEL': 'path_patient_samplelevel', 'MASTER_RESULT': 'path_master_resultable', 'ORDER_CATALOG': 'mill_order_catalog', 'CODE_VALUE': 'mill_code_value', 'TEST_MAP': 'pathology_test_concept_map', 'RESULT_MAP': 'pathology_result_concept_map', 'UNIT_MAP': 'pathology_unit_map', 'EXCL_TBL': 'pathology_result_value_exclusions', 'CONCEPT': 'omop_concept'}
 NUMERIC_REGEX = '^\\s*(?:<=|>=|<|>|≤|≥|=)?\\s*[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?\\s*$'
@@ -207,6 +217,44 @@ def _ensure_full_build_control_tables() -> None:
     spark.sql(f'CREATE SCHEMA IF NOT EXISTS {_qn(MP_CONTROL_SCHEMA)}')
     spark.sql(f'\n        CREATE TABLE IF NOT EXISTS {_qn(MP_FULL_BUILD_MANIFEST)} (\n          build_id STRING NOT NULL,\n          phase STRING NOT NULL,\n          schema_version STRING NOT NULL,\n          config_json STRING NOT NULL,\n          source_versions_json STRING NOT NULL,\n          source_cutoffs_json STRING NOT NULL,\n          run_timestamp TIMESTAMP NOT NULL,\n          started_at TIMESTAMP NOT NULL,\n          updated_at TIMESTAMP NOT NULL,\n          completed_at TIMESTAMP,\n          last_error STRING\n        ) USING DELTA\n        ')
     spark.sql(f'\n        CREATE TABLE IF NOT EXISTS {_qn(MP_FULL_BUILD_PROGRESS)} (\n          build_id STRING NOT NULL,\n          stage_name STRING NOT NULL,\n          bucket_id INT NOT NULL,\n          status STRING NOT NULL,\n          table_name STRING,\n          row_count BIGINT,\n          parent_count BIGINT,\n          started_at TIMESTAMP,\n          completed_at TIMESTAMP,\n          last_error STRING\n        ) USING DELTA\n        ')
+
+
+def _ensure_incremental_control_tables() -> None:
+    """Create the durable restart contract for bounded incremental runs."""
+    spark.sql(f'CREATE SCHEMA IF NOT EXISTS {_qn(MP_CONTROL_SCHEMA)}')
+    spark.sql(f'''
+        CREATE TABLE IF NOT EXISTS {_qn(MP_INCREMENTAL_MANIFEST)} (
+          run_id STRING NOT NULL,
+          phase STRING NOT NULL,
+          schema_version STRING NOT NULL,
+          config_json STRING NOT NULL,
+          source_state_json STRING NOT NULL,
+          source_cutoffs_json STRING NOT NULL,
+          scope_modes_json STRING,
+          run_timestamp TIMESTAMP NOT NULL,
+          started_at TIMESTAMP NOT NULL,
+          updated_at TIMESTAMP NOT NULL,
+          completed_at TIMESTAMP,
+          last_error STRING
+        ) USING DELTA
+        ''')
+    spark.sql(f'''
+        CREATE TABLE IF NOT EXISTS {_qn(MP_INCREMENTAL_PROGRESS)} (
+          run_id STRING NOT NULL,
+          stage_name STRING NOT NULL,
+          branch STRING NOT NULL,
+          bucket_id INT NOT NULL,
+          status STRING NOT NULL,
+          table_name STRING,
+          row_count BIGINT,
+          parent_count BIGINT,
+          changed_rows BIGINT,
+          stale_rows_deleted BIGINT,
+          started_at TIMESTAMP,
+          completed_at TIMESTAMP,
+          last_error STRING
+        ) USING DELTA
+        ''')
 
 
 def _read_state() -> dict[str, dict]:
@@ -354,6 +402,314 @@ def abandon_map_pathology_full_build(drop_stages: bool=False) -> dict:
             _drop_table_if_exists(table_name)
     return {'status': 'ABANDONED', 'build_id': manifest['build_id'], 'stage_tables': tables, 'dropped': bool(drop_stages)}
 
+
+def _incremental_config_json() -> str:
+    return json.dumps(
+        {
+            'schema_version': INCREMENTAL_SCHEMA_VERSION,
+            'linked_bucket_count': int(INCREMENTAL_LINKED_BUCKETS),
+            'raw_bucket_count': int(INCREMENTAL_RAW_BUCKETS),
+            'bucket_hash': 'xxhash64_parent_v1',
+            'scope_contract': 'materialized_parent_scope_v1',
+            'input_contract': 'pinned_scoped_inputs_v1',
+        },
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+
+def _serialize_incremental_state(state: dict[str, dict]) -> str:
+    payload = {}
+    for source_name, row in state.items():
+        payload[source_name] = {
+            'source_name': source_name,
+            'table_name': row.get('table_name'),
+            'last_delta_version': (
+                int(row['last_delta_version'])
+                if row.get('last_delta_version') is not None
+                else None
+            ),
+            'last_adc_updt': _json_timestamp(row.get('last_adc_updt')),
+            'last_success_at': _json_timestamp(row.get('last_success_at')),
+            'pipeline_version': row.get('pipeline_version'),
+        }
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def _deserialize_incremental_state(payload: str) -> dict[str, dict]:
+    state = json.loads(payload)
+    for row in state.values():
+        for column_name in ('last_adc_updt', 'last_success_at'):
+            value = row.get(column_name)
+            row[column_name] = datetime.fromisoformat(value) if value else None
+        if row.get('last_delta_version') is not None:
+            row['last_delta_version'] = int(row['last_delta_version'])
+    return state
+
+
+def _incremental_manifest_row_to_dict(row) -> dict:
+    result = row.asDict()
+    result['state'] = _deserialize_incremental_state(result['source_state_json'])
+    result['cutoffs'] = _deserialize_cutoffs(result['source_cutoffs_json'])
+    result['scope_modes'] = json.loads(result.get('scope_modes_json') or '{}')
+    return result
+
+
+def _write_incremental_manifest(manifest: dict) -> None:
+    row = (
+        manifest['run_id'],
+        manifest['phase'],
+        manifest['schema_version'],
+        manifest['config_json'],
+        manifest['source_state_json'],
+        manifest['source_cutoffs_json'],
+        manifest.get('scope_modes_json'),
+        manifest['run_timestamp'],
+        manifest['started_at'],
+        manifest['updated_at'],
+        manifest.get('completed_at'),
+        manifest.get('last_error'),
+    )
+    schema = (
+        'run_id STRING, phase STRING, schema_version STRING, config_json STRING, '
+        'source_state_json STRING, source_cutoffs_json STRING, scope_modes_json STRING, '
+        'run_timestamp TIMESTAMP, started_at TIMESTAMP, updated_at TIMESTAMP, '
+        'completed_at TIMESTAMP, last_error STRING'
+    )
+    update = spark.createDataFrame([row], schema)
+    (
+        DeltaTable.forName(spark, MP_INCREMENTAL_MANIFEST)
+        .alias('t')
+        .merge(update.alias('s'), 't.run_id=s.run_id')
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+def _update_incremental_phase(
+    manifest: dict,
+    phase: str,
+    error: str | None=None,
+) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    manifest['phase'] = phase
+    manifest['updated_at'] = now
+    manifest['last_error'] = error[:4000] if error else None
+    if phase in {'SUCCESS', 'ABANDONED'}:
+        manifest['completed_at'] = now
+    _write_incremental_manifest(manifest)
+
+
+def _incremental_state_matches(
+    current: dict[str, dict],
+    pinned: dict[str, dict],
+) -> bool:
+    for source_name in SOURCE_TABLES:
+        current_version = (current.get(source_name) or {}).get('last_delta_version')
+        pinned_version = (pinned.get(source_name) or {}).get('last_delta_version')
+        if current_version != pinned_version:
+            return False
+    return True
+
+
+def _load_or_start_incremental(state: dict[str, dict]) -> dict:
+    global INCREMENTAL_RAW_BUCKETS
+    expected_config = _incremental_config_json()
+    active = (
+        spark.table(MP_INCREMENTAL_MANIFEST)
+        .filter(~F.col('phase').isin('SUCCESS', 'ABANDONED'))
+        .orderBy(F.desc('updated_at'))
+        .limit(2)
+        .collect()
+    )
+    if len(active) > 1:
+        raise RuntimeError(
+            'More than one active pathology incremental manifest exists; '
+            'abandon the obsolete run explicitly before continuing.'
+        )
+    if active:
+        manifest = _incremental_manifest_row_to_dict(active[0])
+        if manifest['schema_version'] != INCREMENTAL_SCHEMA_VERSION:
+            raise RuntimeError(
+                'The active pathology incremental manifest uses schema version '
+                f"{manifest['schema_version']}; call "
+                'abandon_map_pathology_incremental() before changing the execution contract.'
+            )
+        if manifest['config_json'] != expected_config:
+            prior_config = json.loads(manifest['config_json'])
+            desired_config = json.loads(expected_config)
+            legacy_compatible = dict(prior_config, raw_bucket_count=desired_config['raw_bucket_count'])
+            if prior_config.get('raw_bucket_count') == 32 and legacy_compatible == desired_config:
+                INCREMENTAL_RAW_BUCKETS = 32
+                expected_config = manifest['config_json']
+                print('[PERF] Resuming pinned 32-bucket legacy manifest; fresh manifests use four.')
+            else:
+                raise RuntimeError('Pathology resume configuration differs beyond the supported raw-bucket migration')
+        if not _incremental_state_matches(state, manifest['state']):
+            raise RuntimeError(
+                'The pathology pipeline state advanced after this incremental manifest '
+                'started. Abandon the stale manifest before starting a new run.'
+            )
+        print(
+            f"[map_pathology_v3] RESUME incremental {manifest['run_id']} "
+            f"from phase {manifest['phase']}"
+        )
+        return manifest
+    cutoffs = _capture_cutoffs()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    manifest = {
+        'run_id': str(uuid.uuid4()),
+        'phase': 'BUILDING',
+        'schema_version': INCREMENTAL_SCHEMA_VERSION,
+        'config_json': expected_config,
+        'source_state_json': _serialize_incremental_state(state),
+        'source_cutoffs_json': _serialize_cutoffs(cutoffs),
+        'scope_modes_json': '{}',
+        'state': state,
+        'cutoffs': cutoffs,
+        'scope_modes': {},
+        'run_timestamp': now,
+        'started_at': now,
+        'updated_at': now,
+        'completed_at': None,
+        'last_error': None,
+    }
+    _write_incremental_manifest(manifest)
+    print(
+        f"[map_pathology_v3] START incremental {manifest['run_id']}; "
+        f"pinned {_mp_builtins.len(cutoffs)} source versions"
+    )
+    return manifest
+
+
+def _write_incremental_progress(
+    run_id: str,
+    stage_name: str,
+    branch: str,
+    bucket_id: int,
+    status: str,
+    table_name: str | None=None,
+    row_count: int | None=None,
+    parent_count: int | None=None,
+    changed_rows: int | None=None,
+    stale_rows_deleted: int | None=None,
+    error: str | None=None,
+) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    existing = (
+        spark.table(MP_INCREMENTAL_PROGRESS)
+        .filter(
+            (F.col('run_id') == run_id)
+            & (F.col('stage_name') == stage_name)
+            & (F.col('branch') == branch)
+            & (F.col('bucket_id') == int(bucket_id))
+        )
+        .limit(1)
+        .collect()
+    )
+    started_at = existing[0]['started_at'] if existing else now
+    completed_at = now if status == 'COMPLETE' else None
+    row = (
+        run_id,
+        stage_name,
+        branch,
+        int(bucket_id),
+        status,
+        table_name,
+        int(row_count) if row_count is not None else None,
+        int(parent_count) if parent_count is not None else None,
+        int(changed_rows) if changed_rows is not None else None,
+        int(stale_rows_deleted) if stale_rows_deleted is not None else None,
+        started_at,
+        completed_at,
+        error[:4000] if error else None,
+    )
+    schema = (
+        'run_id STRING, stage_name STRING, branch STRING, bucket_id INT, '
+        'status STRING, table_name STRING, row_count BIGINT, parent_count BIGINT, '
+        'changed_rows BIGINT, stale_rows_deleted BIGINT, started_at TIMESTAMP, '
+        'completed_at TIMESTAMP, last_error STRING'
+    )
+    update = spark.createDataFrame([row], schema)
+    (
+        DeltaTable.forName(spark, MP_INCREMENTAL_PROGRESS)
+        .alias('t')
+        .merge(
+            update.alias('s'),
+            't.run_id=s.run_id AND t.stage_name=s.stage_name '
+            'AND t.branch=s.branch AND t.bucket_id=s.bucket_id',
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+def _completed_incremental_progress(
+    run_id: str,
+    stage_name: str,
+    branch: str,
+    bucket_id: int,
+    table_name: str | None=None,
+) -> dict | None:
+    rows = (
+        spark.table(MP_INCREMENTAL_PROGRESS)
+        .filter(
+            (F.col('run_id') == run_id)
+            & (F.col('stage_name') == stage_name)
+            & (F.col('branch') == branch)
+            & (F.col('bucket_id') == int(bucket_id))
+            & (F.col('status') == 'COMPLETE')
+        )
+        .orderBy(F.desc('completed_at'))
+        .limit(1)
+        .collect()
+    )
+    if not rows:
+        return None
+    if table_name is not None and not _table_exists(table_name):
+        return None
+    return rows[0].asDict()
+
+
+def abandon_map_pathology_incremental(drop_stages: bool=False) -> dict:
+    """Explicitly abandon the latest in-flight incremental run."""
+    if not _table_exists(MP_INCREMENTAL_MANIFEST):
+        return {'status': 'NO_ACTIVE_INCREMENTAL'}
+    active = (
+        spark.table(MP_INCREMENTAL_MANIFEST)
+        .filter(~F.col('phase').isin('SUCCESS', 'ABANDONED'))
+        .orderBy(F.desc('updated_at'))
+        .limit(1)
+        .collect()
+    )
+    if not active:
+        return {'status': 'NO_ACTIVE_INCREMENTAL'}
+    manifest = _incremental_manifest_row_to_dict(active[0])
+    tables = [
+        row['table_name']
+        for row in (
+            spark.table(MP_INCREMENTAL_PROGRESS)
+            .filter(F.col('run_id') == manifest['run_id'])
+            .select('table_name')
+            .where('table_name IS NOT NULL')
+            .distinct()
+            .collect()
+        )
+    ]
+    _update_incremental_phase(manifest, 'ABANDONED')
+    if drop_stages:
+        for table_name in tables:
+            if table_name.startswith(f'{MP_CONTROL_SCHEMA}.map_pathology_incremental_'):
+                _drop_table_if_exists(table_name)
+    return {
+        'status': 'ABANDONED',
+        'run_id': manifest['run_id'],
+        'stage_tables': tables,
+        'dropped': bool(drop_stages),
+    }
+
 def _read_changes(
     source_name: str,
     state: dict[str, dict],
@@ -412,6 +768,46 @@ def _read_changes(
         return (changed, 'timestamp')
     return (spark.table(table_name), 'full_key_refresh')
 
+def _mp_semantic_snapshot_keys(
+    table_name: str,
+    previous_version: int,
+    current_version: int,
+    key_columns: list[str],
+    semantic_columns: list[str],
+    latest_order_columns: list[str] | None=None,
+) -> DataFrame:
+    """Diff effective lookup snapshots, not delete+insert CDF noise."""
+    def prepared(version: int, payload_name: str) -> DataFrame:
+        frame = spark.read.format('delta').option('versionAsOf', int(version)).table(table_name)
+        if latest_order_columns:
+            ranking = Window.partitionBy(*key_columns).orderBy(
+                *[F.col(column).desc_nulls_last() for column in latest_order_columns]
+            )
+            frame = frame.withColumn('_SEMANTIC_RN', F.row_number().over(ranking)).filter(F.col('_SEMANTIC_RN') == 1).drop('_SEMANTIC_RN')
+        available = [column for column in semantic_columns if column in frame.columns]
+        if not available:
+            raise RuntimeError(f'No semantic comparison columns found for {table_name}')
+        return frame.select(
+            *[F.col(column) for column in key_columns],
+            F.xxhash64(*[F.col(column) for column in available]).alias(payload_name),
+        )
+
+    before = prepared(previous_version, '_BEFORE_PAYLOAD').alias('b')
+    after = prepared(current_version, '_AFTER_PAYLOAD').alias('a')
+    condition = reduce(
+        lambda left, right: left & right,
+        [F.col(f'b.{column}').eqNullSafe(F.col(f'a.{column}')) for column in key_columns],
+    )
+    return (
+        before.join(after, condition, 'full')
+        .where(~F.col('b._BEFORE_PAYLOAD').eqNullSafe(F.col('a._AFTER_PAYLOAD')))
+        .select(*[
+            F.coalesce(F.col(f'b.{column}'), F.col(f'a.{column}')).alias(column)
+            for column in key_columns
+        ])
+        .dropDuplicates(key_columns)
+    )
+
 def _advance_state(cutoffs: dict[str, dict], source_names: list[str] | None=None) -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     selected = source_names or list(cutoffs)
@@ -444,9 +840,9 @@ def _apply_table_metadata() -> None:
         spark.sql(f"ALTER TABLE {_qn(MP_TARGET)} ALTER COLUMN {_qn(column_name)} COMMENT '{escaped}'")
     if ENABLE_LIQUID_CLUSTERING and {'source_table', 'source_parent_key'}.issubset(existing):
         try:
-            spark.sql(f'ALTER TABLE {_qn(MP_TARGET)} CLUSTER BY (source_table, source_parent_key)')
+            spark.sql(f'ALTER TABLE {_qn(MP_TARGET)} CLUSTER BY (source_table)')
         except Exception as exc:
-            print(f'[map_pathology_v3] clustering note: {str(exc).splitlines()[0]}')
+            raise RuntimeError('Pathology liquid clustering could not be enabled; no silent fallback') from exc
 
 def _target_is_v2() -> bool:
     required = {
@@ -483,6 +879,41 @@ def _prepare_incremental_scope(state: dict[str, dict], cutoffs: dict[str, dict],
             cutoffs,
             force_snapshot_fallback=force_snapshot_fallback,
         )
+
+    snapshot_specs = {
+        'mill_code_value': (
+            ['CODE_VALUE'],
+            ['CODE_SET', 'DESCRIPTION', 'DISPLAY', 'CDF_MEANING', 'ACTIVE_IND'],
+            None,
+        ),
+        'mill_order_catalog': (
+            ['CATALOG_CD'],
+            ['CATALOG_TYPE_CD', 'DESCRIPTION', 'PRIMARY_MNEMONIC', 'DEPT_DISPLAY_NAME', 'ACTIVE_IND', 'EVENT_CD', 'CONCEPT_CKI'],
+            None,
+        ),
+        'path_master_resultable': (
+            ['WkgCode', 'TFCCode'],
+            ['TFCDesc_Full', 'TFCDesc_Rep', 'TFCDesc_WP', 'ReportingSynonym', 'PMIPDesc', 'Units', 'NLMC_ID', 'SectionCode', 'WorkSectionCode', 'ReportSection', 'ResultType', 'ResultFormat', 'NumValUpper', 'NumValDPs'],
+            ['LastUpdateDT', 'ADC_UPDT'],
+        ),
+    }
+    for source_name, (keys, payload, ordering) in snapshot_specs.items():
+        previous = state.get(source_name)
+        if previous is None or previous.get('last_delta_version') is None:
+            continue
+        previous_version = int(previous['last_delta_version'])
+        current_version = int(cutoffs[source_name]['end_version'])
+        if current_version <= previous_version:
+            continue
+        changes[source_name] = _mp_semantic_snapshot_keys(
+            cutoffs[source_name]['table_name'],
+            previous_version,
+            current_version,
+            keys,
+            payload,
+            ordering,
+        )
+        modes[source_name] = 'semantic_snapshot_diff'
         print(f'[map_pathology_v3] {source_name}: {modes[source_name]}')
     target = spark.table(MP_TARGET)
     linked_target = target.filter(F.col('source_table') == 'linked')
@@ -611,7 +1042,7 @@ def _mp_build_select(full: bool, branch: str='both', bucket_id: int | None=None,
         source_union_sql = 'SELECT * FROM raw_src'
     else:
         source_union_sql = 'SELECT * FROM linked_src UNION ALL SELECT * FROM raw_src'
-    sql_text = f"\n    WITH\n    {alias_ctes},\n    linked_ranked AS (\n      SELECT\n        ce.CLINICAL_EVENT_ID, ce.EVENT_ID, ce.PERSON_ID, ce.ENCNTR_ID,\n        ce.ORDER_ID, ce.CATALOG_CD, ce.EVENT_CD, ce.PARENT_EVENT_ID,\n        ce.EVENT_RELTN_CD, ce.VALID_FROM_DT_TM, ce.VALID_UNTIL_DT_TM,\n        ce.EVENT_START_DT_TM, ce.EVENT_END_DT_TM, ce.PERFORMED_DT_TM,\n        ce.VERIFIED_DT_TM, ce.RESULT_VAL, ce.RESULT_UNITS_CD,\n        ce.NORMAL_LOW, ce.NORMAL_HIGH, ce.NORMALCY_CD,\n        ce.RECORD_STATUS_CD, ce.RESULT_STATUS_CD, ce.AUTHENTIC_FLAG,\n        ce.CLINSIG_UPDT_DT_TM, ce.UPDT_CNT, ce.CONTRIBUTOR_SYSTEM_CD,\n        ce.REFERENCE_NBR, ce.EVENT_TITLE_TEXT, ce.EVENT_TAG,\n        ce.ADC_UPDT AS ce_adc,\n        o.ORDER_MNEMONIC, o.HNA_ORDER_MNEMONIC, o.ORDERED_AS_MNEMONIC,\n        o.ADC_UPDT AS order_adc,\n        oc.PRIMARY_MNEMONIC, oc.DESCRIPTION AS catalog_description,\n        oc.ADC_UPDT AS catalog_adc,\n        ROW_NUMBER() OVER (\n          PARTITION BY ce.EVENT_ID\n          ORDER BY ce.VALID_UNTIL_DT_TM DESC NULLS LAST,\n                   ce.UPDT_CNT DESC NULLS LAST,\n                   ce.CLINSIG_UPDT_DT_TM DESC NULLS LAST,\n                   ce.ADC_UPDT DESC NULLS LAST,\n                   ce.CLINICAL_EVENT_ID DESC NULLS LAST\n        ) AS rn\n      FROM {_qn(CE)} ce\n      {linked_scope_join}\n      LEFT JOIN {_qn(ORDERS)} o ON CAST(o.ORDER_ID AS BIGINT)=ce.ORDER_ID\n      LEFT JOIN {_qn(ORDER_CATALOG)} oc ON CAST(oc.CATALOG_CD AS BIGINT)=ce.CATALOG_CD\n      WHERE ce.EVENT_CLASS_CD IN (233,236)\n        AND COALESCE(CAST(oc.CATALOG_TYPE_CD AS BIGINT),\n                     CAST(o.CATALOG_TYPE_CD AS BIGINT))=2513\n        {linked_bucket_filter}\n    ),\n    linked_src AS (\n      SELECT\n        'linked' AS source_table,\n        'CERNER' AS source_system,\n        CONCAT('linked|', CAST(ce.EVENT_ID AS STRING)) AS source_parent_key,\n        CONCAT('linked|', CAST(ce.EVENT_ID AS STRING)) AS source_record_key,\n        CAST(ce.EVENT_ID AS BIGINT) AS source_event_id,\n        FALSE AS is_synthetic_key,\n        SUBSTRING(ce.REFERENCE_NBR,1,11) AS lab_no,\n        CAST(NULL AS INT) AS LIMSNo,\n        CAST(NULL AS BIGINT) AS source_sequence_start,\n        CAST(NULL AS BIGINT) AS source_sequence_end,\n        CAST(1 AS BIGINT) AS source_line_count,\n        CAST(NULL AS STRING) AS source_month_year,\n        CAST(NULL AS STRING) AS source_month_year_auth,\n        CAST(ce.PERSON_ID AS BIGINT) AS PERSON_ID,\n        CAST(ce.ENCNTR_ID AS BIGINT) AS ENCNTR_ID,\n        CAST(NULL AS BIGINT) AS person_id_mrn,\n        CAST(NULL AS BIGINT) AS person_id_nhs,\n        'native' AS person_match_status,\n        FALSE AS person_match_conflict,\n        pm.canonical_mrn AS MRN,\n        pn.canonical_nhs AS NHS_Number,\n        CAST(ce.EVENT_CD AS INT) AS EVENT_CD,\n        COALESCE(cv.DESCRIPTION,cv.DISPLAY,ce.EVENT_TITLE_TEXT,ce.EVENT_TAG) AS EVENT_CD_DISPLAY,\n        COALESCE(ce.EVENT_END_DT_TM,ce.PERFORMED_DT_TM,\n                 ce.EVENT_START_DT_TM,ce.VERIFIED_DT_TM) AS measurement_datetime,\n        CASE WHEN ce.EVENT_END_DT_TM IS NOT NULL THEN 'EVENT_END_DT_TM'\n             WHEN ce.PERFORMED_DT_TM IS NOT NULL THEN 'PERFORMED_DT_TM'\n             WHEN ce.EVENT_START_DT_TM IS NOT NULL THEN 'EVENT_START_DT_TM'\n             WHEN ce.VERIFIED_DT_TM IS NOT NULL THEN 'VERIFIED_DT_TM'\n        END AS measurement_datetime_source,\n        'CERNER_TESTCODE' AS code_system,\n        COALESCE(NULLIF(TRIM(ce.ORDER_MNEMONIC),''),\n                 NULLIF(TRIM(ce.HNA_ORDER_MNEMONIC),''),\n                 NULLIF(TRIM(ce.ORDERED_AS_MNEMONIC),''),\n                 NULLIF(TRIM(ce.PRIMARY_MNEMONIC),''),\n                 CAST(ce.EVENT_CD AS STRING)) AS code,\n        CASE WHEN NULLIF(TRIM(ce.ORDER_MNEMONIC),'') IS NOT NULL THEN 'ORDER_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.HNA_ORDER_MNEMONIC),'') IS NOT NULL THEN 'HNA_ORDER_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.ORDERED_AS_MNEMONIC),'') IS NOT NULL THEN 'ORDERED_AS_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.PRIMARY_MNEMONIC),'') IS NOT NULL THEN 'PRIMARY_MNEMONIC'\n             ELSE 'EVENT_CD'\n        END AS code_source,\n        COALESCE(cv.DESCRIPTION,cv.DISPLAY,ce.EVENT_TITLE_TEXT,ce.EVENT_TAG,\n                 ce.catalog_description,CAST(ce.EVENT_CD AS STRING)) AS description,\n        CASE WHEN cv.DESCRIPTION IS NOT NULL THEN 'CODE_VALUE_DESCRIPTION'\n             WHEN cv.DISPLAY IS NOT NULL THEN 'CODE_VALUE_DISPLAY'\n             WHEN ce.EVENT_TITLE_TEXT IS NOT NULL THEN 'EVENT_TITLE_TEXT'\n             WHEN ce.EVENT_TAG IS NOT NULL THEN 'EVENT_TAG'\n             WHEN ce.catalog_description IS NOT NULL THEN 'ORDER_CATALOG_DESCRIPTION'\n             ELSE 'EVENT_CD'\n        END AS description_source,\n        ce.RESULT_VAL AS result_txt,\n        COALESCE(ucv.DESCRIPTION,ucv.DISPLAY) AS unit_source_value,\n        ce.NORMAL_LOW AS range_low_raw,\n        ce.NORMAL_HIGH AS range_high_raw,\n        TRY_CAST(ce.NORMAL_LOW AS DOUBLE) AS range_low,\n        TRY_CAST(ce.NORMAL_HIGH AS DOUBLE) AS range_high,\n        COALESCE(ncv.DESCRIPTION,ncv.DISPLAY) AS normalcy,\n        CAST(NULL AS STRING) AS WkgCode,\n        CAST(NULL AS STRING) AS nlmc_id,\n        COALESCE(ce.VERIFIED_DT_TM,ce.EVENT_END_DT_TM,ce.PERFORMED_DT_TM) AS ReportDate,\n        GREATEST(ce.ce_adc,ce.order_adc,ce.catalog_adc,cv.ADC_UPDT,\n                 ucv.ADC_UPDT,ncv.ADC_UPDT,pm.canonical_mrn_adc,pn.canonical_nhs_adc)\n          AS source_adc_updt,\n        ce.REFERENCE_NBR AS reference_nbr,\n        CAST(ce.CLINICAL_EVENT_ID AS BIGINT) AS clinical_event_id,\n        CAST(ce.ORDER_ID AS BIGINT) AS order_id,\n        CAST(ce.CATALOG_CD AS BIGINT) AS catalog_cd,\n        CAST(ce.PARENT_EVENT_ID AS BIGINT) AS parent_event_id,\n        CAST(ce.EVENT_RELTN_CD AS BIGINT) AS event_reltn_cd,\n        ce.VALID_FROM_DT_TM AS valid_from_dt_tm,\n        ce.VALID_UNTIL_DT_TM AS valid_until_dt_tm,\n        ce.EVENT_START_DT_TM AS event_start_dt_tm,\n        ce.EVENT_END_DT_TM AS event_end_dt_tm,\n        ce.PERFORMED_DT_TM AS performed_dt_tm,\n        ce.VERIFIED_DT_TM AS verified_dt_tm,\n        CAST(ce.RECORD_STATUS_CD AS BIGINT) AS record_status_cd,\n        CAST(ce.RESULT_STATUS_CD AS BIGINT) AS result_status_cd,\n        CAST(ce.AUTHENTIC_FLAG AS BIGINT) AS authentic_flag,\n        ce.CLINSIG_UPDT_DT_TM AS clinsig_updt_dt_tm,\n        CAST(ce.UPDT_CNT AS BIGINT) AS source_updt_cnt,\n        CAST(ce.CONTRIBUTOR_SYSTEM_CD AS BIGINT) AS contributor_system_cd,\n        CAST(ce.RESULT_UNITS_CD AS BIGINT) AS result_units_cd,\n        CAST(ce.NORMALCY_CD AS BIGINT) AS normalcy_cd,\n        CAST(NULL AS STRING) AS legacy_wkg_code,\n        CAST(NULL AS STRING) AS legacy_tfc_code,\n        CAST(NULL AS TIMESTAMP) AS request_dt,\n        CAST(NULL AS TIMESTAMP) AS sample_dt,\n        CAST(NULL AS TIMESTAMP) AS receipt_dt,\n        CAST(NULL AS TIMESTAMP) AS booked_in_dt,\n        CAST(NULL AS STRING) AS order_no,\n        CAST(NULL AS STRING) AS visit_id,\n        CAST(NULL AS STRING) AS ass_auth_code,\n        CAST(NULL AS STRING) AS body_site_code,\n        CAST(NULL AS STRING) AS specimen_type_code,\n        CAST(NULL AS STRING) AS specimen_category,\n        CAST(NULL AS STRING) AS urgent_flag,\n        CAST(NULL AS STRING) AS source_code,\n        CAST(NULL AS STRING) AS clinician_code,\n        CAST(NULL AS STRING) AS master_section_code,\n        CAST(NULL AS STRING) AS work_section_code,\n        CAST(NULL AS STRING) AS report_section,\n        CAST(NULL AS STRING) AS master_result_type,\n        CAST(NULL AS STRING) AS master_result_format,\n        CAST(NULL AS INT) AS master_num_val_upper,\n        CAST(NULL AS INT) AS master_num_val_dps\n      FROM linked_ranked ce\n      LEFT JOIN {_qn(CODE_VALUE)} cv ON CAST(cv.CODE_VALUE AS BIGINT)=ce.EVENT_CD\n      LEFT JOIN {_qn(CODE_VALUE)} ucv ON CAST(ucv.CODE_VALUE AS BIGINT)=ce.RESULT_UNITS_CD\n      LEFT JOIN {_qn(CODE_VALUE)} ncv ON CAST(ncv.CODE_VALUE AS BIGINT)=ce.NORMALCY_CD\n      LEFT JOIN pa_person_mrn pm ON pm.PERSON_ID=CAST(ce.PERSON_ID AS BIGINT)\n      LEFT JOIN pa_person_nhs pn ON pn.PERSON_ID=CAST(ce.PERSON_ID AS BIGINT)\n      WHERE ce.rn=1\n    ),\n    rl_pre AS (\n      SELECT\n        CAST(r.LIMSNo AS INT) AS LIMSNo,\n        r.LabNo,\n        COALESCE(NULLIF(TRIM(r.TFCCode),''),NULLIF(TRIM(r.LegTFCCode),'')) AS TFCCode,\n        COALESCE(NULLIF(TRIM(r.WkgCode),''),NULLIF(TRIM(r.LegWkgCode),'')) AS WkgCode,\n        r.LegTFCCode, r.LegWkgCode, CAST(r.TFCResultSeq AS BIGINT) AS TFCResultSeq,\n        r.TFCValue, r.MonthYear, r.MonthYearAuth, r.ADC_UPDT\n      FROM {_qn(RESULT_LEVEL)} r\n      {raw_scope_result_join}\n      {raw_result_bucket_filter}\n    ),\n    rl_island AS (\n      SELECT p.*,\n        CASE\n          WHEN TFCResultSeq IS NULL THEN\n            XXHASH64(CONCAT_WS('|',COALESCE(CAST(LIMSNo AS STRING),'∅'),\n              COALESCE(LabNo,'∅'),COALESCE(TFCCode,'∅'),COALESCE(WkgCode,'∅'),\n              COALESCE(TFCValue,'∅'),COALESCE(MonthYear,'∅')))\n          WHEN TFCCode RLIKE '^(INTER|UNU)' THEN TFCResultSeq\n          ELSE TFCResultSeq - DENSE_RANK() OVER (\n            PARTITION BY LIMSNo,LabNo,TFCCode,WkgCode\n            ORDER BY TFCResultSeq\n          )\n        END AS island_id\n      FROM rl_pre p\n    ),\n    rl AS (\n      SELECT\n        LIMSNo,LabNo,TFCCode,WkgCode,\n        MAX(LegTFCCode) AS LegTFCCode,\n        MAX(LegWkgCode) AS LegWkgCode,\n        MIN(TFCResultSeq) AS TFCResultSeq,\n        MAX(TFCResultSeq) AS TFCResultSeqEnd,\n        COUNT(*) AS source_line_count,\n        MIN(MonthYear) AS MonthYear,\n        MIN(MonthYearAuth) AS MonthYearAuth,\n        CONCAT_WS(\n          '\\n',\n          TRANSFORM(\n            SORT_ARRAY(COLLECT_LIST(NAMED_STRUCT(\n              'seq',TFCResultSeq,'adc',ADC_UPDT,'value',TFCValue\n            ))),\n            x -> x.value\n          )\n        ) AS TFCValue,\n        MAX(ADC_UPDT) AS ADC_UPDT,\n        island_id\n      FROM rl_island\n      GROUP BY LIMSNo,LabNo,TFCCode,WkgCode,island_id\n    ),\n    sl1 AS (\n      SELECT *\n      FROM (\n        SELECT\n          CAST(sl.LIMSNo AS INT) AS LIMSNo, sl.LabNo, sl.MRN, sl.NHSNo,\n          sl.AssAuthCode, sl.RequestDT, sl.SampleDT, sl.ReportDate,\n          sl.ReceiptDT, sl.BookedInDT, sl.OrderNo, sl.VisitID,\n          sl.BodySiteCode, sl.CSpecTypeCode, sl.SpecimenCategory,\n          sl.UrgentFlag, sl.SourceCode, sl.ClinicianCode,\n          sl.ADC_UPDT AS sample_adc,\n          ROW_NUMBER() OVER (\n            PARTITION BY sl.LIMSNo,sl.LabNo\n            ORDER BY sl.ADC_UPDT DESC NULLS LAST,\n                     sl.SampleDT DESC NULLS LAST,\n                     sl.ReportDate DESC NULLS LAST,\n                     sl.ReceiptDT DESC NULLS LAST,\n                     sl.BookedInDT DESC NULLS LAST,\n                     sl.OrderNo ASC NULLS LAST,\n                     sl.VisitID ASC NULLS LAST,\n                     sl.MRN ASC NULLS LAST,\n                     sl.NHSNo ASC NULLS LAST\n          ) rn\n        FROM {_qn(SAMPLE_LEVEL)} sl\n        {raw_scope_sample_join}\n        {raw_sample_bucket_filter}\n      ) WHERE rn=1\n    ),\n    m1 AS (\n      SELECT *\n      FROM (\n        SELECT\n          m.WkgCode,m.TFCCode,m.TFCDesc_Full,m.TFCDesc_Rep,m.TFCDesc_WP,\n          m.ReportingSynonym,m.PMIPDesc,m.Units,m.NLMC_ID,m.SectionCode,\n          m.WorkSectionCode,m.ReportSection,m.ResultType,m.ResultFormat,\n          m.NumValUpper,m.NumValDPs,m.LastUpdateDT,m.ADC_UPDT,\n          ROW_NUMBER() OVER (\n            PARTITION BY m.WkgCode,m.TFCCode\n            ORDER BY m.LastUpdateDT DESC NULLS LAST,\n                     m.ADC_UPDT DESC NULLS LAST\n          ) rn\n        FROM {_qn(MASTER_RESULT)} m\n      ) WHERE rn=1\n    ),\n    raw_person AS (\n      SELECT\n        rl.*,sl.* EXCEPT (LIMSNo,LabNo,rn),\n        mr.PERSON_ID AS person_id_mrn,\n        nr.PERSON_ID AS person_id_nhs,\n        mr.person_count AS mrn_person_count,\n        nr.person_count AS nhs_person_count,\n        mr.ADC_UPDT AS mrn_alias_adc,\n        nr.ADC_UPDT AS nhs_alias_adc,\n        CASE\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID IS NOT NULL\n               AND mr.PERSON_ID<>nr.PERSON_ID THEN CAST(NULL AS BIGINT)\n          ELSE COALESCE(mr.PERSON_ID,nr.PERSON_ID)\n        END AS resolved_person_id,\n        CASE\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID IS NOT NULL\n               AND mr.PERSON_ID<>nr.PERSON_ID THEN 'conflict'\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID=mr.PERSON_ID THEN 'agreed'\n          WHEN mr.PERSON_ID IS NOT NULL THEN 'mrn_only'\n          WHEN nr.PERSON_ID IS NOT NULL THEN 'nhs_only'\n          WHEN COALESCE(mr.person_count,0)>1 OR COALESCE(nr.person_count,0)>1 THEN 'ambiguous'\n          ELSE 'unresolved'\n        END AS person_match_status\n      FROM rl\n      LEFT JOIN sl1 sl ON sl.LIMSNo <=> rl.LIMSNo AND sl.LabNo <=> rl.LabNo\n      LEFT JOIN mrn_resolver mr ON mr.ALIAS=sl.MRN\n      LEFT JOIN nhs_resolver nr ON nr.ALIAS=sl.NHSNo\n    ),\n    raw_src AS (\n      SELECT\n        'raw' AS source_table,\n        'TFC_LIMS' AS source_system,\n        CONCAT_WS('|','raw',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n                  COALESCE(rp.LabNo,'∅')) AS source_parent_key,\n        CONCAT_WS('|','raw',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n                  COALESCE(rp.LabNo,'∅'),COALESCE(rp.TFCCode,'∅'),\n                  COALESCE(rp.WkgCode,'∅'),CAST(rp.island_id AS STRING))\n          AS source_record_key,\n        COALESCE(\n          rp.TFCResultSeq,\n          XXHASH64(CONCAT_WS('|',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n            COALESCE(rp.LabNo,'∅'),COALESCE(rp.TFCCode,'∅'),\n            COALESCE(rp.WkgCode,'∅'),CAST(rp.island_id AS STRING)))\n        ) AS source_event_id,\n        (rp.TFCResultSeq IS NULL) AS is_synthetic_key,\n        rp.LabNo AS lab_no,\n        rp.LIMSNo,\n        rp.TFCResultSeq AS source_sequence_start,\n        rp.TFCResultSeqEnd AS source_sequence_end,\n        CAST(rp.source_line_count AS BIGINT) AS source_line_count,\n        rp.MonthYear AS source_month_year,\n        rp.MonthYearAuth AS source_month_year_auth,\n        CAST(rp.resolved_person_id AS BIGINT) AS PERSON_ID,\n        CAST(NULL AS BIGINT) AS ENCNTR_ID,\n        CAST(rp.person_id_mrn AS BIGINT) AS person_id_mrn,\n        CAST(rp.person_id_nhs AS BIGINT) AS person_id_nhs,\n        rp.person_match_status,\n        (rp.person_match_status='conflict') AS person_match_conflict,\n        COALESCE(pm.canonical_mrn,rp.MRN) AS MRN,\n        COALESCE(pn.canonical_nhs,rp.NHSNo) AS NHS_Number,\n        CAST(NULL AS INT) AS EVENT_CD,\n        CAST(NULL AS STRING) AS EVENT_CD_DISPLAY,\n        COALESCE(rp.SampleDT,rp.RequestDT,rp.ReceiptDT,rp.BookedInDT,rp.ReportDate)\n          AS measurement_datetime,\n        CASE WHEN rp.SampleDT IS NOT NULL THEN 'SampleDT'\n             WHEN rp.RequestDT IS NOT NULL THEN 'RequestDT'\n             WHEN rp.ReceiptDT IS NOT NULL THEN 'ReceiptDT'\n             WHEN rp.BookedInDT IS NOT NULL THEN 'BookedInDT'\n             WHEN rp.ReportDate IS NOT NULL THEN 'ReportDate'\n        END AS measurement_datetime_source,\n        'TFC' AS code_system,\n        rp.TFCCode AS code,\n        CASE WHEN NULLIF(TRIM(rp.TFCCode),'') IS NOT NULL\n                  AND rp.TFCCode <=> rp.LegTFCCode THEN 'LegTFCCode'\n             WHEN NULLIF(TRIM(rp.TFCCode),'') IS NOT NULL THEN 'TFCCode'\n             ELSE 'missing'\n        END AS code_source,\n        COALESCE(m1.TFCDesc_Full,m1.TFCDesc_Rep,m1.TFCDesc_WP,\n                 m1.ReportingSynonym,m1.PMIPDesc,rp.TFCCode) AS description,\n        CASE WHEN m1.TFCDesc_Full IS NOT NULL THEN 'TFCDesc_Full'\n             WHEN m1.TFCDesc_Rep IS NOT NULL THEN 'TFCDesc_Rep'\n             WHEN m1.TFCDesc_WP IS NOT NULL THEN 'TFCDesc_WP'\n             WHEN m1.ReportingSynonym IS NOT NULL THEN 'ReportingSynonym'\n             WHEN m1.PMIPDesc IS NOT NULL THEN 'PMIPDesc'\n             WHEN rp.TFCCode IS NOT NULL THEN 'TFCCode'\n             ELSE 'missing'\n        END AS description_source,\n        rp.TFCValue AS result_txt,\n        m1.Units AS unit_source_value,\n        CAST(NULL AS STRING) AS range_low_raw,\n        CAST(NULL AS STRING) AS range_high_raw,\n        CAST(NULL AS DOUBLE) AS range_low,\n        CAST(NULL AS DOUBLE) AS range_high,\n        CAST(NULL AS STRING) AS normalcy,\n        rp.WkgCode,\n        m1.NLMC_ID AS nlmc_id,\n        rp.ReportDate,\n        GREATEST(rp.ADC_UPDT,rp.sample_adc,rp.mrn_alias_adc,rp.nhs_alias_adc,\n                 m1.ADC_UPDT,pm.canonical_mrn_adc,pn.canonical_nhs_adc)\n          AS source_adc_updt,\n        CAST(NULL AS STRING) AS reference_nbr,\n        CAST(NULL AS BIGINT) AS clinical_event_id,\n        CAST(NULL AS BIGINT) AS order_id,\n        CAST(NULL AS BIGINT) AS catalog_cd,\n        CAST(NULL AS BIGINT) AS parent_event_id,\n        CAST(NULL AS BIGINT) AS event_reltn_cd,\n        CAST(NULL AS TIMESTAMP) AS valid_from_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS valid_until_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS event_start_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS event_end_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS performed_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS verified_dt_tm,\n        CAST(NULL AS BIGINT) AS record_status_cd,\n        CAST(NULL AS BIGINT) AS result_status_cd,\n        CAST(NULL AS BIGINT) AS authentic_flag,\n        CAST(NULL AS TIMESTAMP) AS clinsig_updt_dt_tm,\n        CAST(NULL AS BIGINT) AS source_updt_cnt,\n        CAST(NULL AS BIGINT) AS contributor_system_cd,\n        CAST(NULL AS BIGINT) AS result_units_cd,\n        CAST(NULL AS BIGINT) AS normalcy_cd,\n        rp.LegWkgCode AS legacy_wkg_code,\n        rp.LegTFCCode AS legacy_tfc_code,\n        rp.RequestDT AS request_dt,\n        rp.SampleDT AS sample_dt,\n        rp.ReceiptDT AS receipt_dt,\n        rp.BookedInDT AS booked_in_dt,\n        rp.OrderNo AS order_no,\n        rp.VisitID AS visit_id,\n        rp.AssAuthCode AS ass_auth_code,\n        rp.BodySiteCode AS body_site_code,\n        rp.CSpecTypeCode AS specimen_type_code,\n        rp.SpecimenCategory AS specimen_category,\n        rp.UrgentFlag AS urgent_flag,\n        rp.SourceCode AS source_code,\n        rp.ClinicianCode AS clinician_code,\n        m1.SectionCode AS master_section_code,\n        m1.WorkSectionCode AS work_section_code,\n        m1.ReportSection AS report_section,\n        m1.ResultType AS master_result_type,\n        m1.ResultFormat AS master_result_format,\n        CAST(m1.NumValUpper AS INT) AS master_num_val_upper,\n        CAST(m1.NumValDPs AS INT) AS master_num_val_dps\n      FROM raw_person rp\n      LEFT JOIN m1 ON m1.WkgCode <=> rp.WkgCode AND m1.TFCCode <=> rp.TFCCode\n      LEFT JOIN pa_person_mrn pm ON pm.PERSON_ID=rp.resolved_person_id\n      LEFT JOIN pa_person_nhs pn ON pn.PERSON_ID=rp.resolved_person_id\n    ),\n    source_union AS (\n      {source_union_sql}\n    ),\n    combined AS (\n      SELECT s.*,\n        XXHASH64(\n          source_parent_key,source_record_key,PERSON_ID,ENCNTR_ID,MRN,NHS_Number,\n          measurement_datetime,code,description,result_txt,unit_source_value,\n          range_low_raw,range_high_raw,normalcy,WkgCode,nlmc_id,ReportDate,\n          reference_nbr,clinical_event_id,order_id,catalog_cd,valid_until_dt_tm,\n          source_adc_updt,request_dt,sample_dt,receipt_dt,booked_in_dt\n        ) AS source_payload_hash\n      FROM source_union s\n    ),\n    test_map_ranked AS (\n      SELECT *\n      FROM (\n        SELECT tm.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY code_system,code,description\n            ORDER BY CASE confidence_tier\n                       WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2\n                       WHEN 'auto_low' THEN 3 ELSE 9 END,\n                     mapping_version DESC NULLS LAST,mapped_at DESC NULLS LAST\n          ) rn\n        FROM {_qn(TEST_MAP)} tm\n        WHERE confidence_tier IN {test_tiers}\n          AND measurement_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    test_code_observed_desc AS (\n      SELECT DISTINCT code_system,code,description FROM combined\n    ),\n    test_code_desc_coverage AS (\n      SELECT o.code_system,o.code,\n             COUNT(*) AS n_observed_descriptions,\n             SUM(CASE WHEN tm.measurement_concept_id IS NULL THEN 0 ELSE 1 END) AS n_mapped_descriptions\n      FROM test_code_observed_desc o\n      LEFT JOIN test_map_ranked tm\n        ON tm.code_system=o.code_system\n       AND tm.code <=> o.code\n       AND tm.description <=> o.description\n      GROUP BY o.code_system,o.code\n    ),\n    test_code_safe AS (\n      SELECT r.code_system,r.code,MIN(r.measurement_concept_id) AS measurement_concept_id,\n             MIN(r.concept_name) AS concept_name,'safe_code' AS confidence_tier\n      FROM test_map_ranked r\n      JOIN test_code_desc_coverage cov\n        ON cov.code_system=r.code_system\n       AND cov.code <=> r.code\n       AND cov.n_mapped_descriptions=cov.n_observed_descriptions\n      GROUP BY r.code_system,r.code\n      HAVING COUNT(DISTINCT r.measurement_concept_id)=1\n    ),\n    test_joined AS (\n      SELECT c.*,\n        COALESCE(tm.measurement_concept_id,nt.measurement_concept_id,\n                 tc.measurement_concept_id) AS measurement_concept_id,\n        COALESCE(tm.concept_name,nt.concept_name,tc.concept_name)\n          AS measurement_concept_name,\n        COALESCE(tm.confidence_tier,nt.confidence_tier,tc.confidence_tier)\n          AS test_confidence_tier,\n        CASE WHEN tm.measurement_concept_id IS NOT NULL THEN 'exact_context'\n             WHEN nt.measurement_concept_id IS NOT NULL AND c.source_table='linked'\n               THEN 'native_event_cd'\n             WHEN nt.measurement_concept_id IS NOT NULL THEN 'native_nlmc'\n             WHEN tc.measurement_concept_id IS NOT NULL THEN 'safe_code'\n             ELSE 'unmapped'\n        END AS test_mapping_match_type\n      FROM combined c\n      LEFT JOIN test_map_ranked tm\n        ON tm.code_system=c.code_system\n       AND tm.code <=> c.code\n       AND tm.description <=> c.description\n      LEFT JOIN {_qn(MP_NATIVE_TEST)} nt\n        ON nt.key_type=CASE WHEN c.source_table='linked' THEN 'EVENT_CD' ELSE 'NLMC_ID' END\n       AND nt.key_value <=> CASE WHEN c.source_table='linked'\n                                THEN CAST(c.EVENT_CD AS STRING) ELSE c.nlmc_id END\n      LEFT JOIN test_code_safe tc\n        ON tc.code_system=c.code_system AND tc.code <=> c.code\n    ),\n    result_derived AS (\n      SELECT t.*,\n        CASE WHEN result_txt RLIKE '{numeric_re}' THEN 1 ELSE 0 END AS rd_result_numeric,\n        CASE WHEN result_txt RLIKE '^\\\\s*<=' THEN 4171754\n             WHEN result_txt RLIKE '^\\\\s*>=' THEN 4171755\n             WHEN result_txt RLIKE '^\\\\s*[<]' THEN 4171756\n             WHEN result_txt RLIKE '^\\\\s*[>]' THEN 4172704\n             WHEN result_txt RLIKE '^\\\\s*≤' THEN 4171754\n             WHEN result_txt RLIKE '^\\\\s*≥' THEN 4171755\n             ELSE NULL\n        END AS rd_operator_concept_id,\n        CASE WHEN result_txt RLIKE '{numeric_re}'\n             THEN TRY_CAST(\n               REGEXP_REPLACE(TRIM(result_txt),'^(?:<=|>=|<|>|≤|≥|=)\\\\s*','')\n               AS DOUBLE\n             )\n        END AS rd_value_as_number,\n        CASE WHEN result_txt IS NOT NULL AND TRIM(result_txt)<>''\n                   AND NOT (result_txt RLIKE '{numeric_re}')\n             THEN LOWER(TRIM(REGEXP_REPLACE(result_txt,'\\\\s+',' ')))\n        END AS rd_result_normalized,\n        CASE WHEN result_txt IS NOT NULL AND TRIM(result_txt)<>''\n                   AND NOT (result_txt RLIKE '{numeric_re}')\n             THEN COALESCE(\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd.MM.yyyy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd/MM/yyyy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'yyyy-MM-dd'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd.MM.yy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd/MM/yy')\n             )\n        END AS rd_value_as_datetime\n      FROM test_joined t\n    ),\n    result_map_ranked AS (\n      SELECT *\n      FROM (\n        SELECT rm.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY code_system,code,description,result_normalized\n            ORDER BY CASE confidence_tier\n                       WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2\n                       WHEN 'auto_anchor' THEN 3 WHEN 'auto_value' THEN 4\n                       WHEN 'auto_genpos' THEN 5 WHEN 'auto_low' THEN 6 ELSE 9 END,\n                     mapping_version DESC NULLS LAST,mapped_at DESC NULLS LAST\n          ) rn\n        FROM {_qn(RESULT_MAP)} rm\n        WHERE confidence_tier IN {result_tiers}\n          AND value_as_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    result_code_observed_desc AS (\n      SELECT DISTINCT code_system,code,description,rd_result_normalized\n      FROM result_derived\n      WHERE rd_result_numeric=0\n    ),\n    result_code_desc_coverage AS (\n      SELECT o.code_system,o.code,o.rd_result_normalized,\n             COUNT(*) AS n_observed_descriptions,\n             SUM(CASE WHEN rm.value_as_concept_id IS NULL THEN 0 ELSE 1 END) AS n_mapped_descriptions\n      FROM result_code_observed_desc o\n      LEFT JOIN result_map_ranked rm\n        ON rm.code_system=o.code_system\n       AND rm.code <=> o.code\n       AND rm.description <=> o.description\n       AND rm.result_normalized <=> o.rd_result_normalized\n      GROUP BY o.code_system,o.code,o.rd_result_normalized\n    ),\n    result_code_safe AS (\n      SELECT r.code_system,r.code,r.result_normalized,\n             MIN(r.value_as_concept_id) AS value_as_concept_id,\n             MIN(r.concept_name) AS concept_name,\n             MIN(r.confidence_tier) AS confidence_tier,\n             (MAX(CAST(r.is_suspected AS INT))=1) AS is_suspected,\n             MIN(r.growth_grade) AS growth_grade\n      FROM result_map_ranked r\n      JOIN result_code_desc_coverage cov\n        ON cov.code_system=r.code_system\n       AND cov.code <=> r.code\n       AND cov.rd_result_normalized <=> r.result_normalized\n       AND cov.n_mapped_descriptions=cov.n_observed_descriptions\n      GROUP BY r.code_system,r.code,r.result_normalized\n      HAVING COUNT(DISTINCT r.value_as_concept_id)=1\n    ),\n    result_joined AS (\n      SELECT d.*,\n        CASE WHEN d.rd_result_numeric=1 THEN CAST(NULL AS BIGINT)\n             ELSE COALESCE(rm.value_as_concept_id,nr.value_as_concept_id,\n                           rc.value_as_concept_id)\n        END AS value_as_concept_id,\n        COALESCE(rm.concept_name,nr.concept_name,rc.concept_name) AS result_concept_name,\n        COALESCE(rm.confidence_tier,nr.confidence_tier,rc.confidence_tier)\n          AS result_confidence_tier,\n        COALESCE(rm.is_suspected,rc.is_suspected) AS result_is_suspected,\n        COALESCE(rm.growth_grade,rc.growth_grade) AS result_growth_grade,\n        CASE WHEN d.rd_result_numeric=1 THEN 'numeric'\n             WHEN rm.value_as_concept_id IS NOT NULL THEN 'exact_context'\n             WHEN nr.value_as_concept_id IS NOT NULL THEN 'native_context'\n             WHEN rc.value_as_concept_id IS NOT NULL THEN 'safe_code_result'\n             ELSE 'unmapped'\n        END AS result_mapping_match_type\n      FROM result_derived d\n      LEFT JOIN result_map_ranked rm\n        ON rm.code_system=d.code_system\n       AND rm.code <=> d.code\n       AND rm.description <=> d.description\n       AND rm.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n      LEFT JOIN {_qn(MP_NATIVE_RESULT)} nr\n        ON nr.key_type=CASE WHEN d.source_table='linked' THEN 'EVENT_CD' ELSE 'NLMC_ID' END\n       AND nr.key_value <=> CASE WHEN d.source_table='linked'\n                                THEN CAST(d.EVENT_CD AS STRING) ELSE d.nlmc_id END\n       AND nr.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n      LEFT JOIN result_code_safe rc\n        ON rc.code_system=d.code_system\n       AND rc.code <=> d.code\n       AND rc.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n    ),\n    unit_exact AS (\n      SELECT unit_source_value,unit_concept_id,ucum_code\n      FROM (\n        SELECT um.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY unit_source_value\n            ORDER BY unit_concept_id DESC NULLS LAST,ucum_code ASC NULLS LAST\n          ) rn\n        FROM {_qn(UNIT_MAP)} um\n        WHERE unit_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    unit_normalized AS (\n      SELECT LOWER(TRIM(unit_source_value)) AS unit_norm,\n             MIN(unit_concept_id) AS unit_concept_id,\n             MIN(ucum_code) AS ucum_code\n      FROM unit_exact\n      WHERE unit_source_value IS NOT NULL AND TRIM(unit_source_value)<>''\n      GROUP BY LOWER(TRIM(unit_source_value))\n      HAVING COUNT(DISTINCT unit_concept_id)=1\n    ),\n    unit_joined AS (\n      SELECT r.*,\n        COALESCE(ue.unit_concept_id,un.unit_concept_id) AS unit_concept_id,\n        COALESCE(ue.ucum_code,un.ucum_code) AS ucum_code,\n        CASE WHEN ue.unit_concept_id IS NOT NULL THEN 'exact'\n             WHEN un.unit_concept_id IS NOT NULL THEN 'normalized'\n             ELSE 'unmapped'\n        END AS unit_mapping_match_type\n      FROM result_joined r\n      LEFT JOIN unit_exact ue ON ue.unit_source_value <=> r.unit_source_value\n      LEFT JOIN unit_normalized un\n        ON un.unit_norm=LOWER(TRIM(r.unit_source_value))\n       AND ue.unit_concept_id IS NULL\n    ),\n    projected AS (\n      SELECT\n        u.source_table,\n        CAST(u.source_event_id AS BIGINT) AS source_event_id,\n        u.is_synthetic_key,\n        u.lab_no,\n        CAST(u.PERSON_ID AS BIGINT) AS PERSON_ID,\n        CAST(u.ENCNTR_ID AS BIGINT) AS ENCNTR_ID,\n        u.MRN,u.NHS_Number,u.EVENT_CD,u.EVENT_CD_DISPLAY,\n        u.measurement_datetime,u.code_system,u.code,u.description,\n        CASE WHEN mc.vocabulary_id='SNOMED' THEN mc.concept_code END AS test_snomed_code,\n        CASE WHEN mc.vocabulary_id='LOINC' THEN mc.concept_code END AS test_loinc_code,\n        CAST(u.measurement_concept_id AS BIGINT) AS test_omop_concept_id,\n        mc.standard_concept AS test_omop_standard_concept,\n        mc.vocabulary_id AS test_vocabulary_id,\n        CAST(u.measurement_concept_id AS BIGINT) AS measurement_concept_id,\n        u.measurement_concept_name,u.test_confidence_tier,\n        u.rd_value_as_number AS value_as_number,\n        CAST(u.rd_operator_concept_id AS BIGINT) AS operator_concept_id,\n        CAST(u.value_as_concept_id AS BIGINT) AS value_as_concept_id,\n        u.result_concept_name,u.result_confidence_tier,\n        u.result_is_suspected,u.result_growth_grade,\n        CASE WHEN rcpt.vocabulary_id='SNOMED' THEN rcpt.concept_code END AS result_snomed_code,\n        CASE WHEN rcpt.vocabulary_id='LOINC' THEN rcpt.concept_code END AS result_loinc_code,\n        CAST(u.value_as_concept_id AS BIGINT) AS result_omop_concept_id,\n        rcpt.standard_concept AS result_omop_standard_concept,\n        rcpt.vocabulary_id AS result_vocabulary_id,\n        CASE\n          WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'missing'\n          WHEN u.rd_result_numeric=1 THEN 'numeric'\n          WHEN u.rd_value_as_datetime IS NOT NULL THEN 'datetime'\n          WHEN u.value_as_concept_id IS NOT NULL THEN 'mapped'\n          WHEN u.rd_result_normalized RLIKE '{exclusion_re}' THEN 'excluded'\n          WHEN NOT (u.rd_result_normalized RLIKE '[a-z0-9]') THEN 'sentinel'\n          ELSE 'free_text'\n        END AS result_status,\n        u.result_txt AS value_source_value,\n        u.unit_source_value,u.unit_concept_id,u.ucum_code,\n        u.range_low,u.range_high,u.normalcy,u.WkgCode,u.nlmc_id,u.ReportDate,\n        CURRENT_TIMESTAMP() AS ADC_UPDT,\n        u.source_system,u.source_parent_key,u.source_record_key,\n        u.source_adc_updt,CURRENT_TIMESTAMP() AS loaded_at,\n        CURRENT_TIMESTAMP() AS mapping_updated_at,\n        u.source_payload_hash,\n        XXHASH64(\n          u.measurement_concept_id,u.measurement_concept_name,u.test_confidence_tier,\n          u.value_as_concept_id,u.result_concept_name,u.result_confidence_tier,\n          u.result_is_suspected,u.result_growth_grade,u.unit_concept_id,u.ucum_code,\n          u.rd_value_as_number,u.rd_operator_concept_id\n        ) AS mapping_payload_hash,\n        u.LIMSNo,u.source_sequence_start,u.source_sequence_end,u.source_line_count,\n        u.source_month_year,u.source_month_year_auth,\n        u.person_id_mrn,u.person_id_nhs,u.person_match_status,u.person_match_conflict,\n        u.measurement_datetime_source,u.code_source,u.description_source,\n        u.test_mapping_match_type,u.result_mapping_match_type,u.unit_mapping_match_type,\n        CASE WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'blank'\n             WHEN u.rd_result_numeric=1 THEN 'numeric'\n             WHEN u.rd_value_as_datetime IS NOT NULL THEN 'datetime'\n             ELSE 'text'\n        END AS result_parse_status,\n        u.rd_value_as_datetime AS value_as_datetime,\n        u.range_low_raw,u.range_high_raw,u.reference_nbr,u.clinical_event_id,\n        u.order_id,u.catalog_cd,u.parent_event_id,u.event_reltn_cd,\n        u.valid_from_dt_tm,u.valid_until_dt_tm,u.event_start_dt_tm,u.event_end_dt_tm,\n        u.performed_dt_tm,u.verified_dt_tm,u.record_status_cd,u.result_status_cd,\n        u.authentic_flag,u.clinsig_updt_dt_tm,u.source_updt_cnt,\n        u.contributor_system_cd,u.result_units_cd,u.normalcy_cd,\n        u.legacy_wkg_code,u.legacy_tfc_code,u.request_dt,u.sample_dt,\n        u.receipt_dt,u.booked_in_dt,u.order_no,u.visit_id,u.ass_auth_code,\n        u.body_site_code,u.specimen_type_code,u.specimen_category,u.urgent_flag,\n        u.source_code,u.clinician_code,u.master_section_code,u.work_section_code,\n        u.report_section,u.master_result_type,u.master_result_format,\n        u.master_num_val_upper,u.master_num_val_dps,\n        CONCAT_WS('|',\n          CASE WHEN u.person_match_conflict THEN 'PERSON_ID_CONFLICT' END,\n          CASE WHEN u.PERSON_ID IS NULL THEN 'PERSON_ID_UNRESOLVED' END,\n          CASE WHEN u.measurement_datetime IS NULL THEN 'MEASUREMENT_DATETIME_MISSING' END,\n          CASE WHEN u.measurement_datetime<TIMESTAMP'1900-01-01' THEN 'MEASUREMENT_DATETIME_SENTINEL' END,\n          CASE WHEN u.measurement_datetime>CURRENT_TIMESTAMP()+INTERVAL 1 DAY THEN 'MEASUREMENT_DATETIME_FUTURE' END,\n          CASE WHEN u.code IS NULL OR TRIM(u.code)='' THEN 'CODE_MISSING' END,\n          CASE WHEN u.description IS NULL OR TRIM(u.description)='' THEN 'DESCRIPTION_MISSING' END,\n          CASE WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'RESULT_BLANK' END,\n          CASE WHEN u.is_synthetic_key THEN 'SYNTHETIC_SOURCE_KEY' END,\n          CASE WHEN u.source_table='raw' AND u.LIMSNo IS NULL THEN 'LIMSNO_MISSING' END,\n          CASE WHEN u.source_table='raw' AND u.ReportDate<u.measurement_datetime\n                     AND TO_DATE(u.ReportDate)<TO_DATE(u.measurement_datetime)\n               THEN 'REPORT_BEFORE_SAMPLE_DATE' END\n        ) AS data_quality_flags\n      FROM unit_joined u\n      LEFT JOIN {_qn(CONCEPT)} mc ON mc.concept_id=u.measurement_concept_id\n      LEFT JOIN {_qn(CONCEPT)} rcpt ON rcpt.concept_id=u.value_as_concept_id\n    )\n    SELECT * FROM projected\n    "
+    sql_text = f"\n    WITH\n    {alias_ctes},\n    linked_ranked AS (\n      SELECT\n        ce.CLINICAL_EVENT_ID, ce.EVENT_ID, ce.PERSON_ID, ce.ENCNTR_ID,\n        ce.ORDER_ID, ce.CATALOG_CD, ce.EVENT_CD, ce.PARENT_EVENT_ID,\n        ce.EVENT_RELTN_CD, ce.VALID_FROM_DT_TM, ce.VALID_UNTIL_DT_TM,\n        ce.EVENT_START_DT_TM, ce.EVENT_END_DT_TM, ce.PERFORMED_DT_TM,\n        ce.VERIFIED_DT_TM, ce.RESULT_VAL, ce.RESULT_UNITS_CD,\n        ce.NORMAL_LOW, ce.NORMAL_HIGH, ce.NORMALCY_CD,\n        ce.RECORD_STATUS_CD, ce.RESULT_STATUS_CD, ce.AUTHENTIC_FLAG,\n        ce.CLINSIG_UPDT_DT_TM, ce.UPDT_CNT, ce.CONTRIBUTOR_SYSTEM_CD,\n        ce.REFERENCE_NBR, ce.EVENT_TITLE_TEXT, ce.EVENT_TAG,\n        ce.ADC_UPDT AS ce_adc,\n        o.ORDER_MNEMONIC, o.HNA_ORDER_MNEMONIC, o.ORDERED_AS_MNEMONIC,\n        o.ADC_UPDT AS order_adc,\n        oc.PRIMARY_MNEMONIC, oc.DESCRIPTION AS catalog_description,\n        oc.ADC_UPDT AS catalog_adc,\n        ROW_NUMBER() OVER (\n          PARTITION BY ce.EVENT_ID\n          ORDER BY ce.VALID_UNTIL_DT_TM DESC NULLS LAST,\n                   ce.UPDT_CNT DESC NULLS LAST,\n                   ce.CLINSIG_UPDT_DT_TM DESC NULLS LAST,\n                   ce.ADC_UPDT DESC NULLS LAST,\n                   ce.CLINICAL_EVENT_ID DESC NULLS LAST\n        ) AS rn\n      FROM {_qn(CE)} ce\n      {linked_scope_join}\n      LEFT JOIN {_qn(ORDERS)} o ON CAST(o.ORDER_ID AS BIGINT)=ce.ORDER_ID\n      LEFT JOIN {_qn(ORDER_CATALOG)} oc ON CAST(oc.CATALOG_CD AS BIGINT)=ce.CATALOG_CD\n      WHERE ce.EVENT_CLASS_CD IN (233,236)\n        AND COALESCE(CAST(oc.CATALOG_TYPE_CD AS BIGINT),\n                     CAST(o.CATALOG_TYPE_CD AS BIGINT))=2513\n        {linked_bucket_filter}\n    ),\n    linked_src AS (\n      SELECT\n        'linked' AS source_table,\n        'CERNER' AS source_system,\n        CONCAT('linked|', CAST(ce.EVENT_ID AS STRING)) AS source_parent_key,\n        CONCAT('linked|', CAST(ce.EVENT_ID AS STRING)) AS source_record_key,\n        CAST(ce.EVENT_ID AS BIGINT) AS source_event_id,\n        FALSE AS is_synthetic_key,\n        SUBSTRING(ce.REFERENCE_NBR,1,11) AS lab_no,\n        CAST(NULL AS INT) AS LIMSNo,\n        CAST(NULL AS BIGINT) AS source_sequence_start,\n        CAST(NULL AS BIGINT) AS source_sequence_end,\n        CAST(1 AS BIGINT) AS source_line_count,\n        CAST(NULL AS STRING) AS source_month_year,\n        CAST(NULL AS STRING) AS source_month_year_auth,\n        CAST(ce.PERSON_ID AS BIGINT) AS PERSON_ID,\n        CAST(ce.ENCNTR_ID AS BIGINT) AS ENCNTR_ID,\n        CAST(NULL AS BIGINT) AS person_id_mrn,\n        CAST(NULL AS BIGINT) AS person_id_nhs,\n        'native' AS person_match_status,\n        FALSE AS person_match_conflict,\n        pm.canonical_mrn AS MRN,\n        pn.canonical_nhs AS NHS_Number,\n        CAST(ce.EVENT_CD AS INT) AS EVENT_CD,\n        COALESCE(cv.DESCRIPTION,cv.DISPLAY,ce.EVENT_TITLE_TEXT,ce.EVENT_TAG) AS EVENT_CD_DISPLAY,\n        COALESCE(ce.EVENT_END_DT_TM,ce.PERFORMED_DT_TM,\n                 ce.EVENT_START_DT_TM,ce.VERIFIED_DT_TM) AS measurement_datetime,\n        CASE WHEN ce.EVENT_END_DT_TM IS NOT NULL THEN 'EVENT_END_DT_TM'\n             WHEN ce.PERFORMED_DT_TM IS NOT NULL THEN 'PERFORMED_DT_TM'\n             WHEN ce.EVENT_START_DT_TM IS NOT NULL THEN 'EVENT_START_DT_TM'\n             WHEN ce.VERIFIED_DT_TM IS NOT NULL THEN 'VERIFIED_DT_TM'\n        END AS measurement_datetime_source,\n        'CERNER_TESTCODE' AS code_system,\n        COALESCE(NULLIF(TRIM(ce.ORDER_MNEMONIC),''),\n                 NULLIF(TRIM(ce.HNA_ORDER_MNEMONIC),''),\n                 NULLIF(TRIM(ce.ORDERED_AS_MNEMONIC),''),\n                 NULLIF(TRIM(ce.PRIMARY_MNEMONIC),''),\n                 CAST(ce.EVENT_CD AS STRING)) AS code,\n        CASE WHEN NULLIF(TRIM(ce.ORDER_MNEMONIC),'') IS NOT NULL THEN 'ORDER_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.HNA_ORDER_MNEMONIC),'') IS NOT NULL THEN 'HNA_ORDER_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.ORDERED_AS_MNEMONIC),'') IS NOT NULL THEN 'ORDERED_AS_MNEMONIC'\n             WHEN NULLIF(TRIM(ce.PRIMARY_MNEMONIC),'') IS NOT NULL THEN 'PRIMARY_MNEMONIC'\n             ELSE 'EVENT_CD'\n        END AS code_source,\n        COALESCE(cv.DESCRIPTION,cv.DISPLAY,ce.EVENT_TITLE_TEXT,ce.EVENT_TAG,\n                 ce.catalog_description,CAST(ce.EVENT_CD AS STRING)) AS description,\n        CASE WHEN cv.DESCRIPTION IS NOT NULL THEN 'CODE_VALUE_DESCRIPTION'\n             WHEN cv.DISPLAY IS NOT NULL THEN 'CODE_VALUE_DISPLAY'\n             WHEN ce.EVENT_TITLE_TEXT IS NOT NULL THEN 'EVENT_TITLE_TEXT'\n             WHEN ce.EVENT_TAG IS NOT NULL THEN 'EVENT_TAG'\n             WHEN ce.catalog_description IS NOT NULL THEN 'ORDER_CATALOG_DESCRIPTION'\n             ELSE 'EVENT_CD'\n        END AS description_source,\n        ce.RESULT_VAL AS result_txt,\n        COALESCE(ucv.DESCRIPTION,ucv.DISPLAY) AS unit_source_value,\n        ce.NORMAL_LOW AS range_low_raw,\n        ce.NORMAL_HIGH AS range_high_raw,\n        TRY_CAST(ce.NORMAL_LOW AS DOUBLE) AS range_low,\n        TRY_CAST(ce.NORMAL_HIGH AS DOUBLE) AS range_high,\n        COALESCE(ncv.DESCRIPTION,ncv.DISPLAY) AS normalcy,\n        CAST(NULL AS STRING) AS WkgCode,\n        CAST(NULL AS STRING) AS nlmc_id,\n        COALESCE(ce.VERIFIED_DT_TM,ce.EVENT_END_DT_TM,ce.PERFORMED_DT_TM) AS ReportDate,\n        GREATEST(ce.ce_adc,ce.order_adc,ce.catalog_adc,cv.ADC_UPDT,\n                 ucv.ADC_UPDT,ncv.ADC_UPDT,pm.canonical_mrn_adc,pn.canonical_nhs_adc)\n          AS source_adc_updt,\n        ce.REFERENCE_NBR AS reference_nbr,\n        CAST(ce.CLINICAL_EVENT_ID AS BIGINT) AS clinical_event_id,\n        CAST(ce.ORDER_ID AS BIGINT) AS order_id,\n        CAST(ce.CATALOG_CD AS BIGINT) AS catalog_cd,\n        CAST(ce.PARENT_EVENT_ID AS BIGINT) AS parent_event_id,\n        CAST(ce.EVENT_RELTN_CD AS BIGINT) AS event_reltn_cd,\n        ce.VALID_FROM_DT_TM AS valid_from_dt_tm,\n        ce.VALID_UNTIL_DT_TM AS valid_until_dt_tm,\n        ce.EVENT_START_DT_TM AS event_start_dt_tm,\n        ce.EVENT_END_DT_TM AS event_end_dt_tm,\n        ce.PERFORMED_DT_TM AS performed_dt_tm,\n        ce.VERIFIED_DT_TM AS verified_dt_tm,\n        CAST(ce.RECORD_STATUS_CD AS BIGINT) AS record_status_cd,\n        CAST(ce.RESULT_STATUS_CD AS BIGINT) AS result_status_cd,\n        CAST(ce.AUTHENTIC_FLAG AS BIGINT) AS authentic_flag,\n        ce.CLINSIG_UPDT_DT_TM AS clinsig_updt_dt_tm,\n        CAST(ce.UPDT_CNT AS BIGINT) AS source_updt_cnt,\n        CAST(ce.CONTRIBUTOR_SYSTEM_CD AS BIGINT) AS contributor_system_cd,\n        CAST(ce.RESULT_UNITS_CD AS BIGINT) AS result_units_cd,\n        CAST(ce.NORMALCY_CD AS BIGINT) AS normalcy_cd,\n        CAST(NULL AS STRING) AS legacy_wkg_code,\n        CAST(NULL AS STRING) AS legacy_tfc_code,\n        CAST(NULL AS TIMESTAMP) AS request_dt,\n        CAST(NULL AS TIMESTAMP) AS sample_dt,\n        CAST(NULL AS TIMESTAMP) AS receipt_dt,\n        CAST(NULL AS TIMESTAMP) AS booked_in_dt,\n        CAST(NULL AS STRING) AS order_no,\n        CAST(NULL AS STRING) AS visit_id,\n        CAST(NULL AS STRING) AS ass_auth_code,\n        CAST(NULL AS STRING) AS body_site_code,\n        CAST(NULL AS STRING) AS specimen_type_code,\n        CAST(NULL AS STRING) AS specimen_category,\n        CAST(NULL AS STRING) AS urgent_flag,\n        CAST(NULL AS STRING) AS source_code,\n        CAST(NULL AS STRING) AS clinician_code,\n        CAST(NULL AS STRING) AS master_section_code,\n        CAST(NULL AS STRING) AS work_section_code,\n        CAST(NULL AS STRING) AS report_section,\n        CAST(NULL AS STRING) AS master_result_type,\n        CAST(NULL AS STRING) AS master_result_format,\n        CAST(NULL AS INT) AS master_num_val_upper,\n        CAST(NULL AS INT) AS master_num_val_dps\n      FROM linked_ranked ce\n      LEFT JOIN {_qn(CODE_VALUE)} cv ON CAST(cv.CODE_VALUE AS BIGINT)=ce.EVENT_CD\n      LEFT JOIN {_qn(CODE_VALUE)} ucv ON CAST(ucv.CODE_VALUE AS BIGINT)=ce.RESULT_UNITS_CD\n      LEFT JOIN {_qn(CODE_VALUE)} ncv ON CAST(ncv.CODE_VALUE AS BIGINT)=ce.NORMALCY_CD\n      LEFT JOIN pa_person_mrn pm ON pm.PERSON_ID=CAST(ce.PERSON_ID AS BIGINT)\n      LEFT JOIN pa_person_nhs pn ON pn.PERSON_ID=CAST(ce.PERSON_ID AS BIGINT)\n      WHERE ce.rn=1\n    ),\n    rl_pre AS (\n      SELECT\n        CAST(r.LIMSNo AS INT) AS LIMSNo,\n        r.LabNo,\n        COALESCE(NULLIF(TRIM(r.TFCCode),''),NULLIF(TRIM(r.LegTFCCode),'')) AS TFCCode,\n        COALESCE(NULLIF(TRIM(r.WkgCode),''),NULLIF(TRIM(r.LegWkgCode),'')) AS WkgCode,\n        r.LegTFCCode, r.LegWkgCode, CAST(r.TFCResultSeq AS BIGINT) AS TFCResultSeq,\n        r.TFCValue, r.MonthYear, r.MonthYearAuth, r.ADC_UPDT\n      FROM {_qn(RESULT_LEVEL)} r\n      {raw_scope_result_join}\n      {raw_result_bucket_filter}\n    ),\n    rl_island AS (\n      SELECT p.*,\n        CASE\n          WHEN TFCResultSeq IS NULL THEN\n            XXHASH64(CONCAT_WS('|',COALESCE(CAST(LIMSNo AS STRING),'∅'),\n              COALESCE(LabNo,'∅'),COALESCE(TFCCode,'∅'),COALESCE(WkgCode,'∅'),\n              COALESCE(TFCValue,'∅'),COALESCE(MonthYear,'∅')))\n          WHEN TFCCode RLIKE '^(INTER|UNU)' THEN TFCResultSeq\n          ELSE TFCResultSeq - DENSE_RANK() OVER (\n            PARTITION BY LIMSNo,LabNo,TFCCode,WkgCode\n            ORDER BY TFCResultSeq\n          )\n        END AS island_id\n      FROM rl_pre p\n    ),\n    rl AS (\n      SELECT\n        LIMSNo,LabNo,TFCCode,WkgCode,\n        MAX(LegTFCCode) AS LegTFCCode,\n        MAX(LegWkgCode) AS LegWkgCode,\n        MIN(TFCResultSeq) AS TFCResultSeq,\n        MAX(TFCResultSeq) AS TFCResultSeqEnd,\n        COUNT(*) AS source_line_count,\n        MIN(MonthYear) AS MonthYear,\n        MIN(MonthYearAuth) AS MonthYearAuth,\n        CONCAT_WS(\n          '\\n',\n          TRANSFORM(\n            SORT_ARRAY(COLLECT_LIST(NAMED_STRUCT(\n              'seq',TFCResultSeq,'adc',ADC_UPDT,'value',TFCValue\n            ))),\n            x -> x.value\n          )\n        ) AS TFCValue,\n        MAX(ADC_UPDT) AS ADC_UPDT,\n        island_id\n      FROM rl_island\n      GROUP BY LIMSNo,LabNo,TFCCode,WkgCode,island_id\n    ),\n    sl1 AS (\n      SELECT *\n      FROM (\n        SELECT\n          CAST(sl.LIMSNo AS INT) AS LIMSNo, sl.LabNo, sl.MRN, sl.NHSNo,\n          sl.AssAuthCode, sl.RequestDT, sl.SampleDT, sl.ReportDate,\n          sl.ReceiptDT, sl.BookedInDT, sl.OrderNo, sl.VisitID,\n          sl.BodySiteCode, sl.CSpecTypeCode, sl.SpecimenCategory,\n          sl.UrgentFlag, sl.SourceCode, sl.ClinicianCode,\n          sl.ADC_UPDT AS sample_adc,\n          ROW_NUMBER() OVER (\n            PARTITION BY sl.LIMSNo,sl.LabNo\n            ORDER BY sl.ADC_UPDT DESC NULLS LAST,\n                     sl.SampleDT DESC NULLS LAST,\n                     sl.ReportDate DESC NULLS LAST,\n                     sl.ReceiptDT DESC NULLS LAST,\n                     sl.BookedInDT DESC NULLS LAST,\n                     sl.OrderNo ASC NULLS LAST,\n                     sl.VisitID ASC NULLS LAST,\n                     sl.MRN ASC NULLS LAST,\n                     sl.NHSNo ASC NULLS LAST\n          ) rn\n        FROM {_qn(SAMPLE_LEVEL)} sl\n        {raw_scope_sample_join}\n        {raw_sample_bucket_filter}\n      ) WHERE rn=1\n    ),\n    m1 AS (\n      SELECT *\n      FROM (\n        SELECT\n          m.WkgCode,m.TFCCode,m.TFCDesc_Full,m.TFCDesc_Rep,m.TFCDesc_WP,\n          m.ReportingSynonym,m.PMIPDesc,m.Units,m.NLMC_ID,m.SectionCode,\n          m.WorkSectionCode,m.ReportSection,m.ResultType,m.ResultFormat,\n          m.NumValUpper,m.NumValDPs,m.LastUpdateDT,m.ADC_UPDT,\n          ROW_NUMBER() OVER (\n            PARTITION BY m.WkgCode,m.TFCCode\n            ORDER BY m.LastUpdateDT DESC NULLS LAST,\n                     m.ADC_UPDT DESC NULLS LAST\n          ) rn\n        FROM {_qn(MASTER_RESULT)} m\n      ) WHERE rn=1\n    ),\n    raw_person AS (\n      SELECT\n        rl.*,sl.* EXCEPT (LIMSNo,LabNo,rn),\n        mr.PERSON_ID AS person_id_mrn,\n        nr.PERSON_ID AS person_id_nhs,\n        mr.person_count AS mrn_person_count,\n        nr.person_count AS nhs_person_count,\n        mr.ADC_UPDT AS mrn_alias_adc,\n        nr.ADC_UPDT AS nhs_alias_adc,\n        CASE\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID IS NOT NULL\n               AND mr.PERSON_ID<>nr.PERSON_ID THEN CAST(NULL AS BIGINT)\n          ELSE COALESCE(mr.PERSON_ID,nr.PERSON_ID)\n        END AS resolved_person_id,\n        CASE\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID IS NOT NULL\n               AND mr.PERSON_ID<>nr.PERSON_ID THEN 'conflict'\n          WHEN mr.PERSON_ID IS NOT NULL AND nr.PERSON_ID=mr.PERSON_ID THEN 'agreed'\n          WHEN mr.PERSON_ID IS NOT NULL THEN 'mrn_only'\n          WHEN nr.PERSON_ID IS NOT NULL THEN 'nhs_only'\n          WHEN COALESCE(mr.person_count,0)>1 OR COALESCE(nr.person_count,0)>1 THEN 'ambiguous'\n          ELSE 'unresolved'\n        END AS person_match_status\n      FROM rl\n      LEFT JOIN sl1 sl ON sl.LIMSNo <=> rl.LIMSNo AND sl.LabNo <=> rl.LabNo\n      LEFT JOIN mrn_resolver mr ON mr.ALIAS=sl.MRN\n      LEFT JOIN nhs_resolver nr ON nr.ALIAS=sl.NHSNo\n    ),\n    raw_src AS (\n      SELECT\n        'raw' AS source_table,\n        'TFC_LIMS' AS source_system,\n        CONCAT_WS('|','raw',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n                  COALESCE(rp.LabNo,'∅')) AS source_parent_key,\n        CONCAT_WS('|','raw',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n                  COALESCE(rp.LabNo,'∅'),COALESCE(rp.TFCCode,'∅'),\n                  COALESCE(rp.WkgCode,'∅'),CAST(rp.island_id AS STRING))\n          AS source_record_key,\n        COALESCE(\n          rp.TFCResultSeq,\n          XXHASH64(CONCAT_WS('|',COALESCE(CAST(rp.LIMSNo AS STRING),'∅'),\n            COALESCE(rp.LabNo,'∅'),COALESCE(rp.TFCCode,'∅'),\n            COALESCE(rp.WkgCode,'∅'),CAST(rp.island_id AS STRING)))\n        ) AS source_event_id,\n        (rp.TFCResultSeq IS NULL) AS is_synthetic_key,\n        rp.LabNo AS lab_no,\n        rp.LIMSNo,\n        rp.TFCResultSeq AS source_sequence_start,\n        rp.TFCResultSeqEnd AS source_sequence_end,\n        CAST(rp.source_line_count AS BIGINT) AS source_line_count,\n        rp.MonthYear AS source_month_year,\n        rp.MonthYearAuth AS source_month_year_auth,\n        CAST(rp.resolved_person_id AS BIGINT) AS PERSON_ID,\n        CAST(NULL AS BIGINT) AS ENCNTR_ID,\n        CAST(rp.person_id_mrn AS BIGINT) AS person_id_mrn,\n        CAST(rp.person_id_nhs AS BIGINT) AS person_id_nhs,\n        rp.person_match_status,\n        (rp.person_match_status='conflict') AS person_match_conflict,\n        COALESCE(pm.canonical_mrn,rp.MRN) AS MRN,\n        COALESCE(pn.canonical_nhs,rp.NHSNo) AS NHS_Number,\n        CAST(NULL AS INT) AS EVENT_CD,\n        CAST(NULL AS STRING) AS EVENT_CD_DISPLAY,\n        COALESCE(rp.SampleDT,rp.RequestDT,rp.ReceiptDT,rp.BookedInDT,rp.ReportDate)\n          AS measurement_datetime,\n        CASE WHEN rp.SampleDT IS NOT NULL THEN 'SampleDT'\n             WHEN rp.RequestDT IS NOT NULL THEN 'RequestDT'\n             WHEN rp.ReceiptDT IS NOT NULL THEN 'ReceiptDT'\n             WHEN rp.BookedInDT IS NOT NULL THEN 'BookedInDT'\n             WHEN rp.ReportDate IS NOT NULL THEN 'ReportDate'\n        END AS measurement_datetime_source,\n        'TFC' AS code_system,\n        rp.TFCCode AS code,\n        CASE WHEN NULLIF(TRIM(rp.TFCCode),'') IS NOT NULL\n                  AND rp.TFCCode <=> rp.LegTFCCode THEN 'LegTFCCode'\n             WHEN NULLIF(TRIM(rp.TFCCode),'') IS NOT NULL THEN 'TFCCode'\n             ELSE 'missing'\n        END AS code_source,\n        COALESCE(m1.TFCDesc_Full,m1.TFCDesc_Rep,m1.TFCDesc_WP,\n                 m1.ReportingSynonym,m1.PMIPDesc,rp.TFCCode) AS description,\n        CASE WHEN m1.TFCDesc_Full IS NOT NULL THEN 'TFCDesc_Full'\n             WHEN m1.TFCDesc_Rep IS NOT NULL THEN 'TFCDesc_Rep'\n             WHEN m1.TFCDesc_WP IS NOT NULL THEN 'TFCDesc_WP'\n             WHEN m1.ReportingSynonym IS NOT NULL THEN 'ReportingSynonym'\n             WHEN m1.PMIPDesc IS NOT NULL THEN 'PMIPDesc'\n             WHEN rp.TFCCode IS NOT NULL THEN 'TFCCode'\n             ELSE 'missing'\n        END AS description_source,\n        rp.TFCValue AS result_txt,\n        m1.Units AS unit_source_value,\n        CAST(NULL AS STRING) AS range_low_raw,\n        CAST(NULL AS STRING) AS range_high_raw,\n        CAST(NULL AS DOUBLE) AS range_low,\n        CAST(NULL AS DOUBLE) AS range_high,\n        CAST(NULL AS STRING) AS normalcy,\n        rp.WkgCode,\n        m1.NLMC_ID AS nlmc_id,\n        rp.ReportDate,\n        GREATEST(rp.ADC_UPDT,rp.sample_adc,rp.mrn_alias_adc,rp.nhs_alias_adc,\n                 m1.ADC_UPDT,pm.canonical_mrn_adc,pn.canonical_nhs_adc)\n          AS source_adc_updt,\n        CAST(NULL AS STRING) AS reference_nbr,\n        CAST(NULL AS BIGINT) AS clinical_event_id,\n        CAST(NULL AS BIGINT) AS order_id,\n        CAST(NULL AS BIGINT) AS catalog_cd,\n        CAST(NULL AS BIGINT) AS parent_event_id,\n        CAST(NULL AS BIGINT) AS event_reltn_cd,\n        CAST(NULL AS TIMESTAMP) AS valid_from_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS valid_until_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS event_start_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS event_end_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS performed_dt_tm,\n        CAST(NULL AS TIMESTAMP) AS verified_dt_tm,\n        CAST(NULL AS BIGINT) AS record_status_cd,\n        CAST(NULL AS BIGINT) AS result_status_cd,\n        CAST(NULL AS BIGINT) AS authentic_flag,\n        CAST(NULL AS TIMESTAMP) AS clinsig_updt_dt_tm,\n        CAST(NULL AS BIGINT) AS source_updt_cnt,\n        CAST(NULL AS BIGINT) AS contributor_system_cd,\n        CAST(NULL AS BIGINT) AS result_units_cd,\n        CAST(NULL AS BIGINT) AS normalcy_cd,\n        rp.LegWkgCode AS legacy_wkg_code,\n        rp.LegTFCCode AS legacy_tfc_code,\n        rp.RequestDT AS request_dt,\n        rp.SampleDT AS sample_dt,\n        rp.ReceiptDT AS receipt_dt,\n        rp.BookedInDT AS booked_in_dt,\n        rp.OrderNo AS order_no,\n        rp.VisitID AS visit_id,\n        rp.AssAuthCode AS ass_auth_code,\n        rp.BodySiteCode AS body_site_code,\n        rp.CSpecTypeCode AS specimen_type_code,\n        rp.SpecimenCategory AS specimen_category,\n        rp.UrgentFlag AS urgent_flag,\n        rp.SourceCode AS source_code,\n        rp.ClinicianCode AS clinician_code,\n        m1.SectionCode AS master_section_code,\n        m1.WorkSectionCode AS work_section_code,\n        m1.ReportSection AS report_section,\n        m1.ResultType AS master_result_type,\n        m1.ResultFormat AS master_result_format,\n        CAST(m1.NumValUpper AS INT) AS master_num_val_upper,\n        CAST(m1.NumValDPs AS INT) AS master_num_val_dps\n      FROM raw_person rp\n      LEFT JOIN m1 ON m1.WkgCode <=> rp.WkgCode AND m1.TFCCode <=> rp.TFCCode\n      LEFT JOIN pa_person_mrn pm ON pm.PERSON_ID=rp.resolved_person_id\n      LEFT JOIN pa_person_nhs pn ON pn.PERSON_ID=rp.resolved_person_id\n    ),\n    source_union AS (\n      {source_union_sql}\n    ),\n    combined AS (\n      SELECT s.*,\n        XXHASH64(\n          source_parent_key,source_record_key,PERSON_ID,ENCNTR_ID,MRN,NHS_Number,\n          measurement_datetime,code,description,result_txt,unit_source_value,\n          range_low_raw,range_high_raw,normalcy,WkgCode,nlmc_id,ReportDate,\n          reference_nbr,clinical_event_id,order_id,catalog_cd,valid_until_dt_tm,\n          request_dt,sample_dt,receipt_dt,booked_in_dt\n        ) AS source_payload_hash\n      FROM source_union s\n    ),\n    test_map_ranked AS (\n      SELECT *\n      FROM (\n        SELECT tm.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY code_system,code,description\n            ORDER BY CASE confidence_tier\n                       WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2\n                       WHEN 'auto_low' THEN 3 ELSE 9 END,\n                     mapping_version DESC NULLS LAST,mapped_at DESC NULLS LAST\n          ) rn\n        FROM {_qn(TEST_MAP)} tm\n        WHERE confidence_tier IN {test_tiers}\n          AND measurement_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    test_code_observed_desc AS (\n      SELECT DISTINCT code_system,code,description FROM combined\n    ),\n    test_code_desc_coverage AS (\n      SELECT o.code_system,o.code,\n             COUNT(*) AS n_observed_descriptions,\n             SUM(CASE WHEN tm.measurement_concept_id IS NULL THEN 0 ELSE 1 END) AS n_mapped_descriptions\n      FROM test_code_observed_desc o\n      LEFT JOIN test_map_ranked tm\n        ON tm.code_system=o.code_system\n       AND tm.code <=> o.code\n       AND tm.description <=> o.description\n      GROUP BY o.code_system,o.code\n    ),\n    test_code_safe AS (\n      SELECT r.code_system,r.code,MIN(r.measurement_concept_id) AS measurement_concept_id,\n             MIN(r.concept_name) AS concept_name,'safe_code' AS confidence_tier\n      FROM test_map_ranked r\n      JOIN test_code_desc_coverage cov\n        ON cov.code_system=r.code_system\n       AND cov.code <=> r.code\n       AND cov.n_mapped_descriptions=cov.n_observed_descriptions\n      GROUP BY r.code_system,r.code\n      HAVING COUNT(DISTINCT r.measurement_concept_id)=1\n    ),\n    test_joined AS (\n      SELECT c.*,\n        COALESCE(tm.measurement_concept_id,nt.measurement_concept_id,\n                 tc.measurement_concept_id) AS measurement_concept_id,\n        COALESCE(tm.concept_name,nt.concept_name,tc.concept_name)\n          AS measurement_concept_name,\n        COALESCE(tm.confidence_tier,nt.confidence_tier,tc.confidence_tier)\n          AS test_confidence_tier,\n        CASE WHEN tm.measurement_concept_id IS NOT NULL THEN 'exact_context'\n             WHEN nt.measurement_concept_id IS NOT NULL AND c.source_table='linked'\n               THEN 'native_event_cd'\n             WHEN nt.measurement_concept_id IS NOT NULL THEN 'native_nlmc'\n             WHEN tc.measurement_concept_id IS NOT NULL THEN 'safe_code'\n             ELSE 'unmapped'\n        END AS test_mapping_match_type\n      FROM combined c\n      LEFT JOIN test_map_ranked tm\n        ON tm.code_system=c.code_system\n       AND tm.code <=> c.code\n       AND tm.description <=> c.description\n      LEFT JOIN {_qn(MP_NATIVE_TEST)} nt\n        ON nt.key_type=CASE WHEN c.source_table='linked' THEN 'EVENT_CD' ELSE 'NLMC_ID' END\n       AND nt.key_value <=> CASE WHEN c.source_table='linked'\n                                THEN CAST(c.EVENT_CD AS STRING) ELSE c.nlmc_id END\n      LEFT JOIN test_code_safe tc\n        ON tc.code_system=c.code_system AND tc.code <=> c.code\n    ),\n    result_derived AS (\n      SELECT t.*,\n        CASE WHEN result_txt RLIKE '{numeric_re}' THEN 1 ELSE 0 END AS rd_result_numeric,\n        CASE WHEN result_txt RLIKE '^\\\\s*<=' THEN 4171754\n             WHEN result_txt RLIKE '^\\\\s*>=' THEN 4171755\n             WHEN result_txt RLIKE '^\\\\s*[<]' THEN 4171756\n             WHEN result_txt RLIKE '^\\\\s*[>]' THEN 4172704\n             WHEN result_txt RLIKE '^\\\\s*≤' THEN 4171754\n             WHEN result_txt RLIKE '^\\\\s*≥' THEN 4171755\n             ELSE NULL\n        END AS rd_operator_concept_id,\n        CASE WHEN result_txt RLIKE '{numeric_re}'\n             THEN TRY_CAST(\n               REGEXP_REPLACE(TRIM(result_txt),'^(?:<=|>=|<|>|≤|≥|=)\\\\s*','')\n               AS DOUBLE\n             )\n        END AS rd_value_as_number,\n        CASE WHEN result_txt IS NOT NULL AND TRIM(result_txt)<>''\n                   AND NOT (result_txt RLIKE '{numeric_re}')\n             THEN LOWER(TRIM(REGEXP_REPLACE(result_txt,'\\\\s+',' ')))\n        END AS rd_result_normalized,\n        CASE WHEN result_txt IS NOT NULL AND TRIM(result_txt)<>''\n                   AND NOT (result_txt RLIKE '{numeric_re}')\n             THEN COALESCE(\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd.MM.yyyy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd/MM/yyyy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'yyyy-MM-dd'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd.MM.yy'),\n               TRY_TO_TIMESTAMP(TRIM(result_txt),'dd/MM/yy')\n             )\n        END AS rd_value_as_datetime\n      FROM test_joined t\n    ),\n    result_map_ranked AS (\n      SELECT *\n      FROM (\n        SELECT rm.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY code_system,code,description,result_normalized\n            ORDER BY CASE confidence_tier\n                       WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2\n                       WHEN 'auto_anchor' THEN 3 WHEN 'auto_value' THEN 4\n                       WHEN 'auto_genpos' THEN 5 WHEN 'auto_low' THEN 6 ELSE 9 END,\n                     mapping_version DESC NULLS LAST,mapped_at DESC NULLS LAST\n          ) rn\n        FROM {_qn(RESULT_MAP)} rm\n        WHERE confidence_tier IN {result_tiers}\n          AND value_as_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    result_code_observed_desc AS (\n      SELECT DISTINCT code_system,code,description,rd_result_normalized\n      FROM result_derived\n      WHERE rd_result_numeric=0\n    ),\n    result_code_desc_coverage AS (\n      SELECT o.code_system,o.code,o.rd_result_normalized,\n             COUNT(*) AS n_observed_descriptions,\n             SUM(CASE WHEN rm.value_as_concept_id IS NULL THEN 0 ELSE 1 END) AS n_mapped_descriptions\n      FROM result_code_observed_desc o\n      LEFT JOIN result_map_ranked rm\n        ON rm.code_system=o.code_system\n       AND rm.code <=> o.code\n       AND rm.description <=> o.description\n       AND rm.result_normalized <=> o.rd_result_normalized\n      GROUP BY o.code_system,o.code,o.rd_result_normalized\n    ),\n    result_code_safe AS (\n      SELECT r.code_system,r.code,r.result_normalized,\n             MIN(r.value_as_concept_id) AS value_as_concept_id,\n             MIN(r.concept_name) AS concept_name,\n             MIN(r.confidence_tier) AS confidence_tier,\n             (MAX(CAST(r.is_suspected AS INT))=1) AS is_suspected,\n             MIN(r.growth_grade) AS growth_grade\n      FROM result_map_ranked r\n      JOIN result_code_desc_coverage cov\n        ON cov.code_system=r.code_system\n       AND cov.code <=> r.code\n       AND cov.rd_result_normalized <=> r.result_normalized\n       AND cov.n_mapped_descriptions=cov.n_observed_descriptions\n      GROUP BY r.code_system,r.code,r.result_normalized\n      HAVING COUNT(DISTINCT r.value_as_concept_id)=1\n    ),\n    result_joined AS (\n      SELECT d.*,\n        CASE WHEN d.rd_result_numeric=1 THEN CAST(NULL AS BIGINT)\n             ELSE COALESCE(rm.value_as_concept_id,nr.value_as_concept_id,\n                           rc.value_as_concept_id)\n        END AS value_as_concept_id,\n        COALESCE(rm.concept_name,nr.concept_name,rc.concept_name) AS result_concept_name,\n        COALESCE(rm.confidence_tier,nr.confidence_tier,rc.confidence_tier)\n          AS result_confidence_tier,\n        COALESCE(rm.is_suspected,rc.is_suspected) AS result_is_suspected,\n        COALESCE(rm.growth_grade,rc.growth_grade) AS result_growth_grade,\n        CASE WHEN d.rd_result_numeric=1 THEN 'numeric'\n             WHEN rm.value_as_concept_id IS NOT NULL THEN 'exact_context'\n             WHEN nr.value_as_concept_id IS NOT NULL THEN 'native_context'\n             WHEN rc.value_as_concept_id IS NOT NULL THEN 'safe_code_result'\n             ELSE 'unmapped'\n        END AS result_mapping_match_type\n      FROM result_derived d\n      LEFT JOIN result_map_ranked rm\n        ON rm.code_system=d.code_system\n       AND rm.code <=> d.code\n       AND rm.description <=> d.description\n       AND rm.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n      LEFT JOIN {_qn(MP_NATIVE_RESULT)} nr\n        ON nr.key_type=CASE WHEN d.source_table='linked' THEN 'EVENT_CD' ELSE 'NLMC_ID' END\n       AND nr.key_value <=> CASE WHEN d.source_table='linked'\n                                THEN CAST(d.EVENT_CD AS STRING) ELSE d.nlmc_id END\n       AND nr.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n      LEFT JOIN result_code_safe rc\n        ON rc.code_system=d.code_system\n       AND rc.code <=> d.code\n       AND rc.result_normalized <=> d.rd_result_normalized\n       AND d.rd_result_numeric=0\n    ),\n    unit_exact AS (\n      SELECT unit_source_value,unit_concept_id,ucum_code\n      FROM (\n        SELECT um.*,\n          ROW_NUMBER() OVER (\n            PARTITION BY unit_source_value\n            ORDER BY unit_concept_id DESC NULLS LAST,ucum_code ASC NULLS LAST\n          ) rn\n        FROM {_qn(UNIT_MAP)} um\n        WHERE unit_concept_id IS NOT NULL\n      ) WHERE rn=1\n    ),\n    unit_normalized AS (\n      SELECT LOWER(TRIM(unit_source_value)) AS unit_norm,\n             MIN(unit_concept_id) AS unit_concept_id,\n             MIN(ucum_code) AS ucum_code\n      FROM unit_exact\n      WHERE unit_source_value IS NOT NULL AND TRIM(unit_source_value)<>''\n      GROUP BY LOWER(TRIM(unit_source_value))\n      HAVING COUNT(DISTINCT unit_concept_id)=1\n    ),\n    unit_joined AS (\n      SELECT r.*,\n        COALESCE(ue.unit_concept_id,un.unit_concept_id) AS unit_concept_id,\n        COALESCE(ue.ucum_code,un.ucum_code) AS ucum_code,\n        CASE WHEN ue.unit_concept_id IS NOT NULL THEN 'exact'\n             WHEN un.unit_concept_id IS NOT NULL THEN 'normalized'\n             ELSE 'unmapped'\n        END AS unit_mapping_match_type\n      FROM result_joined r\n      LEFT JOIN unit_exact ue ON ue.unit_source_value <=> r.unit_source_value\n      LEFT JOIN unit_normalized un\n        ON un.unit_norm=LOWER(TRIM(r.unit_source_value))\n       AND ue.unit_concept_id IS NULL\n    ),\n    projected AS (\n      SELECT\n        u.source_table,\n        CAST(u.source_event_id AS BIGINT) AS source_event_id,\n        u.is_synthetic_key,\n        u.lab_no,\n        CAST(u.PERSON_ID AS BIGINT) AS PERSON_ID,\n        CAST(u.ENCNTR_ID AS BIGINT) AS ENCNTR_ID,\n        u.MRN,u.NHS_Number,u.EVENT_CD,u.EVENT_CD_DISPLAY,\n        u.measurement_datetime,u.code_system,u.code,u.description,\n        CASE WHEN mc.vocabulary_id='SNOMED' THEN mc.concept_code END AS test_snomed_code,\n        CASE WHEN mc.vocabulary_id='LOINC' THEN mc.concept_code END AS test_loinc_code,\n        CAST(u.measurement_concept_id AS BIGINT) AS test_omop_concept_id,\n        mc.standard_concept AS test_omop_standard_concept,\n        mc.vocabulary_id AS test_vocabulary_id,\n        CAST(u.measurement_concept_id AS BIGINT) AS measurement_concept_id,\n        u.measurement_concept_name,u.test_confidence_tier,\n        u.rd_value_as_number AS value_as_number,\n        CAST(u.rd_operator_concept_id AS BIGINT) AS operator_concept_id,\n        CAST(u.value_as_concept_id AS BIGINT) AS value_as_concept_id,\n        u.result_concept_name,u.result_confidence_tier,\n        u.result_is_suspected,u.result_growth_grade,\n        CASE WHEN rcpt.vocabulary_id='SNOMED' THEN rcpt.concept_code END AS result_snomed_code,\n        CASE WHEN rcpt.vocabulary_id='LOINC' THEN rcpt.concept_code END AS result_loinc_code,\n        CAST(u.value_as_concept_id AS BIGINT) AS result_omop_concept_id,\n        rcpt.standard_concept AS result_omop_standard_concept,\n        rcpt.vocabulary_id AS result_vocabulary_id,\n        CASE\n          WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'missing'\n          WHEN u.rd_result_numeric=1 THEN 'numeric'\n          WHEN u.rd_value_as_datetime IS NOT NULL THEN 'datetime'\n          WHEN u.value_as_concept_id IS NOT NULL THEN 'mapped'\n          WHEN u.rd_result_normalized RLIKE '{exclusion_re}' THEN 'excluded'\n          WHEN NOT (u.rd_result_normalized RLIKE '[a-z0-9]') THEN 'sentinel'\n          ELSE 'free_text'\n        END AS result_status,\n        u.result_txt AS value_source_value,\n        u.unit_source_value,u.unit_concept_id,u.ucum_code,\n        u.range_low,u.range_high,u.normalcy,u.WkgCode,u.nlmc_id,u.ReportDate,\n        CURRENT_TIMESTAMP() AS ADC_UPDT,\n        u.source_system,u.source_parent_key,u.source_record_key,\n        u.source_adc_updt,CURRENT_TIMESTAMP() AS loaded_at,\n        CURRENT_TIMESTAMP() AS mapping_updated_at,\n        u.source_payload_hash,\n        XXHASH64(\n          u.measurement_concept_id,u.measurement_concept_name,u.test_confidence_tier,\n          u.value_as_concept_id,u.result_concept_name,u.result_confidence_tier,\n          u.result_is_suspected,u.result_growth_grade,u.unit_concept_id,u.ucum_code,\n          u.rd_value_as_number,u.rd_operator_concept_id\n        ) AS mapping_payload_hash,\n        u.LIMSNo,u.source_sequence_start,u.source_sequence_end,u.source_line_count,\n        u.source_month_year,u.source_month_year_auth,\n        u.person_id_mrn,u.person_id_nhs,u.person_match_status,u.person_match_conflict,\n        u.measurement_datetime_source,u.code_source,u.description_source,\n        u.test_mapping_match_type,u.result_mapping_match_type,u.unit_mapping_match_type,\n        CASE WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'blank'\n             WHEN u.rd_result_numeric=1 THEN 'numeric'\n             WHEN u.rd_value_as_datetime IS NOT NULL THEN 'datetime'\n             ELSE 'text'\n        END AS result_parse_status,\n        u.rd_value_as_datetime AS value_as_datetime,\n        u.range_low_raw,u.range_high_raw,u.reference_nbr,u.clinical_event_id,\n        u.order_id,u.catalog_cd,u.parent_event_id,u.event_reltn_cd,\n        u.valid_from_dt_tm,u.valid_until_dt_tm,u.event_start_dt_tm,u.event_end_dt_tm,\n        u.performed_dt_tm,u.verified_dt_tm,u.record_status_cd,u.result_status_cd,\n        u.authentic_flag,u.clinsig_updt_dt_tm,u.source_updt_cnt,\n        u.contributor_system_cd,u.result_units_cd,u.normalcy_cd,\n        u.legacy_wkg_code,u.legacy_tfc_code,u.request_dt,u.sample_dt,\n        u.receipt_dt,u.booked_in_dt,u.order_no,u.visit_id,u.ass_auth_code,\n        u.body_site_code,u.specimen_type_code,u.specimen_category,u.urgent_flag,\n        u.source_code,u.clinician_code,u.master_section_code,u.work_section_code,\n        u.report_section,u.master_result_type,u.master_result_format,\n        u.master_num_val_upper,u.master_num_val_dps,\n        CONCAT_WS('|',\n          CASE WHEN u.person_match_conflict THEN 'PERSON_ID_CONFLICT' END,\n          CASE WHEN u.PERSON_ID IS NULL THEN 'PERSON_ID_UNRESOLVED' END,\n          CASE WHEN u.measurement_datetime IS NULL THEN 'MEASUREMENT_DATETIME_MISSING' END,\n          CASE WHEN u.measurement_datetime<TIMESTAMP'1900-01-01' THEN 'MEASUREMENT_DATETIME_SENTINEL' END,\n          CASE WHEN u.measurement_datetime>CURRENT_TIMESTAMP()+INTERVAL 1 DAY THEN 'MEASUREMENT_DATETIME_FUTURE' END,\n          CASE WHEN u.code IS NULL OR TRIM(u.code)='' THEN 'CODE_MISSING' END,\n          CASE WHEN u.description IS NULL OR TRIM(u.description)='' THEN 'DESCRIPTION_MISSING' END,\n          CASE WHEN u.result_txt IS NULL OR TRIM(u.result_txt)='' THEN 'RESULT_BLANK' END,\n          CASE WHEN u.is_synthetic_key THEN 'SYNTHETIC_SOURCE_KEY' END,\n          CASE WHEN u.source_table='raw' AND u.LIMSNo IS NULL THEN 'LIMSNO_MISSING' END,\n          CASE WHEN u.source_table='raw' AND u.ReportDate<u.measurement_datetime\n                     AND TO_DATE(u.ReportDate)<TO_DATE(u.measurement_datetime)\n               THEN 'REPORT_BEFORE_SAMPLE_DATE' END\n        ) AS data_quality_flags\n      FROM unit_joined u\n      LEFT JOIN {_qn(CONCEPT)} mc ON mc.concept_id=u.measurement_concept_id\n      LEFT JOIN {_qn(CONCEPT)} rcpt ON rcpt.concept_id=u.value_as_concept_id\n    )\n    SELECT * FROM projected\n    "
     if run_timestamp is not None:
         sql_text = sql_text.replace('CURRENT_TIMESTAMP()', _ts_literal(run_timestamp))
     return sql_text
@@ -671,16 +1102,14 @@ def _merge_and_reconcile(stage_table: str, touched_parents: DataFrame) -> dict[s
         column_name: F.col(f's.{column_name}')
         for column_name in source.columns
     }
-    comparisons = ' OR '.join(
-        f'NOT (t.`{column_name}` <=> s.`{column_name}`)'
-        for column_name in source.columns
-        if column_name != 'source_record_key'
-    )
     DeltaTable.forName(spark, MP_TARGET).alias('t').merge(
         source.alias('s'),
         't.source_record_key=s.source_record_key',
     ).whenMatchedUpdate(
-        condition=comparisons or 'false',
+        condition=(
+            'NOT (t.source_payload_hash <=> s.source_payload_hash) OR '
+            'NOT (t.mapping_payload_hash <=> s.mapping_payload_hash)'
+        ),
         set=assignments,
     ).whenNotMatchedInsert(values=assignments).execute()
     stale = spark.table(MP_TARGET).join(parent_keys, 'source_parent_key', 'inner').join(source_keys, 'source_record_key', 'left_anti').select('source_record_key').dropDuplicates()
@@ -692,6 +1121,1251 @@ def _merge_and_reconcile(stage_table: str, touched_parents: DataFrame) -> dict[s
 
 def _drop_table_if_exists(table_name: str) -> None:
     spark.sql(f'DROP TABLE IF EXISTS {_qn(table_name)}')
+
+
+def _incremental_stage_table(run_id: str, suffix: str) -> str:
+    safe_run = re.sub('[^a-zA-Z0-9_]', '_', run_id)
+    return f'{MP_CONTROL_SCHEMA}.map_pathology_incremental_{safe_run}_{suffix}'
+
+
+def _pathology_stage_audit(stage: str, details: dict | None=None) -> None:
+    payload = {'component': 'map_pathology', 'stage': stage, **(details or {})}
+    print(f"[map_pathology_v3] {stage}: {json.dumps(payload, default=str, sort_keys=True)}")
+    audit_fn = globals().get('_pipeline_audit')
+    if audit_fn is not None:
+        try:
+            audit_fn(MP_TARGET, 'PATHOLOGY_STAGE', payload)
+        except Exception as exc:
+            print(
+                '[map_pathology_v3] stage audit warning: '
+                f'{str(exc).splitlines()[0][:500]}'
+            )
+
+
+def _latest_operation_metrics(table_name: str) -> dict[str, int]:
+    row = spark.sql(f'DESCRIBE HISTORY {_qn(table_name)} LIMIT 1').first()
+    raw = (row['operationMetrics'] if row else None) or {}
+    metrics = {}
+    for key, value in raw.items():
+        try:
+            metrics[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return metrics
+
+
+def _latest_write_row_count(table_name: str) -> int:
+    metrics = _latest_operation_metrics(table_name)
+    for key in ('numOutputRows', 'numTargetRowsInserted', 'numWrittenRows'):
+        if key in metrics:
+            return int(metrics[key])
+    return int(spark.table(table_name).count())
+
+
+def _incremental_phase_reached(manifest: dict, required_phase: str) -> bool:
+    order = {
+        'BUILDING': 0,
+        'SCOPE_COMPLETE': 1,
+        'INPUTS_COMPLETE': 2,
+        'BUCKETS_COMPLETE': 3,
+        'RECONCILED': 4,
+        'MAPPING_COMPLETE': 5,
+        'SUCCESS': 6,
+        'ABANDONED': -1,
+    }
+    return order.get(manifest['phase'], -1) >= order[required_phase]
+
+
+def _incremental_bucket_expression(branch: str):
+    if branch == 'linked':
+        return F.pmod(
+            F.xxhash64(
+                F.coalesce(F.col('source_event_id').cast('string'), F.lit('∅'))
+            ),
+            F.lit(int(INCREMENTAL_LINKED_BUCKETS)),
+        ).cast('int')
+    if branch == 'raw':
+        return F.pmod(
+            F.xxhash64(
+                F.concat_ws(
+                    '|',
+                    F.coalesce(F.col('LIMSNo').cast('string'), F.lit('∅')),
+                    F.coalesce(F.col('lab_no').cast('string'), F.lit('∅')),
+                )
+            ),
+            F.lit(int(INCREMENTAL_RAW_BUCKETS)),
+        ).cast('int')
+    raise ValueError(f'Unsupported incremental branch: {branch}')
+
+
+def _validate_incremental_scope(table_name: str) -> dict[str, int]:
+    scope = spark.table(table_name)
+    required = {
+        'source_table',
+        'source_parent_key',
+        'source_event_id',
+        'LIMSNo',
+        'lab_no',
+        '_mp_bucket',
+    }
+    missing = required - set(scope.columns)
+    if missing:
+        raise RuntimeError(
+            f'Incremental scope is missing required columns: {sorted(missing)}'
+        )
+    summary = scope.agg(
+        F.count('*').alias('row_count'),
+        F.sum(
+            F.when(
+                F.col('source_parent_key').isNull()
+                | ~F.col('source_table').isin('linked', 'raw')
+                | F.col('_mp_bucket').isNull(),
+                1,
+            ).otherwise(0)
+        ).alias('invalid_rows'),
+        F.sum(
+            F.when(F.col('source_table') == 'linked', 1).otherwise(0)
+        ).alias('linked_parents'),
+        F.sum(
+            F.when(F.col('source_table') == 'raw', 1).otherwise(0)
+        ).alias('raw_parents'),
+    ).first()
+    if int(summary['invalid_rows'] or 0):
+        raise RuntimeError('Incremental scope contains invalid branch, key, or bucket values.')
+    duplicate = (
+        scope.groupBy('source_parent_key')
+        .count()
+        .filter(F.col('count') > 1)
+        .limit(1)
+        .count()
+    )
+    if duplicate:
+        raise RuntimeError('Incremental scope contains duplicate source_parent_key values.')
+    linked_bad_bucket = (
+        scope.filter(F.col('source_table') == 'linked')
+        .filter(
+            (F.col('_mp_bucket') < 0)
+            | (F.col('_mp_bucket') >= int(INCREMENTAL_LINKED_BUCKETS))
+        )
+        .limit(1)
+        .count()
+    )
+    raw_bad_bucket = (
+        scope.filter(F.col('source_table') == 'raw')
+        .filter(
+            (F.col('_mp_bucket') < 0)
+            | (F.col('_mp_bucket') >= int(INCREMENTAL_RAW_BUCKETS))
+        )
+        .limit(1)
+        .count()
+    )
+    if linked_bad_bucket or raw_bad_bucket:
+        raise RuntimeError('Incremental scope contains an out-of-range bucket.')
+    return {
+        'row_count': int(summary['row_count'] or 0),
+        'parent_count': int(summary['row_count'] or 0),
+        'linked_parents': int(summary['linked_parents'] or 0),
+        'raw_parents': int(summary['raw_parents'] or 0),
+    }
+
+
+def _materialize_incremental_scope(manifest: dict) -> dict:
+    run_id = manifest['run_id']
+    table_name = _incremental_stage_table(run_id, 'scope')
+    completed = _completed_incremental_progress(
+        run_id, 'SCOPE', 'all', -1, table_name
+    )
+    if completed is not None:
+        metrics = {
+            'table_name': table_name,
+            'row_count': int(completed.get('row_count') or 0),
+            'parent_count': int(completed.get('parent_count') or 0),
+            'linked_parents': int(
+                spark.table(table_name)
+                .filter(F.col('source_table') == 'linked')
+                .count()
+            ),
+            'raw_parents': int(
+                spark.table(table_name)
+                .filter(F.col('source_table') == 'raw')
+                .count()
+            ),
+            'scope_modes': manifest.get('scope_modes') or {},
+        }
+        _pathology_stage_audit('SCOPE_REUSE', metrics)
+        return metrics
+
+    force_snapshot_fallback = False
+    attempts = int(INCREMENTAL_STAGE_RETRIES) + 2
+    for attempt in _mp_builtins.range(1, attempts + 1):
+        _write_incremental_progress(
+            run_id,
+            'SCOPE',
+            'all',
+            -1,
+            'RUNNING',
+            table_name=table_name,
+        )
+        try:
+            _drop_table_if_exists(table_name)
+            parents, scope_modes = _prepare_incremental_scope(
+                manifest['state'],
+                manifest['cutoffs'],
+                force_snapshot_fallback=force_snapshot_fallback,
+            )
+            bucketed = parents.withColumn(
+                '_mp_bucket',
+                F.when(
+                    F.col('source_table') == 'linked',
+                    _incremental_bucket_expression('linked'),
+                ).otherwise(_incremental_bucket_expression('raw')),
+            )
+            (
+                bucketed.write.format('delta')
+                .mode('overwrite')
+                .option('overwriteSchema', 'true')
+                .partitionBy('source_table', '_mp_bucket')
+                .saveAsTable(table_name)
+            )
+            metrics = _validate_incremental_scope(table_name)
+            metrics['table_name'] = table_name
+            metrics['scope_modes'] = scope_modes
+            manifest['scope_modes'] = scope_modes
+            manifest['scope_modes_json'] = json.dumps(
+                scope_modes, sort_keys=True, separators=(',', ':')
+            )
+            _write_incremental_manifest(manifest)
+            _write_incremental_progress(
+                run_id,
+                'SCOPE',
+                'all',
+                -1,
+                'COMPLETE',
+                table_name=table_name,
+                row_count=metrics['row_count'],
+                parent_count=metrics['parent_count'],
+            )
+            _pathology_stage_audit('SCOPE_COMPLETE', metrics)
+            return metrics
+        except Exception as exc:
+            _write_incremental_progress(
+                run_id,
+                'SCOPE',
+                'all',
+                -1,
+                'FAILED',
+                table_name=table_name,
+                error=str(exc),
+            )
+            if (
+                not force_snapshot_fallback
+                and _incremental_snapshot_read_unavailable(exc)
+            ):
+                force_snapshot_fallback = True
+                print(
+                    '[map_pathology_v3] scope CDF read failed during materialization; '
+                    'retrying from pinned ADC-watermark snapshots'
+                )
+                continue
+            if not _retryable_full_build_failure(exc) or attempt >= attempts:
+                raise
+            print(
+                f'[map_pathology_v3] RETRY SCOPE attempt={attempt + 1}/{attempts}; '
+                f'reason={str(exc).splitlines()[0][:500]}'
+            )
+    raise RuntimeError('Incremental scope did not complete.')
+
+
+def _incremental_snapshot_df(manifest: dict, source_name: str) -> DataFrame:
+    cutoff = manifest['cutoffs'][source_name]
+    table_name = cutoff['table_name']
+    version = int(cutoff['end_version'])
+    try:
+        return (
+            spark.read.format('delta')
+            .option('versionAsOf', version)
+            .table(table_name)
+        )
+    except Exception as exc:
+        latest_version = _latest_delta_version(table_name)
+        if version != latest_version or not _time_travel_retention_expired(exc):
+            raise
+        print(
+            f'[map_pathology_v3] current snapshot fallback for pinned incremental '
+            f'input {table_name} at version {version}'
+        )
+        return spark.table(table_name)
+
+
+def _run_incremental_df_stage(
+    manifest: dict,
+    stage_name: str,
+    branch: str,
+    bucket_id: int,
+    table_name: str,
+    dataframe_factory,
+    partition_columns: tuple[str, ...]=(),
+    validator=None,
+) -> dict:
+    completed = _completed_incremental_progress(
+        manifest['run_id'], stage_name, branch, bucket_id, table_name
+    )
+    if completed is not None:
+        metrics = {
+            'table_name': table_name,
+            'row_count': int(completed.get('row_count') or 0),
+            'parent_count': int(completed.get('parent_count') or 0),
+        }
+        _pathology_stage_audit(f'{stage_name}_REUSE', metrics)
+        return metrics
+    attempts = int(INCREMENTAL_STAGE_RETRIES) + 1
+    for attempt in _mp_builtins.range(1, attempts + 1):
+        _write_incremental_progress(
+            manifest['run_id'],
+            stage_name,
+            branch,
+            bucket_id,
+            'RUNNING',
+            table_name=table_name,
+        )
+        try:
+            _drop_table_if_exists(table_name)
+            frame = dataframe_factory()
+            writer = (
+                frame.write.format('delta')
+                .mode('overwrite')
+                .option('overwriteSchema', 'true')
+            )
+            if partition_columns:
+                writer = writer.partitionBy(*partition_columns)
+            writer.saveAsTable(table_name)
+            metrics = (
+                validator(table_name)
+                if validator is not None
+                else {
+                    'row_count': _latest_write_row_count(table_name),
+                    'parent_count': 0,
+                }
+            )
+            metrics['table_name'] = table_name
+            _write_incremental_progress(
+                manifest['run_id'],
+                stage_name,
+                branch,
+                bucket_id,
+                'COMPLETE',
+                table_name=table_name,
+                row_count=int(metrics.get('row_count') or 0),
+                parent_count=int(metrics.get('parent_count') or 0),
+            )
+            _pathology_stage_audit(f'{stage_name}_COMPLETE', metrics)
+            return metrics
+        except Exception as exc:
+            _write_incremental_progress(
+                manifest['run_id'],
+                stage_name,
+                branch,
+                bucket_id,
+                'FAILED',
+                table_name=table_name,
+                error=str(exc),
+            )
+            if not _retryable_full_build_failure(exc) or attempt >= attempts:
+                raise
+            print(
+                f'[map_pathology_v3] RETRY {stage_name} '
+                f'attempt={attempt + 1}/{attempts}; '
+                f'reason={str(exc).splitlines()[0][:500]}'
+            )
+    raise RuntimeError(f'Incremental stage did not complete: {stage_name}')
+
+
+def _build_incremental_inputs(manifest: dict, scope_table: str) -> dict[str, str]:
+    """Land each large source once, partitioned by the same parent hash as stages."""
+    run_id = manifest['run_id']
+    alias_person_table = _incremental_stage_table(run_id, 'alias_person')
+    alias_resolver_table = _incremental_stage_table(run_id, 'alias_resolver')
+    linked_ce_table = _incremental_stage_table(run_id, 'linked_ce_input')
+    linked_orders_table = _incremental_stage_table(run_id, 'linked_orders_input')
+    raw_result_table = _incremental_stage_table(run_id, 'raw_result_input')
+    raw_sample_table = _incremental_stage_table(run_id, 'raw_sample_input')
+    master_result_table = _incremental_stage_table(run_id, 'master_result_input')
+    order_catalog_table = _incremental_stage_table(run_id, 'order_catalog_input')
+    code_value_table = _incremental_stage_table(run_id, 'code_value_input')
+    test_map_table = _incremental_stage_table(run_id, 'test_map_input')
+    result_map_table = _incremental_stage_table(run_id, 'result_map_input')
+    unit_map_table = _incremental_stage_table(run_id, 'unit_map_input')
+    native_test_table = _incremental_stage_table(run_id, 'native_test_input')
+    native_result_table = _incremental_stage_table(run_id, 'native_result_input')
+    exclusion_table = _incremental_stage_table(run_id, 'exclusion_input')
+    concept_table = _incremental_stage_table(run_id, 'concept_input')
+
+    alias_view = (
+        'mp_inc_alias_source_'
+        + re.sub('[^a-zA-Z0-9]', '', manifest['run_id'])[:12]
+    )
+    original_person_alias = globals()['PERSON_ALIAS']
+    try:
+        _incremental_snapshot_df(
+            manifest, 'mill_person_alias'
+        ).createOrReplaceTempView(alias_view)
+        globals()['PERSON_ALIAS'] = alias_view
+        _run_incremental_df_stage(
+            manifest,
+            'ALIAS_PERSON',
+            'all',
+            -1,
+            alias_person_table,
+            lambda: spark.sql(_full_build_alias_person_sql()),
+        )
+        _run_incremental_df_stage(
+            manifest,
+            'ALIAS_RESOLVER',
+            'all',
+            -1,
+            alias_resolver_table,
+            lambda: spark.sql(_full_build_alias_resolver_sql()),
+        )
+    finally:
+        globals()['PERSON_ALIAS'] = original_person_alias
+        try:
+            spark.catalog.dropTempView(alias_view)
+        except Exception:
+            pass
+
+    for stage_name, source_name, table_name in (
+        ('MASTER_RESULT_INPUT', 'path_master_resultable', master_result_table),
+        ('ORDER_CATALOG_INPUT', 'mill_order_catalog', order_catalog_table),
+        ('CODE_VALUE_INPUT', 'mill_code_value', code_value_table),
+        ('TEST_MAP_INPUT', 'pathology_test_concept_map', test_map_table),
+        ('RESULT_MAP_INPUT', 'pathology_result_concept_map', result_map_table),
+        ('UNIT_MAP_INPUT', 'pathology_unit_map', unit_map_table),
+    ):
+        _run_incremental_df_stage(
+            manifest,
+            stage_name,
+            'lookup',
+            -1,
+            table_name,
+            lambda source_name=source_name: _incremental_snapshot_df(
+                manifest, source_name
+            ),
+        )
+    _run_incremental_df_stage(
+        manifest,
+        'NATIVE_TEST_INPUT',
+        'lookup',
+        -1,
+        native_test_table,
+        lambda: spark.table(MP_NATIVE_TEST),
+    )
+    _run_incremental_df_stage(
+        manifest,
+        'NATIVE_RESULT_INPUT',
+        'lookup',
+        -1,
+        native_result_table,
+        lambda: spark.table(MP_NATIVE_RESULT),
+    )
+    _run_incremental_df_stage(
+        manifest,
+        'EXCLUSION_INPUT',
+        'lookup',
+        -1,
+        exclusion_table,
+        lambda: spark.table(EXCL_TBL),
+    )
+
+    def concept_factory():
+        ids = (
+            spark.table(test_map_table)
+            .select(
+                F.col('measurement_concept_id').cast('long').alias('concept_id')
+            )
+            .unionByName(
+                spark.table(result_map_table).select(
+                    F.col('value_as_concept_id').cast('long').alias('concept_id')
+                )
+            )
+            .unionByName(
+                spark.table(native_test_table).select(
+                    F.col('measurement_concept_id').cast('long').alias('concept_id')
+                )
+            )
+            .unionByName(
+                spark.table(native_result_table).select(
+                    F.col('value_as_concept_id').cast('long').alias('concept_id')
+                )
+            )
+            .filter(F.col('concept_id').isNotNull())
+            .dropDuplicates(['concept_id'])
+        )
+        return spark.table(CONCEPT).join(ids, 'concept_id', 'left_semi')
+
+    _run_incremental_df_stage(
+        manifest,
+        'CONCEPT_INPUT',
+        'lookup',
+        -1,
+        concept_table,
+        concept_factory,
+    )
+
+    def linked_ce_factory():
+        keys = (
+            spark.table(scope_table)
+            .filter(F.col('source_table') == 'linked')
+            .select(
+                F.col('source_event_id').cast('long').alias('_scope_event_id')
+            )
+        )
+        source = _incremental_snapshot_df(manifest, 'mill_clinical_event').select(*['CLINICAL_EVENT_ID', 'EVENT_ID', 'PERSON_ID', 'ENCNTR_ID', 'ORDER_ID', 'CATALOG_CD', 'EVENT_CD', 'PARENT_EVENT_ID', 'EVENT_RELTN_CD', 'VALID_FROM_DT_TM', 'VALID_UNTIL_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM', 'VERIFIED_DT_TM', 'RESULT_VAL', 'RESULT_UNITS_CD', 'NORMAL_LOW', 'NORMAL_HIGH', 'NORMALCY_CD', 'RECORD_STATUS_CD', 'RESULT_STATUS_CD', 'AUTHENTIC_FLAG', 'CLINSIG_UPDT_DT_TM', 'UPDT_CNT', 'CONTRIBUTOR_SYSTEM_CD', 'REFERENCE_NBR', 'EVENT_TITLE_TEXT', 'EVENT_TAG', 'ADC_UPDT', 'EVENT_CLASS_CD'])
+        return (
+            source.alias('s')
+            .join(
+                keys.alias('p'),
+                F.col('s.EVENT_ID').cast('long') == F.col('p._scope_event_id'),
+                'inner',
+            )
+            .select('s.*')
+            .withColumn(
+                '_mp_bucket',
+                F.pmod(
+                    F.xxhash64(
+                        F.coalesce(
+                            F.col('EVENT_ID').cast('long').cast('string'),
+                            F.lit('∅'),
+                        )
+                    ),
+                    F.lit(int(INCREMENTAL_LINKED_BUCKETS)),
+                ).cast('int'),
+            )
+        )
+
+    _run_incremental_df_stage(
+        manifest,
+        'LINKED_CE_INPUT',
+        'linked',
+        -1,
+        linked_ce_table,
+        linked_ce_factory,
+        partition_columns=('_mp_bucket',),
+    )
+
+    def linked_orders_factory():
+        order_buckets = (
+            spark.table(linked_ce_table)
+            .select(
+                F.col('ORDER_ID').cast('long').alias('_scope_order_id'),
+                F.col('_mp_bucket'),
+            )
+            .filter(F.col('_scope_order_id').isNotNull())
+            .dropDuplicates(['_scope_order_id', '_mp_bucket'])
+        )
+        orders = _incremental_snapshot_df(manifest, 'mill_orders')
+        return (
+            orders.alias('o')
+            .join(
+                order_buckets.alias('b'),
+                F.col('o.ORDER_ID').cast('long') == F.col('b._scope_order_id'),
+                'inner',
+            )
+            .select('o.*', F.col('b._mp_bucket').alias('_mp_bucket'))
+        )
+
+    _run_incremental_df_stage(
+        manifest,
+        'LINKED_ORDERS_INPUT',
+        'linked',
+        -1,
+        linked_orders_table,
+        linked_orders_factory,
+        partition_columns=('_mp_bucket',),
+    )
+
+    def raw_source_factory(source_name: str):
+        keys = (
+            spark.table(scope_table)
+            .filter(F.col('source_table') == 'raw')
+            .select(
+                F.col('LIMSNo').cast('int').alias('_scope_lims_no'),
+                F.col('lab_no').cast('string').alias('_scope_lab_no'),
+            )
+        )
+        source = _incremental_snapshot_df(manifest, source_name)
+        return (
+            source.alias('s')
+            .join(
+                keys.alias('p'),
+                F.col('s.LIMSNo').cast('int').eqNullSafe(F.col('p._scope_lims_no'))
+                & F.col('s.LabNo').cast('string').eqNullSafe(
+                    F.col('p._scope_lab_no')
+                ),
+                'inner',
+            )
+            .select('s.*')
+            .withColumn(
+                '_mp_bucket',
+                F.pmod(
+                    F.xxhash64(
+                        F.concat_ws(
+                            '|',
+                            F.coalesce(
+                                F.col('LIMSNo').cast('int').cast('string'),
+                                F.lit('∅'),
+                            ),
+                            F.coalesce(F.col('LabNo'), F.lit('∅')),
+                        )
+                    ),
+                    F.lit(int(INCREMENTAL_RAW_BUCKETS)),
+                ).cast('int'),
+            )
+        )
+
+    _run_incremental_df_stage(
+        manifest,
+        'RAW_RESULT_INPUT',
+        'raw',
+        -1,
+        raw_result_table,
+        lambda: raw_source_factory('path_patient_resultlevel'),
+        partition_columns=('_mp_bucket',),
+    )
+    _run_incremental_df_stage(
+        manifest,
+        'RAW_SAMPLE_INPUT',
+        'raw',
+        -1,
+        raw_sample_table,
+        lambda: raw_source_factory('path_patient_samplelevel'),
+        partition_columns=('_mp_bucket',),
+    )
+
+    return {
+        'alias_person': alias_person_table,
+        'alias_resolver': alias_resolver_table,
+        'linked_ce': linked_ce_table,
+        'linked_orders': linked_orders_table,
+        'raw_result': raw_result_table,
+        'raw_sample': raw_sample_table,
+        'master_result': master_result_table,
+        'order_catalog': order_catalog_table,
+        'code_value': code_value_table,
+        'test_map': test_map_table,
+        'result_map': result_map_table,
+        'unit_map': unit_map_table,
+        'native_test': native_test_table,
+        'native_result': native_result_table,
+        'exclusion': exclusion_table,
+        'concept': concept_table,
+    }
+
+
+def _install_incremental_bucket_views(
+    manifest: dict,
+    scope_table: str,
+    inputs: dict[str, str],
+    branch: str,
+    bucket_id: int,
+) -> tuple[dict[str, str], list[str]]:
+    token = re.sub('[^a-zA-Z0-9]', '', manifest['run_id'])[:12]
+    originals: dict[str, str] = {}
+    views: list[str] = ['mp_v2_linked_scope', 'mp_v2_raw_scope']
+    for global_name, input_name in (
+        ('MASTER_RESULT', 'master_result'),
+        ('ORDER_CATALOG', 'order_catalog'),
+        ('CODE_VALUE', 'code_value'),
+        ('TEST_MAP', 'test_map'),
+        ('RESULT_MAP', 'result_map'),
+        ('UNIT_MAP', 'unit_map'),
+        ('MP_NATIVE_TEST', 'native_test'),
+        ('MP_NATIVE_RESULT', 'native_result'),
+        ('EXCL_TBL', 'exclusion'),
+        ('CONCEPT', 'concept'),
+    ):
+        originals[global_name] = globals()[global_name]
+        globals()[global_name] = inputs[input_name]
+    scope = spark.table(scope_table).filter(
+        (F.col('source_table') == branch)
+        & (F.col('_mp_bucket') == int(bucket_id))
+    )
+    if branch == 'linked':
+        (
+            scope.select(
+                F.col('source_event_id').cast('long').alias('EVENT_ID')
+            )
+            .dropDuplicates(['EVENT_ID'])
+            .createOrReplaceTempView('mp_v2_linked_scope')
+        )
+        spark.createDataFrame([], 'LIMSNo INT, LabNo STRING').createOrReplaceTempView(
+            'mp_v2_raw_scope'
+        )
+        ce_view = f'mp_inc_{token}_linked_ce_b{int(bucket_id):03d}'
+        orders_view = f'mp_inc_{token}_linked_orders_b{int(bucket_id):03d}'
+        (
+            spark.table(inputs['linked_ce'])
+            .filter(F.col('_mp_bucket') == int(bucket_id))
+            .drop('_mp_bucket')
+            .createOrReplaceTempView(ce_view)
+        )
+        (
+            spark.table(inputs['linked_orders'])
+            .filter(F.col('_mp_bucket') == int(bucket_id))
+            .drop('_mp_bucket')
+            .createOrReplaceTempView(orders_view)
+        )
+        originals['CE'] = globals()['CE']
+        originals['ORDERS'] = globals()['ORDERS']
+        globals()['CE'] = ce_view
+        globals()['ORDERS'] = orders_view
+        views.extend([ce_view, orders_view])
+    elif branch == 'raw':
+        spark.createDataFrame([], 'EVENT_ID LONG').createOrReplaceTempView(
+            'mp_v2_linked_scope'
+        )
+        (
+            scope.select(
+                F.col('LIMSNo').cast('int').alias('LIMSNo'),
+                F.col('lab_no').cast('string').alias('LabNo'),
+            )
+            .dropDuplicates(['LIMSNo', 'LabNo'])
+            .createOrReplaceTempView('mp_v2_raw_scope')
+        )
+        result_view = f'mp_inc_{token}_raw_result_b{int(bucket_id):03d}'
+        sample_view = f'mp_inc_{token}_raw_sample_b{int(bucket_id):03d}'
+        (
+            spark.table(inputs['raw_result'])
+            .filter(F.col('_mp_bucket') == int(bucket_id))
+            .drop('_mp_bucket')
+            .createOrReplaceTempView(result_view)
+        )
+        (
+            spark.table(inputs['raw_sample'])
+            .filter(F.col('_mp_bucket') == int(bucket_id))
+            .drop('_mp_bucket')
+            .createOrReplaceTempView(sample_view)
+        )
+        originals['RESULT_LEVEL'] = globals()['RESULT_LEVEL']
+        originals['SAMPLE_LEVEL'] = globals()['SAMPLE_LEVEL']
+        globals()['RESULT_LEVEL'] = result_view
+        globals()['SAMPLE_LEVEL'] = sample_view
+        views.extend([result_view, sample_view])
+    else:
+        raise ValueError(f'Unsupported incremental branch: {branch}')
+    return originals, views
+
+
+def _restore_incremental_bucket_views(
+    originals: dict[str, str],
+    views: list[str],
+) -> None:
+    for global_name, original_value in originals.items():
+        globals()[global_name] = original_value
+    for view_name in views:
+        try:
+            spark.catalog.dropTempView(view_name)
+        except Exception:
+            pass
+
+
+def _validate_incremental_bucket(
+    table_name: str,
+    branch: str,
+    parent_count: int,
+) -> dict[str, int]:
+    stage = spark.table(table_name)
+    required = {
+        'source_table',
+        'source_parent_key',
+        'source_record_key',
+        'source_event_id',
+        'source_payload_hash',
+        'mapping_payload_hash',
+    }
+    missing = required - set(stage.columns)
+    if missing:
+        raise RuntimeError(
+            f'Incremental bucket is missing required columns: {sorted(missing)}'
+        )
+    summary = stage.agg(
+        F.count('*').alias('row_count'),
+        F.sum(
+            F.when(
+                (F.col('source_table') != F.lit(branch))
+                | F.col('source_parent_key').isNull()
+                | F.col('source_record_key').isNull(),
+                1,
+            ).otherwise(0)
+        ).alias('invalid_rows'),
+    ).first()
+    if int(summary['invalid_rows'] or 0):
+        raise RuntimeError(f'{branch} bucket contains invalid branch or key values.')
+    duplicate = (
+        stage.groupBy('source_record_key')
+        .count()
+        .filter(F.col('count') > 1)
+        .orderBy(F.desc('count'))
+        .limit(10)
+        .collect()
+    )
+    if duplicate:
+        raise RuntimeError(
+            'Incremental bucket contains duplicate source_record_key values: '
+            + ', '.join(
+                f"{row['source_record_key']} ({row['count']})" for row in duplicate
+            )
+        )
+    return {
+        'row_count': int(summary['row_count'] or 0),
+        'parent_count': int(parent_count),
+    }
+
+
+def _merge_incremental_stage_rows(stage_table: str) -> int:
+    source = bronze_project_contract(spark.table(stage_table), MP_TARGET)
+    assignments = {
+        column_name: F.col(f's.{column_name}') for column_name in source.columns
+    }
+    (
+        DeltaTable.forName(spark, MP_TARGET)
+        .alias('t')
+        .merge(source.alias('s'), 't.source_record_key=s.source_record_key')
+        .whenMatchedUpdate(
+            condition=(
+                'NOT (t.source_payload_hash <=> s.source_payload_hash) OR '
+                'NOT (t.mapping_payload_hash <=> s.mapping_payload_hash)'
+            ),
+            set=assignments,
+        )
+        .whenNotMatchedInsert(values=assignments)
+        .execute()
+    )
+    metrics = _latest_operation_metrics(MP_TARGET)
+    return int(metrics.get('numTargetRowsInserted', 0)) + int(
+        metrics.get('numTargetRowsUpdated', 0)
+    )
+
+
+def _run_incremental_bucket(
+    manifest: dict,
+    scope_table: str,
+    inputs: dict[str, str],
+    branch: str,
+    bucket_id: int,
+) -> dict:
+    run_id = manifest['run_id']
+    stage_name = f'{branch.upper()}_BUCKET'
+    merge_stage_name = f'MERGE_{branch.upper()}_BUCKET'
+    stage_table = _incremental_stage_table(
+        run_id, f'{branch}_b{int(bucket_id):03d}'
+    )
+    parent_count = int(
+        spark.table(scope_table)
+        .filter(
+            (F.col('source_table') == branch)
+            & (F.col('_mp_bucket') == int(bucket_id))
+        )
+        .count()
+    )
+    completed_stage = _completed_incremental_progress(
+        run_id, stage_name, branch, bucket_id, stage_table
+    )
+    if completed_stage is None:
+        attempts = int(INCREMENTAL_STAGE_RETRIES) + 1
+        for attempt in _mp_builtins.range(1, attempts + 1):
+            _write_incremental_progress(
+                run_id,
+                stage_name,
+                branch,
+                bucket_id,
+                'RUNNING',
+                table_name=stage_table,
+                parent_count=parent_count,
+            )
+            originals: dict[str, str] = {}
+            views: list[str] = []
+            try:
+                _drop_table_if_exists(stage_table)
+                if parent_count == 0:
+                    (
+                        spark.table(MP_TARGET)
+                        .limit(0)
+                        .write.format('delta')
+                        .mode('overwrite')
+                        .option('overwriteSchema', 'true')
+                        .saveAsTable(stage_table)
+                    )
+                else:
+                    originals, views = _install_incremental_bucket_views(
+                        manifest,
+                        scope_table,
+                        inputs,
+                        branch,
+                        bucket_id,
+                    )
+                    sql_text = _mp_build_select(
+                        full=False,
+                        branch=branch,
+                        alias_person_table=inputs['alias_person'],
+                        alias_resolver_table=inputs['alias_resolver'],
+                        run_timestamp=manifest['run_timestamp'],
+                    )
+                    _materialize_stage(sql_text, stage_table, count_rows=False)
+                stage_metrics = _validate_incremental_bucket(
+                    stage_table, branch, parent_count
+                )
+                _write_incremental_progress(
+                    run_id,
+                    stage_name,
+                    branch,
+                    bucket_id,
+                    'COMPLETE',
+                    table_name=stage_table,
+                    row_count=stage_metrics['row_count'],
+                    parent_count=stage_metrics['parent_count'],
+                )
+                _pathology_stage_audit(
+                    'BUCKET_STAGE_COMPLETE',
+                    {
+                        'branch': branch,
+                        'bucket_id': int(bucket_id),
+                        'row_count': stage_metrics['row_count'],
+                        'parent_count': parent_count,
+                        'table_name': stage_table,
+                    },
+                )
+                completed_stage = {
+                    **stage_metrics,
+                    'table_name': stage_table,
+                }
+                break
+            except Exception as exc:
+                _write_incremental_progress(
+                    run_id,
+                    stage_name,
+                    branch,
+                    bucket_id,
+                    'FAILED',
+                    table_name=stage_table,
+                    parent_count=parent_count,
+                    error=str(exc),
+                )
+                if not _retryable_full_build_failure(exc) or attempt >= attempts:
+                    raise
+                print(
+                    f'[map_pathology_v3] RETRY {stage_name} '
+                    f'bucket={bucket_id} attempt={attempt + 1}/{attempts}; '
+                    f'reason={str(exc).splitlines()[0][:500]}'
+                )
+            finally:
+                _restore_incremental_bucket_views(originals, views)
+    else:
+        _pathology_stage_audit(
+            'BUCKET_STAGE_REUSE',
+            {
+                'branch': branch,
+                'bucket_id': int(bucket_id),
+                'row_count': int(completed_stage.get('row_count') or 0),
+                'parent_count': int(completed_stage.get('parent_count') or 0),
+                'table_name': stage_table,
+            },
+        )
+
+    completed_merge = _completed_incremental_progress(
+        run_id, merge_stage_name, branch, bucket_id, stage_table
+    )
+    if completed_merge is None:
+        attempts = int(INCREMENTAL_STAGE_RETRIES) + 1
+        for attempt in _mp_builtins.range(1, attempts + 1):
+            _write_incremental_progress(
+                run_id,
+                merge_stage_name,
+                branch,
+                bucket_id,
+                'RUNNING',
+                table_name=stage_table,
+                row_count=int(completed_stage.get('row_count') or 0),
+                parent_count=parent_count,
+            )
+            try:
+                changed_rows = _merge_incremental_stage_rows(stage_table)
+                _write_incremental_progress(
+                    run_id,
+                    merge_stage_name,
+                    branch,
+                    bucket_id,
+                    'COMPLETE',
+                    table_name=stage_table,
+                    row_count=int(completed_stage.get('row_count') or 0),
+                    parent_count=parent_count,
+                    changed_rows=changed_rows,
+                )
+                completed_merge = {'changed_rows': changed_rows}
+                _pathology_stage_audit(
+                    'BUCKET_MERGE_COMPLETE',
+                    {
+                        'branch': branch,
+                        'bucket_id': int(bucket_id),
+                        'changed_rows': changed_rows,
+                    },
+                )
+                break
+            except Exception as exc:
+                _write_incremental_progress(
+                    run_id,
+                    merge_stage_name,
+                    branch,
+                    bucket_id,
+                    'FAILED',
+                    table_name=stage_table,
+                    error=str(exc),
+                )
+                if not _retryable_full_build_failure(exc) or attempt >= attempts:
+                    raise
+                print(
+                    f'[map_pathology_v3] RETRY {merge_stage_name} '
+                    f'bucket={bucket_id} attempt={attempt + 1}/{attempts}; '
+                    f'reason={str(exc).splitlines()[0][:500]}'
+                )
+    else:
+        _pathology_stage_audit(
+            'BUCKET_MERGE_REUSE',
+            {
+                'branch': branch,
+                'bucket_id': int(bucket_id),
+                'changed_rows': int(completed_merge.get('changed_rows') or 0),
+            },
+        )
+    return {
+        'branch': branch,
+        'bucket_id': int(bucket_id),
+        'table_name': stage_table,
+        'row_count': int(completed_stage.get('row_count') or 0),
+        'parent_count': parent_count,
+        'changed_rows': int(completed_merge.get('changed_rows') or 0),
+    }
+
+
+def _run_incremental_buckets(
+    manifest: dict,
+    scope_table: str,
+    inputs: dict[str, str],
+) -> list[dict]:
+    metrics = []
+    for branch, bucket_count in (
+        ('linked', int(INCREMENTAL_LINKED_BUCKETS)),
+        ('raw', int(INCREMENTAL_RAW_BUCKETS)),
+    ):
+        for bucket_id in _mp_builtins.range(bucket_count):
+            metrics.append(
+                _run_incremental_bucket(
+                    manifest,
+                    scope_table,
+                    inputs,
+                    branch,
+                    bucket_id,
+                )
+            )
+    return metrics
+
+
+def _incremental_source_keys(bucket_metrics: list[dict]) -> DataFrame:
+    frames = [
+        spark.table(item['table_name']).select('source_record_key')
+        for item in bucket_metrics
+    ]
+    if not frames:
+        return spark.createDataFrame([], 'source_record_key STRING')
+    return reduce(lambda left, right: left.unionByName(right), frames)
+
+
+def _reconcile_incremental_stale(
+    manifest: dict,
+    scope_table: str,
+    bucket_metrics: list[dict],
+) -> int:
+    run_id = manifest['run_id']
+    stale_table = _incremental_stage_table(run_id, 'stale_keys')
+
+    def stale_factory():
+        parent_keys = spark.table(scope_table).select('source_parent_key')
+        source_keys = _incremental_source_keys(bucket_metrics)
+        return (
+            spark.table(MP_TARGET)
+            .join(parent_keys, 'source_parent_key', 'inner')
+            .join(source_keys, 'source_record_key', 'left_anti')
+            .select('source_record_key')
+            .dropDuplicates(['source_record_key'])
+        )
+
+    stale_metrics = _run_incremental_df_stage(
+        manifest,
+        'STALE_KEYS',
+        'all',
+        -1,
+        stale_table,
+        stale_factory,
+    )
+    stale_count = int(stale_metrics.get('row_count') or 0)
+    completed_delete = _completed_incremental_progress(
+        run_id, 'STALE_DELETE', 'all', -1, stale_table
+    )
+    if completed_delete is not None:
+        deleted = int(completed_delete.get('stale_rows_deleted') or 0)
+        _pathology_stage_audit(
+            'STALE_DELETE_REUSE', {'stale_rows_deleted': deleted}
+        )
+        return deleted
+    if stale_count == 0:
+        _write_incremental_progress(
+            run_id,
+            'STALE_DELETE',
+            'all',
+            -1,
+            'COMPLETE',
+            table_name=stale_table,
+            row_count=0,
+            stale_rows_deleted=0,
+        )
+        return 0
+    attempts = int(INCREMENTAL_STAGE_RETRIES) + 1
+    for attempt in _mp_builtins.range(1, attempts + 1):
+        _write_incremental_progress(
+            run_id,
+            'STALE_DELETE',
+            'all',
+            -1,
+            'RUNNING',
+            table_name=stale_table,
+            row_count=stale_count,
+        )
+        try:
+            (
+                DeltaTable.forName(spark, MP_TARGET)
+                .alias('t')
+                .merge(
+                    spark.table(stale_table).alias('s'),
+                    't.source_record_key=s.source_record_key',
+                )
+                .whenMatchedDelete()
+                .execute()
+            )
+            operation = _latest_operation_metrics(MP_TARGET)
+            deleted = int(operation.get('numTargetRowsDeleted', stale_count))
+            _write_incremental_progress(
+                run_id,
+                'STALE_DELETE',
+                'all',
+                -1,
+                'COMPLETE',
+                table_name=stale_table,
+                row_count=stale_count,
+                stale_rows_deleted=deleted,
+            )
+            _pathology_stage_audit(
+                'STALE_DELETE_COMPLETE', {'stale_rows_deleted': deleted}
+            )
+            return deleted
+        except Exception as exc:
+            _write_incremental_progress(
+                run_id,
+                'STALE_DELETE',
+                'all',
+                -1,
+                'FAILED',
+                table_name=stale_table,
+                row_count=stale_count,
+                error=str(exc),
+            )
+            if not _retryable_full_build_failure(exc) or attempt >= attempts:
+                raise
+            print(
+                f'[map_pathology_v3] RETRY STALE_DELETE '
+                f'attempt={attempt + 1}/{attempts}; '
+                f'reason={str(exc).splitlines()[0][:500]}'
+            )
+    raise RuntimeError('Incremental stale-row reconciliation did not complete.')
+
+
+def _register_incremental_discovery_view(
+    manifest: dict,
+    bucket_metrics: list[dict],
+) -> str:
+    token = re.sub('[^a-zA-Z0-9]', '', manifest['run_id'])[:12]
+    view_name = f'mp_pathology_incremental_discovery_{token}'
+    discovery = None
+    for item in bucket_metrics:
+        frame = spark.table(item['table_name'])
+        discovery = (
+            frame
+            if discovery is None
+            else discovery.unionByName(frame, allowMissingColumns=True)
+        )
+    if discovery is None:
+        raise RuntimeError('No completed incremental bucket tables exist for discovery.')
+    discovery.createOrReplaceTempView(view_name)
+    return view_name
+
+
+def _cleanup_incremental_stages(run_id: str) -> None:
+    tables = [
+        row['table_name']
+        for row in (
+            spark.table(MP_INCREMENTAL_PROGRESS)
+            .filter(F.col('run_id') == run_id)
+            .select('table_name')
+            .where('table_name IS NOT NULL')
+            .distinct()
+            .collect()
+        )
+    ]
+    prefix = f'{MP_CONTROL_SCHEMA}.map_pathology_incremental_'
+    for table_name in tables:
+        if not table_name.startswith(prefix):
+            continue
+        try:
+            _drop_table_if_exists(table_name)
+        except Exception as exc:
+            print(
+                f'[map_pathology_v3] incremental cleanup warning for {table_name}: '
+                f'{str(exc).splitlines()[0][:500]}'
+            )
+
+
+def _run_restartable_incremental(manifest: dict) -> dict:
+    scope_metrics = _materialize_incremental_scope(manifest)
+    if not _incremental_phase_reached(manifest, 'SCOPE_COMPLETE'):
+        _update_incremental_phase(manifest, 'SCOPE_COMPLETE')
+    inputs = _build_incremental_inputs(manifest, scope_metrics['table_name'])
+    if not _incremental_phase_reached(manifest, 'INPUTS_COMPLETE'):
+        _update_incremental_phase(manifest, 'INPUTS_COMPLETE')
+    bucket_metrics = _run_incremental_buckets(
+        manifest, scope_metrics['table_name'], inputs
+    )
+    if not _incremental_phase_reached(manifest, 'BUCKETS_COMPLETE'):
+        _update_incremental_phase(manifest, 'BUCKETS_COMPLETE')
+    stale_rows_deleted = _reconcile_incremental_stale(
+        manifest, scope_metrics['table_name'], bucket_metrics
+    )
+    if not _incremental_phase_reached(manifest, 'RECONCILED'):
+        _update_incremental_phase(manifest, 'RECONCILED')
+    discovery_view = _register_incremental_discovery_view(
+        manifest, bucket_metrics
+    )
+    return {
+        'manifest': manifest,
+        'source_stage': discovery_view,
+        'discovery_view': discovery_view,
+        'source_parent_count': int(scope_metrics['parent_count']),
+        'staged_row_count': _mp_builtins.sum(
+            int(item['row_count']) for item in bucket_metrics
+        ),
+        'changed_rows': _mp_builtins.sum(
+            int(item['changed_rows']) for item in bucket_metrics
+        ),
+        'stale_rows_deleted': int(stale_rows_deleted),
+        'bucket_metrics': bucket_metrics,
+    }
 
 def _full_build_alias_person_sql() -> str:
     return f'\n    WITH ranked AS (\n      SELECT\n        CAST(PERSON_ID AS BIGINT) AS PERSON_ID,\n        CAST(PERSON_ALIAS_TYPE_CD AS INT) AS alias_type,\n        ALIAS,\n        ADC_UPDT,\n        ROW_NUMBER() OVER (\n          PARTITION BY PERSON_ID,PERSON_ALIAS_TYPE_CD\n          ORDER BY BEG_EFFECTIVE_DT_TM DESC NULLS LAST,\n                   PERSON_ALIAS_ID DESC NULLS LAST\n        ) AS rn\n      FROM {_qn(PERSON_ALIAS)}\n      WHERE ACTIVE_IND=1 AND PERSON_ALIAS_TYPE_CD IN (10,18)\n    )\n    SELECT\n      PERSON_ID,\n      MAX(CASE WHEN alias_type=10 THEN ALIAS END) AS canonical_mrn,\n      MAX(CASE WHEN alias_type=10 THEN ADC_UPDT END) AS canonical_mrn_adc,\n      MAX(CASE WHEN alias_type=18 THEN ALIAS END) AS canonical_nhs,\n      MAX(CASE WHEN alias_type=18 THEN ADC_UPDT END) AS canonical_nhs_adc\n    FROM ranked\n    WHERE rn=1\n    GROUP BY PERSON_ID\n    '
@@ -1021,6 +2695,8 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     scratch_tables: list[str] = []
     full_manifest: dict | None = None
+    incremental_manifest: dict | None = None
+    incremental_discovery_view: str | None = None
     mode = 'UNKNOWN'
     source_parent_count = 0
     staged_row_count = 0
@@ -1041,7 +2717,12 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
             started_at = full_manifest['started_at']
             cutoffs = full_manifest['cutoffs']
         else:
-            cutoffs = _capture_cutoffs()
+            _ensure_incremental_control_tables()
+            incremental_manifest = _load_or_start_incremental(state)
+            run_id = incremental_manifest['run_id']
+            started_at = incremental_manifest['started_at']
+            cutoffs = incremental_manifest['cutoffs']
+            state = incremental_manifest['state']
         print(f'[map_pathology_v3] {mode}; run_id={run_id}')
         if full_manifest is not None and _phase_reached(full_manifest, 'PUBLISHED'):
             print('[map_pathology_v3] post-publication resume: deferring native crosswalk refresh')
@@ -1058,36 +2739,21 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
                 _set_rebuild_flag(False)
                 _update_full_build_phase(full_manifest, 'BASELINE_READY')
         else:
-            source_stage = _stage_table(run_id, 'source')
-            scratch_tables.append(source_stage)
-            try:
-                touched_parents, scope_modes = _prepare_incremental_scope(state, cutoffs)
-                source_parent_count = int(touched_parents.count())
-            except Exception as scope_exc:
-                if not _incremental_snapshot_read_unavailable(scope_exc):
-                    raise
-                print(
-                    '[map_pathology_v3] RECOVERY: deferred CDF read failed; '
-                    'rebuilding incremental scope from current snapshots and ADC watermarks. '
-                    f'Reason: {str(scope_exc).splitlines()[0][:1000]}'
-                )
-                touched_parents, scope_modes = _prepare_incremental_scope(
-                    state,
-                    cutoffs,
-                    force_snapshot_fallback=True,
-                )
-                source_parent_count = int(touched_parents.count())
-            print(f'[map_pathology_v3] touched source parents: {source_parent_count:,}; modes={scope_modes}')
-            if source_parent_count:
-                staged_row_count = _materialize_stage(_mp_build_select(full=False), source_stage)
-                validation = _validate_stage(source_stage)
-                staged_row_count = validation['row_count']
-                merge_metrics = _merge_and_reconcile(source_stage, touched_parents)
-                inserted_or_updated_rows += merge_metrics['changed_rows']
-                stale_rows_deleted += merge_metrics['stale_rows_deleted']
-            else:
-                spark.table(MP_TARGET).limit(0).write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(source_stage)
-            None
+            incremental_metrics = _run_restartable_incremental(
+                incremental_manifest
+            )
+            source_stage = incremental_metrics['source_stage']
+            incremental_discovery_view = incremental_metrics['discovery_view']
+            source_parent_count = int(
+                incremental_metrics['source_parent_count']
+            )
+            staged_row_count = int(incremental_metrics['staged_row_count'])
+            inserted_or_updated_rows += int(
+                incremental_metrics['changed_rows']
+            )
+            stale_rows_deleted += int(
+                incremental_metrics['stale_rows_deleted']
+            )
         skip_discovery_and_embed = False
         if full_manifest is not None:
             resumed_from_bulk_gate = _bulk_remap_required(full_manifest.get('last_error'))
@@ -1100,6 +2766,12 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
         bulk_remap_deferred = mapping_metrics['bulk_remap_deferred']
         inserted_or_updated_rows += mapping_metrics['mapping_changed_rows']
         stale_rows_deleted += mapping_metrics['mapping_stale_rows_deleted']
+        if incremental_manifest is not None and not _incremental_phase_reached(
+            incremental_manifest, 'MAPPING_COMPLETE'
+        ):
+            _update_incremental_phase(
+                incremental_manifest, 'MAPPING_COMPLETE'
+            )
         _refresh_map_cutoffs(cutoffs)
         _advance_state(cutoffs)
         if full_manifest is not None:
@@ -1107,6 +2779,9 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
             _cleanup_full_build_stages(full_manifest['build_id'])
             _drop_table_if_exists(MP_FULL_BUILD_PROGRESS)
             _drop_table_if_exists(MP_FULL_BUILD_MANIFEST)
+        if incremental_manifest is not None:
+            _update_incremental_phase(incremental_manifest, 'SUCCESS')
+            _cleanup_incremental_stages(incremental_manifest['run_id'])
         completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         _write_run_log(run_id=run_id, started_at=started_at, completed_at=completed_at, mode=mode, status='SUCCESS', pipeline_version=MP_VERSION, source_parent_count=source_parent_count, staged_row_count=staged_row_count, inserted_or_updated_rows=inserted_or_updated_rows, stale_rows_deleted=stale_rows_deleted, additive_map_keys=additive_map_keys, correction_map_keys=correction_map_keys, message='Completed; bulk embedding remap deferred' if bulk_remap_deferred else 'Completed')
         result = {'run_id': run_id, 'mode': mode, 'source_parent_count': source_parent_count, 'staged_row_count': staged_row_count, 'inserted_or_updated_rows': inserted_or_updated_rows, 'stale_rows_deleted': stale_rows_deleted, 'additive_map_keys': additive_map_keys, 'correction_map_keys': correction_map_keys, 'bulk_remap_deferred': bulk_remap_deferred, 'rebuild_flagged': _read_rebuild_flag()}
@@ -1120,6 +2795,18 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
                 _update_full_build_phase(full_manifest, full_manifest['phase'], error=message)
             except Exception as manifest_exc:
                 print(f'[map_pathology_v3] manifest error recording warning: {str(manifest_exc).splitlines()[0][:500]}')
+        if incremental_manifest is not None:
+            try:
+                _update_incremental_phase(
+                    incremental_manifest,
+                    incremental_manifest['phase'],
+                    error=message,
+                )
+            except Exception as manifest_exc:
+                print(
+                    '[map_pathology_v3] incremental manifest error recording warning: '
+                    f'{str(manifest_exc).splitlines()[0][:500]}'
+                )
         _write_run_log(run_id=run_id, started_at=started_at, completed_at=completed_at, mode=mode, status='FAILED', pipeline_version=MP_VERSION, source_parent_count=source_parent_count, staged_row_count=staged_row_count, inserted_or_updated_rows=inserted_or_updated_rows, stale_rows_deleted=stale_rows_deleted, additive_map_keys=additive_map_keys, correction_map_keys=correction_map_keys, message=message[:4000])
         raise
     finally:
@@ -1128,6 +2815,11 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
                 _drop_table_if_exists(table_name)
             except Exception as cleanup_exc:
                 print(f'[map_pathology_v3] scratch cleanup warning for {table_name}: {str(cleanup_exc)[:500]}')
+        if incremental_discovery_view is not None:
+            try:
+                spark.catalog.dropTempView(incremental_discovery_view)
+            except Exception:
+                pass
         ENABLE_EMBED_LOOP = previous_embed_setting
 
 def validate_map_pathology_v2() -> dict:
@@ -1186,6 +2878,7 @@ def validate_map_pathology_v2() -> dict:
     }
     print(result)
     return result
+
 # COMMAND ----------
 
 # MAGIC %md

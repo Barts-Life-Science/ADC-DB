@@ -1653,7 +1653,20 @@ def _mmp_align_to_schema(df: DataFrame, schema: T.StructType, allow_missing: boo
     return df.select(*expressions)
 
 def _mmp_add_row_hash(df: DataFrame, schema: T.StructType, exclusions: Sequence[str]) -> DataFrame:
+    # Ingestion and orchestration timestamps are retained as provenance but are
+    # not semantic row content. Including them makes snapshot reloads look like
+    # clinical changes and rewrites otherwise identical rows.
     excluded = {name.lower() for name in exclusions}
+    excluded.update({
+        field.name.lower()
+        for field in schema.fields
+        if field.name.upper() == 'ADC_UPDT'
+        or field.name.upper().endswith('_ADC_UPDT')
+        or field.name.upper().endswith('_SOURCE_VERSION')
+        or field.name.upper().endswith('_CDF_COMMIT_VERSION')
+        or field.name.upper().endswith('_CDF_COMMIT_TIMESTAMP')
+        or field.name.upper() in {'LAST_UTC_TS', 'TRIGGER_SOURCES'}
+    })
     columns = [field.name for field in schema.fields if field.name.lower() not in excluded and field.name.lower() != 'row_hash' and (field.name in df.columns)]
     normalized = [F.coalesce(F.col(name).cast('string'), F.lit('<NULL>')) for name in columns]
     return df.withColumn('ROW_HASH', F.xxhash64(*normalized))
@@ -1810,7 +1823,10 @@ def _mmp_schema_matches(table_name: str, schema: T.StructType) -> bool:
         return False
     current = [(field.name.lower(), field.dataType.simpleString()) for field in spark.table(table_name).schema.fields]
     expected = [(field.name.lower(), field.dataType.simpleString()) for field in schema.fields]
-    return current == expected
+    expected_names = {name for name, _ in expected}
+    base = [field for field in current if field[0] in expected_names]
+    additive = [field for field in current if field[0] not in expected_names]
+    return base == expected and all(name.startswith('anon_') for name, _ in additive)
 
 def _mmp_write_replacement(df: DataFrame, table_name: str, schema: T.StructType) -> None:
     effective_schema = (
@@ -1824,8 +1840,24 @@ def _mmp_write_replacement(df: DataFrame, table_name: str, schema: T.StructType)
     aligned.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(table_name)
 
 def _mmp_merge_change_condition(schema: T.StructType, key_columns: Sequence[str]) -> str:
+    names = {field.name.upper() for field in schema.fields}
+    if 'ROW_HASH' in names:
+        presence = (
+            " OR NOT (t.SOURCE_PRESENT_IND <=> s.SOURCE_PRESENT_IND)"
+            if 'SOURCE_PRESENT_IND' in names else ''
+        )
+        return 'NOT (t.ROW_HASH <=> s.ROW_HASH)' + presence
     keys = {column.lower() for column in key_columns}
-    comparisons = [f'NOT (t.{field.name} <=> s.{field.name})' for field in schema.fields if field.name.lower() not in keys and field.name not in {'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'SOURCE_ABSENT_DETECTED_TS'}]
+    volatile = {'PIPELINE_RUN_ID', 'PIPELINE_UPDT_DT_TM', 'SOURCE_ABSENT_DETECTED_TS', 'TRIGGER_SOURCES'}
+    comparisons = [
+        f'NOT (t.{field.name} <=> s.{field.name})'
+        for field in schema.fields
+        if field.name.lower() not in keys
+        and field.name.upper() not in volatile
+        and field.name.upper() != 'ADC_UPDT'
+        and not field.name.upper().endswith('_ADC_UPDT')
+        and not field.name.upper().endswith('_SOURCE_VERSION')
+    ]
     return ' OR '.join(comparisons) if comparisons else 'false'
 
 def _mmp_reconcile_full_snapshot(current_df: DataFrame, table_name: str, schema: T.StructType, key_columns: Sequence[str], comment: str, config: MapMedicalPersonnelConfig) -> None:
@@ -2201,7 +2233,7 @@ def create_medical_personnel_mapping_incr(config: MapMedicalPersonnelConfig=DEFA
     missing_tables = [table for table in required_tables if not _mmp_table_exists(table)]
     if missing_tables:
         raise RuntimeError('Medical-personnel v2 is not deployed. Missing tables: ' + ', '.join(missing_tables) + '. Run deploy_map_medical_personnel_improvements() once.')
-    expected_schemas = ((config.target_table, schema_map_medical_personnel_v2), (config.group_bridge_table, schema_map_medical_personnel_group), (config.alias_bridge_table, schema_map_medical_personnel_alias), (config.event_state_table, schema_map_medical_personnel_event_state), (config.location_evidence_table, schema_map_medical_personnel_location_evidence))
+    expected_schemas = ((config.target_table, bronze_contract_schema(config.target_table)), (config.group_bridge_table, schema_map_medical_personnel_group), (config.alias_bridge_table, schema_map_medical_personnel_alias), (config.event_state_table, schema_map_medical_personnel_event_state), (config.location_evidence_table, schema_map_medical_personnel_location_evidence))
     incompatible = [table for table, schema in expected_schemas if not _mmp_schema_matches(table, schema)]
     if incompatible:
         raise RuntimeError('Medical-personnel v2 schema mismatch for: ' + ', '.join(incompatible) + '. Run deploy_map_medical_personnel_improvements() once.')
@@ -2209,16 +2241,30 @@ def create_medical_personnel_mapping_incr(config: MapMedicalPersonnelConfig=DEFA
     missing_checkpoints = [source for source in config.location_cdf_sources if source not in checkpoints]
     if missing_checkpoints:
         raise RuntimeError('Missing source-version checkpoints for: ' + ', '.join(missing_checkpoints) + '. Run deploy_map_medical_personnel_improvements() once.')
+    global _map_medical_pending_versions
+    global _map_medical_pending_run_id
+    global _map_medical_last_location_stats
     versions = {table: _mmp_get_latest_delta_version(table) for table in config.all_sources}
     run_id = str(uuid4())
     run_timestamp = datetime.now(timezone.utc)
+    changed_sources = [
+        table for table, version in versions.items()
+        if int(version) > int(checkpoints.get(table, -1))
+    ]
+    if not changed_sources:
+        _map_medical_pending_versions = versions
+        _map_medical_pending_run_id = run_id
+        _map_medical_last_location_stats = {
+            'changed_event_keys': 0,
+            'changed_encounters': 0,
+            'affected_personnel': 0,
+            'no_change_fast_path': 1,
+        }
+        return spark.table(config.target_table).limit(0)
     location_stats = _mmp_refresh_location_support_incremental(checkpoints, versions, run_id, run_timestamp, config)
     _mmp_refresh_group_bridge(versions, run_id, run_timestamp, config)
     _mmp_refresh_alias_bridge(versions, run_id, run_timestamp, config)
     result = _mmp_build_target_snapshot(versions, run_id, run_timestamp, config)
-    global _map_medical_pending_versions
-    global _map_medical_pending_run_id
-    global _map_medical_last_location_stats
     _map_medical_pending_versions = versions
     _map_medical_pending_run_id = run_id
     _map_medical_last_location_stats = location_stats
@@ -3017,17 +3063,40 @@ def _latest_encounter_cdf(config: MapEncounterConfig, starting_version: int, end
     return (upserts, deletes, trigger_rows)
 
 def _changed_lookup_codes(config: MapEncounterConfig, starting_version: int, ending_version: int) -> List[int]:
-    changes = _read_cdf(config.code_value_table, starting_version, ending_version)
-    if changes is None:
+    if starting_version > ending_version:
         return []
-    changed_codes = changes.filter(F.col('_change_type').isin('insert', 'update_preimage', 'update_postimage', 'delete')).select(_checked_long(F.col('CODE_VALUE'), 'MILL_CODE_VALUE CDF CODE_VALUE', required=True).alias('CODE_VALUE')).dropDuplicates(['CODE_VALUE'])
-    try:
-        count = changed_codes.count()
-        if count > config.max_incremental_lookup_codes:
-            raise OverflowError(f'{count:,} code values changed, exceeding the safe incremental threshold of {config.max_incremental_lookup_codes:,}')
-        return [int(row['CODE_VALUE']) for row in changed_codes.collect()]
-    finally:
-        None
+    previous_version = int(starting_version) - 1
+    semantic_columns = ['CODE_SET', 'DISPLAY', 'DESCRIPTION', 'CDF_MEANING', 'ACTIVE_IND']
+
+    def snapshot(version: int, payload_name: str) -> DataFrame:
+        frame = _read_snapshot(config.code_value_table, version)
+        available = [name for name in semantic_columns if name in frame.columns]
+        payload = F.sha2(
+            F.to_json(F.struct(*[F.col(name).alias(name) for name in available]), {'ignoreNullFields': 'false'}),
+            256,
+        )
+        return (
+            frame.select(
+                _checked_long(F.col('CODE_VALUE'), 'MILL_CODE_VALUE.CODE_VALUE', required=True).alias('CODE_VALUE'),
+                payload.alias('_PAYLOAD'),
+            )
+            .where(F.col('CODE_VALUE').isNotNull())
+            .groupBy('CODE_VALUE')
+            .agg(F.sort_array(F.collect_set('_PAYLOAD')).alias(payload_name))
+        )
+
+    before = snapshot(previous_version, '_BEFORE').alias('b')
+    after = snapshot(int(ending_version), '_AFTER').alias('a')
+    changed_codes = (
+        before.join(after, F.col('b.CODE_VALUE').eqNullSafe(F.col('a.CODE_VALUE')), 'full')
+        .where(~F.col('b._BEFORE').eqNullSafe(F.col('a._AFTER')))
+        .select(F.coalesce(F.col('b.CODE_VALUE'), F.col('a.CODE_VALUE')).alias('CODE_VALUE'))
+        .dropDuplicates(['CODE_VALUE'])
+    )
+    count = changed_codes.count()
+    if count > config.max_incremental_lookup_codes:
+        raise OverflowError(f'{count:,} semantically changed code values exceed the safe incremental threshold of {config.max_incremental_lookup_codes:,}')
+    return [int(row['CODE_VALUE']) for row in changed_codes.collect()]
 
 def _raw_rows_affected_by_lookup_codes(raw_snapshot: DataFrame, changed_codes: Sequence[int]) -> Optional[DataFrame]:
     if not changed_codes:
@@ -3308,4 +3377,3 @@ finally:
         has_cdf_enabled = _pipeline_shared_has_cdf_enabled
     if _pipeline_shared_get_incremental is not None:
         get_incremental_data_with_cdf = _pipeline_shared_get_incremental
-
