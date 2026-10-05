@@ -215,6 +215,12 @@ SPINE_ENCOUNTER_SELECT = [
     '`arrival_confidence` AS `arrival_confidence`',
     '`departure_method` AS `departure_method`',
     '`departure_confidence` AS `departure_confidence`',
+    '`class_actcode` AS `class_actcode`',  # SDI_ENCOUNTER_STATE_V1
+    '`class_actcode_display` AS `class_actcode_display`',  # SDI_ENCOUNTER_STATE_V1
+    '`class_actcode_method` AS `class_actcode_method`',  # SDI_ENCOUNTER_STATE_V1
+    '`departure_rejected_reason` AS `departure_rejected_reason`',  # SDI_ENCOUNTER_STATE_V1
+    '`last_activity_datetime` AS `last_activity_datetime`',  # SDI_ENCOUNTER_STATE_V1
+    '`encounter_close_state` AS `encounter_close_state`',  # SDI_ENCOUNTER_STATE_V1
     '`length_of_stay_minutes` AS `length_of_stay_minutes`',
     '`scheduled_start` AS `scheduled_start`',
     'CASE WHEN `scheduled_start` IS NOT NULL AND `scheduled_end` IS NOT NULL AND `scheduled_start` > `scheduled_end` THEN NULL ELSE `scheduled_end` END AS `scheduled_end`',
@@ -256,7 +262,7 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
     "parent_encounter_id": "Governed containment parent when supplied by source evidence.",
     "parentage_status": "Provenance state for encounter containment.",
     "encounter_level": "Rules-light source-classified encounter level.",
-    "class_code": "Source encounter class code.",
+    "class_code": "Source (local Cerner) encounter class code; see class_actcode for the HL7 ActCode.",  # SDI_ENCOUNTER_STATE_V1
     "class_display": "Source encounter class display.",
     "type_code": "Source encounter type code.",
     "type_display": "Source encounter type display.",
@@ -270,6 +276,12 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
     "arrival_confidence": "Source-derived confidence for period_start.",
     "departure_method": "Method selecting period_end.",
     "departure_confidence": "Source-derived confidence for period_end.",
+    "class_actcode": "HL7 v3 ActCode for the encounter class (the vocabulary FHIR Encounter.class uses): IMP, AMB, EMER or PRENC. From encounter_level for spell/outpatient_attendance/emergency_visit/preadmission (the type class is the stronger signal); from the source class display for recurring_contact and other; NULL for results_only, waiting_list_placeholder and unmapped classes (Wait List has no ActCode). Local codes are never relabelled; class_code stays the Cerner code.",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_display": "HL7 ActCode display for class_actcode.",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_method": "How class_actcode was assigned: encounter_level_crosswalk, source_class_crosswalk or no_class (class_actcode NULL). Never NULL.",  # SDI_ENCOUNTER_STATE_V1
+    "departure_rejected_reason": "Why bronze refused the winning departure candidate, leaving period_end NULL: BEFORE_ARRIVAL (it preceded the arrival), ADMINISTRATIVE_CLOSE (a nightly inactivity-timeout close) or FIXED_WINDOW_CLOSE (the 60-day outpatient close job). NULL when no candidate was refused. map_encounter.DEPARTURE_REJECTED_REASON.",  # SDI_ENCOUNTER_STATE_V1
+    "last_activity_datetime": "Latest recorded activity on the encounter (UTC instant): greatest of the last current clinical event, last active order and last nurse-unit arrival. NULL when none exists. Use it to judge whether an encounter with no departure is still live.",  # SDI_ENCOUNTER_STATE_V1
+    "encounter_close_state": "Whether the encounter is known to be closed, in precedence order: departed (period_end is set); source_closed_no_observed_departure (an administrative or fixed-window job closed it, departure time unknown); departure_evidence_invalid (a departure stamp precedes arrival, closure unknown); open_ward_interval (the latest nurse-unit interval has no end); no_departure_recorded (no departure evidence; open or abandoned, judge with last_activity_datetime). Never NULL; no reference to the current date.",  # SDI_ENCOUNTER_STATE_V1
     "length_of_stay_minutes": "Source-productised encounter duration.",
     "scheduled_start": "Scheduled arrival timestamp.",
     "scheduled_end": "Scheduled departure timestamp.",
@@ -287,7 +299,7 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
     "responsible_service_display": "Best available label for MED_SERVICE_CD.",
     "specialty_code": "Source specialty-unit code.",
     "specialty_display": "Source specialty-unit display.",
-    "current_location_key": "Source current nurse-unit code.",
+    "current_location_key": "Deterministic key of the encounter's current nurse unit (joins reference_location.location_key); null when map_encounter.LOC_NURSE_UNIT_CD is null or 0 (no unit recorded).",  # SDI_LOCATION_GOLD_V1
     "organization_id": "Source encounter organization reference.",
     "service_provider_organization_key": "Source organization primarily responsible for the encounter.",
     "reason_for_visit": "Verbatim source reason for visit.",
@@ -356,6 +368,12 @@ def gold_spine_encounter():
         '`arrival_confidence` AS `arrival_confidence`',
         '`departure_method` AS `departure_method`',
         '`departure_confidence` AS `departure_confidence`',
+        '`class_actcode` AS `class_actcode`',  # SDI_ENCOUNTER_STATE_V1
+        '`class_actcode_display` AS `class_actcode_display`',  # SDI_ENCOUNTER_STATE_V1
+        '`class_actcode_method` AS `class_actcode_method`',  # SDI_ENCOUNTER_STATE_V1
+        '`departure_rejected_reason` AS `departure_rejected_reason`',  # SDI_ENCOUNTER_STATE_V1
+        '`last_activity_datetime` AS `last_activity_datetime`',  # SDI_ENCOUNTER_STATE_V1
+        '`encounter_close_state` AS `encounter_close_state`',  # SDI_ENCOUNTER_STATE_V1
         '`length_of_stay_minutes` AS `length_of_stay_minutes`',
         '`scheduled_start` AS `scheduled_start`',
         '`scheduled_end` AS `scheduled_end`',
@@ -1189,8 +1207,8 @@ SPINE_LOCATION_STAY_COLUMN_COMMENTS = {
     "vip_ind": "Source VIP indicator.",
     "source_table": "Fully qualified bronze source table.",
     "source_row_id": "Deterministic grouped source-row identity.",
-    "record_status": "Derived location-stop status: superseded when the grouped maximum map_patient_journey.LOCATION_STOP_END_DT_TM is earlier than 2100-01-01; otherwise active, including an all-null or open-ended maximum. Grouping is by ENCNTR_ID and the stop discriminator. This is a status label, not an end timestamp or a comparison with the current wall clock.",
-    "record_status_effective_to": "Maximum map_patient_journey.LOCATION_STOP_END_DT_TM within the encounter/stop-discriminator group, returned only when that maximum is earlier than 2100-01-01. Otherwise null, including all-null or open-ended maxima. This uses the grouped stop end, not the earliest contributing boundary.",
+    "record_status": "Literal active: map_patient_journey carries no lifecycle flag that retracts or supersedes a location stop, so every published stop is the current record of that stop. Whether the patient has left is period_end / occupancy_end, not this status.",  # SDI_LOCATION_GOLD_V1
+    "record_status_effective_to": "Always null: a location stop has no record-lifecycle end. The stop's own end is period_end.",  # SDI_LOCATION_GOLD_V1
     "loaded_at": "Maximum map_patient_journey.ADC_UPDT within the ENCNTR_ID and stop-discriminator group. The discriminator uses LOCATION_STOP_SEQUENCE when present, otherwise ENCNTR_LOC_HIST_ID. This is contributing ingestion provenance, not the Silver refresh time; null when all contributing ADC_UPDT values are null.",
 }
 
@@ -1289,6 +1307,7 @@ SPINE_PERSON_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`religion_code` AS STRING))) = '0' THEN NULL ELSE `religion_code` END AS `religion_code`",
     '`religion_display` AS `religion_display`',
     '`deceased_ind` AS `deceased_ind`',
+    '`deceased_ind_source` AS `deceased_ind_source`',  # SDI_DECEASED_V1/gold:
     'CASE WHEN `deceased_datetime` < `birth_datetime` THEN NULL ELSE `deceased_datetime` END AS `deceased_datetime`',
     '`deceased_datetime_precision` AS `deceased_datetime_precision`',
     "CASE WHEN UPPER(TRIM(CAST(`confidentiality_code` AS STRING))) = '0' THEN NULL ELSE `confidentiality_code` END AS `confidentiality_code`",
@@ -1299,6 +1318,7 @@ SPINE_PERSON_SELECT = [
     '`current_mrn` AS `current_mrn`',
     '`current_mrn_status` AS `current_mrn_status`',
     '`mrn_selection_status` AS `mrn_selection_status`',
+    '`current_mrn_pool` AS `current_mrn_pool`',  # SDI_MRN_POOL_V1/gold:
     '`nhs_number` AS `nhs_number`',
     '`nhs_number_status` AS `nhs_number_status`',
     '`nhs_number_selection_status` AS `nhs_number_selection_status`',
@@ -1328,7 +1348,8 @@ SPINE_PERSON_COLUMN_COMMENTS = {
     "marital_status_display": "Source marital-status display.",
     "religion_code": "Source religion code.",
     "religion_display": "Source religion display.",
-    "deceased_ind": "Whether the source indicates the person is deceased.",
+    "deceased_ind": "True when a death date is recorded or map_person.deceased_display is 'Deceased' (DECEASED_CD 3768549, CDF YES); false otherwise, including DECEASED_CD 'No' (684730) and 0. Never NULL.",  # SDI_DECEASED_V1/gold:
+    "deceased_ind_source": "Evidence behind deceased_ind: death_date (a death timestamp is recorded) or deceased_code (DECEASED_CD displays 'Deceased' with no date); NULL when deceased_ind is false.",
     "deceased_datetime": "Source death timestamp.",
     "deceased_datetime_precision": "Raw source death-time precision.",
     "confidentiality_code": "Source confidentiality level carried for downstream access control.",
@@ -1336,12 +1357,13 @@ SPINE_PERSON_COLUMN_COMMENTS = {
     "current_address_id": "Current source address reference when available.",
     "latest_known_address_id": "Latest-known source address reference.",
     "address_selection_status": "Provenance for current versus latest-known address selection.",
-    "current_mrn": "Current hospital MRN selected from map_patient_identifier: active alias first, then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak; NULL when selection is ambiguous or no alias exists.",
+    "current_mrn": "Current hospital MRN selected from map_patient_identifier: active alias first; among active aliases the Barts pool (RNJ 5C4 MRN, 6200990) before the BHRUT pool (RF4 MRN, 1115132483); then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak. NULL when the winning pool holds more than one distinct active value (ambiguous) or no alias exists. current_mrn_pool names the pool.",  # SDI_MRN_POOL_V1/gold:
     "current_mrn_status": "Lifecycle status of the selected hospital MRN alias; NULL when selection is ambiguous or no alias exists.",
-    "mrn_selection_status": "Selection outcome for the governed hospital MRN alias pool; ambiguous = multiple active aliases",
+    "mrn_selection_status": "Selection outcome for the hospital MRN: active_alias, latest_valid_alias, ambiguous (the winning pool holds more than one distinct active value; a Barts and a BHRUT MRN together are not ambiguous) or no_alias.",  # SDI_MRN_POOL_V1/gold:
+    "current_mrn_pool": "Alias pool the hospital MRN was selected from: barts (RNJ 5C4 MRN), bhrut (RF4 MRN) or other; set when the selection is ambiguous too (the pool that is ambiguous); NULL when no MRN alias exists.",
     "nhs_number": "Current NHS number selected from map_patient_identifier: active alias first, then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak; NULL when selection is ambiguous or no alias exists.",
     "nhs_number_status": "Lifecycle status of the selected NHS-number alias; NULL when selection is ambiguous or no alias exists.",
-    "nhs_number_selection_status": "Selection outcome for the governed NHS-number alias pool; ambiguous = multiple active aliases",
+    "nhs_number_selection_status": "Selection outcome for the NHS-number alias: active_alias, latest_valid_alias, ambiguous (more than one distinct active NHS number) or no_alias.",  # SDI_MRN_POOL_V1/gold:
     "record_status": "Derived person-row status: active only when map_person.active_ind is 1 and end_effective_dt_tm is null or not earlier than 2100-01-01; otherwise superseded, including a missing active_ind. This is a normalized row-status label, not the source numeric ACTIVE_IND.",
     "record_status_effective_from": "Source person active-status timestamp carried from `active_status_dt_tm` without a fallback timestamp.",
     "record_status_effective_to": "Source `end_effective_dt_tm` when earlier than 2100-01-01; otherwise null, including missing or open-ended sentinel timestamps.",
@@ -1395,6 +1417,7 @@ def gold_spine_person():
         '`religion_code` AS `religion_code`',
         '`religion_display` AS `religion_display`',
         '`deceased_ind` AS `deceased_ind`',
+        '`deceased_ind_source` AS `deceased_ind_source`',  # SDI_DECEASED_V1/gold:
         '`deceased_datetime` AS `deceased_datetime`',
         '`deceased_datetime_precision` AS `deceased_datetime_precision`',
         '`confidentiality_code` AS `confidentiality_code`',
@@ -1405,6 +1428,7 @@ def gold_spine_person():
         '`current_mrn` AS `current_mrn`',
         '`current_mrn_status` AS `current_mrn_status`',
         '`mrn_selection_status` AS `mrn_selection_status`',
+        '`current_mrn_pool` AS `current_mrn_pool`',  # SDI_MRN_POOL_V1/gold:
         '`nhs_number` AS `nhs_number`',
         '`nhs_number_status` AS `nhs_number_status`',
         '`nhs_number_selection_status` AS `nhs_number_selection_status`',
@@ -1986,6 +2010,22 @@ REFERENCE_DEVICE_MAPPING_SELECT = [
     '`normalization_version` AS `normalization_version`',
     '`brand_rules_version` AS `brand_rules_version`',
     '`mapped_at` AS `mapped_at`',
+    # PMS_DEVICE_IDENTITY_V1
+    '`gmdn_implantable` AS `gmdn_implantable`',
+    '`gmdn_definition` AS `gmdn_definition`',
+    '`gmdn_code_status` AS `gmdn_code_status`',
+    '`gmdn_mapping_provenance` AS `gmdn_mapping_provenance`',
+    '`gmdn_reference_present_ind` AS `gmdn_reference_present_ind`',
+    '`gudid_primary_di` AS `gudid_primary_di`',
+    '`gudid_brand_name` AS `gudid_brand_name`',
+    '`gudid_model_number` AS `gudid_model_number`',
+    '`gudid_company_name` AS `gudid_company_name`',
+    '`gudid_catalogue_number` AS `gudid_catalogue_number`',
+    '`gudid_device_status` AS `gudid_device_status`',
+    '`gudid_distribution_status` AS `gudid_distribution_status`',
+    '`source_catalogue_number` AS `source_catalogue_number`',
+    '`source_manufacturer` AS `source_manufacturer`',
+    '`mapped_device_name` AS `mapped_device_name`',
     '`_source_system` AS `_source_system`',
     '`_source_table` AS `_source_table`',
     '`_source_row_id` AS `_source_row_id`',
@@ -2040,6 +2080,22 @@ REFERENCE_DEVICE_MAPPING_COLUMN_COMMENTS = {
     "normalization_version": "Description normalization version.",
     "brand_rules_version": "Boundary-aware phrase-rule version.",
     "mapped_at": "Timestamp when this event was last evaluated.",
+    # PMS_DEVICE_IDENTITY_V1
+    "gmdn_implantable": "GMDN reference implantable flag for the mapped GMDN term, carried from bronze; null when the term has no reference row.",
+    "gmdn_definition": "GMDN reference definition text for the mapped GMDN term.",
+    "gmdn_code_status": "GMDN reference status (active/obsolete) of the mapped term.",
+    "gmdn_mapping_provenance": "How the GMDN term was reached (method and source), carried from bronze.",
+    "gmdn_reference_present_ind": "True when the mapped GMDN code exists in the loaded GMDN reference.",
+    "gudid_primary_di": "FDA GUDID primary device identifier matched for this implant; null when no GUDID match.",
+    "gudid_brand_name": "GUDID brand name for the matched device identifier.",
+    "gudid_model_number": "GUDID version or model number for the matched device identifier.",
+    "gudid_company_name": "GUDID labeler (company) name for the matched device identifier.",
+    "gudid_catalogue_number": "GUDID catalogue number for the matched device identifier.",
+    "gudid_device_status": "GUDID device record status for the matched identifier.",
+    "gudid_distribution_status": "GUDID commercial distribution status for the matched identifier.",
+    "source_catalogue_number": "Catalogue number recorded in SurgiNet for this implant, as entered.",
+    "source_manufacturer": "Manufacturer recorded in SurgiNet for this implant, as entered.",
+    "mapped_device_name": "Device name chosen by the mapping (GUDID or GMDN side) for display.",
     "_source_system": "Value describing source system for the device mapping record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "_source_table": "Value describing source table for the device mapping record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "_source_row_id": "Source implant description event identifier.",
@@ -2108,6 +2164,22 @@ def gold_reference_device_mapping():
         '`normalization_version` AS `normalization_version`',
         '`brand_rules_version` AS `brand_rules_version`',
         '`mapped_at` AS `mapped_at`',
+        # PMS_DEVICE_IDENTITY_V1
+        '`gmdn_implantable` AS `gmdn_implantable`',
+        '`gmdn_definition` AS `gmdn_definition`',
+        '`gmdn_code_status` AS `gmdn_code_status`',
+        '`gmdn_mapping_provenance` AS `gmdn_mapping_provenance`',
+        '`gmdn_reference_present_ind` AS `gmdn_reference_present_ind`',
+        '`gudid_primary_di` AS `gudid_primary_di`',
+        '`gudid_brand_name` AS `gudid_brand_name`',
+        '`gudid_model_number` AS `gudid_model_number`',
+        '`gudid_company_name` AS `gudid_company_name`',
+        '`gudid_catalogue_number` AS `gudid_catalogue_number`',
+        '`gudid_device_status` AS `gudid_device_status`',
+        '`gudid_distribution_status` AS `gudid_distribution_status`',
+        '`source_catalogue_number` AS `source_catalogue_number`',
+        '`source_manufacturer` AS `source_manufacturer`',
+        '`mapped_device_name` AS `mapped_device_name`',
         '`_source_system` AS `_source_system`',
         '`_source_table` AS `_source_table`',
         '`_source_row_id` AS `_source_row_id`',
@@ -2463,13 +2535,13 @@ REFERENCE_LOCATION_SELECT = [
 REFERENCE_LOCATION_COLUMN_COMMENTS = {
     "location_key": "Deterministic SHA-256 key across location levels.",
     "location_code": "Native Millennium location code; primary key together with location_level.",
-    "parent_location_key": "Deterministic SHA-256 key of the parent facility or building.",
-    "location_level": "Derived hierarchy level.",
+    "parent_location_key": "Deterministic SHA-256 key of the parent location: the facility or building for care-site rows; for map_location_unit rows the key of PARENT_LOCATION_CD (a bed's room, a room's nurse unit, a nurse unit's building, otherwise the Millennium location-group parent). Null when the parent is not published.",  # SDI_LOCATION_GOLD_V1
+    "location_level": "Hierarchy level. map_care_site rows: facility, building or nurse_unit. map_location_unit rows: its LOCATION_LEVEL -- nurse_unit, room, bed, or the lower-cased Millennium location type (e.g. ancilsurg, rad, ambulatory, waitroom, facility, building); unclassified when the type is unknown.",  # SDI_LOCATION_GOLD_V1
     "source_location_code": "Source Millennium location code.",
     "name": "Source location name.",
     "status": "Source-derived location status.",
     "organization_id": "Millennium ORGANIZATION_ID as BIGINT when available.",
-    "physical_type_code": "FHIR physical location type code.",
+    "physical_type_code": "FHIR physical location type code: si facility, bu building, wa nurse unit, ro room, bd bed; null for other Millennium location types.",  # SDI_LOCATION_GOLD_V1
     "valid_from": "Source validity start.",
     "valid_to": "Source validity end.",
     "latitude": "Source address latitude.",
@@ -2478,7 +2550,7 @@ REFERENCE_LOCATION_COLUMN_COMMENTS = {
     "address_postcode_masked": "Privacy-aware source postcode.",
     "source_table": "Fully qualified bronze source table.",
     "source_row_id": "Stable source row identifier.",
-    "loaded_at": "From map_care_site: maximum ADC_UPDT per facility_cd for facility rows, maximum ADC_UPDT per building_cd for building rows, and the individual source row's ADC_UPDT for nurse-unit rows. The hierarchy union adds no parent clock or cross-level aggregation; this is bronze ingestion provenance, not location validity time or Silver refresh time.",
+    "loaded_at": "From map_care_site: maximum ADC_UPDT per facility_cd for facility rows, maximum ADC_UPDT per building_cd for building rows, and the individual source row's ADC_UPDT for nurse-unit rows. The hierarchy union adds no parent clock or cross-level aggregation; this is bronze ingestion provenance, not location validity time or Silver refresh time. map_location_unit rows carry that row's ADC_UPDT.",  # SDI_LOCATION_GOLD_V1
 }
 
 @dp.materialized_view(
@@ -4007,6 +4079,182 @@ def gold_reference_theatre_implant():
 
 # COMMAND ----------
 
+# PMS_THEATRE_CASE_V1: gold twin of journey_reference.theatre_case.
+REFERENCE_THEATRE_CASE_SELECT = [
+    '`theatre_case_key` AS `theatre_case_key`',
+    '`surgical_case_number` AS `surgical_case_number`',
+    '`person_id` AS `person_id`',
+    '`encounter_id` AS `encounter_id`',
+    '`case_status` AS `case_status`',
+    '`active_ind` AS `active_ind`',
+    '`source_present_ind` AS `source_present_ind`',
+    '`scheduled_start` AS `scheduled_start`',
+    '`scheduled_start_local` AS `scheduled_start_local`',
+    '`checkin_datetime` AS `checkin_datetime`',
+    '`surgery_start` AS `surgery_start`',
+    '`surgery_start_local` AS `surgery_start_local`',
+    '`surgery_start_quality` AS `surgery_start_quality`',
+    '`surgery_stop` AS `surgery_stop`',
+    '`surgery_duration_minutes` AS `surgery_duration_minutes`',
+    '`scheduled_duration_minutes` AS `scheduled_duration_minutes`',
+    '`performed_milestone_ind` AS `performed_milestone_ind`',
+    '`add_on_ind` AS `add_on_ind`',
+    '`asa_class_code` AS `asa_class_code`',
+    '`asa_class_display` AS `asa_class_display`',
+    '`wound_class_code` AS `wound_class_code`',
+    '`wound_class_display` AS `wound_class_display`',
+    '`anaesthesia_type_code` AS `anaesthesia_type_code`',
+    '`anaesthesia_type_display` AS `anaesthesia_type_display`',
+    '`case_level_code` AS `case_level_code`',
+    '`case_level_display` AS `case_level_display`',
+    '`patient_type_code` AS `patient_type_code`',
+    '`patient_type_display` AS `patient_type_display`',
+    '`surgical_specialty_id` AS `surgical_specialty_id`',
+    '`surgeon_practitioner_id` AS `surgeon_practitioner_id`',
+    '`anaesthetist_practitioner_id` AS `anaesthetist_practitioner_id`',
+    '`institution_display` AS `institution_display`',
+    '`department_display` AS `department_display`',
+    '`surgical_area_display` AS `surgical_area_display`',
+    '`operating_location_display` AS `operating_location_display`',
+    '`cancel_datetime` AS `cancel_datetime`',
+    '`cancel_reason_code` AS `cancel_reason_code`',
+    '`cancel_reason_display` AS `cancel_reason_display`',
+    '`implant_expected_ind` AS `implant_expected_ind`',
+    '`implant_expected_source` AS `implant_expected_source`',
+    '`loaded_at` AS `loaded_at`',
+    '`_source_system` AS `_source_system`',
+    '`_source_table` AS `_source_table`',
+    '`_source_row_id` AS `_source_row_id`',
+]
+
+# contract v2: source history comes directly from the main research table; no separate metadata input is needed.
+REFERENCE_THEATRE_CASE_ADVISORY_RULES = {
+    # A stop before start is a keying error in SurgiNet milestones; the times are kept as recorded
+    # and the expectation metric reports how often it happens.
+    "surgery_stop_not_before_start":
+        "NOT COALESCE(`surgery_stop` < `surgery_start`, FALSE)",
+}
+
+REFERENCE_THEATRE_CASE_COLUMN_COMMENTS = {
+    "theatre_case_key": "SurgiNet SURG_CASE_ID as string; the same value children carry in theatre_case_key.",
+    "surgical_case_number": "Formatted SurgiNet case number as displayed to staff.",
+    "person_id": "Native Millennium PERSON_ID as BIGINT.",
+    "encounter_id": "Native Millennium ENCNTR_ID as BIGINT.",
+    "case_status": "Case status derived in bronze: PERFORMED, CANCELLED or SCHEDULED_ONLY.",
+    "active_ind": "Millennium ACTIVE_IND for the case row.",
+    "source_present_ind": "Whether the case row was present in the latest raw snapshot.",
+    "scheduled_start": "Scheduled case start as a UTC instant (Millennium); use scheduled_start_local for Europe/London wall-clock time.",
+    "scheduled_start_local": "scheduled_start in Europe/London wall-clock time (GMT/BST), from the bronze *_LOCAL companion.",
+    "checkin_datetime": "Patient check-in to theatres as a UTC instant (Millennium).",
+    "surgery_start": "Surgery start as a UTC instant (Millennium); use surgery_start_local for Europe/London wall-clock time.",
+    "surgery_start_local": "surgery_start in Europe/London wall-clock time (GMT/BST), from the bronze *_LOCAL companion.",
+    "surgery_start_quality": "Bronze quality flag for surgery_start (e.g. milestone vs fallback).",
+    "surgery_stop": "Surgery stop as a UTC instant (Millennium).",
+    "surgery_duration_minutes": "Surgery stop minus start in minutes, as derived in bronze.",
+    "scheduled_duration_minutes": "Scheduled case duration in minutes.",
+    "performed_milestone_ind": "Whether a performed milestone was recorded for the case.",
+    "add_on_ind": "SurgiNet add-on flag: case added to a list after scheduling (emergency/urgent proxy).",
+    "asa_class_code": "Millennium code value for ASA physical status class.",
+    "asa_class_display": "ASA physical status class description.",
+    "wound_class_code": "Millennium code value for wound class.",
+    "wound_class_display": "Wound class description (clean, clean-contaminated, ...).",
+    "anaesthesia_type_code": "Millennium code value for anaesthesia type.",
+    "anaesthesia_type_display": "Anaesthesia type description.",
+    "case_level_code": "Millennium code value for case level.",
+    "case_level_display": "Case level description.",
+    "patient_type_code": "Millennium code value for patient type.",
+    "patient_type_display": "Patient type description (inpatient, day case, ...).",
+    "surgical_specialty_id": "SurgiNet surgical specialty (prsnl_group) id.",
+    "surgeon_practitioner_id": "Native Millennium personnel PERSON_ID of the primary surgeon.",
+    "anaesthetist_practitioner_id": "Native Millennium personnel PERSON_ID of the anaesthetist.",
+    "institution_display": "Institution (hospital site) description.",
+    "department_display": "Theatre department description.",
+    "surgical_area_display": "Surgical area description.",
+    "operating_location_display": "Operating room description.",
+    "cancel_datetime": "Case cancellation time as a UTC instant (Millennium); null when not cancelled.",
+    "cancel_reason_code": "Millennium code value for the cancellation reason.",
+    "cancel_reason_display": "Cancellation reason description.",
+    "implant_expected_ind": "True when any active procedure on the case is implant-flagged at scheduling or in the procedure catalogue; null when the case has no procedure rows.",
+    "implant_expected_source": "scheduled_procedure when any procedure was implant-flagged at scheduling, else procedure_catalogue; null when not expected.",
+    "loaded_at": "map_theatre_case.ADC_UPDT carried unchanged; bronze ingestion provenance, not case time.",
+    "_source_system": "Constant surginet.",
+    "_source_table": "Bronze source table for the case row.",
+    "_source_row_id": "Bronze SURG_CASE_ID.",
+}
+
+@dp.materialized_view(
+    name=_n("gold_qc._reference_theatre_case"),
+    comment="Internal quality-controlled twin of reference_theatre_case: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
+    refresh_policy="incremental",
+)
+@dp.expect_all(REFERENCE_THEATRE_CASE_ADVISORY_RULES)
+def _gold_qc_reference_theatre_case():
+    # encounter_id pointers the spine does not have are nulled; the case row is kept.
+    df = _qc(
+        "reference_theatre_case",
+        REFERENCE_THEATRE_CASE_SELECT,
+        fk_columns=["encounter_id"],
+    )
+    return _with_comments(df, REFERENCE_THEATRE_CASE_COLUMN_COMMENTS)
+
+@dp.materialized_view(
+    name=_n("gold_reference.theatre_case"),
+    comment=(
+        "One SurgiNet surgical case with ASA, wound class, anaesthesia, urgency, times and the implant-expected flag. "
+        "Gold QC twin of the silver product: encounter_id is nulled when the spine lacks it, 1 check is advisory."
+    ),
+    table_properties={"quality": "gold"},
+    refresh_policy="incremental",
+)
+def gold_reference_theatre_case():
+    df = spark.read.table(_n("gold_qc._reference_theatre_case")).selectExpr(
+        '`theatre_case_key` AS `theatre_case_key`',
+        '`surgical_case_number` AS `surgical_case_number`',
+        '`person_id` AS `person_id`',
+        '`encounter_id` AS `encounter_id`',
+        '`case_status` AS `case_status`',
+        '`active_ind` AS `active_ind`',
+        '`source_present_ind` AS `source_present_ind`',
+        '`scheduled_start` AS `scheduled_start`',
+        '`scheduled_start_local` AS `scheduled_start_local`',
+        '`checkin_datetime` AS `checkin_datetime`',
+        '`surgery_start` AS `surgery_start`',
+        '`surgery_start_local` AS `surgery_start_local`',
+        '`surgery_start_quality` AS `surgery_start_quality`',
+        '`surgery_stop` AS `surgery_stop`',
+        '`surgery_duration_minutes` AS `surgery_duration_minutes`',
+        '`scheduled_duration_minutes` AS `scheduled_duration_minutes`',
+        '`performed_milestone_ind` AS `performed_milestone_ind`',
+        '`add_on_ind` AS `add_on_ind`',
+        '`asa_class_code` AS `asa_class_code`',
+        '`asa_class_display` AS `asa_class_display`',
+        '`wound_class_code` AS `wound_class_code`',
+        '`wound_class_display` AS `wound_class_display`',
+        '`anaesthesia_type_code` AS `anaesthesia_type_code`',
+        '`anaesthesia_type_display` AS `anaesthesia_type_display`',
+        '`case_level_code` AS `case_level_code`',
+        '`case_level_display` AS `case_level_display`',
+        '`patient_type_code` AS `patient_type_code`',
+        '`patient_type_display` AS `patient_type_display`',
+        '`surgical_specialty_id` AS `surgical_specialty_id`',
+        '`surgeon_practitioner_id` AS `surgeon_practitioner_id`',
+        '`anaesthetist_practitioner_id` AS `anaesthetist_practitioner_id`',
+        '`institution_display` AS `institution_display`',
+        '`department_display` AS `department_display`',
+        '`surgical_area_display` AS `surgical_area_display`',
+        '`operating_location_display` AS `operating_location_display`',
+        '`cancel_datetime` AS `cancel_datetime`',
+        '`cancel_reason_code` AS `cancel_reason_code`',
+        '`cancel_reason_display` AS `cancel_reason_display`',
+        '`implant_expected_ind` AS `implant_expected_ind`',
+        '`implant_expected_source` AS `implant_expected_source`',
+        '`loaded_at` AS `loaded_at`',
+        '`_source_system` AS `_source_system`',
+        '`_source_table` AS `_source_table`',
+        '`_source_row_id` AS `_source_row_id`',
+    )
+    return _with_comments(df, REFERENCE_THEATRE_CASE_COLUMN_COMMENTS)
+
 # ==== journey_reference.value_set ====
 
 # contract v2: identifier names follow the native-id contract; lifecycle/QC and extracted child payloads are omitted.
@@ -4076,4 +4324,36 @@ def gold_reference_value_set():
     return _with_comments(df, REFERENCE_VALUE_SET_COLUMN_COMMENTS)
 
 # COMMAND ----------
+
+# ==== journey_reference.person_gp_registration ==== PMS_P1_T5_GOLD_V1
+REFERENCE_PERSON_GP_REGISTRATION_COLUMNS = ["person_gp_registration_key", "person_id", "person_org_reltn_id", "organization_id",
+    "practice_ods_code", "practice_name", "registration_start", "registration_end", "active_ind", "current_ind",
+    "free_text_ind", "loaded_at", "_source_system", "_source_table", "_source_row_id"]
+REFERENCE_PERSON_GP_REGISTRATION_SELECT = [f"`{c}` AS `{c}`" for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS]
+REFERENCE_PERSON_GP_REGISTRATION_MANDATORY_RULES = {
+    # A registration that belongs to no spine person cannot be used; _qc nulls person_id for non-spine parents.
+    "gold.reference.person_gp_registration.person_id.fk_containment": "`person_id` IS NOT NULL",
+}
+REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES = {
+    # A malformed practice code is reported, not dropped: the registration itself is still true.
+    "gold.reference.person_gp_registration.ods_code_wellformed": "`practice_ods_code` IS NULL OR `practice_ods_code` RLIKE '^[A-Z][0-9]{5}$'",
+}
+REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS = {c: f"reference_person_gp_registration field {c}; see silver column comment." for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS}
+
+@dp.materialized_view(name=_n("gold_qc._reference_person_gp_registration"),
+    comment="Internal quality-controlled twin of reference_person_gp_registration.", refresh_policy="incremental")
+@dp.expect_all_or_drop(REFERENCE_PERSON_GP_REGISTRATION_MANDATORY_RULES)
+@dp.expect_all(REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES)
+def _gold_qc_reference_person_gp_registration():
+    """Quality-controlled twin of journey_reference.person_gp_registration."""
+    df = _qc("reference_person_gp_registration", REFERENCE_PERSON_GP_REGISTRATION_SELECT, fk_columns=["person_id"])
+    return _with_comments(df, REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS)
+
+@dp.materialized_view(name=_n("gold_reference.person_gp_registration"),
+    comment="Registered GP practice history per person. Gold QC twin: 1 rule drops rows (no spine person), 1 advisory.",
+    table_properties={"quality": "gold"}, refresh_policy="incremental")
+def gold_reference_person_gp_registration():
+    """Contract-v2 public twin of reference_person_gp_registration."""
+    df = spark.read.table(_n("gold_qc._reference_person_gp_registration")).selectExpr(*REFERENCE_PERSON_GP_REGISTRATION_SELECT)
+    return _with_comments(df, REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS)
 

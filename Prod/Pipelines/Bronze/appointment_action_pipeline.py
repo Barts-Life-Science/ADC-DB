@@ -88,6 +88,5 @@ for col in spark.table(TARGET).columns:
     spark.sql(f"ALTER TABLE {qname(TARGET)} ALTER COLUMN `{col}` SET TAGS ('ig_risk'='{risk}','ig_severity'='{severity}')")
 spark.sql(f"ALTER TABLE {qname(TARGET)} CLUSTER BY (SCH_EVENT_ID, ACTION_DT_TM)")
 result = {"target":TARGET,"operation":operation,"rows":spark.table(TARGET).count(),"sample_mode":SAMPLE_MODE,"sample_rows":SAMPLE_ROWS}
-spark.createDataFrame([(RUN_ID,json.dumps(result,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("8_dev.tdx_evidence.appointment_action_pipeline_runs")
+spark.createDataFrame([(RUN_ID,json.dumps(result,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("6_mgmt.bronze.appointment_action_pipeline_runs")  # OGR_NO_DEV_V1/appointment_action
 dbutils.notebook.exit(json.dumps(result,sort_keys=True))
-

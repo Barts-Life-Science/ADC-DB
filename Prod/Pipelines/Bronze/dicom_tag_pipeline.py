@@ -48,7 +48,9 @@ def _control_schema(target):
 CONTROL_SCHEMA = _control_schema(TARGET_SCHEMA)
 
 SOURCE_TAGS = "4_prod.dicom_tags.extracted_dicom_tags"
-SOURCE_TIER = "8_dev.pacs.dicom_pii_tier"
+# Promoted from 8_dev.pacs.dicom_pii_tier on 2026-09-26.
+# DICOM_TIER_PROD_SOURCE_PATCH_APPLIED v1
+SOURCE_TIER = "4_prod.dicom_tags.dicom_pii_tier"
 SOURCE_EXAM = "4_prod.bronze.map_pacs_examination"
 TARGET = f"{TARGET_SCHEMA}.map_dicom_file_attribute"
 SHARED_CONTROL = f"{CONTROL_SCHEMA}.s6_source_versions"

@@ -59,8 +59,8 @@ def bronze_lookup_schema(target_schema: str) -> str:
 
 def periodic_lane_state(force_full_refresh: bool) -> dict[str, object]:
     mode = value("periodic_lanes", "auto").lower()
-    if mode not in {"auto", "false", "no", "off", "true", "yes", "on"}:
-        raise ValueError("periodic_lanes must be auto, true, or false")
+    if mode not in {"auto", "false", "no", "off", "true", "yes", "on", "indications"}:
+        raise ValueError("periodic_lanes must be auto, true, false, or indications")
     now = datetime.now(timezone.utc)
     iso_week = int(now.isocalendar().week)
     if force_full_refresh:
@@ -81,6 +81,58 @@ def periodic_lane_state(force_full_refresh: bool) -> dict[str, object]:
     }
 
 
+# DQ4_B5_INDICATIONS_ON_DIAGNOSIS_V1: rule indications_diagnosis_version_v1. The indications lane reads
+# 4_prod.bronze.map_diagnosis, so it runs whenever that table has moved since the lane last ran,
+# not only every fourth ISO week. The version it ran against is kept on map_pathology_indication.
+INDICATIONS_DIAGNOSIS_SOURCE = "4_prod.bronze.map_diagnosis"
+INDICATIONS_VERSION_PROPERTY = "pathology.indications.map_diagnosis_version"
+
+
+def indications_lane_state(periodic: dict[str, object], target_schema: str) -> dict[str, object]:
+    current = int(spark.sql(f"DESCRIBE HISTORY {INDICATIONS_DIAGNOSIS_SOURCE} LIMIT 1").first()["version"])
+    table = f"{target_schema}.map_pathology_indication"
+    last = None
+    if spark.catalog.tableExists(table):
+        props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
+        last = props.get(INDICATIONS_VERSION_PROPERTY)
+    if periodic["enabled"]:
+        enabled, reason = True, periodic["reason"]
+    elif periodic["mode"] in {"false", "no", "off"}:
+        enabled, reason = False, "explicit_override"
+    elif periodic["mode"] == "indications":
+        enabled, reason = True, "explicit_indications"
+    elif last is None or int(last) != current:
+        enabled, reason = True, "map_diagnosis_version_changed"
+    else:
+        enabled, reason = False, "map_diagnosis_unchanged"
+    return {"enabled": enabled, "reason": reason, "map_diagnosis_version": current,
+            "last_map_diagnosis_version": last}
+
+
+# STM_SPECIMEN_TYPE_V1/runner: isolates carry map_pathology_specimen_type columns, so the AMR lane also runs whenever the map
+# has moved since the lane last ran. The version it ran against is kept on map_pathology_microbiology_isolate.
+SPECIMEN_MAP_VERSION_PROPERTY = "pathology.amr.specimen_map_version"
+
+
+def amr_lane_state(periodic: dict[str, object], target_schema: str) -> dict[str, object]:
+    current = int(spark.sql(f"DESCRIBE HISTORY {target_schema}.map_pathology_specimen_type LIMIT 1").first()["version"])
+    table = f"{target_schema}.map_pathology_microbiology_isolate"
+    last = None
+    if spark.catalog.tableExists(table):
+        props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
+        last = props.get(SPECIMEN_MAP_VERSION_PROPERTY)
+    if periodic["enabled"]:
+        enabled, reason = True, periodic["reason"]
+    elif periodic["mode"] in {"false", "no", "off"}:
+        enabled, reason = False, "explicit_override"
+    elif last is None or int(last) != current:
+        enabled, reason = True, "specimen_map_version_changed"
+    else:
+        enabled, reason = False, "specimen_map_unchanged"
+    return {"enabled": enabled, "reason": reason, "specimen_map_version": current,
+            "last_specimen_map_version": last}
+
+
 started = time.monotonic()
 target_schema = value("target_schema", "8_dev.bronze")
 allow_production_write = flag("allow_production_write")
@@ -97,7 +149,8 @@ force_full_refresh = flag("force_full_refresh")
 if force_full_refresh:
     spark.sql(
         f"DELETE FROM {target_schema}.pathology_expansion_state "
-        "WHERE source_name IN ('map_pathology','path_patient_samplelevel')"
+        "WHERE source_name IN ('map_pathology','path_patient_samplelevel',"
+        "'mill_order_detail','specimen_map','path_master_orderables')"
     )
 
 core = run_incremental_core(spark, config, validate_stage_keys=False)
@@ -115,14 +168,6 @@ if periodic["enabled"]:
     else:
         genetics = "SKIPPED_NO_HGNC"
 
-    indications = run_indications(
-        spark,
-        config,
-        include_proposed_rules=True,
-        include_diagnosis_context=True,
-        full_reconcile=True,
-        validate_stage_keys=False,
-    )
     amr = run_amr(
         spark,
         config,
@@ -137,8 +182,37 @@ else:
         "iso_week": periodic["iso_week"],
     }
     genetics = skipped
-    indications = skipped
     amr = skipped
+amr_lane = amr_lane_state(periodic, target_schema)
+if amr_lane["enabled"] and not periodic["enabled"]:
+    amr = run_amr(
+        spark,
+        config,
+        include_proposed_rules=True,
+        full_reconcile=True,
+        validate_stage_keys=False,
+    )
+if amr_lane["enabled"] and "status" not in amr:
+    spark.sql(
+        f"ALTER TABLE {target_schema}.map_pathology_microbiology_isolate SET TBLPROPERTIES "
+        f"('{SPECIMEN_MAP_VERSION_PROPERTY}' = '{amr_lane['specimen_map_version']}')"
+    )
+indications_lane = indications_lane_state(periodic, target_schema)
+if indications_lane["enabled"]:
+    indications = run_indications(
+        spark,
+        config,
+        include_proposed_rules=True,
+        include_diagnosis_context=True,
+        full_reconcile=True,
+        validate_stage_keys=False,
+    )
+    spark.sql(
+        f"ALTER TABLE {target_schema}.map_pathology_indication SET TBLPROPERTIES "
+        f"('{INDICATIONS_VERSION_PROPERTY}' = '{indications_lane['map_diagnosis_version']}')"
+    )
+else:
+    indications = {"status": "SKIPPED_DIAGNOSIS_UNCHANGED", **indications_lane}
 create_views(spark, config)
 
 result = {
@@ -151,6 +225,8 @@ result = {
     "run_id": core["run_id"],
     "core": core.get("metrics", {}),
     "periodic_lanes": periodic,
+    "indications_lane": indications_lane,
+    "amr_lane": amr_lane,
     "genetics": genetics,
     "indications": indications,
     "amr": amr,

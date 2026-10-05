@@ -97,13 +97,15 @@ def _record_source_versions(target, versions):
 # ==== COMMON BLOCK v1 (SYNC-WITH _completeness_common) ====
 from pyspark.sql import functions as F
 
-SENTINEL_FLOOR = "1901-01-01"
+# DQ4_B1_RADIOLOGY_TS_FLOOR_V1: rule ts_plausible_v1. Clinical-event timestamps before 1971 are epoch/1000
+# truncations (raw 2024-08-08 load) or sentinels, so _CLEAN nulls them.
+SENTINEL_FLOOR = "1971-01-01"
 
 def dq_columns(df, date_cols):
     """Master plan §2.2 date-quality standard block.
     For each timestamp column C adds:
       C_FUTURE_IND   - value is after now()
-      C_SENTINEL_IND - value is before 1901-01-01
+      C_SENTINEL_IND - value is before SENTINEL_FLOOR (1971-01-01)
       C_CLEAN        - value, or NULL when either flag is set
     Source column is retained untouched (bronze keeps source values; silver chooses).
     """
@@ -643,11 +645,43 @@ best=(best.join(_pacs_stats,"EVENT_ID","left")
     .when(F.col("PACS_LINK_METHOD")=="ACCESSION_ONLY_UNIQUE",F.col("_ONLY_PX")).cast("long"))
  .withColumn("PACS_LINK_CANDIDATE_COUNT",F.coalesce(F.col("_ALL"),F.lit(0)).cast("int"))
  .drop("_ALL","_COMPAT","_CODE_ANY","_CODE_OK","_CODE_PX","_ONLY_PX","_HAS_CODE"))
+# SDI_DICOM_MODALITY_V1: DICOM Modality (0008,0060) beside the NHS Imaging category. A category that is itself a DICOM
+# term passes through; the others take the dominant PACS acquisition modality of linked exams when it holds >= 90% over
+# >= 1000 exams (mappings/nhsi_to_dicom.json, evidence 2026-09-28); mixed categories publish no code. Derived from
+# NHSI_MODALITY_CATEGORY (hashed), so both columns sit outside ROW_HASH like the _LOCAL companions. The SDI backfill
+# applies the same rule to rows this run does not revisit.
+SDI_NHSI_TO_DICOM={"Ultrasound - Non Obstetric": "US", "Ultrasound - Obstetric": "US", "MRI": "MR", "Cardiac CT": "CT", "Cardiac MRI": "MR", "U/S Guided Interventional Procedures": "US", "Non Vascular Interventional Radiology": "XA", "CT Colonography": "CT", "Vascular Interventional Radiology": "XA", "CT Guided Interventional Procedures": "CT", "Neuro Interventional Radiology": "XA", "Fluoroscopy Guided Interventional Procedures": "XA", "Interventional Radiology": "XA"}
+SDI_NHSI_MIXED=["Catheter Laboratory / Interventional Cardiology", "DEXA", "Fluoroscopy - Static", "Mammography - Symptomatic", "Nuclear Medicine", "PET CT", "Plain X-Ray"]
+SDI_DICOM_MODALITIES=[
+    "ANN", "AR", "ASMT", "AU", "BDUS", "BI", "BMD", "CFM", "CR", "CT", "CTPROTOCOL", "DG", "DMS", "DOC",
+    "DX", "ECG", "EEG", "EMG", "EOG", "EPS", "ES", "FID", "GM", "HC", "HD", "IO", "IOL", "IVOCT",
+    "IVUS", "KER", "KO", "LEN", "LS", "M3D", "MG", "MR", "NM", "OAM", "OCT", "OP", "OPM", "OPT",
+    "OPTBSV", "OPTENF", "OPV", "OSS", "OT", "PA", "PLAN", "POS", "PR", "PT", "PX", "REG", "RESP", "RF",
+    "RG", "RTDOSE", "RTIMAGE", "RTINTENT", "RTPLAN", "RTRAD", "RTRECORD", "RTSEGANN", "RTSTRUCT", "RWV", "SEG", "SM", "SMR", "SR",
+    "SRF", "STAIN", "TEXTUREMAP", "TG", "US", "VA", "XA", "XAPROTOCOL", "XC",
+]
+def sdi_modality_dicom(cat):
+    c=F.when(F.trim(cat)!="",F.trim(cat))
+    passthrough=F.upper(c).isin(*SDI_DICOM_MODALITIES)
+    code=F.when(passthrough,F.upper(c))
+    method=F.when(c.isNull(),F.lit(None).cast("string")).when(passthrough,F.lit("dicom_passthrough"))
+    for k,v in SDI_NHSI_TO_DICOM.items():
+        code=code.when(c==k,F.lit(v))
+        method=method.when(c==k,F.lit("nhsi_category_map"))
+    method=method.when(c.isin(*SDI_NHSI_MIXED),F.lit("nhsi_category_mixed")).otherwise(F.lit("unmapped"))
+    return [code.alias("MODALITY_DICOM"),method.alias("MODALITY_DICOM_METHOD")]
+# SDI_DICOM_MODALITY_V1 end
 best,flagged=dq_all_clinical(best,admin_stamps={"UPDT_DT_TM","SOURCE_ADC_UPDT"})
 admin={"UPDT_DT_TM","SOURCE_ADC_UPDT","PIPELINE_UPDT_DT_TM","ROW_HASH"}
 hash_cols=[c for c in best.columns if c not in admin and not c.endswith(("_FUTURE_IND","_SENTINEL_IND","_CLEAN"))]
 out=(best.withColumn("ROW_HASH",F.xxhash64(F.to_json(F.struct(*[F.col(c) for c in hash_cols]))))
-     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp()))
+     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp())
+     # TZ_LOCAL_V1/radiology: Europe/London companions, outside ROW_HASH.
+     .withColumns({
+         "PERFORMED_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("PERFORMED_DT_TM_CLEAN"), "Europe/London"),
+         "EVENT_END_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("EVENT_END_DT_TM_CLEAN"), "Europe/London"),
+     })
+     .select("*",*sdi_modality_dicom(F.col("NHSI_MODALITY_CATEGORY"))))  # SDI_DICOM_MODALITY_V1
 if not spark.catalog.tableExists(TARGET):
     out.limit(0).write.format("delta").mode("overwrite").option("delta.enableChangeDataFeed","true").saveAsTable(TARGET)
 # Additive-only schema evolution (no reliance on session autoMerge): add staged columns the
@@ -693,6 +727,8 @@ RADIOLOGY_V2_COMMENTS={
  "PACS_EXAMINATION_ID":"Linked map_pacs_examination row; set only for PACS_LINK_METHOD ACCESSION_EXAM_CODE or ACCESSION_ONLY_UNIQUE.",
  "PACS_LINK_METHOD":"ACCESSION_EXAM_CODE | ACCESSION_ONLY_UNIQUE | AMBIGUOUS_EXAM_CODE | EXAM_CODE_NOT_IN_ACCESSION | ACCESSION_AMBIGUOUS | IDENTITY_CONFLICT | NO_PACS_CANDIDATE | NO_ACCESSION.",
  "PACS_LINK_CANDIDATE_COUNT":"Present PACS examinations sharing the accession (before code/identity filtering).",
+ "MODALITY_DICOM":"DICOM Modality (0008,0060) defined term inferred from NHSI_MODALITY_CATEGORY: the category itself when it is a DICOM term (CT), else the dominant PACS acquisition modality of linked exams in that category when it holds >= 90% over >= 1000 exams (SDI mapping 2026-09-28). NULL for mixed or unmapped categories and when the category is NULL.",  # SDI_DICOM_MODALITY_V1
+ "MODALITY_DICOM_METHOD":"dicom_passthrough | nhsi_category_map | nhsi_category_mixed (category spans several DICOM modalities, e.g. Plain X-Ray DX/CR) | unmapped (Other, Other Modality or an unknown label). NULL when NHSI_MODALITY_CATEGORY is NULL.",  # SDI_DICOM_MODALITY_V1
 }
 # IG: accession-bearing columns are identifiers (4/2, as REFERENCE_NBR); the rest 0/0.
 RADIOLOGY_V2_IG={c:("0","0") for c in RADIOLOGY_V2_COMMENTS}
@@ -721,5 +757,4 @@ print("A9 build complete")
 # and record the warm-median weekly cost. NICIP concept columns remain a follow-up after S4 Task 5b.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-
 

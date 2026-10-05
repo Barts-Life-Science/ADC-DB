@@ -318,7 +318,8 @@ CLUSTER_KEYS = {RESOURCE: ["SCH_APPT_ID"]}
 def materialize_stage(df: DataFrame, target: str, keys: list[str]) -> DataFrame:
     staging_table = f"{target}_stg"
     staged = (
-        with_row_hash(df)
+        # TZ_LOCAL_V1/scheduling: Europe/London companions (no-op for tables without UTC event columns).
+        bronze_add_time_companions(with_row_hash(df), target)
         .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID))
         .withColumn("SOURCE_PRESENT_IND", F.lit(True))
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
@@ -1122,5 +1123,4 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 

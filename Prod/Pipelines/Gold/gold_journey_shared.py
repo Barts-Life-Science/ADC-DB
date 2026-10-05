@@ -541,6 +541,7 @@ GOLD_V2_LIFECYCLE = {'clinical_allergy_intolerance': {'join_keys': ['patient_eve
                               'support_columns': ['record_status', 'loaded_at']},
  'reference_service': {'join_keys': ['service_key'], 'support_columns': ['load_batch_id', 'loaded_at']},
  'reference_theatre_attendance': {'join_keys': ['theatre_attendance_key'], 'support_columns': ['loaded_at']},
+ 'reference_theatre_case': {'join_keys': ['theatre_case_key'], 'support_columns': ['loaded_at']},  # PMS_THEATRE_CASE_V1
  'reference_theatre_case_milestone': {'join_keys': ['theatre_case_milestone_key'],
                                       'support_columns': ['loaded_at']},
  'reference_theatre_implant': {'join_keys': ['theatre_implant_key'], 'support_columns': ['loaded_at']},
@@ -660,6 +661,16 @@ GOLD_V2_DATE_FLAGS = {'clinical_allergy_intolerance': ['event_after_death_30d', 
  'text_document': ['event_after_death_30d', 'event_before_birth']}
 GOLD_V2_SOURCE_SUPPORT = {'text_document': ['is_latest_version']}
 
+# DQ4_G_GOLD_RULES_V1: rule dq4_g2_sex_plausibility_v1. A concept that only one sex can carry (an
+# obstetric diagnosis, a prostatectomy) recorded on a person of the other recorded sex is
+# flagged, never removed: either the code or the person's recorded sex may be the wrong side.
+# The concept list is the DQ2 plausibility list promoted to 3_lookup (287 concepts, v1).
+GOLD_SEX_PLAUSIBILITY_COLUMNS = {
+    "clinical_condition": "condition_omop_concept_id",
+    "clinical_procedure": "procedure_omop_concept_id",
+}
+GOLD_SEX_PLAUSIBILITY_TABLE = "3_lookup.omop.concept_sex_plausibility"
+
 # S3B_GOLD_PATCH_APPLIED v1
 # S3C_GOLD_PATCH_APPLIED v1
 GOLD_V2_POLICIES = json.loads(spark.conf.get("journey.s3b_policies", "{}"))
@@ -684,34 +695,51 @@ GOVERNED_TRANSLATION_RULES = (
 )
 GOVERNED_ROLLUP_RULES = ("trud:icdsctmap:rollup", "trud:opcssctmap:rollup")
 
+# GOLD_COMPACT_GATE_PATCH_APPLIED v1
 def _s3_axis_gate_and_policy(item):
-    """Decide whether a mapped target meets the configured policy and return its provenance."""
+    """Decide whether a mapped target meets the configured policy and return its provenance.
+
+    Governed rule prefixes and policies are array literals tested by higher-order functions, so
+    the expression is one size whatever their number. Unrolled per-prefix OR and per-policy CASE
+    chains made Enzyme planning of the QC twins exhaust the driver (2026-09-25/26 gold failures).
+    """
     method = item["map_method"]
     rule = F.coalesce(item["map_rule_id"], F.lit(""))
     native = method == "source_native"
-    translation = F.lit(False)
-    for prefix in GOVERNED_TRANSLATION_RULES:
-        translation = translation | (method.isin("rule", "exact_synonym") & rule.startswith(prefix))
-    for prefix in GOVERNED_ROLLUP_RULES:
-        translation = translation | ((method == "ancestor_rollup") & rule.startswith(prefix) &
-                                     (F.coalesce(item["map_rollup_levels"], F.lit(99)) <= F.lit(4)))
-    translation = translation & ~rule.contains("EXACT_string_similarity")
+    levels = F.coalesce(item["map_rollup_levels"], F.lit(99))
+    translation = (
+        (method.isin("rule", "exact_synonym")
+         & F.exists(F.array(*[F.lit(p) for p in GOVERNED_TRANSLATION_RULES]), lambda p: rule.startswith(p)))
+        | ((method == "ancestor_rollup")
+           & F.exists(F.array(*[F.lit(p) for p in GOVERNED_ROLLUP_RULES]), lambda p: rule.startswith(p))
+           & (levels <= F.lit(4)))
+    ) & ~rule.contains("EXACT_string_similarity")
+    policy_id = F.when(native, F.lit("source_native")).when(translation, F.lit("governed_translation"))
     banded = F.lit(False)
-    policy_id = (F.when(native, F.lit("source_native"))
-                 .when(translation, F.lit("governed_translation")))
-    for current_id, policy in sorted(GOLD_V2_POLICIES.items()):
-        max_levels = int(policy.get("rollup_config", {}).get("max_levels", 3))
-        matched = (
-            (method == policy["method"]) &
-            rule.contains(f":{policy['lane']}:") &
-            (F.coalesce(item["map_scoring_model"], F.lit("")) == F.lit(policy["scoring_model"])) &
-            F.coalesce(item["map_version"], F.lit("")).contains(F.lit(policy["hierarchy_version"])) &
-            (F.coalesce(item["map_cosine"], F.lit(0.0)) >= F.lit(float(policy["cutoff"]))) &
-            ((method != "ancestor_rollup") |
-             (F.coalesce(item["map_rollup_levels"], F.lit(99)) <= F.lit(max_levels)))
-        )
-        banded = banded | matched
-        policy_id = F.when(matched, F.lit(current_id)).otherwise(policy_id)
+    if GOLD_V2_POLICIES:
+        policies = F.array(*[
+            F.struct(
+                F.lit(current_id).alias("id"),
+                F.lit(policy["method"]).alias("method"),
+                F.lit(f":{policy['lane']}:").alias("lane"),
+                F.lit(policy["scoring_model"]).alias("scoring_model"),
+                F.lit(policy["hierarchy_version"]).alias("hierarchy_version"),
+                F.lit(float(policy["cutoff"])).alias("cutoff"),
+                F.lit(int(policy.get("rollup_config", {}).get("max_levels", 3))).alias("max_levels"),
+            )
+            for current_id, policy in sorted(GOLD_V2_POLICIES.items())
+        ])
+        matched = F.filter(policies, lambda p: (
+            (method == p["method"]) &
+            rule.contains(p["lane"]) &
+            (F.coalesce(item["map_scoring_model"], F.lit("")) == p["scoring_model"]) &
+            F.coalesce(item["map_version"], F.lit("")).contains(p["hierarchy_version"]) &
+            (F.coalesce(item["map_cosine"], F.lit(0.0)) >= p["cutoff"]) &
+            ((method != "ancestor_rollup") | (levels <= p["max_levels"]))
+        ))
+        # The last matching policy in id order wins, as the unrolled CASE chain did.
+        banded = F.size(matched) > 0
+        policy_id = F.when(banded, F.element_at(matched, -1)["id"]).otherwise(policy_id)
     rejected = F.coalesce(item["map_status"], F.lit("")).isin("judge_rejected", "vetoed_polarity")
     gate = F.coalesce((native | translation | banded) & ~rejected, F.lit(False))
     policy_id = F.when(rejected, F.concat(F.lit("withheld:"), item["map_status"])).otherwise(policy_id)
@@ -820,8 +848,13 @@ def _s3_flatten_gold_public(df, table_name):
     """Restore flat coding columns and null targets that fail the mapping policy."""
     specs=GOLD_S3_AXIS_SPECS.get(table_name,{})
     for old_name, axes in specs.items():
-        payload=F.from_json(F.col(old_name), "struct<"+",".join(
-            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis,_ in axes)+">")
+        # Parse once and gate once (see GOLD_PARSE_ONCE in _qc): inline from_json and a per-field gate
+        # copy the parse into every reference.
+        parsed="__gold_parsed_"+old_name
+        df=df.withColumn(parsed,F.from_json(F.col(old_name), "struct<"+",".join(
+            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis,_ in axes)+">"))
+        payload=F.col(parsed)
+        scratch=[parsed]
         replacement=[]
         for axis, source_only in axes:
             a=payload[axis]
@@ -829,6 +862,9 @@ def _s3_flatten_gold_public(df, table_name):
                 df=df.withColumn(f"{axis}_{field}",a[field])
             if not source_only:
                 gate, _ = _s3_axis_gate_and_policy(a)
+                df=df.withColumn("__gold_gate_"+axis,gate)
+                scratch.append("__gold_gate_"+axis)
+                gate=F.col("__gold_gate_"+axis)
                 for field in ("snomed_code","snomed_display","omop_concept_id",
                               "target_system","target_code","target_display"):
                     df=df.withColumn(f"{axis}_{field}",F.when(gate,a[field]))
@@ -842,7 +878,7 @@ def _s3_flatten_gold_public(df, table_name):
         for name in df.columns:
             if name==old_name: order.extend(replacement)
             elif name not in replacement: order.append(name)
-        df=df.select(*order)
+        df=df.select(*[name for name in order if name not in scratch])
     return df
 
 def _s3_gate_direct_public(df, table_name):
@@ -919,7 +955,31 @@ def _qc(table_name, select_exprs, fk_columns=(), date_flags=()):
         if column not in selected_names:
             prepared.append(f"`{column}` AS `{column}`")
 
+    sex_column = GOLD_SEX_PLAUSIBILITY_COLUMNS.get(table_name)
+    if sex_column:
+        prepared.append(f"`{sex_column}` AS `_qc_sex_concept_id`")
     df = source.selectExpr(*prepared)
+    if sex_column:
+        # DQ4 G2: internal flag event_sex_implausible; the public wrappers select explicitly.
+        rules = spark.read.table(GOLD_SEX_PLAUSIBILITY_TABLE).select(
+            F.col("concept_id").alias("_qc_sex_rule_concept_id"),
+            F.col("plausible_gender").alias("_qc_sex_plausible"),
+        )
+        sexes = (
+            spark.read.table(_src("spine_person"))
+            .select(F.col("person_id").alias("_qc_sex_person_id"), F.col("gender_display").alias("_qc_person_sex"))
+            .where(F.col("_qc_sex_person_id").isNotNull() & F.col("_qc_person_sex").isin("Male", "Female"))
+            .dropDuplicates(["_qc_sex_person_id"])
+        )
+        df = (
+            df.join(F.broadcast(rules), df._qc_sex_concept_id == rules._qc_sex_rule_concept_id, "left")
+            .join(sexes, df.person_id == sexes._qc_sex_person_id, "left")
+            .withColumn(
+                "event_sex_implausible",
+                F.coalesce(F.col("_qc_sex_plausible") != F.col("_qc_person_sex"), F.lit(False)),
+            )
+            .drop("_qc_sex_concept_id", "_qc_sex_rule_concept_id", "_qc_sex_plausible", "_qc_sex_person_id", "_qc_person_sex")
+        )
 
     if "person_id" in fk_columns:
         parent = spark.read.table("_gold_person_keys")
@@ -987,8 +1047,14 @@ def _qc(table_name, select_exprs, fk_columns=(), date_flags=()):
         transport = "__gold_json_" + old_name
         if transport not in df.columns:
             continue
-        payload = F.from_json(F.col(transport), "struct<" + ",".join(
-            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis, _ in axes) + ">")
+        # GOLD_PARSE_ONCE_PATCH_APPLIED v1
+        # Parse once into a column. An inline from_json is copied into every field reference of the
+        # policy gate (495 copies per axis at 22 policies), and Enzyme then plans the join-shaped twin
+        # for tens of minutes until the driver runs out of memory (2026-09-25/26 gold failures).
+        parsed = "__gold_parsed_" + old_name
+        df = df.withColumn(parsed, F.from_json(F.col(transport), "struct<" + ",".join(
+            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis, _ in axes) + ">"))
+        payload = F.col(parsed)
         for axis, source_only in axes:
             if not source_only:
                 item = payload[axis]
@@ -996,6 +1062,7 @@ def _qc(table_name, select_exprs, fk_columns=(), date_flags=()):
                 has_target = item["snomed_code"].isNotNull() | item["omop_concept_id"].isNotNull()
                 df = df.withColumn(f"_{axis}_gate_pass", F.when(has_target, gate))
                 df = df.withColumn(f"_{axis}_policy_id", F.when(has_target, policy_id))
+        df = df.drop(parsed)
     for axis, source_only in GOLD_S3B_DIRECT_AXES.get(table_name, ()):
         if not source_only:
             required = _s3_axis_columns(axis, False)
@@ -1023,18 +1090,21 @@ def _tdx_comments(frame, product):
         frame = frame.withMetadata(column, {"comment": f"{product} field {column}; quality-controlled TDX publication."})
     return frame
 
+# S3D_GOLD_ADMISSION_PATCH_APPLIED v1
 def _released(frame):
-    """Release text only when redaction version, input digest and context still match."""
+    """Release text when anonymisation succeeded and its input digest and context still match.
+
+    Any redactor version is released: the version travels with the text as provenance.
+    """
     columns = set(frame.columns)
     required = {
-        "anon_status", "anon_redactor_version", "anon_source_text_sha",
+        "anon_status", "anon_source_text_sha",
         "anon_input_digest", "anon_context_fingerprint", "context_fingerprint_current",
     }
     if not required.issubset(columns):
         return F.lit(False)
     return (
         (F.col("anon_status") == "anonymized")
-        & F.col("anon_redactor_version").isin("v3.3")
         & F.col("anon_source_text_sha").eqNullSafe(F.col("anon_input_digest"))
         & F.col("anon_context_fingerprint").eqNullSafe(F.col("context_fingerprint_current"))
     )

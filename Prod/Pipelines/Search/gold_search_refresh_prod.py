@@ -83,7 +83,7 @@ MAX_COST_USD = 2.00
 EST_USD_PER_TERM = 0.0000039
 FLUSH_ROWS = 1_000
 
-STAGING_PATH = "/Volumes/8_dev/embeddings/staging_gold_search"
+STAGING_PATH = "/Volumes/3_lookup/embeddings/staging_gold_search"  # OGR_NO_DEV_V1/gold_search
 LOCK_FILE = f"{STAGING_PATH}/.embed_lock"
 LOCK_STALE_SECONDS = 300
 
@@ -680,8 +680,7 @@ def embed_pending(max_terms=MAX_EMBED_TERMS, max_cost_usd=MAX_COST_USD, dry_run=
 
 def _ensure_objects():
     spark.sql("CREATE SCHEMA IF NOT EXISTS 3_lookup.gold")
-    spark.sql("CREATE SCHEMA IF NOT EXISTS 8_dev.embeddings")
-    spark.sql("CREATE VOLUME IF NOT EXISTS 8_dev.embeddings.staging_gold_search")
+    spark.sql("CREATE VOLUME IF NOT EXISTS 3_lookup.embeddings.staging_gold_search")
     spark.sql("""
     CREATE TABLE IF NOT EXISTS 3_lookup.gold.search_corpus (
       corpus_id          STRING   COMMENT 'Deterministic PK: sha2 of facet, object, column, coding system and code.',

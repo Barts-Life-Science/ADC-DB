@@ -680,6 +680,11 @@ CLINICAL_CONDITION_ADVISORY_RULES = {
     # unknown rate. Seen on 358,178 of 49,615,774 rows (0.722%) when profiled on 2026-08-24.
     "gold.clinical.condition.table.before_birth_event_datetime_person_birth_datetime":
         "NOT COALESCE(event_before_birth, FALSE)",
+
+    # DQ4 G2. Left as a warning because either the code or the person's recorded sex may be
+    # the wrong side. Seen on 1,191 of 50,978,755 rows when profiled on 2026-09-26.
+    "gold.clinical.condition.table.sex_implausible_concept":
+        "NOT COALESCE(event_sex_implausible, FALSE)",
 }
 
 CLINICAL_CONDITION_COLUMN_COMMENTS = {
@@ -1934,7 +1939,12 @@ CLINICAL_IMAGING_EXAM_SELECT = [
     '`accession_identifier` AS `accession_identifier`',
     '`study_instance_uid` AS `study_instance_uid`',
     '`modality_code` AS `modality_code`',
+    '`modality_dicom_code` AS `modality_dicom_code`',  # SDI_DICOM_MODALITY_V1
+    '`modality_dicom_method` AS `modality_dicom_method`',  # SDI_DICOM_MODALITY_V1
     "CASE WHEN UPPER(TRIM(CAST(`body_site_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `body_site_code` END AS `body_site_code`",
+    '`body_site_snomed_code` AS `body_site_snomed_code`',  # SDI_IMAGING_BODY_SITE_V1
+    '`body_site_snomed_display` AS `body_site_snomed_display`',  # SDI_IMAGING_BODY_SITE_V1
+    '`body_site_snomed_method` AS `body_site_snomed_method`',  # SDI_IMAGING_BODY_SITE_V1
     '`report_patient_event_key` AS `report_patient_event_key`',
     '`requester_practitioner_id` AS `requester_practitioner_id`',
     '`performer_practitioner_id` AS `performer_practitioner_id`',
@@ -2043,8 +2053,13 @@ CLINICAL_IMAGING_EXAM_COLUMN_COMMENTS = {
     "status_code": "Imaging study status.",
     "accession_identifier": "Imaging accession identifier, unchanged: PACS MILL_LINK_REF, Millennium REFERENCE_NBR. For the Barts/Sectra extraction accession use sectra_accession_number.",
     "study_instance_uid": "DICOM study instance UID.",
-    "modality_code": "Imaging modality code.",
-    "body_site_code": "Coded body part or anatomical region examined.",
+    "modality_code": "Local modality label as recorded: PACS MODALITY, or the Millennium NHS Imaging category (NHSI_MODALITY_CATEGORY). Not a DICOM code; see modality_dicom_code.",  # SDI_DICOM_MODALITY_V1
+    "modality_dicom_code": "DICOM Modality (0008,0060) defined term. PACS: MODALITY when it is a DICOM term. Millennium: the linked PACS examination's acquisition modality, else the bronze NHSI-category inference (map_radiology_event.MODALITY_DICOM). NULL when no evidence names a single modality.",
+    "modality_dicom_method": "How modality_dicom_code was set: pacs (PACS MODALITY is a DICOM term), pacs_non_dicom (PACS MODALITY is a site label, e.g. Pano/XDEXA; no code), pacs_link (Millennium exam, linked PACS examination), dicom_passthrough / nhsi_category_map / nhsi_category_mixed / unmapped (bronze NHSI-category inference). NULL when no modality was recorded.",
+    "body_site_code": "Source body-site value as recorded (PACS BODY_PART); not a SNOMED code.",  # SDI_DICOM_MODALITY_V1
+    "body_site_snomed_code": "SNOMED CT body structure derived from the mapped examination concept (exam_omop_concept_id) through the OMOP procedure-site relationships: Has dir proc site, else Has proc site, else Has indir proc site; the lowest concept id when several share that rank.",
+    "body_site_snomed_display": "SNOMED CT preferred name for body_site_snomed_code.",
+    "body_site_snomed_method": "omop_has_dir_proc_site | omop_has_proc_site | omop_has_indir_proc_site, with a _multiple suffix when the examination names several sites at that rank (only one is published). NULL when the examination has no mapped concept or no site relationship.",
     "report_patient_event_key": "Deterministic SHA-256 key of the linked report event.",
     "requester_practitioner_id": "Nullable Millennium personnel PERSON_ID for the requester.",
     "performer_practitioner_id": "Nullable Millennium personnel PERSON_ID for the performer.",
@@ -2206,7 +2221,12 @@ def gold_clinical_imaging_exam():
         '`accession_identifier` AS `accession_identifier`',
         '`study_instance_uid` AS `study_instance_uid`',
         '`modality_code` AS `modality_code`',
+        '`modality_dicom_code` AS `modality_dicom_code`',  # SDI_DICOM_MODALITY_V1
+        '`modality_dicom_method` AS `modality_dicom_method`',  # SDI_DICOM_MODALITY_V1
         '`body_site_code` AS `body_site_code`',
+        '`body_site_snomed_code` AS `body_site_snomed_code`',  # SDI_IMAGING_BODY_SITE_V1
+        '`body_site_snomed_display` AS `body_site_snomed_display`',  # SDI_IMAGING_BODY_SITE_V1
+        '`body_site_snomed_method` AS `body_site_snomed_method`',  # SDI_IMAGING_BODY_SITE_V1
         '`report_patient_event_key` AS `report_patient_event_key`',
         '`requester_practitioner_id` AS `requester_practitioner_id`',
         '`performer_practitioner_id` AS `performer_practitioner_id`',
@@ -2461,6 +2481,9 @@ CLINICAL_IMAGING_REPORT_LINK_COLUMNS = ['link_key',
  'text_integrity_status',
  'report_text_available_ind',
  'approved_anonymised_text_available_ind',
+ 'report_text_anonymised',
+ 'anonymisation_redactor_version',
+ 'anonymised_at',
  'person_id',
  'record_status',
  'loaded_at']
@@ -2502,6 +2525,17 @@ CLINICAL_IMAGING_REPORT_LINK_COLUMN_COMMENTS = {'link_key': 'Deterministic SHA-2
                                            'current text (anon_status anonymized and matching '
                                            'source hash). False when missing or stale; never '
                                            'inferred from raw text.',
+ 'report_text_anonymised': 'Approved-lane anonymised report text for this link: '
+                           'map_pacs_report.anon_report_text (pacs_native), '
+                           'map_pacs_report_text_bridge.anon_bridged_text (mill_blob_text_bridge) '
+                           'or mill_blob_text.anon_text for the linked version (mill_blob_text). '
+                           'Set exactly when approved_anonymised_text_available_ind is true; never '
+                           'falls back to raw text.',
+ 'anonymisation_redactor_version': 'anon_redactor_version of the lane row that produced '
+                                   'report_text_anonymised; NULL when report_text_anonymised is '
+                                   'NULL.',
+ 'anonymised_at': 'anon_processed_at of the lane row that produced report_text_anonymised; NULL '
+                  'when report_text_anonymised is NULL.',
  'person_id': 'Report/document person when resolved.',
  'record_status': 'Link record status: active, or the linked document/report record status when '
                   'that is not active.',
@@ -4257,7 +4291,16 @@ CLINICAL_PATHOLOGY_RESULT_SELECT = [
     '`representation_role` AS `representation_role`',
     '`preferred_result_ind` AS `preferred_result_ind`',
     '`person_projection_status` AS `person_projection_status`',
-    'CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL ELSE `value_number` END AS `value_number`',
+    # DQ4_G_GOLD_RULES_V1: G6 label-only tests ZZZB/ZZZM/ZZZS carry no measured number (3,945,068 rows);
+    # G7 FIT/FIT2/UMNT/24MT 999, 9999 and 99999 are "not measurable" fillers (8,075 rows; 9 and 99
+    # are real FIT values and stay); G4 haematocrit is L/L, so 10-100 is a percentage and is
+    # rescaled (4,686,743 rows, median 38 every year) and anything else above 1 is nulled (215).
+    "CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL"
+    " WHEN `source_code` IN ('ZZZB', 'ZZZM', 'ZZZS') THEN NULL"
+    " WHEN `source_code` IN ('FIT', 'FIT2', 'UMNT', '24MT') AND `value_number` IN (999, 9999, 99999) THEN NULL"
+    " WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` BETWEEN 10 AND 100 THEN CAST(`value_number` / 100 AS DECIMAL(38,10))"
+    " WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` > 1 THEN NULL"
+    " ELSE `value_number` END AS `value_number`",
     "CASE WHEN TRIM(CAST(`value_text` AS STRING)) = '' THEN NULL ELSE `value_text` END AS `value_text`",
     "CASE WHEN CAST(`value_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`value_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`value_datetime` AS DATE)) < 9999 OR CAST(`value_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`value_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `value_datetime` END END AS `value_datetime`",
     '`value_concept_id` AS `value_concept_id`',
@@ -4265,6 +4308,11 @@ CLINICAL_PATHOLOGY_RESULT_SELECT = [
     '`operator_concept_id` AS `operator_concept_id`',
     "CASE WHEN TRIM(CAST(`unit_source_value` AS STRING)) = '' THEN NULL ELSE `unit_source_value` END AS `unit_source_value`",
     '`ucum_code` AS `ucum_code`',
+    "`test_mapping_match_type` AS `test_mapping_match_type`",  # SDI_PATH_V1
+    "`test_mapping_rule_id` AS `test_mapping_rule_id`",  # SDI_PATH_V1
+    "CASE WHEN (CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL WHEN `source_code` IN ('ZZZB', 'ZZZM', 'ZZZS') THEN NULL WHEN `source_code` IN ('FIT', 'FIT2', 'UMNT', '24MT') AND `value_number` IN (999, 9999, 99999) THEN NULL WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` BETWEEN 10 AND 100 THEN CAST(`value_number` / 100 AS DECIMAL(38,10)) WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` > 1 THEN NULL ELSE `value_number` END) IS NULL THEN NULL ELSE `canonical_ucum_code` END AS `canonical_ucum_code`",  # SDI_PATH_V1
+    "CASE WHEN (CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL WHEN `source_code` IN ('ZZZB', 'ZZZM', 'ZZZS') THEN NULL WHEN `source_code` IN ('FIT', 'FIT2', 'UMNT', '24MT') AND `value_number` IN (999, 9999, 99999) THEN NULL WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` BETWEEN 10 AND 100 THEN CAST(`value_number` / 100 AS DECIMAL(38,10)) WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` > 1 THEN NULL ELSE `value_number` END) IS NULL THEN NULL WHEN `canonical_conversion` IN ('identity', 'egfr_unit_implied', 'inr_unit_implied') THEN CAST((CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL WHEN `source_code` IN ('ZZZB', 'ZZZM', 'ZZZS') THEN NULL WHEN `source_code` IN ('FIT', 'FIT2', 'UMNT', '24MT') AND `value_number` IN (999, 9999, 99999) THEN NULL WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` BETWEEN 10 AND 100 THEN CAST(`value_number` / 100 AS DECIMAL(38,10)) WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` > 1 THEN NULL ELSE `value_number` END) AS DECIMAL(38,10)) ELSE `value_canonical` END AS `value_canonical`",  # SDI_PATH_V1
+    "CASE WHEN (CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 THEN NULL WHEN `source_code` IN ('ZZZB', 'ZZZM', 'ZZZS') THEN NULL WHEN `source_code` IN ('FIT', 'FIT2', 'UMNT', '24MT') AND `value_number` IN (999, 9999, 99999) THEN NULL WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` BETWEEN 10 AND 100 THEN CAST(`value_number` / 100 AS DECIMAL(38,10)) WHEN `source_code` IN ('HCT', 'BHCT') AND `value_number` > 1 THEN NULL ELSE `value_number` END) IS NULL THEN NULL ELSE `canonical_conversion` END AS `canonical_conversion`",  # SDI_PATH_V1
     '`unit_concept_id` AS `unit_concept_id`',
     '`reference_range_low` AS `reference_range_low`',
     '`reference_range_high` AS `reference_range_high`',
@@ -4359,6 +4407,11 @@ CLINICAL_PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "operator_concept_id": "Result comparison operator concept.",
     "unit_source_value": "Verbatim source unit.",
     "ucum_code": "UCUM unit code.",
+    "test_mapping_match_type": "map_pathology.test_mapping_match_type: How measurement_concept_id was set: exact_context (the map key of this row code and description), native_event_cd / native_nlmc (native code map), safe_code (every observed description of the code maps to one concept), cross_arm_display (SDI_PATH_XARM_V1: a Millennium-linked row takes the concept the TFC LIMS arm map gives the same analyte display, and that arm tier), placeholder_code (SDI_PATH_PLACEHOLDER_V1: an unused/internal placeholder test code, unmapped by design), or unmapped.",  # SDI_PATH_V1
+    "test_mapping_rule_id": "map_pathology.test_mapping_rule_id: Rule that set a cross_arm_display or placeholder_code test mapping (SDI_PATH_XARM_V1 | SDI_PATH_PLACEHOLDER_V1); NULL when the row map key, a native map or the safe-code rule set it, or nothing did.",  # SDI_PATH_V1
+    "canonical_ucum_code": "NULL wherever Gold nulls value_number. map_pathology.canonical_ucum_code: UCUM unit of value_canonical (SDI_PATH_UNIT_V1): g/L for g/dL results, mmol/mol (IFCC) for HbA1c in %, ng/L for troponin T in ug/L, mL/min/{1.73_m2} for eGFR, {INR} for INR, else ucum_code. NULL when value_as_number is NULL, no unit is known, or the unit label contradicts the values (unit_label_conflict).",  # SDI_PATH_V1
+    "value_canonical": "Silver value_canonical after the Gold value_number repairs: NULL wherever value_number is nulled; where the conversion leaves the value unchanged (identity, egfr_unit_implied, inr_unit_implied) it is the repaired value_number, so the haematocrit percentage rescale carries through. value_as_number restated in canonical_ucum_code (see canonical_conversion); equal to value_as_number unless converted. NULL when canonical_conversion is NULL or unit_label_conflict.",  # SDI_PATH_V1
+    "canonical_conversion": "NULL wherever Gold nulls value_number. map_pathology.canonical_conversion: g/dL->g/L (x10) | %->mmol/mol (IFCC = (NGSP - 2.15) x 10.929, 1 dp) | ug/L->ng/L (x1000, troponin T only) | unit_label_conflict (troponin I labelled ug/L: TFC TROI has held ng/L-scale values since 2014, so neither the label nor a conversion is trusted; value_canonical and canonical_ucum_code are NULL) | egfr_unit_implied / inr_unit_implied (unit named by the test concept; value unchanged) | identity (ucum_code kept) | NULL (no numeric value, or no unit).",  # SDI_PATH_V1
     "unit_concept_id": "OMOP unit concept identifier.",
     "reference_range_low": "Reference-range lower bound.",
     "reference_range_high": "Reference-range upper bound.",
@@ -4395,7 +4448,7 @@ def _gold_qc_clinical_pathology_result():
     name=_n("gold_clinical.pathology_result"),
     comment=(
         "One pathology result with typed value, units, range, interpretation and mapping "
-        "evidence. Gold QC twin of the silver product: 11 columns are repaired or nulled, 1 "
+        "evidence. Gold QC twin of the silver product: 14 columns are repaired or nulled, 1 "
         "rule(s) drop rows, 5 check(s) are advisory. Each rule states its reason in the "
         "pipeline notebook, and Lakeflow expectation metrics report what every rule matched "
         "on each update."
@@ -4431,6 +4484,11 @@ def gold_clinical_pathology_result():
         '`operator_concept_id` AS `operator_concept_id`',
         '`unit_source_value` AS `unit_source_value`',
         '`ucum_code` AS `ucum_code`',
+        '`test_mapping_match_type` AS `test_mapping_match_type`',  # SDI_PATH_V1
+        '`test_mapping_rule_id` AS `test_mapping_rule_id`',  # SDI_PATH_V1
+        '`canonical_ucum_code` AS `canonical_ucum_code`',  # SDI_PATH_V1
+        '`value_canonical` AS `value_canonical`',  # SDI_PATH_V1
+        '`canonical_conversion` AS `canonical_conversion`',  # SDI_PATH_V1
         '`unit_concept_id` AS `unit_concept_id`',
         '`reference_range_low` AS `reference_range_low`',
         '`reference_range_high` AS `reference_range_high`',
@@ -4548,6 +4606,11 @@ CLINICAL_PROCEDURE_ADVISORY_RULES = {
     # unknown rate. Seen on 41,288 of 16,307,178 rows (0.253%) when profiled on 2026-08-24.
     "gold.clinical.procedure.table.before_birth_event_datetime_person_birth_datetime":
         "NOT COALESCE(event_before_birth, FALSE)",
+
+    # DQ4 G2. Left as a warning because either the code or the person's recorded sex may be
+    # the wrong side. Seen on 45 of 16,521,359 rows when profiled on 2026-09-26.
+    "gold.clinical.procedure.table.sex_implausible_concept":
+        "NOT COALESCE(event_sex_implausible, FALSE)",
 }
 
 CLINICAL_PROCEDURE_COLUMN_COMMENTS = {
@@ -5632,7 +5695,13 @@ CLINICAL_VITAL_SIGN_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`vital_code` AS `vital_code`',
-    'CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 OR `value_number` < 0 THEN NULL ELSE `value_number` END AS `value_number`',
+    # DQ4 G5 tympanic/axillary/oral temperature outside 25-45 C is not a living reading
+    # (23,145 rows; every unit is Celsius or blank, so there is no Fahrenheit to rescue; skin
+    # temperature is left alone); G8 a weight, height or BMI of exactly 0 is a blank (46,661 rows).
+    'CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 OR `value_number` < 0 THEN NULL'
+    ' WHEN `vital_omop_concept_id` IN (4215364, 4188706, 4218834) AND (`value_number` < 25 OR `value_number` > 45) THEN NULL'
+    ' WHEN `vital_omop_concept_id` IN (4099154, 4177340, 36304833) AND `value_number` = 0 THEN NULL'
+    ' ELSE `value_number` END AS `value_number`',
     '`value_text` AS `value_text`',
     '`unit_source_value` AS `unit_source_value`',
     '`unit_concept_id` AS `unit_concept_id`',
@@ -5660,6 +5729,7 @@ CLINICAL_VITAL_SIGN_SELECT = [
     '`loaded_at` AS `loaded_at`',
     '`registry_field_id` AS `registry_field_id`',
     '`event_datetime_status` AS `event_datetime_status`',
+    '`vital_omop_concept_id` AS `_qc_vital_concept_id`',
 ]
 for _s3b_axis in ("unit", "method", "body_site", "interpretation"):
     CLINICAL_VITAL_SIGN_SELECT.extend(
@@ -5706,6 +5776,12 @@ CLINICAL_VITAL_SIGN_ADVISORY_RULES = {
     # mostly minutes, which reads as two clocks rather than two events in the wrong order.
     "gold.clinical.vital_sign.table.ordering_violation_event_datetime_event_end_datetime":
         "NOT COALESCE((`event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime`), FALSE)",
+
+    # DQ4 G1. Left as a warning because a pair cannot say which of its two readings is wrong,
+    # and nulling both would lose the sound one. Seen on 5,173 of 26,158,007 unambiguous pairs
+    # (both rows flagged) when profiled on 2026-09-26.
+    "gold.clinical.vital_sign.value_number.bp_pair_implausible":
+        "NOT COALESCE(bp_pair_implausible, FALSE)",
 }
 
 CLINICAL_VITAL_SIGN_COLUMN_COMMENTS = {
@@ -5759,6 +5835,25 @@ for _s3b_axis in ("unit", "method", "body_site", "interpretation"):
         for name in _s3_axis_columns(_s3b_axis)
     })
 
+# DQ4 G1: rule gold.clinical.vital_sign.value_number.bp_pair_implausible. A systolic and a
+# diastolic reading pair when each is the only one of its kind for the person at that instant
+# (26,158,007 of 33,001,175 instants; the rest are ambiguous and never judged). A pair is
+# implausible when systolic <= diastolic, systolic < 20 or diastolic > 200.
+_G1_SYSTOLIC, _G1_DIASTOLIC = 4152194, 4154790
+
+def _g1_bp_pair_implausible(df):
+    from pyspark.sql import Window
+    systolic = F.col("_qc_vital_concept_id") == _G1_SYSTOLIC
+    diastolic = F.col("_qc_vital_concept_id") == _G1_DIASTOLIC
+    is_bp = F.coalesce(systolic | diastolic, F.lit(False))
+    pair = Window.partitionBy("person_id", "event_datetime", is_bp)
+    n_sys = F.count(F.when(systolic, 1)).over(pair)
+    n_dia = F.count(F.when(diastolic, 1)).over(pair)
+    sbp = F.max(F.when(systolic, F.col("value_number"))).over(pair)
+    dbp = F.max(F.when(diastolic, F.col("value_number"))).over(pair)
+    judged = is_bp & F.col("person_id").isNotNull() & F.col("event_datetime").isNotNull() & (n_sys == 1) & (n_dia == 1)
+    return df.withColumn("bp_pair_implausible", judged & ((sbp <= dbp) | (sbp < 20) | (dbp > 200)))
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_vital_sign"),
     comment="Internal quality-controlled twin of clinical_vital_sign: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -5768,7 +5863,7 @@ for _s3b_axis in ("unit", "method", "body_site", "interpretation"):
 @dp.expect_all(CLINICAL_VITAL_SIGN_ADVISORY_RULES)
 def _gold_qc_clinical_vital_sign():
     """Quality-controlled twin of journey_clinical.vital_sign."""
-    df = _qc("clinical_vital_sign", CLINICAL_VITAL_SIGN_SELECT)
+    df = _g1_bp_pair_implausible(_qc("clinical_vital_sign", CLINICAL_VITAL_SIGN_SELECT))
     return _with_comments(df, CLINICAL_VITAL_SIGN_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -6841,4 +6936,30 @@ def gold_clinical_presenting_complaint():
             .drop("_complaint_gate_pass", "_complaint_policy_id"))
 
 # COMMAND ----------
+
+# COMMAND ----------
+
+# ==== journey_clinical.medication_order_attribute ==== PMS_P1_T6_GOLD_V1
+CLINICAL_MEDICATION_ORDER_ATTRIBUTE_MANDATORY_RULES = {
+    # An attribute row whose order is not admitted to gold has no parent to describe.
+    "gold.clinical_medication_order_attribute.parent_admitted": "COALESCE(__gold_parent_present, FALSE)"}
+CLINICAL_MEDICATION_ORDER_ATTRIBUTE_ADVISORY_RULES = {
+    # Implausible weights are reported, not dropped; the other attributes on the order stay valid.
+    "gold.clinical_medication_order_attribute.weight_plausible": "weight_value IS NULL OR weight_value BETWEEN 0.2 AND 400"}
+
+@dp.materialized_view(name=_n("gold_qc._clinical_medication_order_attribute"),
+    comment="Internal QC twin of clinical_medication_order_attribute; drops orders not admitted to gold medication_order.",
+    refresh_policy="incremental")
+@dp.expect_all_or_drop(CLINICAL_MEDICATION_ORDER_ATTRIBUTE_MANDATORY_RULES)
+@dp.expect_all(CLINICAL_MEDICATION_ORDER_ATTRIBUTE_ADVISORY_RULES)
+def _gold_qc_clinical_medication_order_attribute():
+    parent = spark.read.table(_n("gold_clinical.medication_order")).select('order_id').dropDuplicates(['order_id'])
+    child = spark.read.table(_src("clinical_medication_order_attribute"))
+    return _with_parent_status(child, parent, ['order_id'])
+
+@dp.materialized_view(name=_n("gold_clinical.medication_order_attribute"),
+    comment="One row per admitted medication order with its latest detail attributes. Join key: order_id.",
+    table_properties={"quality": "gold"}, refresh_policy="incremental")
+def gold_clinical_medication_order_attribute():
+    return spark.read.table(_n("gold_qc._clinical_medication_order_attribute")).drop("__gold_parent_present")
 

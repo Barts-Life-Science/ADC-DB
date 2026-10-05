@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Forms
 # MAGIC PowerForm response selection and the thirty instrument tables. Each configuration and instrument is readable in its own cell.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 6 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -82,20 +82,22 @@ def materialized_view(column_comments=None, **options):
 
 PUBLIC_SCHEMA = spark.conf.get("journey.public_schema")
 INTERNAL_SCHEMA = spark.conf.get("journey.internal_schema")
+# Reviewed form config seeds, promoted from 8_dev.s2_work to 3_lookup.omop on 2026-09-26.
+# FORM_CONFIG_PROD_SOURCE_PATCH_APPLIED v1
 FORM_CONFIG_CENSUS_SOURCE = spark.conf.get(
     "journey.form_config_census_source",
-    "8_dev.s2_work.form_config_census_source",
+    "3_lookup.omop.form_config_census",
 )
 FORM_SLUG_LOOKUP_SOURCE = spark.conf.get(
     "journey.form_slug_lookup_source",
-    "8_dev.s2_work.form_slug_lookup_source",
+    "3_lookup.omop.form_slug_lookup",
 )
 FORM_ELEMENT_LOOKUP_SOURCE = spark.conf.get(
     "journey.form_element_lookup_source",
-    "8_dev.s2_work.form_element_lookup_source",
+    "3_lookup.omop.form_element_lookup",
 )
 S3B_SMOKING_LOOKUP_SOURCE = spark.conf.get(
-    "journey.s3b.smoking_lookup", "8_dev.lookup.smoking_answer_snomed_map"
+    "journey.s3b.smoking_lookup", "3_lookup.omop.smoking_answer_snomed_map"
 )
 
 
@@ -6574,7 +6576,8 @@ def _form_config_census():
 # The Task 4 lifecycle split removes identity/status/load columns from the public parent.
 # The Task 3 relational-child split removes responses. Child-row loaded_at remains on
 # clinical_form_response as provenance for the response itself.
-FORM_HOUSE_COLUMNS_V2 = ['patient_event_key', 'dcp_forms_activity_id', 'subject_key', 'subject_id_system', 'person_id', 'encounter_id', 'event_datetime', 'event_end_datetime', 'source_coding_system', 'source_code', 'source_display', 'form_type_code', 'form_type_display', 'form_status_code', 'form_status_display', 'authored_datetime', 'completed_datetime', 'performed_practitioner_id', 'organization_id', 'response_row_count', 'active_response_row_count', 'empty_response_row_count', 'invalid_response_row_count', 'matched_response_row_count', 'unmatched_response_row_count', 'confidentiality_code', 'vip_ind', 'withheld_identity_ind', 'source_feed', 'record_status', 'record_status_effective_from', 'record_status_effective_to', 'source_update_timestamp', 'loaded_at']
+FORM_HOUSE_COLUMNS_V2 = ['patient_event_key', 'dcp_forms_activity_id', 'subject_key', 'subject_id_system', 'person_id', 'encounter_id', 'event_datetime', 'event_end_datetime', 'event_datetime_local', 'event_end_datetime_local', 'source_coding_system', 'source_code', 'source_display', 'form_type_code', 'form_type_display', 'form_status_code', 'form_status_display', 'authored_datetime', 'completed_datetime', 'performed_practitioner_id', 'organization_id', 'response_row_count', 'active_response_row_count', 'empty_response_row_count', 'invalid_response_row_count', 'matched_response_row_count', 'unmatched_response_row_count', 'confidentiality_code', 'vip_ind', 'withheld_identity_ind', 'source_feed', 'record_status', 'record_status_effective_from', 'record_status_effective_to', 'source_update_timestamp', 'loaded_at']
+# TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
 
 FORM_HOUSE_COLUMN_COMMENTS = {
     'patient_event_key': 'Deterministic SHA-256 event identity; stable cross-feed join key.',
@@ -6585,6 +6588,8 @@ FORM_HOUSE_COLUMN_COMMENTS = {
     'encounter_id': 'Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.',
     'event_datetime': 'First documented timestamp.',
     'event_end_datetime': 'Last documented or performed timestamp.',
+    'event_datetime_local': 'event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.',
+    'event_end_datetime_local': 'event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.',
     'source_coding_system': 'Source form coding system.',
     'source_code': 'Source form reference identifier.',
     'source_display': 'Source form description.',
@@ -7815,6 +7820,8 @@ INSTRUMENT_PARENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "First documented timestamp.",
     "event_end_datetime": "Last documented or performed timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source form coding system.",
     "source_code": "Source form reference identifier.",
     "source_display": "Source form description.",
@@ -13824,4 +13831,3 @@ assert set(FORM_RESPONSE_COLUMN_COMMENTS) == (
         for column in _s3b_axis_columns(axis)
     }
 )
-

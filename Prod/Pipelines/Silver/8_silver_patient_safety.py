@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Patient safety
 # MAGIC Safety incidents, participants, injuries, factors, actions, status and incident text.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 8 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -197,6 +197,9 @@ def build_clinical_safety_incident_index_lane():
         optional("encounter_id", "string").alias("encounter_id"),
         F.coalesce(optional("incident_dt_tm_clean", "timestamp"), optional("incident_dt_tm", "timestamp")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(optional("incident_dt_tm_clean", "timestamp"), optional("incident_dt_tm", "timestamp")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
+        # TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
         F.lit("datix").alias("_source_system"),
         optional("source_table", "string").alias("_source_table"),
         optional("source_row_id", "string").alias("_source_row_id"),
@@ -210,4 +213,3 @@ def build_clinical_safety_incident_index_lane():
         optional("load_batch_id", "string").alias("load_batch_id"),
         optional("loaded_at", "timestamp").alias("loaded_at"),
     )
-

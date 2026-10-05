@@ -1,4 +1,8 @@
 # Databricks notebook source
+# PMS_P1_T1_V3
+# PMS_P1_T0_SCHEMA_V1
+# PMS_P1_T2_V1
+# PMS_P1_T3_V1
 # BRONZE_FIX_857469999366132_V1
 # BRONZE_FIX_946452877034658_V1
 # TDX Datix bronze writer. Default is an incident-linked bounded sample; full mode is guarded.
@@ -33,6 +37,7 @@ SRC_INCIDENTS=f"{RAW}.datix_incidents_main"; SRC_CONTACTS=f"{RAW}.datix_contacts
 SRC_INJURIES=f"{RAW}.datix_inc_injuries"; SRC_STATUS=f"{RAW}.datix_inc_status_audit"; SRC_ACTIONS=f"{RAW}.datix_ca_actions"
 SRC_LFPSE=f"{RAW}.datix_lfpse_main"; SRC_LFPSE_PATIENT=f"{RAW}.datix_lfpse_patients_details"
 SRC_IDENTIFIERS="4_prod.bronze.map_patient_identifier"; SRC_PERSON="4_prod.bronze.map_person"; SRC_ENCOUNTER="4_prod.bronze.map_encounter"
+dbutils.widgets.text("drug_lexicon_table","3_lookup.omop.drug_name_lexicon"); SRC_DRUG_LEXICON=dbutils.widgets.get("drug_lexicon_table")
 INCIDENT=f"{TARGET_SCHEMA}.map_safety_incident"; PARTICIPANT=f"{TARGET_SCHEMA}.map_safety_incident_participant"
 INJURY=f"{TARGET_SCHEMA}.map_safety_incident_injury"; FACTOR=f"{TARGET_SCHEMA}.map_safety_incident_factor"
 LFPSE=f"{TARGET_SCHEMA}.map_safety_incident_lfpse"; ACTION=f"{TARGET_SCHEMA}.map_safety_incident_action"
@@ -80,7 +85,7 @@ def _snapshot_rows_from_history(table, version):
 def assert_snapshot_not_shrunk(table):
     if SAMPLE_MODE:
         return
-    pins = (spark.table("8_dev.tdx_evidence.source_pins")
+    pins = (spark.table("6_mgmt.bronze.tdx_source_pins")  # OGR_NO_DEV_V1/datix
             .where(F.col("source_table") == table).select("row_count", "delta_version").collect())
     if len(pins) != 1:
         raise RuntimeError(f"{table}: expected one saved snapshot baseline, found {len(pins)}")
@@ -113,7 +118,7 @@ def finalise(df,key_cols,source_table,source_row_col):
 
 def governance(table):
     spark.sql(f"COMMENT ON TABLE {qname(table)} IS 'TDX Datix curated bronze product. Reported incidents and associations are not incidence rates or proven causality.'")
-    ids=("PERSON","ENCNTR","NHS","MRN","NAME","DOB","DOD","POSTCODE","ADDRESS","TEL","PHONE","FAX","EMAIL","LOGIN","INITIAL","SERIAL")
+    ids=("PERSON","ENCNTR","NHS","MRN","NAME","DOB","DOD","POSTCODE","ADDRESS","TEL","PHONE","FAX","EMAIL","LOGIN","INITIAL","SERIAL","BATCH_NUMBER")  # PMS_DATIX_DEVICE_V1: batch/lot is a device identifier
     texts=("TEXT","NOTES","DESCR","ACTION","OUTCOME","PROGRESS","SYNOPSIS","MONITOR","RESOURCE","PROBLEM")
     for c in spark.table(table).columns:
         spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{c.replace('`','``')}` COMMENT 'TDX Datix bronze field {c}.'")
@@ -139,6 +144,11 @@ def publish(df,target,keys,snapshot=False):
         op="CREATE"
     else:
         validate(df)
+        # PMS_P1_T0_SCHEMA_V1: additive schema evolution; the explicit MERGE set cannot add columns.
+        have={c.lower() for c in spark.table(target).columns}
+        add=[f for f in df.schema.fields if f.name.lower() not in have]
+        if add:
+            spark.sql(f"ALTER TABLE {qname(target)} ADD COLUMNS ("+", ".join(f"`{f.name.replace('`','``')}` {f.dataType.simpleString()}" for f in add)+")")
         dt=DeltaTable.forName(spark,target); cond=" AND ".join(f"t.`{k}` <=> s.`{k}`" for k in keys)
         mutable=[c for c in df.columns if c not in keys and not c.startswith("anon_")]
         m=(dt.alias("t").merge(df.alias("s"),cond).whenMatchedUpdate(condition="NOT (t.ROW_HASH <=> s.ROW_HASH)",set={c:f"s.`{c}`" for c in mutable}).whenNotMatchedInsertAll())
@@ -165,25 +175,84 @@ links=active_incident_filter(spark.table(SRC_LINKS))
 contact_ids=links.select(F.col("con_id").cast("long").alias("_con_id")).where("_con_id IS NOT NULL").distinct()
 contacts=spark.table(SRC_CONTACTS).alias("c").join(F.broadcast(contact_ids),F.col("c.recordid").cast("long")==F.col("_con_id"),"inner").drop("_con_id")
 
-# Limit the identifier lookup to aliases actually present in the bounded contact cohort.
-mrn_values=[r[0] for r in contacts.select(F.upper(F.trim("con_number")).alias("value")).where("value IS NOT NULL AND value<>''").distinct().limit(10000).collect() if r[0]]
-nhs_values=[r[0] for r in contacts.select(F.regexp_replace("con_nhsno","[^0-9]","").alias("value")).where("value IS NOT NULL AND value<>''").distinct().limit(10000).collect() if r[0]]
-ids=spark.table(SRC_IDENTIFIERS).where("CURRENT_IND")
-mrn=(ids.where((F.col("ALIAS_TYPE")=="MRN") & F.upper(F.trim("ALIAS_VALUE")).isin(mrn_values or ["__NONE__"]))
-    .groupBy(F.upper(F.trim("ALIAS_VALUE")).alias("_mrn")).agg(F.countDistinct("PERSON_ID").alias("_mrn_n"),F.max("PERSON_ID").cast("long").alias("_mrn_person")))
-nhs=(ids.where((F.col("ALIAS_TYPE")=="NHS") & F.regexp_replace("ALIAS_VALUE","[^0-9]","").isin(nhs_values or ["__NONE__"]))
-    .groupBy(F.regexp_replace("ALIAS_VALUE","[^0-9]","").alias("_nhs")).agg(F.countDistinct("PERSON_ID").alias("_nhs_n"),F.max("PERSON_ID").cast("long").alias("_nhs_person")))
+# PMS_P1_T1_V3: resolve the whole contact cohort by join; the former collect()/limit(10000) lookup
+# silently capped resolution at 10k aliases in full mode.
+# Keys: MRN compared letters+digits only on both sides (Datix holds spaced/dashed/slashed forms);
+# current MRN aliases win, historic aliases are used only for a key no current alias holds. The NHS key
+# is con_nhsno, else a mod-11-valid 10-digit con_number (NHS numbers typed into the MRN field).
+# DOB refutation: a single-identifier link (MRN-only or NHS-only) is withheld as conflict_dob when both
+# DOBs exist and disagree beyond Datix entry noise (+/-1 day for UTC births, one of year/month/day
+# mistyped, or day/month swapped). Measured 2026-09-29: MRN-only links carried ~3x the wholly-different-DOB
+# rate of MRN+NHS-agreeing links, i.e. MRN collisions. MRN+NHS agreement is not refuted.
+# Core rescue: an unresolved, ambiguous or DOB-refuted contact takes the one person whose MRN digit core
+# (digits, leading zeros dropped, >=5 long) matches and whose DOB agrees within +/-1 day, unless a unique
+# NHS match names someone else. Measured 2026-09-29: 24.6k rescued; a 400-day-shifted DOB null model gave 2.
+person_dob=spark.table(SRC_PERSON).select(F.col("person_id").cast("long").alias("_pid"),F.col("birth_date").alias("_birth_date"))
+def _alnum(c): return F.upper(F.regexp_replace(c,"[^A-Za-z0-9]",""))
+def _core(c):
+    k=F.regexp_replace(F.regexp_replace(c,"[^0-9]",""),"^0+","")
+    return F.when(F.length(k)>=5,k)
+_mrn_digits=F.regexp_replace("con_number","[^0-9]","")
+_nhs_ok=(F.length(_mrn_digits)==10)&F.upper(F.trim("con_number")).rlike(r"^[0-9][0-9 \-]*$")&(
+    F.pmod(F.lit(11)-F.pmod(reduce(lambda a,b:a+b,[F.substring(_mrn_digits,i,1).cast("int")*(11-i) for i in range(1,10)]),F.lit(11)),F.lit(11))
+    ==F.substring(_mrn_digits,10,1).cast("int"))
+keys=contacts.select(F.col("recordid").cast("long").alias("CON_ID"),_alnum("con_number").alias("_mrn"),
+    F.coalesce(F.nullif(F.regexp_replace("con_nhsno","[^0-9]",""),F.lit("")),F.when(_nhs_ok,_mrn_digits)).alias("_nhs"),F.to_date("con_dob").alias("_dob"),_core("con_number").alias("_core"))
+ids=spark.table(SRC_IDENTIFIERS)
+mrn_keys=keys.select("_mrn").where("_mrn IS NOT NULL AND _mrn<>''").distinct()
+nhs_keys=keys.select("_nhs").where("_nhs IS NOT NULL AND _nhs<>''").distinct()
+mrn=(ids.where(F.col("ALIAS_TYPE")=="MRN").select(_alnum("ALIAS_VALUE").alias("_mrn"),F.col("PERSON_ID").cast("long").alias("_p"),F.col("CURRENT_IND").alias("_cur"))
+    .join(mrn_keys,"_mrn","left_semi").where("_p IS NOT NULL")
+    # Current aliases hold the key when any exist; otherwise its historic aliases do.
+    .withColumn("_tier",F.max(F.col("_cur").cast("int")).over(Window.partitionBy("_mrn"))).where(F.coalesce(F.col("_cur").cast("int"),F.lit(0))==F.col("_tier"))
+    .groupBy("_mrn")
+    .agg(F.countDistinct("_p").alias("_mrn_n"),F.max("_p").alias("_mrn_person"),F.collect_set("_p").alias("_mrn_cands")))
+nhs=(ids.where((F.col("ALIAS_TYPE")=="NHS")&F.col("CURRENT_IND")).select(F.regexp_replace("ALIAS_VALUE","[^0-9]","").alias("_nhs"),F.col("PERSON_ID").cast("long").alias("_p"))
+    .join(nhs_keys,"_nhs","left_semi").groupBy("_nhs")
+    .agg(F.countDistinct("_p").alias("_nhs_n"),F.max("_p").alias("_nhs_person")))
+
+core_keys=keys.select("_core").where("_core IS NOT NULL").distinct()
+mrn_core=(ids.where(F.col("ALIAS_TYPE")=="MRN").select(_core("ALIAS_VALUE").alias("_core"),F.col("PERSON_ID").cast("long").alias("_cp"))
+    .join(core_keys,"_core","left_semi").where("_cp IS NOT NULL").distinct())
+core_pick=(keys.where("_core IS NOT NULL AND _dob IS NOT NULL").select("CON_ID","_core","_dob").join(mrn_core,"_core")
+    .join(person_dob.select(F.col("_pid").alias("_cp"),F.col("_birth_date").alias("_cbd")),"_cp")
+    .where(F.abs(F.datediff("_cbd","_dob"))<=1)
+    .groupBy("CON_ID").agg(F.countDistinct("_cp").alias("_core_n"),F.max("_cp").alias("_core_any"))
+    .select("CON_ID",F.when(F.col("_core_n")==1,F.col("_core_any")).alias("_core_person")))
+
+def dob_consistent(a,b):
+    ya,yb,ma,mb,da,db=F.year(a),F.year(b),F.month(a),F.month(b),F.dayofmonth(a),F.dayofmonth(b)
+    return ((F.abs(F.datediff(a,b))<=1)|((ya==yb)&(ma==mb))|((ya==yb)&(da==db))|((ma==mb)&(da==db))|((ya==yb)&(ma==db)&(da==mb)))
 
 def resolved_contacts():
-    c=contacts.select(F.col("recordid").cast("long").alias("CON_ID"),F.upper(F.trim("con_number")).alias("_mrn"),F.regexp_replace("con_nhsno","[^0-9]","").alias("_nhs"),F.col("con_dob").alias("_dob"))
-    j=c.join(mrn,"_mrn","left").join(nhs,"_nhs","left")
+    j=keys.join(mrn,"_mrn","left").join(nhs,"_nhs","left")
+    # A multi-person MRN is rescued only when exactly one candidate's DOB agrees within +/-1 day
+    # (mill BIRTH_DT_TM is UTC, so BST births land a day early).
+    dob_pick=(j.where(F.col("_mrn_n")>1).select("CON_ID","_dob",F.explode("_mrn_cands").alias("_cand"))
+        .join(person_dob,F.col("_cand")==F.col("_pid"))
+        .where(F.abs(F.datediff("_birth_date","_dob"))<=1)
+        .groupBy("CON_ID").agg(F.countDistinct("_cand").alias("_dob_n"),F.max("_cand").alias("_dob_person_any"))
+        .select("CON_ID",F.when(F.col("_dob_n")==1,F.col("_dob_person_any")).alias("_dob_person")))
+    j=j.join(dob_pick,"CON_ID","left")
     mrn_multi=F.col("_mrn_n")>1; nhs_multi=F.col("_nhs_n")>1; mrn_ok=F.col("_mrn_n")==1; nhs_ok=F.col("_nhs_n")==1
     agree=mrn_ok&nhs_ok&(F.col("_mrn_person")==F.col("_nhs_person")); conflict=mrn_ok&nhs_ok&(F.col("_mrn_person")!=F.col("_nhs_person"))
-    status=(F.when(mrn_multi|nhs_multi|conflict,"ambiguous").when(agree,"resolved_mrn_nhs").when(mrn_ok,"resolved_mrn").when(nhs_ok,"resolved_nhs").otherwise("unresolved"))
-    person=F.when(status.startswith("resolved"),F.coalesce(F.when(mrn_ok,F.col("_mrn_person")),F.when(nhs_ok,F.col("_nhs_person"))))
-    return j.select("CON_ID",person.cast("long").alias("PERSON_ID"),status.alias("PERSON_RESOLUTION_STATUS"),F.lit("TDX-P1 multi-match-first, mrn>nhs unique-only 2026-09-13").alias("PERSON_RESOLUTION_RULE"),"_dob")
+    dob_rescue=mrn_multi&F.col("_dob_person").isNotNull()&(~F.coalesce(nhs_ok,F.lit(False))|(F.col("_nhs_person")==F.col("_dob_person")))
+    status=(F.when(conflict,"ambiguous").when(agree,"resolved_mrn_nhs").when(dob_rescue,"resolved_mrn_dob")
+        .when(mrn_multi|nhs_multi,"ambiguous").when(mrn_ok,"resolved_mrn").when(nhs_ok,"resolved_nhs").otherwise("unresolved"))
+    person=(F.when(status=="resolved_mrn_dob",F.col("_dob_person"))
+        .when(status.startswith("resolved"),F.coalesce(F.when(mrn_ok,F.col("_mrn_person")),F.when(nhs_ok,F.col("_nhs_person")))))
+    j=(j.withColumn("_status",status).withColumn("_person",person.cast("long"))
+        .join(person_dob,F.col("_person")==F.col("_pid"),"left"))
+    refuted=F.col("_status").isin("resolved_mrn","resolved_nhs")&F.col("_dob").isNotNull()&F.col("_birth_date").isNotNull()&~dob_consistent(F.col("_dob"),F.col("_birth_date"))
+    j=j.join(core_pick,"CON_ID","left")
+    base=F.when(refuted,"conflict_dob").otherwise(F.col("_status"))
+    core_ok=(base.isin("unresolved","ambiguous","conflict_dob")&F.col("_core_person").isNotNull()
+        &~(F.coalesce(nhs_ok,F.lit(False))&(F.col("_nhs_person")!=F.col("_core_person"))))
+    return j.select("CON_ID",F.when(core_ok,F.col("_core_person")).when(~refuted,F.col("_person")).alias("PERSON_ID"),
+        F.when(core_ok,"resolved_mrn_core_dob").otherwise(base).alias("PERSON_RESOLUTION_STATUS"),
+        F.lit("TDX-P3 full-cohort join; alnum MRN (current aliases, else historic); NHS from con_nhsno else mod-11 10-digit con_number; multi-match-first except DOB+/-1d-unique MRN; single-identifier links withheld on DOB conflict beyond one-field typo; else unique MRN digit-core + DOB+/-1d; mrn>nhs unique-only 2026-09-29").alias("PERSON_RESOLUTION_RULE"),
+        F.col("_dob"))
 resolved=resolved_contacts()
-person_dob=spark.table(SRC_PERSON).select(F.col("person_id").cast("long").alias("_pid"),F.col("birth_date").alias("_birth_date"))
 
 # COMMAND ----------
 
@@ -229,10 +298,49 @@ incident_dt=F.when(valid_time,F.to_timestamp(F.concat_ws(" ",F.date_format("i.in
 incident_clean=F.when(incident_dt>=F.lit("1990-01-01").cast("timestamp"),incident_dt)
 header_fields=["inc_ourref","inc_type","inc_category","inc_subcategory","inc_severity","inc_grade","inc_consequence","inc_likelihood","inc_rating","inc_impact","inc_outcomecode","inc_result","inc_cause","inc_acctype","inc_riddor","inc_is_riddor","inc_riddorno","inc_ridloc","inc_notify","inc_treatment","inc_injury","inc_bodypart","inc_pat_type","inc_carestage","inc_clinoutcome","inc_clinoutcome2","inc_clintype","inc_further_inv","inc_rc_required","inc_organisation","inc_unit","inc_directorate","inc_clingroup","inc_specialty","inc_nspecialty","inc_loctype","inc_locactual","inc_location","inc_unit_type","inc_head","inc_mgr","rep_approved","seclevel","secgroup","inc_name","inc_dob","inc_gender","inc_ethnicity","inc_postcode","inc_repname","inc_reportedby","inc_investigator"]
 header_fields=[x for x in header_fields if has_col(SRC_INCIDENTS,x)]
-incident=i.select(F.col("i.recordid").cast("long").alias("RECORDID"),*[F.col(f"i.{x}").alias(x.upper()) for x in header_fields],incident_dt.alias("INCIDENT_DT_TM"),incident_clean.alias("INCIDENT_DT_TM_CLEAN"),F.col("i.inc_dreported").alias("REPORTED_DT_TM"),F.col("i.inc_dopened").alias("OPENED_DT_TM"),F.col("i.inc_dnotified").alias("NOTIFIED_DT_TM"),F.col("i.inc_inv_dstart").alias("INVESTIGATION_START_DT_TM"),F.col("i.inc_inv_dcomp").alias("INVESTIGATION_COMPLETE_DT_TM"),F.col("i.updateddate").alias("SOURCE_UPDT_DT_TM"),F.coalesce("AFFECTED_PATIENT_COUNT",F.lit(0)).cast("long").alias("AFFECTED_PATIENT_COUNT"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,F.col("_affected_person")).cast("long").alias("PERSON_ID"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,"resolved_affected_participant").otherwise("none_or_multiple").alias("PERSON_LINK_METHOD"),F.lit(None).cast("long").alias("ENCNTR_ID"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,"sample_not_evaluated" if SAMPLE_MODE else "pending_overlap_resolution").otherwise("no_person").alias("ENCOUNTER_LINK_METHOD"),F.lit("TDX-E1 2026-09-13").alias("ENCOUNTER_LINK_RULE"),F.col("i.ADC_UPDT").alias("SOURCE_ADC_UPDT"),"_participants")
+incident=i.select(F.col("i.recordid").cast("long").alias("RECORDID"),*[F.col(f"i.{x}").alias(x.upper()) for x in header_fields],incident_dt.alias("INCIDENT_DT_TM"),incident_clean.alias("INCIDENT_DT_TM_CLEAN"),valid_time.alias("INCIDENT_TIME_VALID_IND"),F.col("i.inc_dreported").alias("REPORTED_DT_TM"),F.col("i.inc_dopened").alias("OPENED_DT_TM"),F.col("i.inc_dnotified").alias("NOTIFIED_DT_TM"),F.col("i.inc_inv_dstart").alias("INVESTIGATION_START_DT_TM"),F.col("i.inc_inv_dcomp").alias("INVESTIGATION_COMPLETE_DT_TM"),F.col("i.updateddate").alias("SOURCE_UPDT_DT_TM"),F.coalesce("AFFECTED_PATIENT_COUNT",F.lit(0)).cast("long").alias("AFFECTED_PATIENT_COUNT"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,F.col("_affected_person")).cast("long").alias("PERSON_ID"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,"resolved_affected_participant").otherwise("none_or_multiple").alias("PERSON_LINK_METHOD"),F.lit(None).cast("long").alias("ENCNTR_ID"),F.when(F.col("AFFECTED_PATIENT_COUNT")==1,"sample_not_evaluated" if SAMPLE_MODE else "pending_overlap_resolution").otherwise("no_person").alias("ENCOUNTER_LINK_METHOD"),F.lit("TDX-E1 2026-09-13").alias("ENCOUNTER_LINK_RULE"),F.col("i.ADC_UPDT").alias("SOURCE_ADC_UPDT"),"_participants")
 incident=incident.withColumn("CONTEXT_FINGERPRINT_CURRENT",F.sha2(F.concat_ws("|",F.coalesce("INC_NAME",F.lit("")),F.coalesce(F.col("INC_DOB").cast("string"),F.lit("")),F.coalesce("INC_POSTCODE",F.lit("")),F.coalesce("INC_REPNAME",F.lit("")),F.coalesce("INC_INVESTIGATOR",F.lit("")),F.to_json(F.coalesce("_participants",F.array().cast("array<string>")))),256)).drop("_participants")
 for code,table in [("INC_TYPE","datix_code_inc_type"),("INC_CATEGORY","datix_code_inc_cat"),("INC_SUBCATEGORY","datix_code_inc_subcat"),("INC_SEVERITY","datix_code_inc_severity"),("INC_GRADE","datix_code_inc_grades"),("SECGROUP","datix_code_secgroup")]:
     if code in incident.columns: incident=datix_decode(incident,code,table,code+"_DISPLAY")
+# PMS_P1_T2_V1 — TDX-E2: link an incident to the person's containing encounter. Datix times are
+# Europe/London wall clock; map_encounter *_BEST bounds are UTC (the *_BEST_LOCAL columns are unpopulated).
+# BEST, not raw DISCH/DEPART: BEST is NULL where the departure was rejected (ADMINISTRATIVE_CLOSE,
+# FIXED_WINDOW_CLOSE, BEFORE_ARRIVAL), so rejected closure stamps never widen a window.
+# Unresolved end policy: a NULL (or pre-arrival) BEST departure is bounded at arrival + 1 day. For
+# Outpatient/Recurring (same-day attendances) that bound is the natural window; for Inpatient/Emergency
+# it is a truncation, so those links are LOW confidence.
+# An undated-time incident spans its whole day.
+DAY=F.expr("INTERVAL 1 DAY")
+enc=(spark.table(SRC_ENCOUNTER)
+     .where(F.col("encntr_type_class_desc").isin("Inpatient","Emergency","Outpatient","Recurring"))
+     .select(F.col("ENCNTR_ID").cast("long").alias("_eid"),F.col("PERSON_ID").cast("long").alias("_epid"),
+        F.from_utc_timestamp("ARRIVAL_DT_TM_BEST","Europe/London").alias("_beg"),
+        F.from_utc_timestamp("DEPARTURE_DT_TM_BEST","Europe/London").alias("_end_raw"),
+        F.col("ARRIVAL_CONFIDENCE").alias("_aconf"),F.col("DEPARTURE_CONFIDENCE").alias("_dconf"),
+        F.col("encntr_type_class_desc").isin("Inpatient","Emergency").alias("_stay"))
+     .where("_eid IS NOT NULL AND _beg IS NOT NULL")
+     .withColumn("_open",F.col("_end_raw").isNull()|(F.col("_end_raw")<F.col("_beg")))
+     .withColumn("_end",F.when(F.col("_open"),F.col("_beg")+DAY).otherwise(F.col("_end_raw")))
+     .dropDuplicates(["_eid"]))
+inc_keys=(incident.select(F.col("RECORDID").alias("_rid"),F.col("PERSON_ID").alias("_ipid"),F.col("INCIDENT_DT_TM_CLEAN").alias("_t0"),
+        F.when(F.col("INCIDENT_TIME_VALID_IND"),F.col("INCIDENT_DT_TM_CLEAN")).otherwise(F.col("INCIDENT_DT_TM_CLEAN")+DAY).alias("_t1"))
+     .where("_ipid IS NOT NULL AND _t0 IS NOT NULL"))
+cand=(inc_keys.join(enc,(F.col("_epid")==F.col("_ipid"))&(F.col("_beg")<=F.col("_t1"))&(F.col("_end")>=F.col("_t0")))
+     .withColumn("_span",F.col("_end").cast("long")-F.col("_beg").cast("long")))
+n_all=cand.groupBy("_rid").agg(F.countDistinct("_eid").alias("_n_all"))
+narrow=(cand.withColumn("_min",F.min("_span").over(Window.partitionBy("_rid"))).where(F.col("_span")==F.col("_min"))
+     .groupBy("_rid").agg(F.countDistinct("_eid").alias("_n_best"),F.max("_eid").alias("_best_eid"),
+        F.max((F.col("_open")&F.col("_stay")).cast("int")).alias("_best_open"),
+        F.min(F.when((F.col("_aconf")=="HIGH")&(F.col("_dconf")=="HIGH"),1).otherwise(0)).alias("_best_high")))
+link=n_all.join(narrow,"_rid")
+incident=(incident.join(link,F.col("RECORDID")==F.col("_rid"),"left")
+    .withColumn("ENCNTR_ID",F.when(F.col("_n_best")==1,F.col("_best_eid")).cast("long"))
+    .withColumn("ENCOUNTER_LINK_METHOD",F.when(F.col("PERSON_ID").isNull(),"no_person").when(F.col("_n_all").isNull(),"no_overlap")
+        .when(F.col("_n_all")==1,"overlap_unique").when(F.col("_n_best")==1,"overlap_narrowest").otherwise("ambiguous"))
+    .withColumn("ENCOUNTER_LINK_CONFIDENCE",F.when(F.col("ENCNTR_ID").isNull(),F.lit(None).cast("string"))
+        .when(F.col("_best_open")==1,"LOW").when(F.col("_best_high")==1,"HIGH").otherwise("MEDIUM"))
+    .withColumn("ENCOUNTER_LINK_RULE",F.lit("TDX-E2 containing encounter on map_encounter *_BEST bounds; IP/ED/OP/Recurring; open end=arrival+1d (LOW for IP/ED); narrowest span unique; Europe/London 2026-09-29"))
+    .drop("_rid","_n_all","_n_best","_best_eid","_best_open","_best_high"))
 incident=finalise(incident,["RECORDID"],SRC_INCIDENTS,"RECORDID")
 incident_result=publish(incident,INCIDENT,["RECORDID"])
 
@@ -280,6 +388,16 @@ FACTOR_CONFIG=[
     ("people_action",SRC_LFPSE,"recordid",["lfpse_people_action_factors","lfpse_people_involvement_factor"]),
     ("process",SRC_LFPSE,"recordid",["lfpse_involved_processes","lfpse_safety_challenges"]),
 ]
+# PMS_DATIX_DEVICE_V1: typed device columns; FACTOR_CODE keeps only the first configured field, so the rest were dropped.
+PMS_DEVICE_SOURCES={
+    SRC_INCIDENTS:{"DEVICE_EQUIPMENT":"inc_equipment","DEVICE_TYPE":"inc_eqpt_type","DEVICE_MANUFACTURER":"inc_manufacturer","DEVICE_MODEL":"inc_model","DEVICE_SUPPLIER":"inc_supplier","DEVICE_SERIAL_NUMBER":"inc_serialno","DEVICE_BATCH_NUMBER":"inc_batchno"},
+    SRC_LFPSE:{"DEVICE_TYPE":"lfpse_device_type","DEVICE_MANUFACTURER":"lfpse_manufacturer","DEVICE_MODEL":"lfpse_model","DEVICE_INVOLVEMENT_FACTORS":"lfpse_device_involvement_factors"},
+}
+PMS_DEVICE_NAMES=['DEVICE_EQUIPMENT', 'DEVICE_TYPE', 'DEVICE_MANUFACTURER', 'DEVICE_MODEL', 'DEVICE_SUPPLIER', 'DEVICE_SERIAL_NUMBER', 'DEVICE_BATCH_NUMBER', 'DEVICE_INVOLVEMENT_FACTORS']
+def pms_device_columns(factor_type,table,available):
+    src=PMS_DEVICE_SOURCES.get(table,{}) if factor_type=="device" else {}
+    return [(F.when(nonblank(src[n]),F.trim(F.col(src[n]).cast("string"))) if src.get(n) in available else F.lit(None).cast("string")).alias(n) for n in PMS_DEVICE_NAMES]
+# PMS_DATIX_DEVICE_V1 end
 factor_parts=[]
 for factor_type,table,key,fields in FACTOR_CONFIG:
     available=[c for c in fields if has_col(table,c)]
@@ -287,9 +405,19 @@ for factor_type,table,key,fields in FACTOR_CONFIG:
     src=incident_source if table==SRC_INCIDENTS else active_incident_filter(datix_source(table))
     inc_col="recordid" if table==SRC_INCIDENTS else "inc_id"
     pred=reduce(lambda a,b:a|b,[nonblank(c) for c in available])
-    factor_parts.append(src.where(pred).select(F.col(inc_col).cast("long").alias("INC_ID"),F.when(F.lit(table==SRC_LFPSE),F.col("recordid").cast("long")).alias("LFPSE_ID"),F.lit(factor_type).alias("FACTOR_TYPE"),F.lit(table.split(".")[-1]).alias("FACTOR_SOURCE_TABLE"),F.col(key).cast("string").alias("FACTOR_SOURCE_RECORD_ID"),F.lit(1).alias("FACTOR_ORDINAL"),F.col(available[0]).cast("string").alias("FACTOR_CODE"),F.col(available[0]).cast("string").alias("FACTOR_DISPLAY"),F.to_json(F.array(*[F.lit(c) for c in available])).alias("SOURCE_FIELDS"),F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT")))
+    factor_parts.append(src.where(pred).select(F.col(inc_col).cast("long").alias("INC_ID"),F.when(F.lit(table==SRC_LFPSE),F.col("recordid").cast("long")).alias("LFPSE_ID"),F.lit(factor_type).alias("FACTOR_TYPE"),F.lit(table.split(".")[-1]).alias("FACTOR_SOURCE_TABLE"),F.col(key).cast("string").alias("FACTOR_SOURCE_RECORD_ID"),F.lit(1).alias("FACTOR_ORDINAL"),F.col(available[0]).cast("string").alias("FACTOR_CODE"),F.col(available[0]).cast("string").alias("FACTOR_DISPLAY"),F.to_json(F.array(*[F.lit(c) for c in available])).alias("SOURCE_FIELDS"),F.to_json(F.struct(*[F.col(c).cast("string").alias(c) for c in available])).alias("FACTOR_ATTRIBUTES_JSON"),F.col("ADC_UPDT").alias("SOURCE_ADC_UPDT"),*pms_device_columns(factor_type,table,available)))  # PMS_DATIX_DEVICE_V1
 factor=reduce(lambda a,b:a.unionByName(b),factor_parts).withColumn("FACTOR_ROW_ID",F.sha2(F.concat_ws("|",F.col("INC_ID"),"FACTOR_TYPE","FACTOR_SOURCE_TABLE","FACTOR_SOURCE_RECORD_ID",F.col("FACTOR_ORDINAL")),256))
-for c,d in [("FACTOR_MAP_METHOD","string"),("FACTOR_MAP_VERSION","string"),("FACTOR_MAP_CONFIDENCE","double"),("FACTOR_MAP_RULE_ID","string")]: factor=factor.withColumn(c,F.lit(None).cast(d))
+# PMS_P1_T3_V1 — medication factors map by exact normalised name to the drug lexicon. FACTOR_CODE keeps
+# the raw source value; the mapped concept lands in FACTOR_TARGET_*. Unmatched medication rows say so.
+lex=spark.table(SRC_DRUG_LEXICON).select(F.col("name_normalised").alias("_lk"),F.col("target_code").alias("_lc"),F.col("target_display").alias("_ld"),F.col("mapping_method").alias("_lm"),F.col("mapping_version").alias("_lv"),F.col("mapping_rule_id").alias("_lr"))
+is_med=F.col("FACTOR_TYPE")=="medication"
+factor=factor.withColumn("_lk",F.when(is_med,F.lower(F.trim(F.regexp_replace("FACTOR_DISPLAY",r"\s+"," "))))).join(F.broadcast(lex),"_lk","left")
+factor=(factor.withColumn("FACTOR_TARGET_SYSTEM",F.when(F.col("_lc").isNotNull(),F.lit("http://snomed.info/sct")))
+    .withColumn("FACTOR_TARGET_CODE",F.col("_lc")).withColumn("FACTOR_TARGET_DISPLAY",F.col("_ld"))
+    .withColumn("FACTOR_MAP_METHOD",F.when(is_med,F.coalesce(F.col("_lm"),F.lit("unmapped"))))
+    .withColumn("FACTOR_MAP_VERSION",F.col("_lv")).withColumn("FACTOR_MAP_RULE_ID",F.col("_lr"))
+    .withColumn("FACTOR_MAP_CONFIDENCE",F.when(F.col("_lc").isNotNull(),F.lit(1.0)).cast("double"))
+    .drop("_lk","_lc","_ld","_lm","_lv","_lr"))
 factor=finalise(factor,["FACTOR_ROW_ID"],"typed Datix factor projection","FACTOR_ROW_ID"); factor_result=publish(factor,FACTOR,["FACTOR_ROW_ID"])
 
 # COMMAND ----------
@@ -325,7 +453,6 @@ fragment_result=publish(frags,FRAGMENT,["FRAGMENT_ID"],snapshot=True)
 # COMMAND ----------
 
 results=[incident_result,participant_result,injury_result,factor_result,lfpse_result,action_result,status_result,fragment_result]
-spark.createDataFrame([(RUN_ID,SAMPLE_MODE,SAMPLE_INCIDENTS,json.dumps(results,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, sample_mode boolean, sample_incidents long, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("8_dev.tdx_evidence.datix_pipeline_runs")
+spark.createDataFrame([(RUN_ID,SAMPLE_MODE,SAMPLE_INCIDENTS,json.dumps(results,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, sample_mode boolean, sample_incidents long, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("6_mgmt.bronze.datix_pipeline_runs")
 dbutils.notebook.exit(json.dumps({"sample_mode":SAMPLE_MODE,"sample_incidents":SAMPLE_INCIDENTS,"results":results},sort_keys=True))
-
 

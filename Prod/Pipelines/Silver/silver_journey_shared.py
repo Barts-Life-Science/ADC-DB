@@ -301,6 +301,14 @@ SRC_S3_ENDOBASE_EXAM_MAP = "3_lookup.omop.endobase_exam_type_snomed_map"
 
 SRC_S3_PATHOLOGY_TEST_ADDITIONS = "3_lookup.omop.pathology_test_snomed_additions"
 
+# STM_SPECIMEN_TYPE_V1/silver-specimen: specimen-type keys in the adapter shape; source_code = "<bronze namespace>|<code>".
+SRC_S3_SPECIMEN_MAP_V2 = "3_lookup.omop.specimen_type_snomed_map"
+
+# Measured cosines for the legacy pathology and device tier lanes. Promoted from
+# 8_dev.lookup.tier_lane_rescore on 2026-09-26; a prod pipeline must never read 8_dev.
+# TIER_RESCORE_PROD_SOURCE_PATCH_APPLIED v1
+SRC_S3B_TIER_LANE_RESCORE = "3_lookup.omop.tier_lane_rescore"
+
 SRC_S3B_MED_TEXT_MAP = "3_lookup.omop.med_text_snomed_map"
 
 SRC_S3B_IMAGING_LOCAL_MAP_V2 = "3_lookup.omop.imaging_local_code_map"
@@ -659,7 +667,7 @@ def _s3_enforce_omop_standard_target(df, axis):
 def _s3_apply_tier_rescore(df, axis, lane, source_display):
     """Attach measured cosine to a legacy tier lane; polarity vetoes also clear its target."""
     target = F.coalesce(F.col(f"{axis}_snomed_code"), F.col(f"{axis}_omop_concept_id").cast("string"))
-    scored = (read_source("8_dev.lookup.tier_lane_rescore").where(F.col("lane") == lane)
+    scored = (read_source(SRC_S3B_TIER_LANE_RESCORE).where(F.col("lane") == lane)
               .select(F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))).alias("_s3_tier_source"),
                       F.col("target_code").alias("_s3_tier_target"),
                       F.col("mapping_cosine").alias("_s3_tier_cosine"),
@@ -972,6 +980,7 @@ LIFECYCLE_COLUMN_COMMENTS = {
     "practitioner_group_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
     "practitioner_location_evidence_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
     "theatre_attendance_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
+    "theatre_case_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",  # PMS_THEATRE_CASE_V1
     "theatre_case_milestone_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
     "theatre_implant_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
     "encounter_attribute_key": "Deterministic v2 key carried unchanged from the public parent; joins one lifecycle row to that research row.",
@@ -1043,6 +1052,77 @@ def _cross_qc_primitive(df, model_name, variant_json_columns):
             .drop("_qc_encounter_id")
         )
     return df
+
+# SDI_DICOM_MODALITY_V1: DICOM Modality (0008,0060) defined terms (mappings/dicom_modalities.json). A PACS MODALITY outside the
+# set (Pano, XDEXA, NMOT, ...) is a site label: it stays in modality_code and gets no DICOM code. A Millennium exam linked to
+# a PACS examination borrows that examination's modality unless it is a non-acquisition object (OT/SR/PR/KO/DOC).
+SDI_DICOM_MODALITIES = [
+        "ANN", "AR", "ASMT", "AU", "BDUS", "BI", "BMD", "CFM", "CR", "CT",
+        "CTPROTOCOL", "DG", "DMS", "DOC", "DX", "ECG", "EEG", "EMG", "EOG", "EPS",
+        "ES", "FID", "GM", "HC", "HD", "IO", "IOL", "IVOCT", "IVUS", "KER",
+        "KO", "LEN", "LS", "M3D", "MG", "MR", "NM", "OAM", "OCT", "OP",
+        "OPM", "OPT", "OPTBSV", "OPTENF", "OPV", "OSS", "OT", "PA", "PLAN", "POS",
+        "PR", "PT", "PX", "REG", "RESP", "RF", "RG", "RTDOSE", "RTIMAGE", "RTINTENT",
+        "RTPLAN", "RTRAD", "RTRECORD", "RTSEGANN", "RTSTRUCT", "RWV", "SEG", "SM", "SMR", "SR",
+        "SRF", "STAIN", "TEXTUREMAP", "TG", "US", "VA", "XA", "XAPROTOCOL", "XC",
+    ]
+SDI_PACS_NON_ACQUISITION = ["OT", "SR", "PR", "KO", "DOC"]
+SDI_BODY_SITE_RELATIONSHIPS = [("Has dir proc site", "omop_has_dir_proc_site"), ("Has proc site", "omop_has_proc_site"),
+                               ("Has indir proc site", "omop_has_indir_proc_site")]
+
+
+def _sdi_pacs_modality_dicom(s):
+    m = F.when(F.trim(s.MODALITY) != "", F.upper(F.trim(s.MODALITY)))
+    ok = m.isin(*SDI_DICOM_MODALITIES)
+    return [F.when(ok, m).alias("modality_dicom_code"),
+            F.when(ok, F.lit("pacs")).when(m.isNotNull(), F.lit("pacs_non_dicom")).alias("modality_dicom_method")]
+
+
+def _sdi_imaging_modality(df):
+    """SDI_DICOM_MODALITY_V1: a Millennium exam linked to one PACS examination (PACS_EXAMINATION_ID is unique) takes that
+    examination's acquisition modality; otherwise the bronze NHSI-category inference stands."""
+    m = F.upper(F.trim(F.col("MODALITY")))
+    px = (read_source(SRC_PACS_EXAMINATION)
+          .where(m.isin(*SDI_DICOM_MODALITIES) & ~m.isin(*SDI_PACS_NON_ACQUISITION))
+          .select(F.col("PACS_EXAMINATION_ID").cast("bigint").alias("_sdi_px_id"), m.alias("_sdi_px_modality")))
+    df = df.join(px, (F.col("source_object") == F.lit("millennium"))
+                 & (F.col("linked_pacs_examination_id") == F.col("_sdi_px_id")), "left")
+    use = F.col("_sdi_px_modality").isNotNull()
+    return (df.withColumn("modality_dicom_code", F.when(use, F.col("_sdi_px_modality")).otherwise(F.col("modality_dicom_code")))
+              .withColumn("modality_dicom_method", F.when(use, F.lit("pacs_link")).otherwise(F.col("modality_dicom_method")))
+              .drop("_sdi_px_id", "_sdi_px_modality"))
+
+
+def _sdi_imaging_body_site(df):
+    """SDI_IMAGING_BODY_SITE_V1: SNOMED body structure of the mapped examination concept via the OMOP procedure-site
+    relationships, best relationship rank first, lowest site concept id on ties; _multiple marks a tie."""
+    rank = F.when(F.col("relationship_id") == SDI_BODY_SITE_RELATIONSHIPS[0][0], F.lit(1))
+    for i, (rel, _) in enumerate(SDI_BODY_SITE_RELATIONSHIPS[1:], start=2):
+        rank = rank.when(F.col("relationship_id") == rel, F.lit(i))
+    site = (read_source("3_lookup.omop.concept")
+            .where((F.col("vocabulary_id") == "SNOMED") & F.col("invalid_reason").isNull())
+            .select(F.col("concept_id").cast("bigint").alias("_sdi_site_id"), F.col("concept_code").alias("_sdi_site_code"),
+                    F.col("concept_name").alias("_sdi_site_name")))
+    rel = (read_source("3_lookup.omop.concept_relationship")
+           .where(F.col("relationship_id").isin(*[r for r, _ in SDI_BODY_SITE_RELATIONSHIPS]) & F.col("invalid_reason").isNull())
+           .select(F.col("concept_id_1").cast("bigint").alias("_sdi_exam_id"), F.col("concept_id_2").cast("bigint").alias("_sdi_site_id"),
+                   rank.alias("_sdi_rank"))
+           .join(site, "_sdi_site_id"))
+    best = rel.groupBy("_sdi_exam_id").agg(F.min("_sdi_rank").alias("_sdi_rank"))
+    pick = (rel.join(best, ["_sdi_exam_id", "_sdi_rank"])
+            .groupBy("_sdi_exam_id", "_sdi_rank")
+            .agg(F.min(F.struct("_sdi_site_id", "_sdi_site_code", "_sdi_site_name")).alias("_sdi_site"),
+                 F.countDistinct("_sdi_site_id").alias("_sdi_sites")))
+    method = F.when(F.col("_sdi_rank") == 1, F.lit(SDI_BODY_SITE_RELATIONSHIPS[0][1]))
+    for i, (_, name) in enumerate(SDI_BODY_SITE_RELATIONSHIPS[1:], start=2):
+        method = method.when(F.col("_sdi_rank") == i, F.lit(name))
+    df = df.join(pick, F.col("exam_omop_concept_id") == F.col("_sdi_exam_id"), "left")
+    return (df.withColumn("body_site_snomed_code", F.col("_sdi_site._sdi_site_code"))
+              .withColumn("body_site_snomed_display", F.col("_sdi_site._sdi_site_name"))
+              .withColumn("body_site_snomed_method",
+                          F.when(F.col("_sdi_sites") > 1, F.concat(method, F.lit("_multiple"))).otherwise(method))
+              .drop("_sdi_exam_id", "_sdi_rank", "_sdi_site", "_sdi_sites"))
+
 
 def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
     # contract v2: lifecycle columns are validated here but never appended to the public parent.
@@ -1182,6 +1262,10 @@ def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifec
         df = _s3_lookup_axis(
             df, "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:tfc",
             F.when(F.lower(F.col("test_source_system")).contains("tfc"), F.col("test_source_code")), model_name=model_name)
+    elif model_name == "specimen":
+        # STM_SPECIMEN_TYPE_V1/silver-specimen: the only specimen-type mapping; keyed on the bronze namespace|code carried on the row.
+        df = _s3_lookup_axis(df, "specimen_type", SRC_S3_SPECIMEN_MAP_V2, "urn:barts:pathology:specimen-type",
+                             F.col("_specimen_type_lookup_key"), model_name=model_name)
     elif model_name == "presenting_complaint":
         df = _s3_direct_axis(df, "complaint", F.col("source_coding_system"), F.col("source_code"), F.col("source_display"))
         df = _s3_lookup_axis(
@@ -1320,6 +1404,8 @@ def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifec
         _extra_axis = {"pathology_result":"result", "clinical_finding":"value", "condition_stage":"stage_group"}[model_name]
         df = _s3_snomed_from_omop(df, _extra_axis)
         df = _s3_enforce_omop_standard_target(df, _extra_axis)
+    if model_name == "imaging_exam":  # SDI_DICOM_MODALITY_V1 / SDI_IMAGING_BODY_SITE_V1
+        df = _sdi_imaging_body_site(_sdi_imaging_modality(df))
     return df.select(*public_columns)
 
 
@@ -1355,6 +1441,8 @@ def _lifecycle_source_episode_encounter():
 
 
 SRC_ENCOUNTER      = "4_prod.bronze.map_encounter"
+SRC_ENCOUNTER_PRACTITIONER = "4_prod.bronze.map_encounter_practitioner"  # OGR_PARTICIPATION_V1
+SRC_PERSON_GP = "4_prod.bronze.map_person_gp"
 
 SRC_DIAGNOSIS = "4_prod.bronze.map_diagnosis"
 
@@ -1423,6 +1511,9 @@ def _family_history_canonical_pregate():
         s.ORIGINATING_ENCNTR_ID.cast("bigint").alias("encounter_id"),
         s.BEG_EFFECTIVE_DT_TM.alias("event_datetime"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
+        s.BEG_EFFECTIVE_DT_TM_LOCAL.alias("event_datetime_local"),
+        F.when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("event_end_datetime_local"),
+        # TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
         s.SOURCE_VOCABULARY_DESC.alias("source_coding_system"),
         source_code.alias("source_code"),
         source_display.alias("source_display"),
@@ -1488,6 +1579,7 @@ def _presenting_complaint_canonical():
         rkey.alias("subject_key"), rsys.alias("subject_id_system"), enc.PERSON_ID.cast("bigint").alias("person_id"),
         F.lit("registration_reason_for_visit").alias("source_object"), enc.ENCNTR_ID.cast("bigint").alias("source_event_id"),
         F.lit(1).cast("int").alias("statement_sequence"), F.coalesce(enc.ARRIVAL_DT_TM_BEST, enc.REG_DT_TM).alias("event_datetime"),
+        F.coalesce(enc.ARRIVAL_DT_TM_BEST_LOCAL, enc.REG_DT_TM_LOCAL).alias("event_datetime_local"),
         enc.encntr_type_class_desc.alias("encounter_class"), F.lit("urn:cerner:encounter:reason-for-visit").alias("source_coding_system"),
         F.lower(F.trim(F.regexp_replace(enc.REASON_FOR_VISIT, r"\s+", " "))).alias("source_code"),
         enc.REASON_FOR_VISIT.alias("source_display"), F.lit(None).cast("string").alias("complaint_group_display"),
@@ -1509,6 +1601,7 @@ def _presenting_complaint_canonical():
         F.row_number().over(Window.partitionBy(nom.ENCNTR_ID).orderBy(
             nom.CLINICAL_EVENT_DT_TM.asc_nulls_last(), nom.EVENT_ID, nom.SEQUENCE_NBR)).cast("int").alias("statement_sequence"),
         nom.CLINICAL_EVENT_DT_TM.alias("event_datetime"), F.lit("Emergency").alias("encounter_class"),
+        nom.CLINICAL_EVENT_DT_TM_LOCAL.alias("event_datetime_local"),
         F.lit("urn:cerner:nomenclature:ed-presenting-complaint").alias("source_coding_system"),
         F.lower(F.trim(F.regexp_replace(nom.SOURCE_STRING, r"\s+", " "))).alias("source_code"), nom.SOURCE_STRING.alias("source_display"),
         F.col("complaint_group_display"),
@@ -1529,6 +1622,7 @@ def _presenting_complaint_canonical():
         tkey.alias("subject_key"), tsys.alias("subject_id_system"), txt.PERSON_ID.cast("bigint").alias("person_id"),
         F.lit("ed_presenting_complaint_text").alias("source_object"), txt.EVENT_ID.cast("bigint").alias("source_event_id"),
         F.lit(1).cast("int").alias("statement_sequence"), txt.RESULT_DT_TM.alias("event_datetime"),
+        txt.RESULT_DT_TM_LOCAL.alias("event_datetime_local"),
         F.lit("Emergency").alias("encounter_class"), F.lit("urn:cerner:clinical-event:presenting-complaint-text").alias("source_coding_system"),
         F.lower(F.trim(F.regexp_replace(ttext, r"\s+", " "))).alias("source_code"), ttext.alias("source_display"),
         F.lit(None).cast("string").alias("complaint_group_display"),
@@ -1541,6 +1635,7 @@ def _presenting_complaint_canonical():
             .withColumn("source_patient_event_key", F.col("patient_event_key"))
             .withColumn("complaint_text_normalised", F.col("source_code"))
             .withColumn("event_end_datetime", F.lit(None).cast("timestamp"))
+            .withColumn("event_end_datetime_local", F.lit(None).cast("timestamp"))
             .withColumn("_source_system", F.lit("millennium"))
             .withColumn("identity_status", F.when(F.col("person_id").isNotNull(), "resolved").otherwise("unresolved"))
             .withColumn("confidentiality_code", F.lit(None).cast("string"))
@@ -1579,6 +1674,9 @@ def _condition_diagnosis_canonical_pregate():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         F.coalesce(s.DIAG_DT_TM, s.ASSERTED_DT_TM, s.BEG_EFFECTIVE_DT_TM).alias("event_datetime"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
+        F.coalesce(s.DIAG_DT_TM_LOCAL, s.ASSERTED_DT_TM_LOCAL, s.BEG_EFFECTIVE_DT_TM_LOCAL).alias("event_datetime_local"),
+        F.when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("event_end_datetime_local"),
+        F.when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("abatement_datetime_local"),
         F.coalesce(s.source_vocabulary_desc, s.CONCEPT_CKI_SOURCE,
                    F.lit("urn:cerner:nomenclature")).alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
@@ -1663,6 +1761,10 @@ def _condition_problem_canonical_pregate():
         F.coalesce(s.ASSERTED_DT_TM, s.ONSET_DT_TM, s.BEG_EFFECTIVE_DT_TM,
                    s.earliest_problem_date).alias("event_datetime"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
+        F.coalesce(s.ASSERTED_DT_TM_LOCAL, s.ONSET_DT_TM_LOCAL, s.BEG_EFFECTIVE_DT_TM_LOCAL,
+                   s.earliest_problem_date_local).alias("event_datetime_local"),
+        F.when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("event_end_datetime_local"),
+        F.when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("abatement_datetime_local"),
         F.coalesce(s.source_vocabulary_desc, s.CONCEPT_CKI_SOURCE,
                    F.lit("urn:cerner:nomenclature")).alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
@@ -1769,6 +1871,8 @@ def _endobase_procedure_canonical_pregate():
         .otherwise(F.lit("unresolved")).alias("identity_status"),
         s.MILL_ENCNTR_ID.cast("bigint").alias("encounter_id"),
         performed.alias("event_datetime"), performed_end.alias("event_end_datetime"),
+        performed.alias("event_datetime_local"),
+        performed_end.alias("event_end_datetime_local"),
         F.lit("urn:barts:endobase:exam-type").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -1855,6 +1959,8 @@ def _cc_procedure_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.OPCS_Proc_Dt_CLEAN.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.OPCS_Proc_Dt_CLEAN.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("http://fhir.hl7.org.uk/CodeSystem/OPCS-4").alias("source_coding_system"),
         s.OPCS_Proc_Code.cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -1940,6 +2046,10 @@ def _maternity_diagnosis_canonical_pregate():
          .alias("identity_status"), F.lit(None).cast("bigint").alias("encounter_id"),
         F.col("s.DIAGDATE_CLEAN").alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        # DIAGDATE_CLEAN is already local wall-clock time.
+        F.col("s.DIAGDATE_CLEAN").alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
+        F.lit(None).cast("timestamp").alias("abatement_datetime_local"),
         F.lit("http://snomed.info/sct").alias("source_coding_system"),
         F.col("s.DIAG").alias("source_code"), F.col("s.DIAG_SNOMED_DESC").alias("source_display"),
         codeable_concept_json(
@@ -2013,6 +2123,8 @@ def _mill_radiology_exam_canonical_pregate(integration=False):
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         s.PERFORMED_DT_TM_CLEAN.alias("event_datetime"),
         s.EVENT_END_DT_TM_CLEAN.alias("event_end_datetime"),
+        s.PERFORMED_DT_TM_CLEAN_LOCAL.alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_CLEAN_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:radiology-exam").alias("source_coding_system"),
         source_code.alias("source_code"), s.EVENT_TITLE_TEXT.alias("source_display"),
         codeable_concept(
@@ -2039,6 +2151,8 @@ def _mill_radiology_exam_canonical_pregate(integration=False):
         s.UPDT_DT_TM.alias("source_update_timestamp"),
         s.PIPELINE_UPDT_DT_TM.alias("loaded_at"),
         *(_mill_radiology_integration_columns(s) if integration else []),
+        *([s.MODALITY_DICOM.alias("modality_dicom_code"),  # SDI_DICOM_MODALITY_V1
+           s.MODALITY_DICOM_METHOD.alias("modality_dicom_method")] if integration else []),
         F.lit("millennium").alias("_source_system"),
         F.lit(SRC_RADIOLOGY_EVENT).alias("_source_table"),
         s.EVENT_ID.cast("string").alias("_source_row_id"),
@@ -2180,6 +2294,8 @@ def _endobase_document_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.col("x._x_encntr_id").cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), event_end.alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        event_end.alias("event_end_datetime_local"),
         F.lit("urn:endobase:document-type").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -2294,6 +2410,8 @@ def _neonatal_narrative_document_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("string").alias("encounter_id"), event_time.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:badgernet:narrative-field").alias("source_coding_system"),
         d.narrative_field.alias("source_code"), d.narrative_field.alias("source_display"),
         codeable_concept_json(
@@ -2375,6 +2493,33 @@ def _encounter_canonical():
         s.END_EFFECTIVE_DT_TM < F.lit("2100-01-01").cast("timestamp"),
         F.lit(False),
     )
+    # SDI_ENCOUNTER_STATE_V1: encounter_level is named so the ActCode crosswalk can read it. Level first for the four
+    # classed levels (type class is the stronger signal); the source class display only for recurring_contact/other.
+    encounter_level = (
+        F.when(type_class.contains("inpatient"), F.lit("spell"))
+         .when(type_class.contains("emergency"), F.lit("emergency_visit"))
+         .when(type_class.contains("outpatient"), F.lit("outpatient_attendance"))
+         .when(type_class.contains("recurring"), F.lit("recurring_contact"))
+         .when(type_class.contains("preadmit"), F.lit("preadmission"))
+         .when(type_class.contains("wait list"), F.lit("waiting_list_placeholder"))
+         .when(type_class.contains("results only"), F.lit("results_only"))
+         .otherwise(F.lit("other"))
+    )
+    lvl_cls = F.element_at(F.create_map(F.lit("spell"), F.lit("IMP"), F.lit("outpatient_attendance"), F.lit("AMB"), F.lit("emergency_visit"), F.lit("EMER"), F.lit("preadmission"), F.lit("PRENC")), encounter_level)
+    src_cls = F.when(encounter_level.isin("recurring_contact", "other"),
+                     F.element_at(F.create_map(F.lit("Inpatient"), F.lit("IMP"), F.lit("Outpatient"), F.lit("AMB"), F.lit("Emergency"), F.lit("EMER"), F.lit("Preadmit"), F.lit("PRENC")), s.encntr_class_desc))
+    class_actcode = F.coalesce(lvl_cls, src_cls)
+    # Bronze declares LAST_WARD_STILL_OPEN_IND but does not publish it; same rule from the two published columns.
+    ward_open = s.LAST_WARD_IN_DT_TM.isNotNull() & (
+        s.LAST_WARD_OUT_DT_TM.isNull() | (s.LAST_WARD_OUT_DT_TM < s.LAST_WARD_IN_DT_TM))
+    close_state = (
+        F.when(s.DEPARTURE_DT_TM_BEST.isNotNull(), F.lit("departed"))
+         .when(s.DEPARTURE_REJECTED_REASON.isin("ADMINISTRATIVE_CLOSE", "FIXED_WINDOW_CLOSE"),
+               F.lit("source_closed_no_observed_departure"))
+         .when(s.DEPARTURE_REJECTED_REASON == "BEFORE_ARRIVAL", F.lit("departure_evidence_invalid"))
+         .when(ward_open, F.lit("open_ward_interval"))
+         .otherwise(F.lit("no_departure_recorded"))
+    )
     # contract v2: retain the encounter SHA as encounter_key and publish native encounter, person, and organization ids
     return s.select(
         stable_id("encounter:mill", s.ENCNTR_ID).alias("encounter_key"),
@@ -2384,14 +2529,7 @@ def _encounter_canonical():
         s.PERSON_ID.cast("bigint").alias("person_id"),
         F.lit(None).cast("string").alias("parent_encounter_id"),
         F.lit("source_parent_unavailable").alias("parentage_status"),
-        F.when(type_class.contains("inpatient"), F.lit("spell"))
-         .when(type_class.contains("emergency"), F.lit("emergency_visit"))
-         .when(type_class.contains("outpatient"), F.lit("outpatient_attendance"))
-         .when(type_class.contains("recurring"), F.lit("recurring_contact"))
-         .when(type_class.contains("preadmit"), F.lit("preadmission"))
-         .when(type_class.contains("wait list"), F.lit("waiting_list_placeholder"))
-         .when(type_class.contains("results only"), F.lit("results_only"))
-         .otherwise(F.lit("other")).alias("encounter_level"),
+        encounter_level.alias("encounter_level"),  # SDI_ENCOUNTER_STATE_V1
         s.ENCNTR_CLASS_CD.cast("string").alias("class_code"),
         s.encntr_class_desc.alias("class_display"),
         s.ENCNTR_TYPE_CD.cast("string").alias("type_code"),
@@ -2402,10 +2540,21 @@ def _encounter_canonical():
         s.encntr_status_desc.alias("status_display"),
         s.ARRIVAL_DT_TM_BEST.alias("period_start"),
         s.DEPARTURE_DT_TM_BEST.alias("period_end"),
+        # VDB_SILVER_LOCAL_V1: bronze publishes the Europe/London companions; silver only carries them.
+        s.ARRIVAL_DT_TM_BEST_LOCAL.alias("period_start_local"),
+        s.DEPARTURE_DT_TM_BEST_LOCAL.alias("period_end_local"),
         s.ARRIVAL_METHOD.alias("arrival_method"),
         s.ARRIVAL_CONFIDENCE.alias("arrival_confidence"),
         s.DEPARTURE_METHOD.alias("departure_method"),
         s.DEPARTURE_CONFIDENCE.alias("departure_confidence"),
+        class_actcode.alias("class_actcode"),  # SDI_ENCOUNTER_STATE_V1
+        F.element_at(F.create_map(F.lit("IMP"), F.lit("inpatient encounter"), F.lit("AMB"), F.lit("ambulatory"), F.lit("EMER"), F.lit("emergency"), F.lit("PRENC"), F.lit("pre-admission")), class_actcode).alias("class_actcode_display"),
+        F.when(lvl_cls.isNotNull(), F.lit("encounter_level_crosswalk"))
+         .when(src_cls.isNotNull(), F.lit("source_class_crosswalk"))
+         .otherwise(F.lit("no_class")).alias("class_actcode_method"),
+        s.DEPARTURE_REJECTED_REASON.alias("departure_rejected_reason"),
+        F.greatest(s.LAST_CLINICAL_EVENT_DT_TM, s.LAST_ORDER_DT_TM, s.LAST_WARD_IN_DT_TM).alias("last_activity_datetime"),
+        close_state.alias("encounter_close_state"),
         s.LENGTH_OF_STAY_MINUTES.cast("long").alias("length_of_stay_minutes"),
         s.SCHEDULED_ARRIVAL_DT_TM.alias("scheduled_start"),
         s.SCHEDULED_DEPARTURE_DT_TM.alias("scheduled_end"),
@@ -2423,7 +2572,7 @@ def _encounter_canonical():
         s.med_service_desc.alias("responsible_service_display"),
         s.SPECIALTY_UNIT_CD.cast("string").alias("specialty_code"),
         s.specialty_unit_desc.alias("specialty_display"),
-        F.when(s.LOC_NURSE_UNIT_CD.isNotNull(),
+        F.when(s.LOC_NURSE_UNIT_CD > 0,  # SDI_LOCATION_ZERO_V1: 0 is "no unit" (4.4M encounters), not a location
                stable_id("location:mill:nurse_unit", s.LOC_NURSE_UNIT_CD)).alias("current_location_key"),
         s.ORGANIZATION_ID.cast("bigint").alias("organization_id"),
         F.when(s.SERVICE_PROVIDER_ORG_ID.isNotNull(),
@@ -2474,10 +2623,18 @@ ENCOUNTER_SOURCE_COLUMNS = [
     "status_display",
     "period_start",
     "period_end",
+    "period_start_local",
+    "period_end_local",
     "arrival_method",
     "arrival_confidence",
     "departure_method",
     "departure_confidence",
+    "class_actcode",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_display",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_method",  # SDI_ENCOUNTER_STATE_V1
+    "departure_rejected_reason",  # SDI_ENCOUNTER_STATE_V1
+    "last_activity_datetime",  # SDI_ENCOUNTER_STATE_V1
+    "encounter_close_state",  # SDI_ENCOUNTER_STATE_V1
     "length_of_stay_minutes",
     "scheduled_start",
     "scheduled_end",
@@ -2534,6 +2691,9 @@ CONDITION_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
+    "abatement_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2597,6 +2757,8 @@ PROCEDURE_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2672,6 +2834,8 @@ def _procedure_canonical_pregate():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         F.coalesce(s.PROCEDURE_DT_TM_EFFECTIVE, s.PROC_START_DT_TM, s.PROC_DT_TM).alias("event_datetime"),
         s.PROC_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.PROCEDURE_DT_TM_EFFECTIVE_LOCAL, s.PROC_START_DT_TM_LOCAL, s.PROC_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.PROC_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.coalesce(s.source_vocabulary_desc, s.CONCEPT_CKI_SOURCE,
                    F.lit("urn:cerner:nomenclature")).alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
@@ -2752,6 +2916,8 @@ def _implant_procedure_canonical_pregate():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         F.coalesce(s.IMPLANT_DT_TM, s.EVENT_START_DT_TM, s.CLINSIG_UPDT_DT_TM).alias("event_datetime"),
         s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.IMPLANT_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL, s.CLINSIG_UPDT_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:barts:implant:primary-procedure").alias("source_coding_system"),
         s.PRIMARY_PROCEDURE.alias("source_code"), s.PRIMARY_PROCEDURE.alias("source_display"),
         codeable_concept_json(
@@ -2763,7 +2929,8 @@ def _implant_procedure_canonical_pregate():
         s.EVENT_END_DT_TM.alias("performed_end"),
         F.lit(None).cast("string").alias("body_site_code"),
         F.lit(None).cast("string").alias("body_site_display"),
-        F.lit(None).cast("string").alias("laterality_code"), s.SIDE_OF_PROCEDURE.alias("laterality_display"),
+        # PMS_IMPLANT_LATERALITY_V1: SIDE_OF_PROCEDURE is the "side checked" checklist answer (Yes/n/a), not a side.
+        F.lit(None).cast("string").alias("laterality_code"), F.lit(None).cast("string").alias("laterality_display"),
         s.PERFORMED_PRSNL_ID.cast("bigint").alias("performer_practitioner_id"),
         F.lit(None).cast("string").alias("procedure_location_code"),
         F.lit(None).cast("string").alias("procedure_location_display"),
@@ -2852,6 +3019,8 @@ def _theatre_procedure_canonical_pregate():
         .alias("identity_status"),
         p.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         performed_start.alias("event_datetime"), p.PROC_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(p.PROC_START_DT_TM_LOCAL, c.SURG_START_DT_TM_LOCAL, c.FIRST_PERFORMED_MILESTONE_DT_TM_LOCAL, c.SCHED_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        p.PROC_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:surginet:procedure").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -2973,16 +3142,21 @@ def _pathology_specimen_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         _clamped_ts(F.coalesce("sample_dt", "request_dt", "report_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce("sample_dt_local", "request_dt_local", "report_dt_local")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:specimen-type").alias("source_coding_system"),
         F.col("specimen_type_code").cast("string").alias("source_code"),
-        F.col("specimen_type_code").cast("string").alias("source_display"),
+        F.coalesce(F.col("specimen_type_display"), F.col("specimen_type_code")).cast("string").alias("source_display"),
+        # STM_SPECIMEN_TYPE_V1/silver-specimen: the source coding carries the bronze namespace and there is no bronze SNOMED coding,
+        # so the axis arrives unmapped and SRC_S3_SPECIMEN_MAP_V2 supplies target and provenance.
         codeable_concept(
-            coding_obj(F.lit("urn:barts:pathology:specimen-type"),
-                       F.col("specimen_type_code"), F.col("specimen_type_code"), True),
-            coding_obj(F.lit("http://snomed.info/sct"), F.col("specimen_type_snomed_code"),
-                       F.col("specimen_type_code"), False,
-                       "bronze.map_pathology_accession", None),
+            coding_obj(F.coalesce(F.col("specimen_type_source_system"), F.lit("urn:barts:pathology:specimen-type")),
+                       F.col("specimen_type_code"),
+                       F.coalesce(F.col("specimen_type_display"), F.col("specimen_type_code")), True),
         ).alias("specimen_type"),
+        F.when(F.col("specimen_type_code").isNotNull(),
+               F.concat_ws("|", F.col("specimen_type_source_system"), F.upper(F.trim(F.col("specimen_type_code")))))
+         .alias("_specimen_type_lookup_key"),
         F.col("pathology_accession_id").alias("accession_identifier"),
         F.col("primary_source_accession_id").alias("resolved_accession_key"), F.col("normalized_lab_no"),
         F.col("canonical_accession_status"), F.col("person_resolution_status"),
@@ -3047,7 +3221,7 @@ def _pathology_report_series_canonical():
             F.max(F.struct(
                 r.version_ordinal, r.report_version_id, r.source_record_key,
                 r.report_role, r.discipline, r.report_code, r.report_section,
-                r.lifecycle_status, r.supersedes_report_version_id, r.issued_dt,
+                r.lifecycle_status, r.supersedes_report_version_id, r.issued_dt, r.issued_dt_local,
                 r.report_text_hash, r.research_qi_only, r.valid_from,
                 F.col("r._resolved_accession_id").alias("pathology_accession_id"),
                 F.col("l._link_encounter_id").alias("source_encounter_id"),
@@ -3083,6 +3257,8 @@ def _pathology_report_series_canonical():
         F.col("v.source_encounter_id").cast("bigint").alias("encounter_id"),
         _clamped_ts(F.col("v.issued_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.col("v.issued_dt_local")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:report-code").alias("source_coding_system"),
         F.col("v.report_code").cast("string").alias("source_code"),
         F.coalesce(F.col("v.report_role"), F.col("v.report_code")).cast("string")
@@ -3137,6 +3313,8 @@ RESULT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -3156,6 +3334,11 @@ RESULT_SOURCE_COLUMNS = [
     "unit_source_value",
     "ucum_code",
     "unit_concept_id",
+    "test_mapping_match_type",  # SDI_PATH_V1
+    "test_mapping_rule_id",  # SDI_PATH_V1
+    "canonical_ucum_code",  # SDI_PATH_V1
+    "value_canonical",  # SDI_PATH_V1
+    "canonical_conversion",  # SDI_PATH_V1
     "reference_range_low",
     "reference_range_high",
     "interpretation_code",
@@ -3208,6 +3391,8 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         _clamped_ts(s.measurement_datetime).alias("event_datetime"),
         _clamped_ts(s.event_end_dt_tm).alias("event_end_datetime"),
+        _clamped_ts(s.measurement_datetime_local).alias("event_datetime_local"),
+        _clamped_ts(s.event_end_dt_tm_local).alias("event_end_datetime_local"),
         F.coalesce(s.code_system, F.lit("urn:barts:pathology:test")).alias("source_coding_system"),
         F.coalesce(s.code, s.EVENT_CD.cast("string")).alias("source_code"),
         F.coalesce(s.description, s.EVENT_CD_DISPLAY).alias("source_display"),
@@ -3248,6 +3433,8 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
         s.result_concept_name.alias("value_concept_display"),
         s.operator_concept_id.cast("string").alias("operator_concept_id"),
         s.unit_source_value, s.ucum_code, s.unit_concept_id.cast("string").alias("unit_concept_id"),
+        s.test_mapping_match_type, s.test_mapping_rule_id, s.canonical_ucum_code,  # SDI_PATH_V1
+        s.value_canonical.cast("decimal(38,10)").alias("value_canonical"), s.canonical_conversion,  # SDI_PATH_V1
         s.range_low.cast("decimal(38,10)").alias("reference_range_low"),
         s.range_high.cast("decimal(38,10)").alias("reference_range_high"),
         s.normalcy.alias("interpretation_code"), s.result_growth_grade.alias("polarity"),
@@ -3304,6 +3491,8 @@ def _pathology_requested_test_canonical_pregate():
         "canonical_person_id", "person_resolution_status", "evidence_mrn", "evidence_nhs",
         F.col("request_dt").alias("_acc_request_dt"),
         F.col("sample_dt").alias("_acc_sample_dt"),
+        F.col("request_dt_local").alias("_acc_request_dt_local"),
+        F.col("sample_dt_local").alias("_acc_sample_dt_local"),
     )
     j = t.join(i, "_resolved_accession_id", "left")
     event_id = stable_id(
@@ -3331,6 +3520,8 @@ def _pathology_requested_test_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         _clamped_ts(F.coalesce("_acc_request_dt", "_acc_sample_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce("_acc_request_dt_local", "_acc_sample_dt_local")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         system_uri.alias("source_coding_system"),
         source_code.cast("string").alias("source_code"),
         F.coalesce(F.col("test_description"), source_code).cast("string").alias("source_display"),
@@ -3381,6 +3572,9 @@ def _genomic_identity_stage():
         F.col("request_dt").alias("_acc_request_dt"),
         F.col("sample_dt").alias("_acc_sample_dt"),
         F.col("report_dt").alias("_acc_report_dt"),
+        F.col("request_dt_local").alias("_acc_request_dt_local"),
+        F.col("sample_dt_local").alias("_acc_sample_dt_local"),
+        F.col("report_dt_local").alias("_acc_report_dt_local"),
     )
 
 def _identity_mapped_columns():
@@ -3403,6 +3597,7 @@ def _genomic_test_canonical_pregate():
         F.col("report_version_id").alias("_rv_id"),
         F.col("report_series_id").alias("_rv_series_id"),
         F.col("issued_dt").alias("_rv_issued_dt"),
+        F.col("issued_dt_local").alias("_rv_issued_dt_local"),
     ).alias("r")
     j = (
         t.join(i, F.col("t._resolved_accession_id") == F.col("i._identity_accession_id"), "left")
@@ -3426,6 +3621,8 @@ def _genomic_test_canonical_pregate():
         _clamped_ts(F.coalesce(F.col("r._rv_issued_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce(F.col("r._rv_issued_dt_local"), F.col("_acc_sample_dt_local"), F.col("_acc_request_dt_local"))).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:assay-code").alias("source_coding_system"),
         F.col("t.assay_code").cast("string").alias("source_code"),
         F.coalesce(F.col("t.assay_name"), F.col("t.assay_code")).alias("source_display"),
@@ -3486,6 +3683,7 @@ def _genomic_result_canonical_pregate():
     r = read_source(SRC_PATHOLOGY_REPORT_VERSIONS).select(
         F.col("report_version_id").alias("_rv_id"),
         F.col("issued_dt").alias("_rv_issued_dt"),
+        F.col("issued_dt_local").alias("_rv_issued_dt_local"),
     ).alias("r")
     j = (
         g.join(parent, F.col("g.genetic_test_id") == F.col("p._gt_id"), "left")
@@ -3511,6 +3709,8 @@ def _genomic_result_canonical_pregate():
         _clamped_ts(F.coalesce(F.col("r._rv_issued_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce(F.col("r._rv_issued_dt_local"), F.col("_acc_sample_dt_local"), F.col("_acc_request_dt_local"))).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.when(F.coalesce(F.col("g.normalized_gene_symbol"),
                           F.col("g.reported_gene_symbol")).isNotNull(),
                F.lit("urn:barts:pathology:gene-symbol"))
@@ -3605,6 +3805,8 @@ def _indication_canonical_pregate():
         _clamped_ts(F.coalesce(F.col("_acc_report_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce(F.col("_acc_report_dt_local"), F.col("_acc_sample_dt_local"), F.col("_acc_request_dt_local"))).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:indication-text").alias("source_coding_system"),
         F.col("x.source_text").cast("string").alias("source_code"),
         F.col("x.source_text").alias("source_display"),
@@ -3675,6 +3877,8 @@ def _micro_isolate_canonical_pregate():
         _clamped_ts(F.coalesce(F.col("_acc_sample_dt"), F.col("_acc_report_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce(F.col("_acc_sample_dt_local"), F.col("_acc_report_dt_local"), F.col("_acc_request_dt_local"))).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.concat(F.lit("urn:barts:winpath:lims"), F.col("m.lims_no"),
                  F.lit(":organism-code")).alias("source_coding_system"),
         F.col("m.organism_code").alias("source_code"),
@@ -3759,6 +3963,8 @@ def _susceptibility_canonical_pregate():
         _clamped_ts(F.coalesce(F.col("_acc_sample_dt"), F.col("_acc_report_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.coalesce(F.col("_acc_sample_dt_local"), F.col("_acc_report_dt_local"), F.col("_acc_request_dt_local"))).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.concat(F.lit("urn:barts:winpath:lims"), F.col("i.lims_no"),
                  F.lit(":agent-code")).alias("source_coding_system"),
         F.col("a.antimicrobial_code").cast("string").alias("source_code"),
@@ -3840,6 +4046,8 @@ def _form_canonical_pregate():
         F.col("ENCNTR_ID").cast("bigint").alias("encounter_id"),
         F.col("authored_datetime").alias("event_datetime"),
         F.col("completed_datetime").alias("event_end_datetime"),
+        F.col("authored_datetime_local").alias("event_datetime_local"),
+        F.col("completed_datetime_local").alias("event_end_datetime_local"),
         F.lit("urn:cerner:form_ref_id").alias("source_coding_system"),
         F.col("FORM_REF_ID").cast("string").alias("source_code"),
         F.col("FORM_DESC_TXT").alias("source_display"),
@@ -3904,7 +4112,7 @@ def _registry_vital_canonical():
         F.concat(F.lit("registry:"), F.col("registry_product")).alias("source_object"),
         "subject_key", "subject_id_system", "person_id",
         F.when(F.col("person_id").isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved")).alias("identity_status"),
-        "encounter_id", "event_datetime", "event_end_datetime",
+        "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         F.lit("urn:barts:registry-field").alias("source_coding_system"), F.col("registry_field_id").alias("source_code"),
         F.col("question_display").alias("source_display"),
         codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("vital_code"),
@@ -3940,6 +4148,8 @@ VITAL_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -4007,6 +4217,8 @@ def _numeric_vital_canonical():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         F.coalesce(s.PERFORMED_DT_TM, s.EVENT_START_DT_TM).alias("event_datetime"),
         s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.PERFORMED_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:event_cd").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"),
         F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY).alias("source_display"),
@@ -4100,6 +4312,8 @@ SCORE_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -4173,6 +4387,8 @@ def _numeric_score_canonical():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         F.coalesce(s.PERFORMED_DT_TM, s.EVENT_START_DT_TM).alias("event_datetime"),
         s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.PERFORMED_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:event_cd").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"),
         F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY).alias("source_display"),
@@ -4323,6 +4539,8 @@ def _medication_dispense_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.ISSUE_DTTM.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.ISSUE_DTTM.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:jac:drug-id").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept(
@@ -4403,6 +4621,8 @@ def _coded_finding_canonical():
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.PERFORMED_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:code_value").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
@@ -4478,6 +4698,8 @@ def _nomen_finding_canonical():
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.CLINICAL_EVENT_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL, s.PERFORMED_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:code_value").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
@@ -4545,6 +4767,8 @@ def _date_finding_canonical():
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.RESULT_DT_TM_LOCAL, s.PERFORMED_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:code_value").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
@@ -4613,6 +4837,8 @@ def _text_finding_canonical():
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.RESULT_DT_TM_LOCAL, s.PERFORMED_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:code_value").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
@@ -4754,6 +4980,8 @@ def _imaging_exam_canonical_pregate(integration=False):
         F.lit(None).cast("bigint").alias("encounter_id"),
         F.coalesce(s.EXAMINATION_DT_TM, s.ARRIVAL_DT_TM).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(s.EXAMINATION_DT_TM, s.ARRIVAL_DT_TM).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:sectra:examination-code").alias("source_coding_system"),
         source_code.alias("source_code"),
         source_display.alias("source_display"),
@@ -4782,6 +5010,7 @@ def _imaging_exam_canonical_pregate(integration=False):
         F.date_format(s.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"),
         s.SRC_ADC_UPDT.alias("source_update_timestamp"), s.ADC_UPDT.alias("loaded_at"),
         *(_pacs_exam_integration_columns(s) if integration else []),
+        *(_sdi_pacs_modality_dicom(s) if integration else []),  # SDI_DICOM_MODALITY_V1
         F.lit("sectra-pacs").alias("_source_system"),
         F.lit(SRC_PACS_EXAMINATION).alias("_source_table"),
         s.PACS_EXAMINATION_ID.cast("string").alias("_source_row_id"),
@@ -4834,6 +5063,8 @@ def _pacs_study_artifact_canonical():
             F.lit(None).cast("bigint").alias("encounter_id"),
             event_time.alias("event_datetime"),
             F.lit(None).cast("timestamp").alias("event_end_datetime"),
+            event_time.alias("event_datetime_local"),
+            F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
             F.lit("urn:sectra:examination-code").alias("source_coding_system"),
             source_code.alias("source_code"),
             s.EXAMINATION_DESCRIPTION.alias("source_display"),
@@ -4952,6 +5183,8 @@ def _dicom_file_artifact_canonical():
             F.lit(None).cast("bigint").alias("encounter_id"),
             event_time.alias("event_datetime"),
             F.lit(None).cast("timestamp").alias("event_end_datetime"),
+            event_time.alias("event_datetime_local"),
+            F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
             F.lit("urn:dicom:sop-class-uid").alias("source_coding_system"),
             source_code.alias("source_code"),
             source_display.alias("source_display"),
@@ -5104,6 +5337,8 @@ def _pathology_report_document_base(rows):
         F.col("source_encounter_id").cast("bigint").alias("encounter_id"),
         _clamped_ts(F.col("issued_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(F.col("issued_dt_local")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:report-code").alias("source_coding_system"),
         F.col("report_code").cast("string").alias("source_code"),
         F.coalesce(F.col("report_role"), F.col("report_code")).cast("string")
@@ -5202,6 +5437,8 @@ DOCUMENT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -5302,6 +5539,8 @@ def _order_comment_document_canonical():
         F.col("HNA_ORDER_MNEMONIC").alias("_o_hna_mnemonic"),
         F.col("ORIG_ORDER_DT_TM_CLEAN").alias("_o_orig_dt"),
         F.col("CURRENT_START_DT_TM_CLEAN").alias("_o_start_dt"),
+        F.col("ORIG_ORDER_DT_TM_CLEAN_LOCAL").alias("_o_orig_dt_local"),
+        F.col("CURRENT_START_DT_TM_CLEAN_LOCAL").alias("_o_start_dt_local"),
         F.col("SOURCE_ADC_UPDT").alias("_o_loaded_at"),
     ).alias("o")
     s = c.join(o, c.ORDER_ID == F.col("o._o_order_id"), "left")
@@ -5340,6 +5579,8 @@ def _order_comment_document_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.col("o._o_encntr_id").cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(c.COMMENT_DT_TM_CLEAN_LOCAL, c.COMMENT_UPDT_DT_TM_CLEAN_LOCAL, F.col("o._o_orig_dt_local"), F.col("o._o_start_dt_local"), c.COMMENT_DT_TM_LOCAL, c.COMMENT_UPDT_DT_TM_LOCAL).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:cerner:order-comment-type").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -5427,6 +5668,8 @@ def _elective_access_comment_document_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:luna:eal-comment").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -5507,7 +5750,9 @@ SRC_PACS_REPORT = "4_prod.bronze.map_pacs_report"
 
 SRC_DOCUMENT_PATIENT_IDENTIFIER = "4_prod.bronze.map_patient_identifier"
 
-SRC_DOCUMENT_LINK_CONTEXT = "8_dev.bronze.document_link_context_s37"
+# PACS report event context is read from SRC_RADIOLOGY_EVENT (every bridged event). It replaced the
+# 663-row 8_dev.bronze.document_link_context_s37 fixture on 2026-09-26.
+# DOCUMENT_CONTEXT_RADIOLOGY_EVENT_PATCH_APPLIED v1
 
 SRC_EAL_COMMENT = "4_prod.bronze.map_elective_access_list"
 
@@ -5817,7 +6062,7 @@ def _text_document_canonical():
     s = _text_finding_canonical().where(F.col("_route") == "document_candidate").alias("s")
     return s.select(
         "patient_event_key", "subject_key", "subject_id_system", "person_id",
-        "identity_status", "encounter_id", "event_datetime", "event_end_datetime",
+        "identity_status", "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         "source_coding_system", "source_code", "source_display",
         codeable_concept_json(
             coding_obj(F.col("source_coding_system"), F.col("source_code"),
@@ -5947,6 +6192,8 @@ def _mill_blob_document_canonical():
         b.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"),
         F.when(ended, b.VALID_UNTIL_DT_TM).alias("event_end_datetime"),
+        F.coalesce(b.CLINSIG_DT_TM_LOCAL, F.coalesce(b.VALID_FROM_DT_TM_LOCAL, b.UPDT_DT_TM_LOCAL, b.ADC_UPDT_LOCAL)).alias("event_datetime_local"),
+        F.when(ended, b.VALID_UNTIL_DT_TM_LOCAL).alias("event_end_datetime_local"),
         F.when(has_event, F.lit("urn:cerner:code_value"))
          .otherwise(F.lit("urn:cerner:blob-content-type")).alias("source_coding_system"),
         F.coalesce(b.EVENT_CD.cast("string"), b.CONTENT_TYPE).alias("source_code"),
@@ -6052,12 +6299,11 @@ def _pacs_report_document_canonical():
     )
     r = r.join(examination, r.PACS_EXAMINATION_ID == F.col("_exam_id"), "left")
     event_context = (
-        read_source(SRC_DOCUMENT_LINK_CONTEXT)
-        .where(F.col("source_kind") == "clinical_event")
+        read_source(SRC_RADIOLOGY_EVENT)
         .select(
-            F.col("source_id").alias("_event_context_id"),
-            F.col("person_id").alias("_event_context_person_id"),
-            F.col("encntr_id").alias("_event_context_encntr_id"),
+            F.col("EVENT_ID").cast("string").alias("_event_context_id"),
+            F.col("PERSON_ID").alias("_event_context_person_id"),
+            F.col("ENCNTR_ID").alias("_event_context_encntr_id"),
         )
     )
     r = r.join(
@@ -6122,6 +6368,8 @@ def _pacs_report_document_canonical():
         resolved_encounter.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(r.REPORT_DT_TM, r.REPORT_MODIFIED_UTC_LOCAL, r.ADC_UPDT_LOCAL).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:sectra:imaging-report").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -6222,6 +6470,8 @@ APPOINTMENT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -6238,6 +6488,11 @@ APPOINTMENT_SOURCE_COLUMNS = [
     "requested_practitioner_id",
     "allocated_practitioner_id",
     "location_code",
+    "location_display",  # SDI_APPT_LOCATION_V1
+    "clinic_resource_code",  # SDI_APPT_LOCATION_V1
+    "clinic_resource_display",  # SDI_APPT_LOCATION_V1
+    "service_resource_code",  # SDI_APPT_LOCATION_V1
+    "service_resource_display",  # SDI_APPT_LOCATION_V1
     "organization_id",
     "recurrence_parent_key",
     "recurrence_type_flag",
@@ -6278,6 +6533,14 @@ def _appointment_canonical():
                                F.col("r._resource_source_update"))
     location_code = F.coalesce(F.col("r._resource_location_cd"),
                                F.col("s._schedule_location_cd"))
+    # SDI_APPT_LOCATION_V1: the display follows the side that supplied location_code; a resource code without a
+    # resource display borrows the schedule display only when the schedule chose the same code.
+    location_display = F.when(
+        F.col("r._resource_location_cd").isNotNull(),
+        F.coalesce(F.col("r._resource_location_display"),
+                   F.when(F.col("s._schedule_location_cd") == F.col("r._resource_location_cd"),
+                          F.col("s._schedule_location_display"))),
+    ).otherwise(F.col("s._schedule_location_display"))
     # contract v2: publish SCH_EVENT_ID, native foreign keys, and explicit recurrence SHA/native identities
     return joined.select(
         event_id.alias("patient_event_key"),
@@ -6291,6 +6554,8 @@ def _appointment_canonical():
         F.coalesce(F.col("r._slot_start"), a.ORIG_REQ_START_DT_TM,
                    a.FIRST_BKD_ASI_DT_TM, a.REFER_DT_TM).alias("event_datetime"),
         F.col("r._slot_end").alias("event_end_datetime"),
+        F.coalesce(F.col("r._slot_start_local"), a.ORIG_REQ_START_DT_TM_LOCAL, a.FIRST_BKD_ASI_DT_TM_LOCAL, a.REFER_DT_TM_LOCAL).alias("event_datetime_local"),
+        F.col("r._slot_end_local").alias("event_end_datetime_local"),
         F.lit("urn:cerner:scheduling:appointment-type").alias("source_coding_system"),
         a.APPT_TYPE_CD.cast("string").alias("source_code"),
         F.coalesce(a.APPT_TYPE_DESCRIPTION, a.APPT_SYNONYM_DESCRIPTION).alias("source_display"),
@@ -6311,6 +6576,11 @@ def _appointment_canonical():
         a.REQUESTED_PERSONNEL_ID.cast("bigint").alias("requested_practitioner_id"),
         F.col("r._allocated_personnel_id").cast("bigint").alias("allocated_practitioner_id"),
         location_code.cast("string").alias("location_code"),
+        location_display.alias("location_display"),  # SDI_APPT_LOCATION_V1
+        F.col("r._clinic_resource_cd").cast("string").alias("clinic_resource_code"),
+        F.col("r._clinic_resource_display").alias("clinic_resource_display"),
+        F.col("r._service_resource_cd").cast("string").alias("service_resource_code"),
+        F.col("r._service_resource_display").alias("service_resource_display"),
         a.ORGANIZATION_ID.cast("bigint").alias("organization_id"),
         F.when(a.RECUR_PARENT_ID.isNotNull(),
                stable_id("appointment:mill_scheduling", a.RECUR_PARENT_ID))
@@ -6370,6 +6640,8 @@ def _referral_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.REFERRAL_RECEIVED_DATETIME.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.REFERRAL_RECEIVED_DATETIME.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:luna:treatment-function").alias("source_coding_system"),
         s.TREATMENT_FUNCTION_CD.alias("source_code"),
         s.TREATMENT_FUNCTION_DESC.alias("source_display"),
@@ -6460,6 +6732,8 @@ def _rtt_pathway_canonical():
         .alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.START_DATETIME.alias("event_datetime"), s.STOP_DATETIME.alias("event_end_datetime"),
+        s.START_DATETIME.alias("event_datetime_local"),
+        s.STOP_DATETIME.alias("event_end_datetime_local"),
         F.lit("urn:barts:luna:rtt-status").alias("source_coding_system"),
         s.CURRENT_RTT_STATUS_CD.alias("source_code"),
         s.CURRENT_RTT_STATUS_DESC.alias("source_display"),
@@ -6538,6 +6812,8 @@ def _rtt_activity_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.RTT_ACTIVITY_DATETIME.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.RTT_ACTIVITY_DATETIME.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:luna:rtt-status").alias("source_coding_system"),
         s.RTT_STATUS_CD.alias("source_code"), s.RTT_STATUS_DESC.alias("source_display"),
         s.RTT_ACTIVITY_OID.cast("long").alias("rtt_activity_oid"),
@@ -6614,6 +6890,8 @@ def _waiting_list_entry_canonical():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         s.WAITING_START_DT_TM.alias("event_datetime"),
         s.WAITING_END_DT_TM.alias("event_end_datetime"),
+        s.WAITING_START_DT_TM_LOCAL.alias("event_datetime_local"),
+        s.WAITING_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:mill:planned-procedure").alias("source_coding_system"),
         s.PLANNED_PROCEDURE_CD.cast("string").alias("source_code"),
         s.PLANNED_PROCEDURE_DESC.alias("source_display"),
@@ -6720,6 +6998,8 @@ def _allergy_canonical_pregate():
         F.coalesce(s.ONSET_DT_TM_CLEAN, s.CREATED_DT_TM_CLEAN).alias("event_datetime"),
         F.when(cancelled, s.CANCEL_DT_TM_CLEAN)
         .when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
+        F.coalesce(s.ONSET_DT_TM_CLEAN_LOCAL, s.CREATED_DT_TM_CLEAN_LOCAL).alias("event_datetime_local"),
+        F.when(cancelled, s.CANCEL_DT_TM_CLEAN_LOCAL).when(ended, s.END_EFFECTIVE_DT_TM_LOCAL).alias("event_end_datetime_local"),
         source_system.alias("source_coding_system"), source_code.alias("source_code"),
         source_display.alias("source_display"),
         codeable_concept(
@@ -6792,6 +7072,8 @@ def _transfusion_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         F.coalesce(s.BEGIN_TS, s.END_TS).alias("event_datetime"),
         s.END_TS.alias("event_end_datetime"),
+        F.coalesce(s.BEGIN_TS, s.END_TS).alias("event_datetime_local"),
+        s.END_TS.alias("event_end_datetime_local"),
         F.lit("urn:isbt:product-code").alias("source_coding_system"),
         source_code.alias("source_code"), s.BLOOD_PRODUCT_GROUP.alias("source_display"),
         s.BEGIN_TS.alias("begin_datetime"), s.END_TS.alias("end_datetime"),
@@ -6874,6 +7156,8 @@ def _cancer_treatment_canonical_pregate():
         .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), end_time.alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        end_time.alias("event_end_datetime_local"),
         F.lit("urn:barts:sact:drug-token").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept(
@@ -6964,6 +7248,8 @@ def _condition_stage_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.ONSET_DATE_CLEAN.cast("timestamp").alias("event_datetime"),
         s.RESOLUTION_DATE_CLEAN.cast("timestamp").alias("event_end_datetime"),
+        s.ONSET_DATE_CLEAN.cast("timestamp").alias("event_datetime_local"),
+        s.RESOLUTION_DATE_CLEAN.cast("timestamp").alias("event_end_datetime_local"),
         F.lit("http://hl7.org/fhir/sid/icd-10").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept(
@@ -7040,6 +7326,8 @@ def _endoscopy_finding_canonical_pregate():
         .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.col("x._x_encntr_id").cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:endobase:dgvs-term").alias("source_coding_system"),
         source_code.alias("source_code"), t.TERM_TEXT.alias("source_display"),
         t._finding_code_json.alias("_finding_code_json"),
@@ -7153,6 +7441,8 @@ def _device_canonical_pregate():
         .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"),
         implant_time.alias("event_datetime"), F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        implant_time.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:mediconnect:device-type").alias("source_coding_system"),
         source_code.alias("source_code"), source_display.alias("source_display"),
         codeable_concept_json(
@@ -7323,6 +7613,8 @@ def _registry_entry_lane(family, slot_key, event_fn, end_fn, parent, rtype_fn, d
         F.lit(None).cast("bigint").alias("encounter_id"),
         event_expr.cast("timestamp").alias("event_datetime"),
         end_fn(s).cast("timestamp").alias("event_end_datetime"),
+        event_expr.cast("timestamp").alias("event_datetime_local"),
+        end_fn(s).cast("timestamp").alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -7386,6 +7678,8 @@ def _community_care_contact_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         _clamped_ts(raw_event).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(raw_event).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.when(s.consultation_type_code.isNotNull(),
                F.lit("urn:barts:community:consultation-type")).alias("source_coding_system"),
         s.consultation_type_code.cast("string").alias("source_code"),
@@ -7466,6 +7760,8 @@ def _community_care_activity_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         _clamped_ts(raw_event).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        _clamped_ts(raw_event).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.when(source_code.isNotNull(), F.lit("urn:barts:community:activity-type"))
          .alias("source_coding_system"),
         source_code.alias("source_code"),
@@ -7580,6 +7876,8 @@ def _hrg_arm(s, arm):
         F.lit(None).cast("bigint").alias("encounter_id"),
         _clamped_ts(raw_event.cast("timestamp")).alias("event_datetime"),
         _clamped_ts(raw_end.cast("timestamp")).alias("event_end_datetime"),
+        _clamped_ts(raw_event.cast("timestamp")).alias("event_datetime_local"),
+        _clamped_ts(raw_end.cast("timestamp")).alias("event_end_datetime_local"),
         F.when(source_code.isNotNull(), F.lit("urn:barts:slam:hrg"))
          .alias("source_coding_system"),
         source_code.cast("string").alias("source_code"),
@@ -7680,6 +7978,8 @@ def _costed_activity_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.ACTIVITY_START_DT_TM.alias("event_datetime"),
         s.ACTIVITY_END_DT_TM.alias("event_end_datetime"),
+        s.ACTIVITY_START_DT_TM.alias("event_datetime_local"),
+        s.ACTIVITY_END_DT_TM.alias("event_end_datetime_local"),
         F.when(s.POD_CD.isNotNull(), F.lit("urn:barts:slam:pod"))
          .alias("source_coding_system"),
         s.POD_CD.alias("source_code"), F.lit(None).cast("string").alias("source_display"),
@@ -7761,6 +8061,8 @@ def _drug_expenditure_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"), s.EFFECTIVE_DT_TM.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.EFFECTIVE_DT_TM.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.when(coded, F.lit("http://snomed.info/sct"))
          .otherwise(F.lit("urn:barts:hcd:chargeable-item")).alias("source_coding_system"),
         F.when(coded, s.DMD_CODE.cast("string"))
@@ -7853,6 +8155,8 @@ def _medication_supply_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.REQUEST_CREATED.cast("timestamp").alias("event_datetime"),
         s.REQUEST_COMPLETED.cast("timestamp").alias("event_end_datetime"),
+        s.REQUEST_CREATED.cast("timestamp").alias("event_datetime_local"),
+        s.REQUEST_COMPLETED.cast("timestamp").alias("event_end_datetime_local"),
         F.when(coded, F.lit("http://snomed.info/sct"))
          .otherwise(F.lit("urn:jac:homecare:item")).alias("source_coding_system"),
         _code_or_display(s.DMD_VTM_CODE, s.ITEM_DESCRIPTION).alias("source_code"),
@@ -7951,6 +8255,8 @@ def _elective_access_entry_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.CREATED_DT_TM.alias("event_datetime"), s.ADMIT_DT_TM_CLEAN.alias("event_end_datetime"),
+        s.CREATED_DT_TM.alias("event_datetime_local"),
+        s.ADMIT_DT_TM_CLEAN.alias("event_end_datetime_local"),
         F.when(coded, F.lit("http://fhir.hl7.org.uk/CodeSystem/OPCS-4"))
          .alias("source_coding_system"),
         F.when(coded, j.PROCEDURE_CODE.cast("string")).alias("source_code"),
@@ -8049,6 +8355,8 @@ def _pathway_tracking_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.LATEST_ACTIVITY_DATE_CLEAN.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.LATEST_ACTIVITY_DATE_CLEAN.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -8168,6 +8476,8 @@ def _critical_care_period_canonical():
         d.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         d.CC_Period_Start_Dt_Tm_CLEAN.alias("event_datetime"),
         d.CC_Period_Disch_Dt_Tm_CLEAN.alias("event_end_datetime"),
+        d.CC_Period_Start_Dt_Tm_CLEAN.alias("event_datetime_local"),
+        d.CC_Period_Disch_Dt_Tm_CLEAN.alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -8234,6 +8544,8 @@ def _critical_care_activity_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.Activity_Date_CLEAN.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.Activity_Date_CLEAN.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:nhs:ccmds:activity").alias("source_coding_system"),
         s.Activity_Code.cast("string").alias("source_code"),
         s.ACTIVITY_DESC.alias("source_display"),
@@ -8294,6 +8606,8 @@ def _critical_care_admission_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.date_unit_adm_CLEAN.alias("event_datetime"),
         s.date_unit_discharge_CLEAN.alias("event_end_datetime"),
+        s.date_unit_adm_CLEAN.alias("event_datetime_local"),
+        s.date_unit_discharge_CLEAN.alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -8357,6 +8671,8 @@ def _cc_daily_score_canonical_pregate():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"), event_time.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:medicus:critical-care-score").alias("source_coding_system"),
         s.SCORE_TYPE.alias("source_code"), s.SCORE_TYPE.alias("source_display"),
         s.SCORE_VALUE.alias("score_value"), s.SCORE_VALUE_RAW.alias("score_value_raw"),
@@ -8415,6 +8731,8 @@ def _neonatal_episode_canonical():
          .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"), event_time.alias("event_datetime"),
         s.DischTime_CLEAN.alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        s.DischTime_CLEAN.alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -8471,6 +8789,8 @@ def _neonatal_care_day_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.ActivityDate.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.ActivityDate.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:nhs:nccmds:activity").alias("source_coding_system"),
         s.CCAC1.alias("source_code"), s.CCAC1.alias("source_display"),
         s.EntityID.alias("entity_id"), s.ActivityDate.alias("activity_date"),
@@ -8531,6 +8851,8 @@ def _neonatal_examination_canonical_pregate():
         F.lit(None).cast("bigint").alias("encounter_id"),
         s.DateOfExamination_CLEAN.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.DateOfExamination_CLEAN.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:badgernet:examination").alias("source_coding_system"),
         source_code.alias("source_code"), F.lit("Newborn and Infant Physical Examination")
          .alias("source_display"),
@@ -8638,6 +8960,8 @@ def _baby_delivery_canonical():
         F.lit(None).cast("bigint").alias("encounter_id"),
         F.col("s.PERSONBIRTHDATETIMEBABY_CLEAN").alias("event_datetime"),
         F.col("s.DISCHARGEDATETIMEBABYHSP_CLEAN").alias("event_end_datetime"),
+        F.col("s.PERSONBIRTHDATETIMEBABY_CLEAN").alias("event_datetime_local"),
+        F.col("s.DISCHARGEDATETIMEBABYHSP_CLEAN").alias("event_end_datetime_local"),
         F.lit("urn:nhs:msds:delivery-method").alias("source_coding_system"),
         F.col("s.DELIVERYMETHODCODE").alias("source_code"),
         F.col("s.DELIVERYMETHODCODE").alias("source_display"),
@@ -8758,6 +9082,8 @@ def _labour_delivery_canonical():
          .alias("identity_status"),
         F.lit(None).cast("bigint").alias("encounter_id"), event_time.alias("event_datetime"),
         F.col("s.DISCHARGEDATETIMEMOTHERHSP_CLEAN").alias("event_end_datetime"),
+        event_time.alias("event_datetime_local"),
+        F.col("s.DISCHARGEDATETIMEMOTHERHSP_CLEAN").alias("event_end_datetime_local"),
         F.lit("urn:nhs:msds:labour-onset-method").alias("source_coding_system"),
         F.col("s.LABOURONSETMETHOD").alias("source_code"),
         F.col("s.LABOURONSETMETHOD").alias("source_display"),
@@ -8832,6 +9158,8 @@ def _maternity_care_contact_canonical():
          .alias("identity_status"), F.lit(None).cast("bigint").alias("encounter_id"),
         F.col("s.CCONTACTDATETIME_CLEAN").alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.col("s.CCONTACTDATETIME_CLEAN").alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit(None).cast("string").alias("source_coding_system"),
         F.lit(None).cast("string").alias("source_code"),
         F.lit(None).cast("string").alias("source_display"),
@@ -9021,6 +9349,19 @@ def _anon_output_or_null(df, output_column, text_columns, key_present=None):
     if key_present is not None:
         current = current & key_present
     return F.when(current, df[output_column])
+
+
+def _anon_lane(df, output_column, text_columns):
+    # Approved output plus its redactor version and processing time, both NULL whenever the
+    # output is NULL, so provenance never describes text that is not published.
+    text = _anon_output_or_null(df, output_column, text_columns)
+
+    def meta(c, t):
+        if c not in df.columns:
+            return F.lit(None).cast(t)
+        return F.when(text.isNotNull(), df[c].cast(t))
+
+    return text, meta("anon_redactor_version", "string"), meta("anon_processed_at", "timestamp")
 
 
 def _pacs_request_anon_status(s):
@@ -9358,6 +9699,9 @@ IMAGING_REPORT_LINK_COLUMNS = [
     "text_integrity_status",
     "report_text_available_ind",
     "approved_anonymised_text_available_ind",
+    "report_text_anonymised",
+    "anonymisation_redactor_version",
+    "anonymised_at",
     "person_id",
     "record_status",
     "loaded_at",
@@ -9385,6 +9729,9 @@ IMAGING_REPORT_LINK_COLUMN_COMMENTS = {
     "text_integrity_status": "Bridge v4 TEXT_INTEGRITY_STATUS for bridged PACS text; NULL otherwise.",
     "report_text_available_ind": "Non-empty report text is available for this link and not version-ambiguous.",
     "approved_anonymised_text_available_ind": "The approved anonymisation lane holds output for the current text (anon_status anonymized and matching source hash). False when missing or stale; never inferred from raw text.",
+    "report_text_anonymised": "Approved-lane anonymised report text for this link: map_pacs_report.anon_report_text (pacs_native), map_pacs_report_text_bridge.anon_bridged_text (mill_blob_text_bridge) or mill_blob_text.anon_text for the linked version (mill_blob_text). Set exactly when approved_anonymised_text_available_ind is true; never falls back to raw text.",
+    "anonymisation_redactor_version": "anon_redactor_version of the lane row that produced report_text_anonymised; NULL when report_text_anonymised is NULL.",
+    "anonymised_at": "anon_processed_at of the lane row that produced report_text_anonymised; NULL when report_text_anonymised is NULL.",
     "person_id": "Report/document person when resolved.",
     "record_status": "Link record status: active, or the linked document/report record status when that is not active.",
     "loaded_at": "Bronze load clock of the link source row.",
@@ -9395,6 +9742,7 @@ IMAGING_REPORT_LINK_IG.update({
     "accession_key": ("4", "2"), "sectra_accession_number": ("4", "2"),
     "person_id": ("2", "1"), "cerner_document_event_id": ("0", "1"),
     "report_datetime": ("1", "1"), "text_sha256": ("1", "1"),
+    "report_text_anonymised": ("3", "2"),
 })
 
 
@@ -9426,15 +9774,19 @@ def _pacs_report_links(docs):
     )
     report = read_source(SRC_PACS_REPORT)
     native_text = report.REPORT_TEXT.isNotNull() & (F.trim(report.REPORT_TEXT) != "")
+    r_anon, r_anon_version, r_anon_at = _anon_lane(report, "anon_report_text", ["REPORT_TEXT"])
     report = report.select(
         F.col("PACS_REPORT_ID").alias("_r_id"),
         native_text.alias("_r_native_text"),
-        _anon_output_or_null(report, "anon_report_text", ["REPORT_TEXT"]).isNotNull()
-        .alias("_r_native_anon"),
+        r_anon.alias("_r_anon_text"),
+        r_anon_version.alias("_r_anon_version"),
+        r_anon_at.alias("_r_anon_at"),
         F.coalesce(F.col("SOURCE_PRESENT_IND"), F.lit(True)).alias("_r_present"),
     )
     bridge_src = read_source(SRC_PACS_TEXT_BRIDGE)
     bridge_present = F.coalesce(bridge_src.SOURCE_PRESENT_IND, F.lit(True))
+    b_anon, b_anon_version, b_anon_at = _anon_lane(
+        bridge_src, "anon_bridged_text", ["BRIDGED_TEXT"])
     bridge = bridge_src.where(bridge_present).select(
         F.col("REPORT_ID").alias("_b_report_id"),
         F.col("EVENT_ID").cast("bigint").alias("_b_event_id"),
@@ -9442,8 +9794,9 @@ def _pacs_report_links(docs):
         .alias("_b_has_text"),
         (F.col("TEXT_INTEGRITY_STATUS") if "TEXT_INTEGRITY_STATUS" in bridge_src.columns
          else F.lit(None).cast("string")).alias("_b_integrity"),
-        _anon_output_or_null(bridge_src, "anon_bridged_text", ["BRIDGED_TEXT"]).isNotNull()
-        .alias("_b_anon"),
+        b_anon.alias("_b_anon_text"),
+        b_anon_version.alias("_b_anon_version"),
+        b_anon_at.alias("_b_anon_at"),
     )
     pacs_docs = docs.where(F.col("_doc_source_feed") == F.lit("pacs_report"))
     j = (
@@ -9460,6 +9813,9 @@ def _pacs_report_links(docs):
                     stable_id("imaging_exam:pacs", F.col("PACS_EXAMINATION_ID")))
     accession_key = F.upper(F.trim(F.col("SECTRA_ACCESSION_NBR")))
     retracted = ~F.coalesce(F.col("_r_present"), F.lit(True))
+    native_anon = native & F.col("_r_anon_text").isNotNull()
+    bridged_anon = bridged & F.col("_b_anon_text").isNotNull()
+    approved = resolved & ~retracted & (native_anon | bridged_anon)
     return j.select(
         stable_id("imaging_report_link", scope, F.coalesce(member, accession_key),
                   F.lit("pacs_report"), F.col("PACS_REPORT_ID")).alias("link_key"),
@@ -9487,10 +9843,14 @@ def _pacs_report_links(docs):
         F.when(resolved & (native | bridged), F.col("_doc_text_sha256")).alias("text_sha256"),
         F.when(bridged, F.col("_b_integrity")).alias("text_integrity_status"),
         (resolved & (native | bridged) & ~retracted).alias("report_text_available_ind"),
-        (resolved & ~retracted & (
-            (native & F.coalesce(F.col("_r_native_anon"), F.lit(False)))
-            | (bridged & F.coalesce(F.col("_b_anon"), F.lit(False)))
-        )).alias("approved_anonymised_text_available_ind"),
+        approved.alias("approved_anonymised_text_available_ind"),
+        F.when(approved & native_anon, F.col("_r_anon_text"))
+        .when(approved & bridged_anon, F.col("_b_anon_text")).alias("report_text_anonymised"),
+        F.when(approved & native_anon, F.col("_r_anon_version"))
+        .when(approved & bridged_anon, F.col("_b_anon_version"))
+        .alias("anonymisation_redactor_version"),
+        F.when(approved & native_anon, F.col("_r_anon_at"))
+        .when(approved & bridged_anon, F.col("_b_anon_at")).alias("anonymised_at"),
         F.coalesce(F.col("_doc_person_id"), F.col("EXAMINATION_PERSON_ID")).cast("bigint")
         .alias("person_id"),
         F.when(retracted, F.lit("retracted")).otherwise(F.lit("active")).alias("record_status"),
@@ -9534,11 +9894,14 @@ def _cerner_report_links(docs):
         .alias("_distinct_texts"),
     )
     blob = read_source(SRC_MILL_BLOB_TEXT)
+    a_anon, a_anon_version, a_anon_at = _anon_lane(blob, "anon_text", ["BLOB_TEXT"])
     blob_anon = blob.select(
         F.col("EVENT_ID").cast("bigint").alias("_a_event_id"),
         F.col("UPDT_CNT").cast("bigint").alias("_a_update_count"),
         F.col("VALID_FROM_DT_TM").alias("_a_valid_from"),
-        _anon_output_or_null(blob, "anon_text", ["BLOB_TEXT"]).isNotNull().alias("_a_anon"),
+        a_anon.alias("_a_anon_text"),
+        a_anon_version.alias("_a_anon_version"),
+        a_anon_at.alias("_a_anon_at"),
     )
     j = (
         pairs.join(current, pairs._doc_evt == current._doc_event_id, "left")
@@ -9558,6 +9921,7 @@ def _cerner_report_links(docs):
     )
     certified = decision.isin("single_current", "identical_text_collapsed") \
         & F.coalesce(F.col("_doc_has_text"), F.lit(False))
+    approved = certified & F.col("_a_anon_text").isNotNull()
     member = stable_id("imaging_exam:mill", F.col("_exam_event_id"))
     return j.select(
         stable_id("imaging_report_link", F.lit("direct_cerner_event"), member,
@@ -9582,8 +9946,10 @@ def _cerner_report_links(docs):
         F.when(certified, F.col("_doc_text_sha256")).alias("text_sha256"),
         F.lit(None).cast("string").alias("text_integrity_status"),
         certified.alias("report_text_available_ind"),
-        (certified & F.coalesce(F.col("_a_anon"), F.lit(False)))
-        .alias("approved_anonymised_text_available_ind"),
+        F.coalesce(approved, F.lit(False)).alias("approved_anonymised_text_available_ind"),
+        F.when(approved, F.col("_a_anon_text")).alias("report_text_anonymised"),
+        F.when(approved, F.col("_a_anon_version")).alias("anonymisation_redactor_version"),
+        F.when(approved, F.col("_a_anon_at")).alias("anonymised_at"),
         F.coalesce(F.col("_doc_person_id"), F.col("_doc_evt_person")).cast("bigint")
         .alias("person_id"),
         F.lit("active").alias("record_status"),

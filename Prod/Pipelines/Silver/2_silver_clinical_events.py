@@ -151,6 +151,9 @@ FAMILY_HISTORY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
+    # TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
     'source_coding_system',
     'source_code',
     'source_display',
@@ -192,6 +195,8 @@ FAMILY_HISTORY_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ORIGINATING_ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Source family-history effective start.",
     "event_end_datetime": "Source effective end when the assertion is no longer current.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim source code system.",
     "source_code": "Source condition code",
     "source_display": "Verbatim source condition display.",
@@ -267,7 +272,7 @@ def family_history_lifecycle():
 PRESENTING_COMPLAINT_PUBLIC_COLUMNS = [
     "patient_event_key", "source_patient_event_key", "encounter_key", "encounter_id", "subject_key",
     "subject_id_system", "person_id", "source_object", "source_event_id", "statement_sequence",
-    "event_datetime", "encounter_class", "source_coding_system", "source_code", "source_display",
+    "event_datetime", "event_datetime_local", "encounter_class", "source_coding_system", "source_code", "source_display",
     "complaint_text_normalised", "complaint_group_display", *axis_columns("complaint"),
     "record_status", "record_status_effective_from", "record_status_effective_to", "confidentiality_code",
     "vip_ind", "withheld_identity_ind", "source_update_timestamp", "loaded_at",
@@ -284,6 +289,7 @@ PRESENTING_COMPLAINT_COLUMN_COMMENTS = {
 }
 
 PRESENTING_COMPLAINT_COLUMN_COMMENTS.update(axis_comments("complaint", "presenting complaint"))
+PRESENTING_COMPLAINT_COLUMN_COMMENTS["event_datetime_local"] = 'event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.'
 
 PRESENTING_COMPLAINT_COLUMN_COMMENTS["complaint_map_cosine"] = (
     "Cosine similarity between the normalised source text and selected SNOMED target, measured by complaint_map_scoring_model."
@@ -447,7 +453,7 @@ def _qc_condition():
 # COMMAND ----------
 
 # contract v2: the researcher-facing parent excludes lifecycle, QC and retired fields.
-CONDITION_PUBLIC_COLUMNS = [
+CONDITION_PUBLIC_COLUMNS = [  # VDB_SILVER_COND_LOCAL_V1: + Europe/London companions
     'patient_event_key',
     'source_object',
     'diagnosis_id',
@@ -458,6 +464,9 @@ CONDITION_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
+    'abatement_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -522,6 +531,9 @@ CONDITION_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Primary assertion timestamp.",
     "event_end_datetime": "Source effective end where supplied.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time, over the bronze *_LOCAL companions of the same fallback chain (diagnosis: DIAG_DT_TM, ASSERTED_DT_TM, BEG_EFFECTIVE_DT_TM; problem: ASSERTED_DT_TM, ONSET_DT_TM, BEG_EFFECTIVE_DT_TM, earliest_problem_date). The maternity arm's DIAGDATE_CLEAN is already local wall-clock and is carried unchanged. Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (END_EFFECTIVE_DT_TM_LOCAL under the same before-2100 rule); null on the maternity arm.",
+    "abatement_datetime_local": "abatement_datetime in Europe/London wall-clock time (END_EFFECTIVE_DT_TM_LOCAL under the same before-2100 rule); null on the maternity arm.",
     "source_coding_system": "Verbatim source coding system.",
     "source_code": "Source condition code",
     "source_display": "Verbatim source condition display.",
@@ -666,6 +678,8 @@ PROCEDURE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -832,6 +846,8 @@ PROCEDURE_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Primary performed timestamp.",
     "event_end_datetime": "Procedure end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim source coding system.",
     "source_code": "Source procedure code or implant label",
     "source_display": "Verbatim source procedure display.",
@@ -1185,10 +1201,13 @@ def _pathology_accession_identity():
         "pathology_accession_id", "primary_source_accession_id", "canonical_accession_status",
         "canonical_person_id", "person_resolution_status", "normalized_lab_no",
         "lab_series", "discipline", "request_dt", "sample_dt", "report_dt",
+        "request_dt_local", "sample_dt_local", "report_dt_local",
         "clinical_details", "tlcs_requested", "conditions", "reason", "urgent_flag",
         "body_site_code", "body_site_snomed_code", "specimen_type_code",
         "specimen_type_snomed_code", "source_site_code", "lifecycle_status",
         "research_qi_only", "created_at", "ADC_UPDT",
+        # STM_SPECIMEN_TYPE_V1/silver-identity: specimen-type namespace + display (the lookup key) and the discipline rule id.
+        "specimen_type_source_system", "specimen_type_display", "body_site_source_system", "discipline_rule_id",
     ).join(ev, "pathology_accession_id", "left")
 
 # COMMAND ----------
@@ -1227,6 +1246,8 @@ SPECIMEN_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -1280,9 +1301,11 @@ SPECIMEN_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Collection or receipt timestamp.",
     "event_end_datetime": "Event end when supplied.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source specimen type system.",
     "source_code": "Source specimen type code.",
-    "source_display": "Source specimen type display.",
+    "source_display": "Source specimen-type display (Cerner code value description), else the code.",
     "specimen_type": "Source specimen type CodeableConcept.",
     "accession_identifier": "Canonical accession identifier (pathology_accession_id); never LabNo-derived.",
     "resolved_accession_key": "Alias-resolved accession key retained as derivation evidence.",
@@ -1290,7 +1313,7 @@ SPECIMEN_COLUMN_COMMENTS = {
     "canonical_accession_status": "Canonical accession-link state.",
     "person_resolution_status": "Person-projection eligibility state.",
     "lab_series": "Source laboratory series.",
-    "discipline": "Source pathology discipline.",
+    "discipline": "Pathology discipline from bronze map_pathology_accession: lab series first, then the majority member WkgCode or Cerner activity type; the rule is bronze discipline_rule_id.",
     "urgent_flag": "Source urgent-request indicator code (Y",
     "research_qi_only": "Registry doctrine flag; true on 100% of rows today — describe-only",
     "clinical_details": "Source clinical details. Identifiable free text; ig_risk 4",
@@ -1300,7 +1323,7 @@ SPECIMEN_COLUMN_COMMENTS = {
     "body_site_code": "Source collection body-site code.",
     "body_site_snomed_code": "Source-provided SNOMED body-site code.",
     "specimen_type_code": "Native specimen-type code.",
-    "specimen_type_snomed_code": "Source-provided SNOMED specimen-type code.",
+    "specimen_type_snomed_code": "Best-effort SNOMED specimen type from 3_lookup.omop.specimen_type_snomed_map; provenance in specimen_type_map_*.",
     "sample_datetime": "Clamped source sample timestamp.",
     "request_datetime": "Clamped source request timestamp.",
     "report_datetime": "Clamped source report timestamp.",
@@ -1382,6 +1405,8 @@ REPORT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -1430,6 +1455,8 @@ PATHOLOGY_REPORT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Report issue or result timestamp.",
     "event_end_datetime": "Report event end.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source test coding system.",
     "source_code": "Source test code.",
     "source_display": "Source test display.",
@@ -1501,6 +1528,8 @@ RESULT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -1520,6 +1549,11 @@ RESULT_PUBLIC_COLUMNS = [
     'unit_source_value',
     'ucum_code',
     'unit_concept_id',
+    'test_mapping_match_type',  # SDI_PATH_V1
+    'test_mapping_rule_id',  # SDI_PATH_V1
+    'canonical_ucum_code',  # SDI_PATH_V1
+    'value_canonical',  # SDI_PATH_V1
+    'canonical_conversion',  # SDI_PATH_V1
     'reference_range_low',
     'reference_range_high',
     'interpretation_code',
@@ -1630,6 +1664,8 @@ PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each pathology result record. It is derived from bronze field `measurement_datetime` in `4_prod.bronze.map_pathology`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Measurement end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source test coding system.",
     "source_code": "Source test code.",
     "source_display": "Source test display.",
@@ -1648,6 +1684,11 @@ PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "operator_concept_id": "Result comparison operator concept.",
     "unit_source_value": "Verbatim source unit.",
     "ucum_code": "UCUM unit code.",
+    "test_mapping_match_type": "map_pathology.test_mapping_match_type: How measurement_concept_id was set: exact_context (the map key of this row code and description), native_event_cd / native_nlmc (native code map), safe_code (every observed description of the code maps to one concept), cross_arm_display (SDI_PATH_XARM_V1: a Millennium-linked row takes the concept the TFC LIMS arm map gives the same analyte display, and that arm tier), placeholder_code (SDI_PATH_PLACEHOLDER_V1: an unused/internal placeholder test code, unmapped by design), or unmapped.",  # SDI_PATH_V1
+    "test_mapping_rule_id": "map_pathology.test_mapping_rule_id: Rule that set a cross_arm_display or placeholder_code test mapping (SDI_PATH_XARM_V1 | SDI_PATH_PLACEHOLDER_V1); NULL when the row map key, a native map or the safe-code rule set it, or nothing did.",  # SDI_PATH_V1
+    "canonical_ucum_code": "map_pathology.canonical_ucum_code: UCUM unit of value_canonical (SDI_PATH_UNIT_V1): g/L for g/dL results, mmol/mol (IFCC) for HbA1c in %, ng/L for troponin T in ug/L, mL/min/{1.73_m2} for eGFR, {INR} for INR, else ucum_code. NULL when value_as_number is NULL, no unit is known, or the unit label contradicts the values (unit_label_conflict).",  # SDI_PATH_V1
+    "value_canonical": "map_pathology.value_canonical: value_as_number restated in canonical_ucum_code (see canonical_conversion); equal to value_as_number unless converted. NULL when canonical_conversion is NULL or unit_label_conflict.",  # SDI_PATH_V1
+    "canonical_conversion": "map_pathology.canonical_conversion: g/dL->g/L (x10) | %->mmol/mol (IFCC = (NGSP - 2.15) x 10.929, 1 dp) | ug/L->ng/L (x1000, troponin T only) | unit_label_conflict (troponin I labelled ug/L: TFC TROI has held ng/L-scale values since 2014, so neither the label nor a conversion is trusted; value_canonical and canonical_ucum_code are NULL) | egfr_unit_implied / inr_unit_implied (unit named by the test concept; value unchanged) | identity (ucum_code kept) | NULL (no numeric value, or no unit).",  # SDI_PATH_V1
     "unit_concept_id": "OMOP unit concept identifier.",
     "reference_range_low": "Reference-range lower bound.",
     "reference_range_high": "Reference-range upper bound.",
@@ -1713,6 +1754,8 @@ PATHOLOGY_ORDER_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Requested or source-validity timestamp.",
     "event_end_datetime": "Order event end when supplied.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Native order catalogue coding system.",
     "source_code": "Native order catalogue code.",
     "source_display": "Native order description.",
@@ -1761,7 +1804,7 @@ def _lifecycle_source_pathology_order():
     # contract v2: publish the direct pathology-order projection with source_object and key names
     return s.select(
         "patient_event_key", "subject_key", "subject_id_system", "person_id",
-        "identity_status", "encounter_id", "event_datetime", "event_end_datetime",
+        "identity_status", "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         "source_coding_system", "source_code", "source_display",
         "source_object", "wkg_code", "tlc_code", "order_id", "order_mnemonic",
         "raw_request_text", "test_description", "test_snomed_code", "test_omop_concept_id",
@@ -1815,6 +1858,8 @@ GENOMIC_TEST_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -1858,6 +1903,8 @@ GENOMIC_TEST_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -1906,6 +1953,8 @@ GENOMIC_TEST_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Assay coding namespace.",
     "source_code": "Source assay code.",
     "source_display": "Source assay display.",
@@ -1988,6 +2037,8 @@ GENOMIC_RESULT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2054,6 +2105,8 @@ GENOMIC_RESULT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2125,6 +2178,8 @@ GENOMIC_RESULT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Gene-symbol or alteration coding namespace.",
     "source_code": "SNV, indel, fusion, CNV, rearrangement, repeat, karyotype, or other.",
     "source_display": "SNV, indel, fusion, CNV, rearrangement, repeat, karyotype, or other.",
@@ -2293,6 +2348,8 @@ INDICATION_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2339,6 +2396,8 @@ INDICATION_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2390,6 +2449,8 @@ INDICATION_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Accession report/sample/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Indication text namespace.",
     "source_code": "Coded diagnosis display string.",
     "source_display": "Coded diagnosis display string.",
@@ -2475,6 +2536,8 @@ MICRO_ISOLATE_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2520,6 +2583,8 @@ MICRO_ISOLATE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2570,6 +2635,8 @@ MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Organism coding namespace.",
     "source_code": "Organism text or code.",
     "source_display": "Approved SNOMED organism code.",
@@ -2653,6 +2720,8 @@ SUSCEPTIBILITY_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2699,6 +2768,8 @@ SUSCEPTIBILITY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2750,6 +2821,8 @@ SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Antimicrobial coding namespace.",
     "source_code": "Antimicrobial code or text.",
     "source_display": "Source antimicrobial result/test code.",
@@ -3160,6 +3233,9 @@ def _form_grouped_query():
         F.min(a.DOCUMENTATION_DT_TM).alias("authored_datetime"),
         F.max(F.coalesce(a.LAST_DOCUMENTED_DT_TM, a.PERFORMED_DT_TM))
          .alias("completed_datetime"),
+        F.min(a.DOCUMENTATION_DT_TM_LOCAL).alias("authored_datetime_local"),
+        F.max(F.coalesce(a.LAST_DOCUMENTED_DT_TM_LOCAL, a.PERFORMED_DT_TM_LOCAL))
+         .alias("completed_datetime_local"),
         F.max(a.PERFORMED_PRSNL_ID_LONG).alias("PERFORMED_PRSNL_ID"),
         F.parse_json(F.to_json(F.sort_array(F.collect_list(response)))).alias("responses"),
         F.count(F.lit(1)).cast("long").alias("response_row_count"),
@@ -3232,6 +3308,8 @@ FORM_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3283,6 +3361,8 @@ FORM_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "First documented timestamp.",
     "event_end_datetime": "Last documented or performed timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source form coding system.",
     "source_code": "Source form reference identifier.",
     "source_display": "Source form description.",
@@ -3365,7 +3445,7 @@ def _registry_observation_query():
     )
     parent = spark.read.table(_n("journey_clinical.registry_entry")).select(
         F.col("patient_event_key").alias("registry_entry_key"), "subject_key", "subject_id_system",
-        "person_id", "encounter_id", "event_datetime", "event_end_datetime", "record_status",
+        "person_id", "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local", "record_status",
         "record_status_effective_from", "record_status_effective_to", "source_update_timestamp", "loaded_at",
     )
     frames = []
@@ -3408,7 +3488,7 @@ def _registry_observations():
     return _registry_observation_query().select(
         "patient_event_key", "registry_entry_key", "registry_field_id", "registry_product", "registry_field",
         "route", "question_display", "answer_text", "value_number", "unit", "event_datetime_status",
-        "subject_key", "subject_id_system", "person_id", "encounter_id", "event_datetime", "event_end_datetime",
+        "subject_key", "subject_id_system", "person_id", "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         "record_status", "record_status_effective_from", "record_status_effective_to", "source_update_timestamp", "loaded_at",
     )
 
@@ -3425,6 +3505,8 @@ VITAL_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3544,6 +3626,8 @@ def _promoted_vital_canonical():
         F.coalesce(F.col("i.RESPONSE_DT_TM"), F.col("i.PERFORMED_DT_TM"),
                    F.col("i.DOCUMENTATION_DT_TM")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(F.col("i.RESPONSE_DT_TM_LOCAL"), F.col("i.PERFORMED_DT_TM_LOCAL"), F.col("i.DOCUMENTATION_DT_TM_LOCAL")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.col("c.source_coding_system").alias("source_coding_system"),
         F.col("c.source_code").alias("source_code"), F.col("c.source_display").alias("source_display"),
         codeable_concept(
@@ -3634,6 +3718,8 @@ VITAL_SIGN_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinical start date and time of the event as recorded on the Millennium CLINICAL_EVENT row.",
     "event_end_datetime": "Measurement end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each vital sign record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Source vital code.",
     "source_display": "Source vital display.",
@@ -3713,6 +3799,8 @@ SCORE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3816,6 +3904,8 @@ def _promoted_score_canonical():
         F.coalesce(F.col("i.RESPONSE_DT_TM"), F.col("i.PERFORMED_DT_TM"),
                    F.col("i.DOCUMENTATION_DT_TM")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.coalesce(F.col("i.RESPONSE_DT_TM_LOCAL"), F.col("i.PERFORMED_DT_TM_LOCAL"), F.col("i.DOCUMENTATION_DT_TM_LOCAL")).alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.col("c.source_coding_system").alias("source_coding_system"),
         F.col("c.source_code").alias("source_code"), F.col("c.source_display").alias("source_display"),
         codeable_concept(
@@ -3907,6 +3997,8 @@ CLINICAL_SCORE_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinical start date and time of the event as recorded on the Millennium CLINICAL_EVENT row.",
     "event_end_datetime": "Score end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each clinical score record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Source score code.",
     "source_display": "Source score display.",
@@ -4386,6 +4478,8 @@ def _medication_admin_primitive_query():
         F.coalesce(F.col("a.ADMIN_START_DT_TM"), F.col("a.PERFORMED_DT_TM"),
                    F.col("a.SCHEDULED_DT_TM")).alias("event_datetime"),
         F.col("a.ADMIN_END_DT_TM").alias("event_end_datetime"),
+        F.coalesce(F.col("a.ADMIN_START_DT_TM_LOCAL"), F.col("a.PERFORMED_DT_TM_LOCAL"), F.col("a.SCHEDULED_DT_TM_LOCAL")).alias("event_datetime_local"),
+        F.col("a.ADMIN_END_DT_TM_LOCAL").alias("event_end_datetime_local"),
         F.lit("urn:cerner:order_synonym_id").alias("source_coding_system"),
         F.col("a.ORDER_SYNONYM_ID").cast("string").alias("source_code"),
         F.coalesce(F.col("a.ORDER_MNEMONIC"), F.col("a.ORDERED_AS_MNEMONIC"),
@@ -4533,6 +4627,8 @@ def _medication_order_primitive_query():
          .alias("event_datetime"),
         F.coalesce(F.col("o.PROJECTED_STOP_DT_TM"), F.col("o.SOFT_STOP_DT_TM"),
                    F.col("o.DISCONTINUE_EFFECTIVE_DT_TM")).alias("event_end_datetime"),
+        F.coalesce(F.col("o.ORIG_ORDER_DT_TM_LOCAL"), F.col("o.CURRENT_START_DT_TM_LOCAL")).alias("event_datetime_local"),
+        F.coalesce(F.col("o.PROJECTED_STOP_DT_TM_LOCAL"), F.col("o.SOFT_STOP_DT_TM_LOCAL"), F.col("o.DISCONTINUE_EFFECTIVE_DT_TM_LOCAL")).alias("event_end_datetime_local"),
         F.lit("urn:cerner:synonym_id").alias("source_coding_system"),
         F.col("o.SYNONYM_ID").cast("string").alias("source_code"),
         F.coalesce(F.col("o.ORDER_MNEMONIC"), F.col("o.ORDERED_AS_MNEMONIC"),
@@ -4651,6 +4747,8 @@ MEDICATION_ADMIN_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -4721,6 +4819,8 @@ MEDICATION_ADMIN_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Administration start or performed time.",
     "event_end_datetime": "Administration end time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source medication coding system.",
     "source_code": "Source order-synonym identifier.",
     "source_display": "Source medication display.",
@@ -4844,6 +4944,8 @@ MEDICATION_ORDER_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -4905,6 +5007,8 @@ MEDICATION_ORDER_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Order authored or start time.",
     "event_end_datetime": "Projected stop or discontinue time.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source medication coding system.",
     "source_code": "Source medication synonym identifier.",
     "source_display": "Source medication display.",
@@ -5417,6 +5521,8 @@ MEDICATION_DISPENSE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -5461,6 +5567,8 @@ MEDICATION_DISPENSE_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; JAC does not supply encounter context.",
     "event_datetime": "Source issue timestamp.",
     "event_end_datetime": "Dispense end timestamp when supplied.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim JAC drug coding system.",
     "source_code": "Verbatim JAC drug identifier.",
     "source_display": "Verbatim JAC drug description.",
@@ -5540,6 +5648,8 @@ CLINICAL_FINDING_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -5582,6 +5692,8 @@ CLINICAL_FINDING_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -5634,7 +5746,7 @@ def _registry_finding_canonical():
         "patient_event_key", F.lit(None).cast("bigint").alias("event_id"), F.lit(1).cast("bigint").alias("sequence_nbr"),
         F.concat(F.lit("registry:"), F.col("registry_product")).alias("source_object"), "subject_key", "subject_id_system", "person_id",
         F.when(F.col("person_id").isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved")).alias("identity_status"),
-        "encounter_id", "event_datetime", "event_end_datetime", F.lit("urn:barts:registry-field").alias("source_coding_system"),
+        "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local", F.lit("urn:barts:registry-field").alias("source_coding_system"),
         F.col("registry_field_id").alias("source_code"), F.col("question_display").alias("source_display"),
         codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("finding_code"),
         F.lit("registry_categorical").alias("finding_kind"), F.col("answer_text").alias("value_text"),
@@ -5697,6 +5809,8 @@ CLINICAL_FINDING_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinically relevant finding timestamp.",
     "event_end_datetime": "Source effective end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim source event coding system.",
     "source_code": "Verbatim source event code.",
     "source_display": "Verbatim source event display.",
@@ -5774,6 +5888,8 @@ IMAGING_EXAM_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -5782,6 +5898,8 @@ IMAGING_EXAM_SOURCE_COLUMNS = [
     "accession_identifier",
     "study_instance_uid",
     "modality_code",
+    "modality_dicom_code",  # SDI_DICOM_MODALITY_V1
+    "modality_dicom_method",  # SDI_DICOM_MODALITY_V1
     "body_site_code",
     "report_patient_event_key",
     "requester_practitioner_id",
@@ -5811,6 +5929,8 @@ IMAGING_EXAM_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -5819,7 +5939,12 @@ IMAGING_EXAM_PUBLIC_COLUMNS = [
     'accession_identifier',
     'study_instance_uid',
     'modality_code',
+    'modality_dicom_code',  # SDI_DICOM_MODALITY_V1
+    'modality_dicom_method',  # SDI_DICOM_MODALITY_V1
     'body_site_code',
+    'body_site_snomed_code',  # SDI_IMAGING_BODY_SITE_V1
+    'body_site_snomed_display',  # SDI_IMAGING_BODY_SITE_V1
+    'body_site_snomed_method',  # SDI_IMAGING_BODY_SITE_V1
     'report_patient_event_key',
     'requester_practitioner_id',
     'performer_practitioner_id',
@@ -5901,6 +6026,8 @@ IMAGING_EXAM_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Imaging study start timestamp.",
     "event_end_datetime": "Imaging study end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source exam coding system.",
     "source_code": "Source exam code",
     "source_display": "Source exam display.",
@@ -5908,8 +6035,13 @@ IMAGING_EXAM_COLUMN_COMMENTS = {
     "status_code": "Imaging study status.",
     "accession_identifier": "Imaging accession identifier, unchanged: PACS MILL_LINK_REF, Millennium REFERENCE_NBR. For the Barts/Sectra extraction accession use sectra_accession_number.",
     "study_instance_uid": "DICOM study instance UID.",
-    "modality_code": "Imaging modality code.",
-    "body_site_code": "Coded body part or anatomical region examined.",
+    "modality_code": "Local modality label as recorded: PACS MODALITY, or the Millennium NHS Imaging category (NHSI_MODALITY_CATEGORY). Not a DICOM code; see modality_dicom_code.",  # SDI_DICOM_MODALITY_V1
+    "modality_dicom_code": "DICOM Modality (0008,0060) defined term. PACS: MODALITY when it is a DICOM term. Millennium: the linked PACS examination's acquisition modality, else the bronze NHSI-category inference (map_radiology_event.MODALITY_DICOM). NULL when no evidence names a single modality.",
+    "modality_dicom_method": "How modality_dicom_code was set: pacs (PACS MODALITY is a DICOM term), pacs_non_dicom (PACS MODALITY is a site label, e.g. Pano/XDEXA; no code), pacs_link (Millennium exam, linked PACS examination), dicom_passthrough / nhsi_category_map / nhsi_category_mixed / unmapped (bronze NHSI-category inference). NULL when no modality was recorded.",
+    "body_site_code": "Source body-site value as recorded (PACS BODY_PART); not a SNOMED code.",  # SDI_DICOM_MODALITY_V1
+    "body_site_snomed_code": "SNOMED CT body structure derived from the mapped examination concept (exam_omop_concept_id) through the OMOP procedure-site relationships: Has dir proc site, else Has proc site, else Has indir proc site; the lowest concept id when several share that rank.",
+    "body_site_snomed_display": "SNOMED CT preferred name for body_site_snomed_code.",
+    "body_site_snomed_method": "omop_has_dir_proc_site | omop_has_proc_site | omop_has_indir_proc_site, with a _multiple suffix when the examination names several sites at that rank (only one is published). NULL when the examination has no mapped concept or no site relationship.",
     "report_patient_event_key": "Deterministic SHA-256 key of the linked report event.",
     "requester_practitioner_id": "Nullable Millennium personnel PERSON_ID for the requester.",
     "performer_practitioner_id": "Nullable Millennium personnel PERSON_ID for the performer.",
@@ -6045,6 +6177,8 @@ ALLERGY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -6093,6 +6227,8 @@ ALLERGY_INTOLERANCE_COLUMN_COMMENTS = {
     "encounter_id": "Recording encounter reference when supplied.",
     "event_datetime": "Allergy onset timestamp from `ONSET_DT_TM_CLEAN`, falling back to `CREATED_DT_TM_CLEAN` when onset is absent; null when both cleaned timestamps are absent.",
     "event_end_datetime": "Reaction-status end when resolved or cancelled.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim substance code system.",
     "source_code": "Substance code (SNOMED then source identifier then nomenclature id)",
     "source_display": "Verbatim substance display text.",
@@ -6169,6 +6305,8 @@ TRANSFUSION_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -6214,6 +6352,8 @@ TRANSFUSION_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -6264,6 +6404,8 @@ TRANSFUSION_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; BloodTrack transfusion rows do not supply encounter context.",
     "event_datetime": "Transfusion begin timestamp falling back to end.",
     "event_end_datetime": "Transfusion end timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "BloodTrack product coding system.",
     "source_code": "ISBT product code with product display fallback.",
     "source_display": "Blood product description.",
@@ -6344,6 +6486,7 @@ TRANSFUSION_EVENT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "event_datetime": "Effective transaction timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
     "workflow_step": "BloodTrack workflow step.",
     "transaction_success_ind": "Whether the transaction succeeded.",
     "unit_number": "Blood unit number.",
@@ -6404,6 +6547,7 @@ def _lifecycle_source_transfusion_event():
         .when(_present(s.SOURCE_PATIENT_NUMBER), F.lit("provisional"))
         .otherwise(F.lit("unresolved")).alias("identity_status"),
         F.coalesce(s.EVENT_TS_EFFECTIVE, s.SERVER_TRANSACTION_TS).alias("event_datetime"),
+        F.coalesce(s.EVENT_TS_EFFECTIVE, s.SERVER_TRANSACTION_TS).alias("event_datetime_local"),
         s.WORKFLOW_STEP.alias("workflow_step"),
         s.TRANSACTION_SUCCESS_IND.alias("transaction_success_ind"),
         s.UNIT_NUMBER.alias("unit_number"), s.PRODUCT_CODE.alias("product_code"),
@@ -6484,6 +6628,8 @@ CANCER_TREATMENT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -6536,6 +6682,8 @@ CANCER_TREATMENT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Treatment start timestamp.",
     "event_end_datetime": "Treatment end or final-treatment timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "SACT drug-token coding system.",
     "source_code": "Normalized drug token with agent-name display fallback.",
     "source_display": "Source agent name.",
@@ -6744,6 +6892,8 @@ CONDITION_STAGE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -6791,6 +6941,8 @@ CONDITION_STAGE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Sentinel-cleaned diagnosis onset timestamp.",
     "event_end_datetime": "Sentinel-cleaned resolution timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "ICD-10 coding system.",
     "source_code": "ICD diagnosis code with diagnosis-name fallback.",
     "source_display": "Diagnosis name or description.",
@@ -6886,6 +7038,8 @@ ENDOSCOPY_FINDING_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -6924,6 +7078,8 @@ ENDOSCOPY_FINDING_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -6967,6 +7123,8 @@ ENDOSCOPY_FINDING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Parent exam time",
     "event_end_datetime": "Finding end timestamp when supplied.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "DGVS term coding system.",
     "source_code": "DGVS term identifier with term-text fallback.",
     "source_display": "Endobase term text.",
@@ -7050,6 +7208,8 @@ CRITICAL_CARE_PERIOD_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -7095,6 +7255,8 @@ CRITICAL_CARE_PERIOD_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -7145,6 +7307,8 @@ CRITICAL_CARE_PERIOD_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each critical care period record. It is derived from bronze field `CC_Period_Start_Dt_Tm_CLEAN` in `4_prod.bronze.map_critical_care_period`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each critical care period record. It is derived from bronze field `CC_Period_Disch_Dt_Tm_CLEAN` in `4_prod.bronze.map_critical_care_period`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -7274,4 +7438,50 @@ for old_name, axes in S3_TABLE_AXIS_SPECS["clinical_condition_stage"].items():
 
 for old_name, axes in S3_TABLE_AXIS_SPECS["clinical_endoscopy_finding"].items():
     _s3_replace_public_variant(ENDOSCOPY_FINDING_PUBLIC_COLUMNS, old_name, axes)
+
+# COMMAND ----------
+
+# ==== journey_clinical.medication_order_attribute ==== PMS_P1_T6_SILVER_V1
+# (field_meaning, output prefix, kind): text -> _display; number -> _value (+ unit column when paired); datetime -> _datetime
+ORDER_ATTRIBUTES = [
+    ("WEIGHT", "weight", "number"), ("WEIGHTUNIT", "weight_unit", "text"),
+    ("INDICATION", "indication", "text"), ("DCREASON", "dcreason", "text"), ("STOPTYPE", "stoptype", "text"),
+    ("DISPENSECATEGORY", "dispensecategory", "text"), ("PRNREASON", "prnreason", "text"), ("PRNINSTRUCTIONS", "prninstructions", "text"),
+    ("FREETXTDOSE", "freetxtdose", "text"),
+    ("STRENGTHDOSE", "strengthdose", "number"), ("STRENGTHDOSEUNIT", "strengthdose_unit", "text"),
+    ("VOLUMEDOSE", "volumedose", "number"), ("VOLUMEDOSEUNIT", "volumedose_unit", "text"),
+    ("RXROUTE", "rxroute", "text"), ("DRUGFORM", "drugform", "text"),
+    ("FREQSCHEDID", "freqschedid", "text"), ("FREQ", "freq", "text"),
+    ("DURATION", "duration", "number"), ("DURATIONUNIT", "duration_unit", "text"), ("DAYSSUPPLY", "dayssupply", "number"),
+    ("RATE", "rate", "number"), ("RATEUNIT", "rate_unit", "text"),
+    ("INFUSEOVER", "infuseover", "number"), ("INFUSEOVERUNIT", "infuseover_unit", "text"),
+    ("REQSTARTDTTM", "reqstart", "datetime"), ("STOPDTTM", "stop", "datetime"),
+]
+_SUFFIX = {"text": "_display", "number": "_value", "datetime": "_datetime"}
+_VALUE = {"text": "value_text", "number": "value_number", "datetime": "value_datetime"}
+
+def order_attribute_body(d):
+    """Shared body: EAV medication_order_detail -> one row per order_id, latest action wins per meaning."""
+    d = d.where(F.col("field_meaning").isin([m for m, _, _ in ORDER_ATTRIBUTES]))
+    aggs = [F.expr(f"max_by({_VALUE[k]}, struct(action_sequence, detail_sequence)) FILTER (WHERE field_meaning = '{m}')").alias(p + _SUFFIX[k])
+            for m, p, k in ORDER_ATTRIBUTES]
+    return d.groupBy(F.col("order_id").cast("bigint").alias("order_id")).agg(
+        *aggs, F.max("last_action_sequence").alias("last_action_sequence"), F.max("loaded_at").alias("loaded_at"))
+
+ORDER_ATTRIBUTE_COLUMN_COMMENTS = {
+    "order_id": "Millennium ORDER_ID; one row per medication order.",
+    "last_action_sequence": "Highest order action sequence seen in the detail rows.",
+    "loaded_at": "Latest detail loaded_at for the order.",
+    **{p + _SUFFIX[k]: f"Latest {m} order detail ({_VALUE[k]}) by action then detail sequence." for m, p, k in ORDER_ATTRIBUTES},
+}
+
+@materialized_view(
+    name=_n("journey_clinical.medication_order_attribute"),
+    comment="Order-grain pivot of medication_order_detail: latest value per field meaning. Join key: order_id.",
+    cluster_by=["order_id"], refresh_policy="incremental",
+    column_comments=ORDER_ATTRIBUTE_COLUMN_COMMENTS,
+)
+def medication_order_attribute():
+    # Build the declared dataset: one row per medication order with its latest detail attributes.
+    return order_attribute_body(spark.read.table(_n("journey_clinical.medication_order_detail")))
 

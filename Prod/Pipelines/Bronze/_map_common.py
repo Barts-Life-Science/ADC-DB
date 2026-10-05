@@ -7300,6 +7300,9 @@ _PIPELINE_POST_DEPLOYMENT_ASSERTIONS = [
     {
         # Unresolved raw-LIMS linkage is retained and quality-flagged. Assert the
         # status domain and resolved/unresolved consistency instead of dropping rows.
+        # PATH_MATCH_CONTRACT_V2: the 2026-09-25 person-conflict fix added conflict_adjudicated
+        # (one corroborated person, resolved) and mrn_contradicted (DOB and surname contradict
+        # the MRN person, unresolved); this check had not learned them.
         "name": "pathology_person_match_contract",
         "tables": ["{prefix}.map_pathology{suffix}"],
         "sql": (
@@ -7307,13 +7310,13 @@ _PIPELINE_POST_DEPLOYMENT_ASSERTIONS = [
             "{prefix}.map_pathology{suffix} "
             "WHERE person_match_status IS NULL "
             "OR person_match_status NOT IN "
-            "('native', 'agreed', 'mrn_only', 'nhs_only', "
-            "'conflict', 'ambiguous', 'unresolved') "
+            "('native', 'agreed', 'mrn_only', 'nhs_only', 'conflict_adjudicated', "
+            "'conflict', 'ambiguous', 'unresolved', 'mrn_contradicted') "
             "OR (source_table = 'raw' "
-            "AND person_match_status IN ('agreed', 'mrn_only', 'nhs_only') "
+            "AND person_match_status IN ('agreed', 'mrn_only', 'nhs_only', 'conflict_adjudicated') "
             "AND PERSON_ID IS NULL) "
             "OR (source_table = 'raw' "
-            "AND person_match_status IN ('conflict', 'ambiguous', 'unresolved') "
+            "AND person_match_status IN ('conflict', 'ambiguous', 'unresolved', 'mrn_contradicted') "
             "AND PERSON_ID IS NOT NULL)"
         ),
     },
@@ -7619,5 +7622,4 @@ def finalize_map_pipeline_run():
     )
     print(result_json)
     return result_json
-
 

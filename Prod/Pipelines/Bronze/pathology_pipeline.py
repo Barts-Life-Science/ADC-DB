@@ -32,6 +32,10 @@ class PipelineConfig:
     master_orderable_table: str = "4_prod.raw.path_master_orderables"
     master_result_table: str = "4_prod.raw.path_master_resultable"
     omop_concept_table: str = "3_lookup.omop.concept"
+    # STM_SPECIMEN_TYPE_V1/pipeline: Cerner specimen type / body site / activity type sources.
+    order_detail_table: str = "4_prod.raw.mill_order_detail"
+    orders_table: str = "4_prod.raw.mill_orders"
+    code_value_table: str = "3_lookup.mill.mill_code_value"
     enable_approved_accession_merges: bool = False
     enable_result_equivalence: bool = False
 
@@ -441,6 +445,254 @@ def _source_date(frame_alias: str = ""):
     )
 
 
+# STM_SPECIMEN_TYPE_V1/pipeline: specimen type is keyed (source_system, code). Cerner codes are codeset-2052 CODE_VALUEs from
+# mill_order_detail; LIMS codes are LIMS-local mnemonics, namespaced per LIMSNo and, only where
+# map_pathology_specimen_type carries a WkgCode-split key (rule wkg_split_v1), per WkgCode.
+SPECIMEN_MAP_TABLE = "map_pathology_specimen_type"
+CERNER_SPECIMEN_SYSTEM = "urn:cerner:codeset:2052"
+CERNER_BODY_SITE_SYSTEM = "urn:cerner:codeset:1028"
+RAW_SPECIMEN_SYSTEM = "urn:barts:pathology:specimen-type:tfc:lims"
+RAW_BODY_SITE_SYSTEM = "urn:barts:pathology:body-site:tfc:lims"
+ORDERABLES_SPECIMEN_SYSTEM = "urn:barts:pathology:specimen-type:tfc:orderables"
+TLC_SPLIT_PATTERN = r"\s*(?:[,;|]|\r?\n|\t)\s*"
+DISCIPLINE_RULE_VERSION = "discipline_v1"
+# (rule, input, values, discipline), after the S/N/E lab-series rules; the first match wins.
+DISCIPLINE_RULES = (
+    ("wkg:INF|MIC|MICR|MB|VIR", "wkg", ("INF", "MIC", "MICR", "MB", "VIR"), "microbiology"),
+    ("wkg:BHI", "wkg", ("BHI",), "blood_science"),
+    ("wkg:BT", "wkg", ("BT",), "transfusion"),
+    ("wkg:CP", "wkg", ("CP",), "cellular_pathology"),
+    ("activity:Micro", "activity", ("Micro",), "microbiology"),
+    ("activity:Blood Bank", "activity", ("Blood Bank",), "transfusion"),
+    ("activity:General Lab", "activity", ("General Lab",), "blood_science"),
+)
+
+
+def specimen_map_table(config: PipelineConfig) -> str:
+    return f"{config.bronze_schema}.{SPECIMEN_MAP_TABLE}"
+
+
+def normalize_specimen_code(column):
+    """Upper/trim; blank becomes NULL. Map keys are stored in this form."""
+    _, _, F, _ = _imports()
+    value = F.upper(F.trim(column.cast("string")))
+    return F.when(F.length(value) > 0, value)
+
+
+def specimen_split_keys(spark, config: PipelineConfig):
+    """WkgCode-split LIMS keys, read from the map itself."""
+    _, _, F, _ = _imports()
+    return (
+        spark.table(specimen_map_table(config))
+        .filter(F.col("specimen_type_source_system").rlike(r":tfc:lims[0-9]+:"))
+        .select(
+            F.col("specimen_type_source_system").alias("_split_system"),
+            F.col("specimen_type_code").alias("_split_code"),
+        )
+        .dropDuplicates()
+    )
+
+
+def raw_specimen_system(frame, split_keys, lims_column: str, wkg_column: str, code_column: str):
+    """Add specimen_type_source_system to LIMS rows whose `code_column` is already normalised."""
+    _, _, F, _ = _imports()
+    base = F.concat(F.lit(RAW_SPECIMEN_SYSTEM), F.col(lims_column).cast("string"))
+    split_system = F.concat(base, F.lit(":"), F.upper(F.trim(F.col(wkg_column))))
+    return (
+        frame.join(
+            F.broadcast(split_keys),
+            (F.col("_split_system") == split_system) & (F.col("_split_code") == F.col(code_column)),
+            "left",
+        )
+        .withColumn(
+            "specimen_type_source_system",
+            F.when(F.col(code_column).isNotNull(), F.coalesce(F.col("_split_system"), base)),
+        )
+        .drop("_split_system", "_split_code")
+    )
+
+
+def specimen_map_columns(spark, config: PipelineConfig):
+    """Map rows (unique on system, code) renamed for joining onto accessions and isolates."""
+    _, _, F, _ = _imports()
+    return spark.table(specimen_map_table(config)).select(
+        F.col("specimen_type_source_system").alias("_map_system"),
+        F.col("specimen_type_code").alias("_map_code"),
+        F.col("specimen_type_display").alias("_map_display"),
+        F.col("specimen_type_snomed_code").alias("_map_snomed_code"),
+        F.col("specimen_type_omop_concept_id").cast("long").alias("_map_omop_concept_id"),
+        "specimen_type_map_method",
+        "specimen_type_map_rule_id",
+        "specimen_type_map_version",
+        F.col("specimen_type_map_cosine").cast("double").alias("specimen_type_map_cosine"),
+        "specimen_type_map_scoring_model",
+        "specimen_type_map_status",
+    )
+
+
+def join_specimen_map(frame, spark, config: PipelineConfig):
+    """Fill specimen_type_snomed_code, _omop_concept_id and the six map provenance columns."""
+    _, _, F, _ = _imports()
+    return (
+        frame.join(
+            F.broadcast(specimen_map_columns(spark, config)),
+            (F.col("_map_system") == F.col("specimen_type_source_system"))
+            & (F.col("_map_code") == F.col("specimen_type_code")),
+            "left",
+        )
+        .withColumn("specimen_type_snomed_code", F.col("_map_snomed_code"))
+        .withColumn("specimen_type_omop_concept_id", F.col("_map_omop_concept_id"))
+    )
+
+
+def _cerner_order_specimen(spark, config: PipelineConfig):
+    """One SPECIMEN TYPE and one BODYSITE per order (deterministic pick), and the order activity type."""
+    _, Window, F, _ = _imports()
+    detail = (
+        spark.table(config.order_detail_table)
+        .filter(F.col("OE_FIELD_MEANING").isin("SPECIMEN TYPE", "BODYSITE") & F.col("ORDER_ID").isNotNull())
+        .select(
+            F.col("ORDER_ID").cast("long").alias("order_id"),
+            "OE_FIELD_MEANING",
+            "OE_FIELD_VALUE",
+            F.when(F.col("OE_FIELD_VALUE") != 0, F.col("OE_FIELD_VALUE").cast("long").cast("string")).alias("_value"),
+            "ACTION_SEQUENCE",
+            "UPDT_DT_TM",
+        )
+    )
+    pick = Window.partitionBy("order_id", "OE_FIELD_MEANING").orderBy(
+        F.col("_value").isNull().asc(),
+        F.col("ACTION_SEQUENCE").desc_nulls_last(),
+        F.col("UPDT_DT_TM").desc_nulls_last(),
+        F.col("OE_FIELD_VALUE").asc_nulls_last(),
+    )
+    order_specimen = (
+        detail.withColumn("_rn", F.row_number().over(pick))
+        .filter(F.col("_rn") == 1)
+        .groupBy("order_id")
+        .agg(
+            F.max(F.when(F.col("OE_FIELD_MEANING") == "SPECIMEN TYPE", F.col("_value"))).alias("_od_specimen_code"),
+            F.max(F.when(F.col("OE_FIELD_MEANING") == "BODYSITE", F.col("_value"))).alias("_od_body_site_code"),
+        )
+    )
+    code_value = (
+        spark.table(config.code_value_table)
+        .select(F.col("CODE_VALUE").cast("long").alias("_activity_cd"), F.col("DISPLAY").alias("_display"))
+        .groupBy("_activity_cd")
+        .agg(F.min("_display").alias("_activity_type"))
+    )
+    order_activity = (
+        spark.table(config.orders_table)
+        .filter(F.col("ORDER_ID").isNotNull())
+        .groupBy(F.col("ORDER_ID").cast("long").alias("order_id"))
+        .agg(F.max(F.col("ACTIVITY_TYPE_CD").cast("long")).alias("_activity_cd"))
+        .join(code_value, "_activity_cd", "left")
+        .select("order_id", "_activity_type")
+    )
+    return order_specimen, order_activity
+
+
+def _orderables_default_specimen(spark, config: PipelineConfig, raw):
+    """LIMS parents without a code: filled only when every requested TLC shares one non-null default."""
+    _, Window, F, _ = _imports()
+    master_window = Window.partitionBy(
+        F.upper(F.trim("WkgCode")), F.upper(F.trim("TLCCode"))
+    ).orderBy(
+        F.col("LastUpdatedDT").desc_nulls_last(),
+        F.col("ADC_UPDT").desc_nulls_last(),
+        F.col("CSpecTypeCode").asc_nulls_last(),
+    )
+    master = (
+        spark.table(config.master_orderable_table)
+        .withColumn("_rn", F.row_number().over(master_window))
+        .filter(F.col("_rn") == 1)
+        .select(
+            F.upper(F.trim("WkgCode")).alias("_wkg"),
+            F.upper(F.trim("TLCCode")).alias("_tlc"),
+            normalize_specimen_code(F.col("CSpecTypeCode")).alias("_default_code"),
+        )
+    )
+    tlcs = (
+        raw.filter(F.col("specimen_type_code").isNull() & (F.length(F.trim("tlcs_requested")) > 0))
+        .select(
+            "source_parent_key",
+            F.upper(F.trim("wkg_code")).alias("_wkg"),
+            F.explode(F.split(F.col("tlcs_requested"), TLC_SPLIT_PATTERN)).alias("_tlc"),
+        )
+        .withColumn("_tlc", F.upper(F.trim("_tlc")))
+        .filter(F.length("_tlc") > 0)
+    )
+    return (
+        tlcs.join(master, ["_wkg", "_tlc"], "left")
+        .groupBy("source_parent_key")
+        .agg(
+            F.count(F.lit(1)).alias("_n"),
+            F.count("_default_code").alias("_n_coded"),
+            F.countDistinct("_default_code").alias("_n_codes"),
+            F.max("_default_code").alias("_ord_code"),
+        )
+        .filter(
+            (F.col("_n") == F.col("_n_coded")) & (F.col("_n_codes") == 1) & (F.col("_ord_code") != "BLANK")
+        )
+        .select("source_parent_key", "_ord_code")
+    )
+
+
+def _raw_specimen_stage(spark, config: PipelineConfig, raw):
+    _, _, F, _ = _imports()
+    raw = raw.withColumn("specimen_type_code", normalize_specimen_code(F.col("specimen_type_code")))
+    raw = raw.join(_orderables_default_specimen(spark, config, raw), "source_parent_key", "left")
+    raw = raw_specimen_system(raw, specimen_split_keys(spark, config), "LIMSNo", "wkg_code", "specimen_type_code")
+    body = normalize_specimen_code(F.col("body_site_code"))
+    return (
+        raw.withColumn(
+            "specimen_type_derivation",
+            F.when(F.col("specimen_type_code").isNotNull(), F.lit("source"))
+            .when(F.col("_ord_code").isNotNull(), F.lit("orderables_default")),
+        )
+        .withColumn(
+            "specimen_type_source_system",
+            F.when(F.col("specimen_type_code").isNotNull(), F.col("specimen_type_source_system"))
+            .when(F.col("_ord_code").isNotNull(), F.lit(ORDERABLES_SPECIMEN_SYSTEM)),
+        )
+        .withColumn("specimen_type_code", F.coalesce(F.col("specimen_type_code"), F.col("_ord_code")))
+        .withColumn(
+            "body_site_source_system",
+            F.when(body.isNotNull(), F.concat(F.lit(RAW_BODY_SITE_SYSTEM), F.col("LIMSNo").cast("string"))),
+        )
+        .withColumn("body_site_code", body)
+        .withColumn("activity_type", F.lit(None).cast("string"))
+        .drop("_ord_code")
+    )
+
+
+def _accession_pick(source_stage, name: str, fields, present, leading=()):
+    """One member value tuple per accession, kept as a struct so its fields never mix across members.
+
+    Order: has value, `leading`, most members, then the fields and the smallest source accession id.
+    `_<name>_count` is the number of distinct non-null tuples among the members.
+    """
+    _, Window, F, _ = _imports()
+    members = source_stage.groupBy("pathology_accession_id", *fields).agg(
+        F.count(F.lit(1)).alias("_member_n"),
+        F.min("source_accession_id").alias("_min_source"),
+    )
+    accession = Window.partitionBy("pathology_accession_id")
+    ranked = accession.orderBy(
+        present.isNotNull().desc(),
+        *leading,
+        F.col("_member_n").desc(),
+        *[F.col(field).asc_nulls_last() for field in fields],
+        F.col("_min_source").asc_nulls_last(),
+    )
+    return (
+        members.withColumn("_rn", F.row_number().over(ranked))
+        .withColumn(f"_{name}_count", F.sum(present.isNotNull().cast("int")).over(accession))
+        .filter(F.col("_rn") == 1)
+        .select("pathology_accession_id", F.struct(*fields).alias(f"_{name}"), f"_{name}_count")
+    )
+
+
 def build_source_stage(spark, config: PipelineConfig):
     """Build one row per existing source parent plus accession-grain auxiliaries."""
 
@@ -568,6 +820,21 @@ def build_source_stage(spark, config: PipelineConfig):
         )
     )
 
+    # STM_SPECIMEN_TYPE_V1/pipeline: Cerner members take SPECIMEN TYPE / BODYSITE from their order, LIMS members are namespaced.
+    order_specimen, order_activity = _cerner_order_specimen(spark, config)
+    linked = (
+        linked.drop("body_site_code", "specimen_type_code")
+        .join(order_specimen, "order_id", "left")
+        .join(order_activity, "order_id", "left")
+        .withColumn("specimen_type_code", F.col("_od_specimen_code"))
+        .withColumn("specimen_type_source_system", F.when(F.col("specimen_type_code").isNotNull(), F.lit(CERNER_SPECIMEN_SYSTEM)))
+        .withColumn("specimen_type_derivation", F.when(F.col("specimen_type_code").isNotNull(), F.lit("source")))
+        .withColumn("body_site_code", F.col("_od_body_site_code"))
+        .withColumn("body_site_source_system", F.when(F.col("body_site_code").isNotNull(), F.lit(CERNER_BODY_SITE_SYSTEM)))
+        .withColumn("activity_type", F.col("_activity_type"))
+        .drop("_od_specimen_code", "_od_body_site_code", "_activity_type")
+    )
+    raw = _raw_specimen_stage(spark, config, raw)
     source = raw.unionByName(linked)
     source = source.withColumn("normalized_lab_no", _normalize_lab_no(F.col("lab_no")))
     source = source.withColumn(
@@ -848,6 +1115,13 @@ def build_accession_source_rows(source_stage):
         "report_dt",
         "order_id",
         "order_mnemonic",
+        # STM_SPECIMEN_TYPE_V1/pipeline: per-member specimen / body-site evidence and the Cerner activity type.
+        "specimen_type_source_system",
+        "specimen_type_code",
+        "specimen_type_derivation",
+        "body_site_source_system",
+        "body_site_code",
+        "activity_type",
         F.coalesce(F.col("link_status"), F.lit("source_local")).alias("link_status"),
         "link_rule_id",
         "link_confidence",
@@ -859,6 +1133,11 @@ def build_accession_source_rows(source_stage):
 
 def build_accession_rows(spark, source_stage, config: PipelineConfig):
     _, _, F, _ = _imports()
+
+    def local(column):
+        # TZ_LOCAL_V1/pathology: Millennium members are UTC instants; TFC LIMS members are already Europe/London.
+        return F.when(F.col("source_system") == "CERNER", F.from_utc_timestamp(F.col(column), "Europe/London")).otherwise(F.col(column))
+
     eligible = F.when(F.col("person_projection_status") == "eligible", F.col("person_id"))
     grouped = source_stage.groupBy("pathology_accession_id").agg(
         F.min("source_accession_id").alias("primary_source_accession_id"),
@@ -869,19 +1148,55 @@ def build_accession_rows(spark, source_stage, config: PipelineConfig):
         F.min("request_dt").alias("request_dt"),
         F.min("sample_dt").alias("sample_dt"),
         F.max("report_dt").alias("report_dt"),
+        F.min(local("request_dt")).alias("request_dt_local"),
+        F.min(local("sample_dt")).alias("sample_dt_local"),
+        F.max(local("report_dt")).alias("report_dt_local"),
         F.first("clinical_details", ignorenulls=True).alias("clinical_details"),
         F.first("tlcs_requested", ignorenulls=True).alias("tlcs_requested"),
         F.first("conditions", ignorenulls=True).alias("conditions"),
         F.first("reason", ignorenulls=True).alias("reason"),
         F.first("urgent_flag", ignorenulls=True).alias("urgent_flag"),
-        F.first("body_site_code", ignorenulls=True).alias("body_site_code"),
-        F.first("specimen_type_code", ignorenulls=True).alias("specimen_type_code"),
         F.first("source_site_code", ignorenulls=True).alias("source_site_code"),
-        F.first("wkg_code", ignorenulls=True).alias("_wkg_code"),
         F.max(F.when(F.col("link_status") == "confirmed", F.lit(1)).otherwise(F.lit(0))).alias("_has_confirmed_link"),
         F.max(F.when(F.col("person_projection_status") == "conflicting", F.lit(1)).otherwise(F.lit(0))).alias("_has_conflict"),
     )
+    # STM_SPECIMEN_TYPE_V1/pipeline: specimen type, body site and the discipline inputs come from one member each (a struct),
+    # picked by majority with a deterministic tie-break, never from independent F.first calls.
+    specimen_pick = _accession_pick(
+        source_stage,
+        "specimen",
+        ("specimen_type_source_system", "specimen_type_code", "specimen_type_derivation"),
+        F.col("specimen_type_code"),
+        leading=(F.when(F.col("specimen_type_derivation") == "orderables_default", 1).otherwise(0).asc(),),
+    )
+    body_pick = _accession_pick(
+        source_stage, "body", ("body_site_source_system", "body_site_code"), F.col("body_site_code")
+    )
+    discipline_pick = _accession_pick(
+        source_stage, "discipline", ("wkg_code", "activity_type"), F.coalesce(F.col("wkg_code"), F.col("activity_type"))
+    )
+    grouped = (
+        grouped.join(specimen_pick, "pathology_accession_id", "left")
+        .join(body_pick, "pathology_accession_id", "left")
+        .join(discipline_pick, "pathology_accession_id", "left")
+        .withColumn("specimen_type_source_system", F.col("_specimen.specimen_type_source_system"))
+        .withColumn("specimen_type_code", F.col("_specimen.specimen_type_code"))
+        .withColumn("specimen_type_derivation", F.col("_specimen.specimen_type_derivation"))
+        .withColumn("specimen_type_member_count", F.coalesce(F.col("_specimen_count"), F.lit(0)))
+        .withColumn("body_site_source_system", F.col("_body.body_site_source_system"))
+        .withColumn("body_site_code", F.col("_body.body_site_code"))
+    )
+    wkg = F.upper(F.trim(F.col("_discipline.wkg_code")))
+    activity = F.trim(F.col("_discipline.activity_type"))
     series = F.regexp_extract(F.col("normalized_lab_no"), "[A-Z]", 0)
+    discipline_rule = (
+        F.when(series == "S", F.lit("series:S")).when(series == "N", F.lit("series:N")).when(series == "E", F.lit("series:E"))
+    )
+    discipline = F.when(series == "S", "cellular_pathology").when(series == "N", "cytology").when(series == "E", "sihmds")
+    for rule_id, rule_input, rule_values, rule_discipline in DISCIPLINE_RULES:
+        rule_match = (wkg if rule_input == "wkg" else activity).isin(*rule_values)
+        discipline_rule = discipline_rule.when(rule_match, F.lit(rule_id))
+        discipline = discipline.when(rule_match, F.lit(rule_discipline))
     grouped = (
         grouped.withColumn("lab_series", F.when(series == "", F.lit("UNKNOWN")).otherwise(series))
         .withColumn(
@@ -892,13 +1207,10 @@ def build_accession_rows(spark, source_stage, config: PipelineConfig):
             .when(series == "", "unknown")
             .otherwise("other"),
         )
+        .withColumn("discipline", discipline.otherwise("other"))
         .withColumn(
-            "discipline",
-            F.when(series == "S", "cellular_pathology")
-            .when(series == "N", "cytology")
-            .when(series == "E", "sihmds")
-            .when(F.lower(F.coalesce(F.col("_wkg_code"), F.lit(""))).rlike("micro|bact|virol"), "microbiology")
-            .otherwise("other"),
+            "discipline_rule_id",
+            F.concat_ws(":", F.lit(DISCIPLINE_RULE_VERSION), discipline_rule.otherwise(F.lit("default"))),
         )
         .withColumn(
             "person_resolution_status",
@@ -920,8 +1232,9 @@ def build_accession_rows(spark, source_stage, config: PipelineConfig):
         .withColumn("match_rule_version", F.lit("accession_match_v1"))
         .withColumn("research_qi_only", F.lit(True))
         .withColumn("body_site_snomed_code", F.lit(None).cast("string"))
-        .withColumn("specimen_type_snomed_code", F.lit(None).cast("string"))
     )
+    # STM_SPECIMEN_TYPE_V1/pipeline: best-effort SNOMED from map_pathology_specimen_type, with its provenance.
+    grouped = join_specimen_map(grouped, spark, config).withColumn("specimen_type_display", F.col("_map_display"))
     existing_table = f"{config.bronze_schema}.map_pathology_accession"
     if table_exists(spark, existing_table):
         existing = spark.table(existing_table).select(
@@ -1132,6 +1445,8 @@ def build_report_rows(spark, source_stage, config: PipelineConfig):
         .withColumn("report_text", F.col("value_source_value"))
         .withColumn("report_text_hash", F.sha2(F.regexp_replace(F.trim("value_source_value"), r"\s+", " "), 256))
         .withColumn("issued_dt", F.coalesce("ReportDate", "verified_dt_tm", "performed_dt_tm", "measurement_datetime"))
+        # TZ_LOCAL_V1/pathology: linked (Millennium) rows are UTC instants; raw TFC LIMS rows are already Europe/London.
+        .withColumn("issued_dt_local", F.when(F.col("source_table") == "raw", F.col("issued_dt")).otherwise(F.from_utc_timestamp(F.col("issued_dt"), "Europe/London")))
         .withColumn("lifecycle_status", lifecycle)
         .withColumn(
             "report_series_id",

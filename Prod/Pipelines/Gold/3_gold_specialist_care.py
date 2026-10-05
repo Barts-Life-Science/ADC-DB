@@ -116,8 +116,8 @@ CLINICAL_BABY_DELIVERY_COLUMN_COMMENTS = {
     "delivery_method_code": "Source-system code representing delivery method for the baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "phenotypic_sex": "Value describing phenotypic sex for the baby delivery record. It is derived from bronze field `PERSONPHENSEX` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "gestation_length_birth": "Value describing gestation length birth for the baby delivery record. It is derived from bronze field `GESTATIONLENGTHBIRTH` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
-    "birthweight": "Value describing birthweight for the baby delivery record. It is carried from bronze field `BIRTHWEIGHT` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
-    "apgar_5": "Value describing apgar 5 for the baby delivery record. It is derived from bronze field `APGARSCORE5` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
+    "birthweight": "MSDS401 birth weight (empty at source); use clinical_birth.birth_weight_grams for Millennium birth weights.",  # OGR_MATERNITY_SILVER_V1
+    "apgar_5": "MSDS401 Apgar at 5 minutes (empty at source); use clinical_birth.apgar_5_minute for Millennium Apgar scores.",  # OGR_MATERNITY_SILVER_V1
     "baby_death_datetime": "Date and time associated with baby death for the baby delivery record. It is derived from bronze field `PERSONDEATHDATETIMEBABY_CLEAN` in `4_prod.bronze.map_maternity_baby_delivery`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "first_feed_datetime": "Date and time associated with first feed for the baby delivery record. It is derived from bronze field `BABYFIRSTFEEDDATETIME_CLEAN` in `4_prod.bronze.map_maternity_baby_delivery`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "first_feed_code": "Source-system code representing first feed for the baby delivery record. It is derived from bronze field `BABYFIRSTFEEDINDCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
@@ -5830,6 +5830,3 @@ def _gold_qc_clinical_registry_surgery_procedure():
 def gold_clinical_registry_surgery_procedure():
     """Publish clinical_registry_surgery_procedure without exposing the internal parent-admission marker."""
     return spark.read.table(_n("gold_qc._clinical_registry_surgery_procedure")).drop("__gold_parent_present")
-
-# COMMAND ----------
-

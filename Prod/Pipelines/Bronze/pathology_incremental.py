@@ -3,7 +3,25 @@
 from __future__ import annotations
 
 from pathology_contracts import CONTRACT_VERSION
-from pathology_pipeline import PipelineConfig, ensure_contracts, run_core
+from pathology_pipeline import (
+    TLC_SPLIT_PATTERN,
+    PipelineConfig,
+    ensure_contracts,
+    run_core,
+    specimen_map_table,
+)
+
+
+# STM_SPECIMEN_TYPE_V1/incremental: specimen type reads three more sources. A source without a state row forces FULL, so the
+# first run after this change is the one-off full reconcile of both branches.
+def _state_sources(config: PipelineConfig) -> dict[str, str]:
+    return {
+        "map_pathology": config.map_pathology_table,
+        "path_patient_samplelevel": config.sample_table,
+        "mill_order_detail": config.order_detail_table,
+        "specimen_map": specimen_map_table(config),
+        "path_master_orderables": config.master_orderable_table,
+    }
 
 
 def _imports():
@@ -70,6 +88,34 @@ def _semantic_map_parent_changes(changes):
     )
     return direct.unionByName(updates).filter(F.col('source_parent_key').isNotNull()).dropDuplicates()
 
+
+def _semantic_specimen_map_keys(changes):
+    """(system, code) keys whose map payload changed; a key that became WkgCode-split also yields its LIMS base."""
+    _, F = _imports()
+    keys = ["specimen_type_source_system", "specimen_type_code"]
+    ignored = {"_change_type", "_commit_version", "_commit_timestamp", "ADC_UPDT", "created_at", "row_weight"}
+    payload = F.xxhash64(*[F.col(column) for column in changes.columns if column not in ignored])
+    prepared = changes.select(*keys, "_commit_version", "_change_type", payload.alias("_SEMANTIC_PAYLOAD"))
+    direct = prepared.filter(F.col("_change_type").isin("insert", "delete")).select(*keys)
+    before = prepared.filter(F.col("_change_type") == "update_preimage").alias("b")
+    after = prepared.filter(F.col("_change_type") == "update_postimage").alias("a")
+    updates = (
+        before.join(
+            after,
+            [F.col(f"b.{k}").eqNullSafe(F.col(f"a.{k}")) for k in keys]
+            + [F.col("b._commit_version") == F.col("a._commit_version")],
+            "full",
+        )
+        .where(~F.col("b._SEMANTIC_PAYLOAD").eqNullSafe(F.col("a._SEMANTIC_PAYLOAD")))
+        .select(*[F.coalesce(F.col(f"a.{k}"), F.col(f"b.{k}")).alias(k) for k in keys])
+    )
+    changed = direct.unionByName(updates)
+    base = changed.select(
+        F.regexp_replace("specimen_type_source_system", r"(:tfc:lims[0-9]+):[^:]+$", "$1").alias("specimen_type_source_system"),
+        "specimen_type_code",
+    )
+    return changed.unionByName(base).filter(F.col("specimen_type_code").isNotNull()).dropDuplicates()
+
 def changed_parent_keys(spark, config: PipelineConfig):
     """Return touched source parents and pending source versions.
 
@@ -79,10 +125,7 @@ def changed_parent_keys(spark, config: PipelineConfig):
 
     _, F = _imports()
     state = _state(spark, config)
-    sources = {
-        "map_pathology": config.map_pathology_table,
-        "path_patient_samplelevel": config.sample_table,
-    }
+    sources = _state_sources(config)
     versions = {name: current_delta_version(spark, table) for name, table in sources.items()}
     if any(name not in state or state[name]["last_delta_version"] is None for name in sources):
         return None, versions
@@ -119,6 +162,67 @@ def changed_parent_keys(spark, config: PipelineConfig):
                 ).alias("source_parent_key"),
             )
         )
+    # STM_SPECIMEN_TYPE_V1/incremental: order-detail, specimen-map and orderables-default changes reach existing accessions.
+    current_sources = spark.table(
+        f"{config.bronze_schema}.map_pathology_accession_source"
+    ).filter(F.col("is_current") == True)
+    detail_start = int(state["mill_order_detail"]["last_delta_version"]) + 1
+    detail_changes = _read_changes(
+        spark, config.order_detail_table, detail_start, versions["mill_order_detail"]
+    )
+    if detail_changes is not None:
+        changed_orders = (
+            detail_changes.filter(F.col("OE_FIELD_MEANING").isin("SPECIMEN TYPE", "BODYSITE"))
+            .select(F.col("ORDER_ID").cast("long").alias("order_id"))
+            .dropDuplicates()
+        )
+        frames.append(
+            current_sources.filter(F.col("source_system") == "CERNER")
+            .join(changed_orders, "order_id", "inner")
+            .select("source_system", "source_parent_key")
+        )
+    specimen_start = int(state["specimen_map"]["last_delta_version"]) + 1
+    specimen_changes = _read_changes(
+        spark, specimen_map_table(config), specimen_start, versions["specimen_map"]
+    )
+    if specimen_changes is not None:
+        frames.append(
+            current_sources.join(
+                _semantic_specimen_map_keys(specimen_changes),
+                ["specimen_type_source_system", "specimen_type_code"],
+                "inner",
+            ).select("source_system", "source_parent_key")
+        )
+    orderables_start = int(state["path_master_orderables"]["last_delta_version"]) + 1
+    orderables_changes = _read_changes(
+        spark, config.master_orderable_table, orderables_start, versions["path_master_orderables"]
+    )
+    if orderables_changes is not None:
+        changed_tlcs = orderables_changes.select(
+            F.upper(F.trim("WkgCode")).alias("_wkg"), F.upper(F.trim("TLCCode")).alias("_tlc")
+        ).dropDuplicates()
+        requested = spark.table(config.sample_table).select(
+            F.col("LIMSNo").cast("int").alias("LIMSNo"), F.col("LabNo").alias("lab_no"), "TLCsRequested"
+        )
+        frames.append(
+            current_sources.filter(
+                (F.col("source_system") == "TFC_LIMS")
+                & (
+                    F.col("specimen_type_code").isNull()
+                    | (F.col("specimen_type_derivation") == "orderables_default")
+                )
+            )
+            .join(requested, ["LIMSNo", "lab_no"], "inner")
+            .select(
+                "source_system",
+                "source_parent_key",
+                F.upper(F.trim("wkg_code")).alias("_wkg"),
+                F.explode(F.split(F.col("TLCsRequested"), TLC_SPLIT_PATTERN)).alias("_tlc"),
+            )
+            .withColumn("_tlc", F.upper(F.trim("_tlc")))
+            .join(F.broadcast(changed_tlcs), ["_wkg", "_tlc"], "inner")
+            .select("source_system", "source_parent_key")
+        )
     if not frames:
         return spark.createDataFrame([], "source_system string, source_parent_key string"), versions
     output = frames[0]
@@ -134,10 +238,7 @@ def commit_state(
     run_id: str,
 ) -> None:
     DeltaTable, F = _imports()
-    table_names = {
-        "map_pathology": config.map_pathology_table,
-        "path_patient_samplelevel": config.sample_table,
-    }
+    table_names = _state_sources(config)
     rows = [
         (name, table_names[name], int(version), run_id, CONTRACT_VERSION)
         for name, version in versions.items()

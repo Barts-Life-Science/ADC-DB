@@ -116,18 +116,14 @@ TEXT_DOCUMENT_SELECT = [
 ]
 
 # contract v2: QC/batch inputs come from internal _text_document_metadata; source history stays on the main research table.
+# S3D_GOLD_ADMISSION_PATCH_APPLIED v1
 TEXT_DOCUMENT_MANDATORY_RULES = {
-    # The research surface. identity_status = 'resolved' keeps the 319,398,203 rows of
-    # 656,894,348 that are current and attributable; is_latest_version = TRUE keeps the
-    # 624,022,430 rows of 656,894,348 that are current and attributable; source_feed IN
-    # ('ancil_long_blob', 'elective_access_comment', 'endobase_exam',
-    # 'neonatal_episode_narrative', 'order_comment', 'pathology_report', 'text_event') OR
-    # LOWER(TRIM(succession_status)) IN ('final', 'addendum') keeps the 448,698,905 rows of
-    # 656,894,348 that are current and attributable. Superseded versions and rows whose
-    # identity was never resolved are not research data, and a consumer who wants them has
-    # silver.
+    # The research surface: the latest version of every attributable document, whatever its
+    # succession status. Interim, preliminary, unknown and blank-status documents are
+    # published with succession_status so a consumer can keep completed documents only;
+    # superseded versions and rows whose identity was never resolved stay in silver.
     "research_surface":
-        "(identity_status = 'resolved') AND (is_latest_version = TRUE) AND (source_feed IN ('ancil_long_blob', 'elective_access_comment', 'endobase_exam', 'neonatal_episode_narrative', 'order_comment', 'pathology_report', 'text_event') OR LOWER(TRIM(succession_status)) IN ('final', 'addendum'))",
+        "(identity_status = 'resolved') AND (is_latest_version = TRUE)",
 }
 
 TEXT_DOCUMENT_ADVISORY_RULES = {
@@ -156,12 +152,8 @@ TEXT_DOCUMENT_ADVISORY_RULES = {
     "gold.text.document.record_status_effective_to.future_owner":
         "NOT COALESCE((CAST(`record_status_effective_to` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS), FALSE)",
 
-    # Counts what the research surface removed: rows failing source_feed IN
-    # ('ancil_long_blob', 'elective_access_comment', 'endobase_exam',
-    # 'neonatal_episode_narrative', 'order_comment', 'pathology_report', 'text_event') OR
-    # LOWER(TRIM(succession_status)) IN ('final', 'addendum'). The mandatory rule above has
-    # already dropped them, so this is how many went, not how many survive. 208,195,443 of
-    # 656,894,348 at the profile.
+    # Counts published documents that are not completed (interim, preliminary, unknown or
+    # blank succession status). They are kept; filter on succession_status to exclude them.
     "gold.text.document.succession_status.default_view_completed":
         "source_feed IN ('ancil_long_blob', 'elective_access_comment', 'endobase_exam', 'neonatal_episode_narrative', 'order_comment', 'pathology_report', 'text_event') OR LOWER(TRIM(succession_status)) IN ('final', 'addendum')",
 
@@ -469,4 +461,3 @@ def gold_text_safety_document():
 def _gold_qc_text_safety_document():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
     return _tdx_qc("text_safety_document", "safety_document_key")
-

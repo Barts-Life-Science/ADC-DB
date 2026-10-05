@@ -307,8 +307,62 @@ def bronze_contract_schema(table_name: str):
     return _bronze_T.StructType(fields)
 
 
+# TZ_LOCAL_V1/bronze_common: Europe/London wall-clock companions of Millennium UTC instants.
+# Bronze owns timestamp semantics: X_LOCAL = X converted from UTC to Europe/London (GMT/BST), published beside X so
+# silver and every product take local dates and clock times without converting. Entry: (columns, utc_when) where
+# utc_when, when set, is the SQL predicate of the UTC rows of a mixed-clock table; other rows are already local.
+BRONZE_TIME_COMPANIONS = {
+    'map_encounter': (('REG_DT_TM',), None),
+    'map_family_history': (('BEG_EFFECTIVE_DT_TM', 'END_EFFECTIVE_DT_TM'), None),
+    'map_nomen_events': (('CLINICAL_EVENT_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_text_events': (('RESULT_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_coded_events': (('EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_date_events': (('RESULT_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_numeric_events': (('EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_procedure': (('PROCEDURE_DT_TM_EFFECTIVE', 'PROC_START_DT_TM', 'PROC_DT_TM', 'PROC_END_DT_TM'), None),
+    'map_implant_details': (('IMPLANT_DT_TM', 'EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'CLINSIG_UPDT_DT_TM'), None),
+    'map_med_admin': (('ADMIN_START_DT_TM', 'PERFORMED_DT_TM', 'SCHEDULED_DT_TM', 'ADMIN_END_DT_TM'), None),
+    'map_pathology': (('measurement_datetime', 'event_end_dt_tm'), "source_table = 'linked'"),
+    'map_radiology_event': (('PERFORMED_DT_TM_CLEAN', 'EVENT_END_DT_TM_CLEAN'), None),
+    'map_theatre_case_procedure': (('PROC_START_DT_TM', 'PROC_END_DT_TM'), None),
+    'map_theatre_case': (('SURG_START_DT_TM', 'FIRST_PERFORMED_MILESTONE_DT_TM', 'SCHED_START_DT_TM'), None),
+    'map_orders': (('ORIG_ORDER_DT_TM_CLEAN', 'CURRENT_START_DT_TM_CLEAN'), None),
+    'map_order_comment': (('COMMENT_DT_TM_CLEAN', 'COMMENT_UPDT_DT_TM_CLEAN', 'COMMENT_DT_TM', 'COMMENT_UPDT_DT_TM'), None),
+    'mill_blob_text': (('CLINSIG_DT_TM', 'VALID_FROM_DT_TM', 'VALID_UNTIL_DT_TM', 'UPDT_DT_TM', 'ADC_UPDT'), None),
+    'map_pacs_report': (('REPORT_MODIFIED_UTC', 'ADC_UPDT'), None),
+    'map_appointment': (('ORIG_REQ_START_DT_TM', 'FIRST_BKD_ASI_DT_TM', 'REFER_DT_TM'), None),
+    'map_appointment_resource': (('BEG_DT_TM', 'END_DT_TM'), None),
+    'map_waiting_list': (('WAITING_START_DT_TM', 'WAITING_END_DT_TM'), None),
+    'map_allergy': (('ONSET_DT_TM_CLEAN', 'CREATED_DT_TM_CLEAN', 'CANCEL_DT_TM_CLEAN', 'END_EFFECTIVE_DT_TM'), None),
+    'mill_form_activity': (('DOCUMENTATION_DT_TM', 'LAST_DOCUMENTED_DT_TM', 'PERFORMED_DT_TM'), None),
+    'map_powerform_assessment_item': (('RESPONSE_DT_TM', 'PERFORMED_DT_TM', 'DOCUMENTATION_DT_TM'), None),
+    'map_medication_order': (('ORIG_ORDER_DT_TM', 'CURRENT_START_DT_TM', 'PROJECTED_STOP_DT_TM', 'SOFT_STOP_DT_TM', 'DISCONTINUE_EFFECTIVE_DT_TM'), None),
+    'map_research_subject': (('ON_STUDY_DT_TM_CLEAN', 'OFF_STUDY_DT_TM_CLEAN'), None),
+}
+
+
+def bronze_time_local_name(column: str) -> str:
+    return column + ("_local" if column.islower() else "_LOCAL")
+
+
+def bronze_add_time_companions(frame, table_name: str):
+    """Add each registered companion the frame can derive and does not already carry."""
+    columns, utc_when = BRONZE_TIME_COMPANIONS.get(bronze_base_table_name(table_name).lower(), ((), None))
+    present = {name.lower() for name in frame.columns}
+    for column in columns:
+        target = bronze_time_local_name(column)
+        if column.lower() not in present or target.lower() in present:
+            continue
+        local = _bronze_F.from_utc_timestamp(_bronze_F.col(column), "Europe/London")
+        if utc_when:
+            local = _bronze_F.when(_bronze_F.expr(utc_when), local).otherwise(_bronze_F.col(column))
+        frame = frame.withColumn(target, local)
+    return frame
+
+
 def bronze_project_contract(frame, table_name: str):
     """Project a primary-table frame to its exact retained-column contract."""
+    frame = bronze_add_time_companions(frame, table_name)
     if not bronze_is_primary_table(table_name):
         return frame
     source_columns = {}
@@ -423,4 +477,3 @@ try:
     bronze_active_spark().conf.set("spark.databricks.delta.schema.autoMerge.enabled", "false")
 except Exception:
     pass
-

@@ -178,6 +178,16 @@ def _m30_hardening_snapshot_fallback_allowed(exc: BaseException) -> bool:
         'delta log file not found',
     ))
 
+# DQ4_B1_TS_PLAUSIBLE_V1: rule ts_plausible_v1. A clinical-event timestamp before 1971 is an epoch/1000
+# truncation or a sentinel, never evidence, so every raw read publishes NULL for it.
+_M30_TS_PLAUSIBLE_COLUMNS = ('EVENT_START_DT_TM', 'EVENT_END_DT_TM', 'PERFORMED_DT_TM', 'VERIFIED_DT_TM')
+
+def _m30_ts_plausible_v1(frame):
+    present = [c for c in _M30_TS_PLAUSIBLE_COLUMNS if c in frame.columns]
+    if not present:
+        return frame
+    return frame.withColumns({c: F.when(F.col(c) >= F.lit('1971-01-01').cast('timestamp'), F.col(c)) for c in present})
+
 def _m30_hardening_read_pinned_snapshot(table_name: str, version: int):
     requested_version = int(version)
     try:
@@ -189,7 +199,7 @@ def _m30_hardening_read_pinned_snapshot(table_name: str, version: int):
         # Spark Connect defers Delta-log validation until analysis/action.
         _ = pinned.schema
         pinned.limit(1).collect()
-        return pinned
+        return _m30_ts_plausible_v1(pinned)
     except Exception as exc:
         if not _m30_hardening_snapshot_fallback_allowed(exc):
             raise
@@ -208,13 +218,13 @@ def _m30_hardening_read_pinned_snapshot(table_name: str, version: int):
         )
         current_snapshot = spark.table(table_name)
         _ = current_snapshot.schema
-        return current_snapshot
+        return _m30_ts_plausible_v1(current_snapshot)
 
 def _m30_hardening_validate_cdf(changes):
     # Keep lazy Spark Connect failures inside the caller's recovery block.
     _ = changes.schema
     changes.limit(1).collect()
-    return changes
+    return _m30_ts_plausible_v1(changes)
 
 def _mne_read_snapshot(table_name: str, version: int) -> DataFrame:
     return _m30_hardening_read_pinned_snapshot(table_name, int(version))
@@ -3408,7 +3418,7 @@ def _snapshot_table(table_name: str, versions: Optional[Dict[str, int]]=None) ->
     version = versions.get(table_name) if versions else None
     if version is not None:
         return _m30_hardening_read_pinned_snapshot(table_name, int(version))
-    return spark.table(table_name)
+    return _m30_ts_plausible_v1(spark.table(table_name))
 
 def _latest_table_version(table_name: str) -> Tuple[int, object]:
     row = spark.sql(f'DESCRIBE HISTORY {qname(table_name)} LIMIT 1').select('version', 'timestamp').first()
@@ -3787,14 +3797,24 @@ def process_nomen_events_full_rebuild(apply: bool=False, trust: str=DEFAULT_TRUS
     if configure_source_retention:
         configure_cdf_retention(DEFAULT_RETENTION_DAYS, apply=False)
     built = order_map_nomen_columns(build_map_nomen_events(versions, event_ids=None, trust=trust, run_id=run_id))
-    validate_map_nomen_build(built, versions, trust, validation_level)
-    built = bronze_project_contract(built, MAP_NOMEN_TARGET)
-    backup_name = None
-    if create_backup and table_exists(MAP_NOMEN_TARGET):
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-        backup_name = f'{MAP_NOMEN_TARGET}__pre_v2_{timestamp}'
-        spark.sql(f'CREATE TABLE {qname(backup_name)} SHALLOW CLONE {qname(MAP_NOMEN_TARGET)}')
-    built.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').option('delta.enableChangeDataFeed', 'true').saveAsTable(MAP_NOMEN_TARGET)
+    # MAP_NOMEN_STAGED_REBUILD_V1: nothing is cached (bronze code stays serverless-safe), so every action on the lazy
+    # build re-ran it from source. Validation's three counts plus the write were four full builds of ~1.1B rows, and
+    # the 2026-10-03 full refresh ran past the 6-hour task limit. Build once into a staging table (as map_date_events
+    # does), then validate and publish from it.
+    staging_table = f"{MAP_NOMEN_TARGET}__rebuild_{run_id.replace('-', '')}"
+    built.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(staging_table)
+    try:
+        staged = spark.table(staging_table)
+        validate_map_nomen_build(staged, versions, trust, validation_level)
+        built = bronze_project_contract(staged, MAP_NOMEN_TARGET)
+        backup_name = None
+        if create_backup and table_exists(MAP_NOMEN_TARGET):
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            backup_name = f'{MAP_NOMEN_TARGET}__pre_v2_{timestamp}'
+            spark.sql(f'CREATE TABLE {qname(backup_name)} SHALLOW CLONE {qname(MAP_NOMEN_TARGET)}')
+        built.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').option('delta.enableChangeDataFeed', 'true').saveAsTable(MAP_NOMEN_TARGET)
+    finally:
+        spark.sql(f'DROP TABLE IF EXISTS {qname(staging_table)}')
     _apply_table_metadata(MAP_NOMEN_TARGET)
     _create_current_view()
     write_checkpoints(versions, run_id)
@@ -3968,7 +3988,7 @@ def _read_delta_snapshot(table_name: str, source_versions: Optional[Dict[str, in
     """Read an exact source snapshot when a run has captured source versions."""
     if source_versions is not None and table_name in source_versions:
         return _m30_hardening_read_pinned_snapshot(table_name, int(source_versions[table_name]))
-    return spark.table(table_name)
+    return _m30_ts_plausible_v1(spark.table(table_name))
 
 def _is_empty(df: DataFrame) -> bool:
     return df.limit(1).count() == 0
@@ -4508,5 +4528,3 @@ for _anon_spec in _ANON_REATTACH_SPECS:
                 f"mismatches={_anon_metrics.mismatches}"
             )
 # END_ANON_TEXT_STATE_REATTACH_V3_2
-
-

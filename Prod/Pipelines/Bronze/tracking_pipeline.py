@@ -284,7 +284,7 @@ else:
         spark.createDataFrame(
             [(RUN_ID, "map_tracking_episode", traceback.format_exc(), datetime.now(timezone.utc).replace(tzinfo=None))],
             "run_id string, stage string, detail string, recorded_at timestamp",
-        ).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_errors")
+        ).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_errors")  # OGR_NO_DEV_V1/tracking
         raise
 episode_keys = spark.table(EPISODE).where("SOURCE_PRESENT_IND").select("TRACKING_ID", "PERSON_ID", "ENCNTR_ID", "LINKAGE_ROUTE", "SURG_CASE_ID")
 
@@ -309,7 +309,7 @@ except BaseException:
     spark.createDataFrame(
         [(RUN_ID, "map_tracking_attendance", traceback.format_exc(), datetime.now(timezone.utc).replace(tzinfo=None))],
         "run_id string, stage string, detail string, recorded_at timestamp",
-    ).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_errors")
+    ).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_errors")
     raise
 
 # COMMAND ----------
@@ -356,7 +356,7 @@ except BaseException:
     spark.createDataFrame(
         [(RUN_ID, "map_tracking_milestone", traceback.format_exc(), datetime.now(timezone.utc).replace(tzinfo=None))],
         "run_id string, stage string, detail string, recorded_at timestamp",
-    ).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_errors")
+    ).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_errors")
     raise
 
 # COMMAND ----------
@@ -398,7 +398,7 @@ except BaseException:
     spark.createDataFrame(
         [(RUN_ID, "map_pending_movement", traceback.format_exc(), datetime.now(timezone.utc).replace(tzinfo=None))],
         "run_id string, stage string, detail string, recorded_at timestamp",
-    ).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_errors")
+    ).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_errors")
     raise
 
 # COMMAND ----------
@@ -424,12 +424,60 @@ bed = bed_src.join(F.broadcast(room_parent), F.col("b.LOC_ROOM_CD").cast("long")
     F.lit(None).cast("long").alias("CLASS_CD"), F.lit(None).cast("boolean").alias("FIXED_BED_IND"), (F.col("b.DUP_BED_IND") == 1).alias("DUP_BED_IND"),
     F.col("b.BED_STATUS_CD").cast("long").alias("CURRENT_BED_STATUS_CD"), (F.col("b.ACTIVE_IND") == 1).alias("ACTIVE_IND"), F.col("b.BEG_EFFECTIVE_DT_TM"), F.col("b.END_EFFECTIVE_DT_TM"), F.col("b.ADC_UPDT").alias("SOURCE_ADC_UPDT"),
 )
-loc = reduce(lambda a, b: a.unionByName(b), [nu, room, bed]).where(F.col("LOCATION_CD") > 0)
+# SDI_LOCATION_UNIT_ALL_V1: the nurse-unit/room/bed arms miss every other Millennium location a patient is booked or
+# tracked at (theatres/ancillary, radiology, ambulatory, waiting rooms, facilities and buildings with no nurse unit), so
+# 13 encounter and 59 appointment location codes (1.59M appointments) could not decode. Land those from LOCATION (type =
+# code set 222 CDF_MEANING, parent = active root-0 LOCATION_GROUP edge), then code-set-220 codes absent from LOCATION.
+# Inventory, HIM, specimen-collection, charge-services, blood-bank and tracking-root types are not patient locations and
+# are not landed. SOURCE_TABLE names each row's own source.
+NON_PATIENT_LOCATION_TYPES = ["INVLOCATOR", "INVLOC", "INVVIEW", "HIM", "HIMROOT", "COLLRTE", "COLLRUN", "COLLROOT",
+                              "STORAGECOMP", "CSLOGIN", "CSTRACK", "BBINVAREA", "BBOWNERROOT", "PTTRACKROOT"]
+SRC_LOCATION = f"{RAW}.mill_location"
+SRC_LOCATION_GROUP = f"{RAW}.mill_location_group"
+nu, room, bed = [df.withColumn("__SOURCE_TABLE", F.lit(src)) for df, src in ((nu, SRC_NURSE_UNIT), (room, SRC_ROOM), (bed, SRC_BED))]
+arm_cd = reduce(lambda a, b: a.unionByName(b), [df.select(F.col("LOCATION_CD").alias("_ARM_CD")) for df in (nu, room, bed)])
+loc_type = spark.table(CODE_VALUE).where(F.col("CODE_SET") == 222).select(
+    F.col("CODE_VALUE").cast("long").alias("_TYPE_CD"), F.col("CDF_MEANING").alias("_TYPE")).dropDuplicates(["_TYPE_CD"])
+group_parent = (spark.table(SRC_LOCATION_GROUP)
+    .where((F.col("ACTIVE_IND") == 1) & (F.col("ROOT_LOC_CD") == 0) & (F.col("PARENT_LOC_CD") > 0))
+    .withColumn("_rn", F.row_number().over(Window.partitionBy(F.col("CHILD_LOC_CD").cast("long")).orderBy(
+        F.col("BEG_EFFECTIVE_DT_TM").desc_nulls_last(), F.col("PARENT_LOC_CD").cast("long").asc_nulls_last())))
+    .where(F.col("_rn") == 1)
+    .select(F.col("CHILD_LOC_CD").cast("long").alias("_CHILD_CD"), F.col("PARENT_LOC_CD").cast("long").alias("_PARENT_CD")))
+
+
+def location_arm(df, code, meaning, active, beg, end, updt, src):
+    m = F.when(F.trim(meaning) != "", F.upper(F.trim(meaning)))
+    return df.join(group_parent, code == F.col("_CHILD_CD"), "left").select(
+        code.alias("LOCATION_CD"),
+        F.when(m == "NURSEUNIT", F.lit("nurse_unit")).otherwise(F.lower(F.coalesce(m, F.lit("unclassified")))).alias("LOCATION_LEVEL"),
+        F.col("_PARENT_CD").alias("PARENT_LOCATION_CD"),
+        F.when(m == "FACILITY", code).alias("FACILITY_CD"), F.when(m == "BUILDING", code).alias("BUILDING_CD"),
+        F.when(m == "NURSEUNIT", code).alias("NURSE_UNIT_CD"),
+        F.lit(None).cast("long").alias("CLASS_CD"), F.lit(None).cast("boolean").alias("FIXED_BED_IND"), F.lit(None).cast("boolean").alias("DUP_BED_IND"),
+        F.lit(None).cast("long").alias("CURRENT_BED_STATUS_CD"), (active == 1).alias("ACTIVE_IND"), beg.alias("BEG_EFFECTIVE_DT_TM"),
+        end.alias("END_EFFECTIVE_DT_TM"), updt.alias("SOURCE_ADC_UPDT"), F.lit(src).alias("__SOURCE_TABLE"),
+    )
+
+
+loc_src = (spark.table(SRC_LOCATION).join(F.broadcast(loc_type), F.col("LOCATION_TYPE_CD").cast("long") == F.col("_TYPE_CD"), "left")
+    .where(~F.upper(F.trim(F.coalesce(F.col("_TYPE"), F.lit("")))).isin(NON_PATIENT_LOCATION_TYPES))
+    .join(arm_cd, F.col("LOCATION_CD").cast("long") == F.col("_ARM_CD"), "left_anti"))
+loc_other = location_arm(loc_src, F.col("LOCATION_CD").cast("long"), F.col("_TYPE"), F.col("ACTIVE_IND"),
+                         F.col("BEG_EFFECTIVE_DT_TM"), F.col("END_EFFECTIVE_DT_TM"), F.col("ADC_UPDT"), SRC_LOCATION)
+cv_src = (spark.table(CODE_VALUE).where(F.col("CODE_SET") == 220)
+    .where(~F.upper(F.trim(F.coalesce(F.col("CDF_MEANING"), F.lit("")))).isin(NON_PATIENT_LOCATION_TYPES))
+    .join(spark.table(SRC_LOCATION).select(F.col("LOCATION_CD").cast("long").alias("_L_CD")),
+          F.col("CODE_VALUE").cast("long") == F.col("_L_CD"), "left_anti")
+    .join(arm_cd, F.col("CODE_VALUE").cast("long") == F.col("_ARM_CD"), "left_anti"))
+loc_code_only = location_arm(cv_src, F.col("CODE_VALUE").cast("long"), F.col("CDF_MEANING"), F.col("ACTIVE_IND"),
+                             F.col("BEGIN_EFFECTIVE_DT_TM"), F.col("END_EFFECTIVE_DT_TM"), F.col("ADC_UPDT"), CODE_VALUE)
+loc = reduce(lambda a, b: a.unionByName(b), [nu, room, bed, loc_other, loc_code_only]).where(F.col("LOCATION_CD") > 0)
 loc = add_decode(loc, "LOCATION_CD", "LOCATION_DISPLAY")
 loc = add_decode(loc, "PARENT_LOCATION_CD", "PARENT_LOCATION_DISPLAY")
 loc = add_decode(loc, "NURSE_UNIT_CD", "NURSE_UNIT_DISPLAY")
 loc = add_decode(loc, "CURRENT_BED_STATUS_CD", "CURRENT_BED_STATUS_DISPLAY")
-loc = finalise(loc, ["LOCATION_CD"], "4_prod.raw.mill_nurse_unit|mill_room|mill_bed", "LOCATION_CD")
+loc = finalise(loc, ["LOCATION_CD"], SRC_LOCATION, "LOCATION_CD").withColumn("SOURCE_TABLE", F.col("__SOURCE_TABLE")).drop("__SOURCE_TABLE")  # SDI_LOCATION_UNIT_ALL_V1
 results.append(publish_or_reuse_sample(loc, LOC_UNIT, ["LOCATION_CD"], cluster_by=["LOCATION_LEVEL", "NURSE_UNIT_CD"]))
 
 # COMMAND ----------
@@ -455,7 +503,7 @@ except BaseException:
     spark.createDataFrame(
         [(RUN_ID, "map_location_attribute_history", traceback.format_exc(), datetime.now(timezone.utc).replace(tzinfo=None))],
         "run_id string, stage string, detail string, recorded_at timestamp",
-    ).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_errors")
+    ).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_errors")
     raise
 
 # COMMAND ----------
@@ -463,6 +511,5 @@ except BaseException:
 spark.createDataFrame(
     [(RUN_ID, PIPELINE_LOGIC_VERSION, SAMPLE_MODE, SAMPLE_ROWS, json.dumps(results, sort_keys=True), datetime.now(timezone.utc).replace(tzinfo=None))],
     "run_id string, logic_version string, sample_mode boolean, sample_rows long, result_json string, recorded_at timestamp",
-).write.mode("append").saveAsTable("8_dev.tdx_evidence.tracking_pipeline_runs")
+).write.mode("append").saveAsTable("6_mgmt.bronze.tracking_pipeline_runs")
 dbutils.notebook.exit(json.dumps({"sample_mode": SAMPLE_MODE, "sample_rows": SAMPLE_ROWS, "results": results}, sort_keys=True))
-

@@ -316,7 +316,12 @@ def gate_target(name, attrs, link_floor):
         # mill_encntr_info legitimately retains historical/orphan ENCNTR_ID values
         # that no longer exist in mill_encounter. Preserve those source rows and
         # distinguish them from an actual map_encounter omission.
+        # ENCOUNTER_OMISSION_HORIZON_V1: an omission is an encounter raw already had when map_encounter was built.
+        # Encounters that reached raw after its horizon are not omissions (the 2026-10-04 full rebuild built
+        # map_encounter a day before this task ran: 3,398 such encounters); the rate check below uses the same horizon.
+        omission_horizon = spark.table("4_prod.bronze.map_encounter").agg(F.max("ADC_UPDT").alias("h")).first()["h"]
         raw_ids=(spark.table("4_prod.raw.mill_encounter")
+                 .where(F.col("ADC_UPDT") <= F.lit(omission_horizon))
                  .select(F.col("ENCNTR_ID").cast("bigint").alias("ENTITY_ID"))
                  .where(F.col("ENTITY_ID").isNotNull()).distinct())
         unlinked_ids=(d.where("LINK_STATUS<>'LINKED'")
@@ -498,4 +503,3 @@ print("A7 build and gates complete")
 # recorded pinned-fixture benchmark pack before promotion.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET_SCHEMA, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-

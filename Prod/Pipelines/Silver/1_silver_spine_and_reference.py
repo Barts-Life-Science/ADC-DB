@@ -21,6 +21,8 @@ from silver_journey_shared import (
     SRC_DATE_EVENTS,
     SRC_DIAGNOSIS,
     SRC_ENCOUNTER,
+    SRC_ENCOUNTER_PRACTITIONER,  # OGR_PARTICIPATION_V1
+    SRC_PERSON_GP,
     SRC_FORM_ACTIVITY,
     SRC_IMPLANT_DETAILS,
     SRC_MEDICATION_ORDER,
@@ -239,44 +241,64 @@ SRC_PERSON         = "4_prod.bronze.map_person"
 
 SRC_PATIENT_IDENTIFIER = "4_prod.bronze.map_patient_identifier"
 
-def _person_alias_selection(alias_type):
+# SDI_MRN_POOL_V1/silver: hospital MRN pools in preference order (higher wins among active aliases).
+MRN_POOL_PREFERENCE = {6200990: ("barts", 2), 1115132483: ("bhrut", 1)}  # RNJ 5C4 MRN, RF4 MRN
+
+
+def _person_alias_selection(alias_type, pool_preference=None):
     """Pick the current MRN or NHS number from the governed alias feed.
-    Ranking: active alias first (CURRENT_IND), then latest valid end-effective (open-ended
-    sorts last via the 2100 sentinel), NULLS LAST via coalesce floors, deterministic
-    SOURCE_PK tiebreak. MULTI_ACTIVE pools are never tiebroken: the whole (person, type)
-    pool resolves to 'ambiguous' with NULL value."""
+    Ranking: active alias first (CURRENT_IND); among active aliases the preferred pool when
+    pool_preference is given; then latest valid end-effective (open-ended sorts last via the
+    2100 sentinel), NULLS LAST via coalesce floors, deterministic SOURCE_PK tiebreak.
+    Ambiguity is never tiebroken: when the winning pool (the whole alias type without
+    pool_preference) holds more than one distinct active value, it resolves to 'ambiguous'
+    with NULL value. The bronze MULTI_ACTIVE_IND is per (person, type), so it would call one
+    Barts plus one BHRUT MRN ambiguous; it is not used."""
     a = read_source(SRC_PATIENT_IDENTIFIER).where(F.col("ALIAS_TYPE") == alias_type)
-    ranked = a.select(
+    current = F.coalesce(a.CURRENT_IND, F.lit(False))
+    pool_rank, pool_label = F.lit(0), F.lit("other")
+    for pool_cd, (label, rank) in (pool_preference or {}).items():
+        pool_rank = F.when(a.ALIAS_POOL_CD == F.lit(pool_cd), F.lit(rank)).otherwise(pool_rank)
+        pool_label = F.when(a.ALIAS_POOL_CD == F.lit(pool_cd), F.lit(label)).otherwise(pool_label)
+    per_pool = a.select(
         a.PERSON_ID.cast("string").alias("_pid"),
-        F.coalesce(a.MULTI_ACTIVE_IND.cast("int"), F.lit(0)).alias("_multi"),
+        (a.ALIAS_POOL_CD if pool_preference else F.lit(0)).alias("_pool"),
+        F.when(current, a.ALIAS_VALUE).alias("_cur_value"),
         a.PIPELINE_UPDT_DT_TM.alias("_alias_loaded_at"),
         a.SOURCE_ADC_UPDT.alias("_alias_source_updt"),
         F.struct(
-            F.coalesce(a.CURRENT_IND.cast("int"), F.lit(0)).alias("o_current"),
+            current.cast("int").alias("o_current"),
+            F.when(current, pool_rank).otherwise(F.lit(0)).alias("o_pool"),
             F.coalesce(a.END_EFFECTIVE_DT_TM_CLEAN,
                        F.lit("2100-01-01").cast("timestamp")).alias("o_valid_to"),
             F.coalesce(a.BEG_EFFECTIVE_DT_TM_CLEAN,
                        F.lit("1900-01-01").cast("timestamp")).alias("o_valid_from"),
             F.coalesce(a.SOURCE_PK, F.lit(-1)).alias("o_tiebreak"),
             a.ALIAS_VALUE.alias("v_value"),
-            F.coalesce(a.CURRENT_IND, F.lit(False)).alias("v_current"),
+            current.alias("v_current"),
+            pool_label.alias("v_pool"),
         ).alias("ranked"),
-    )
-    won = ranked.groupBy("_pid").agg(
+    ).groupBy("_pid", "_pool").agg(
         F.max("ranked").alias("w"),
-        F.max("_multi").alias("_m"),
+        F.countDistinct("_cur_value").alias("_n_current"),
         F.max("_alias_loaded_at").alias("_alias_loaded_at"),
         F.max("_alias_source_updt").alias("_alias_source_updt"),
     )
-    ambiguous = F.col("_m") == 1
+    won = per_pool.groupBy("_pid").agg(
+        F.max(F.struct(F.col("w"), F.col("_n_current"))).alias("p"),
+        F.max("_alias_loaded_at").alias("_alias_loaded_at"),
+        F.max("_alias_source_updt").alias("_alias_source_updt"),
+    )
+    ambiguous = F.col("p._n_current") > 1
     return won.select(
         F.col("_pid"),
-        F.when(ambiguous, F.lit(None).cast("string")).otherwise(F.col("w.v_value")).alias("_value"),
+        F.when(ambiguous, F.lit(None).cast("string")).otherwise(F.col("p.w.v_value")).alias("_value"),
         F.when(ambiguous, F.lit(None).cast("string"))
-         .when(F.col("w.v_current"), F.lit("active")).otherwise(F.lit("inactive")).alias("_value_status"),
+         .when(F.col("p.w.v_current"), F.lit("active")).otherwise(F.lit("inactive")).alias("_value_status"),
         F.when(ambiguous, F.lit("ambiguous"))
-         .when(F.col("w.v_current"), F.lit("active_alias"))
+         .when(F.col("p.w.v_current"), F.lit("active_alias"))
          .otherwise(F.lit("latest_valid_alias")).alias("_selection_status"),
+        F.col("p.w.v_pool").alias("_pool_label"),
         F.col("_alias_loaded_at"),
         F.col("_alias_source_updt"),
     )
@@ -299,7 +321,8 @@ PERSON_COLUMN_COMMENTS = {
     "marital_status_display": "Source marital-status display.",
     "religion_code": "Source religion code.",
     "religion_display": "Source religion display.",
-    "deceased_ind": "Whether the source indicates the person is deceased.",
+    "deceased_ind": "True when a death date is recorded or map_person.deceased_display is 'Deceased' (DECEASED_CD 3768549, CDF YES); false otherwise, including DECEASED_CD 'No' (684730) and 0. Never NULL.",  # SDI_DECEASED_V1/silver:
+    "deceased_ind_source": "Evidence behind deceased_ind: death_date (a death timestamp is recorded) or deceased_code (DECEASED_CD displays 'Deceased' with no date); NULL when deceased_ind is false.",
     "deceased_datetime": "Source death timestamp.",
     "deceased_datetime_precision": "Raw source death-time precision.",
     "confidentiality_code": "Source confidentiality level carried for downstream access control.",
@@ -307,12 +330,13 @@ PERSON_COLUMN_COMMENTS = {
     "current_address_id": "Current source address reference when available.",
     "latest_known_address_id": "Latest-known source address reference.",
     "address_selection_status": "Provenance for current versus latest-known address selection.",
-    "current_mrn": "Current hospital MRN selected from map_patient_identifier: active alias first, then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak; NULL when selection is ambiguous or no alias exists.",
+    "current_mrn": "Current hospital MRN selected from map_patient_identifier: active alias first; among active aliases the Barts pool (RNJ 5C4 MRN, 6200990) before the BHRUT pool (RF4 MRN, 1115132483); then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak. NULL when the winning pool holds more than one distinct active value (ambiguous) or no alias exists. current_mrn_pool names the pool.",  # SDI_MRN_POOL_V1/silver:
     "current_mrn_status": "Lifecycle status of the selected hospital MRN alias; NULL when selection is ambiguous or no alias exists.",
-    "mrn_selection_status": "Selection outcome for the governed hospital MRN alias pool; ambiguous = multiple active aliases",
+    "mrn_selection_status": "Selection outcome for the hospital MRN: active_alias, latest_valid_alias, ambiguous (the winning pool holds more than one distinct active value; a Barts and a BHRUT MRN together are not ambiguous) or no_alias.",  # SDI_MRN_POOL_V1/silver:
+    "current_mrn_pool": "Alias pool the hospital MRN was selected from: barts (RNJ 5C4 MRN), bhrut (RF4 MRN) or other; set when the selection is ambiguous too (the pool that is ambiguous); NULL when no MRN alias exists.",
     "nhs_number": "Current NHS number selected from map_patient_identifier: active alias first, then latest valid end-effective, NULLS LAST, deterministic SOURCE_PK tiebreak; NULL when selection is ambiguous or no alias exists.",
     "nhs_number_status": "Lifecycle status of the selected NHS-number alias; NULL when selection is ambiguous or no alias exists.",
-    "nhs_number_selection_status": "Selection outcome for the governed NHS-number alias pool; ambiguous = multiple active aliases",
+    "nhs_number_selection_status": "Selection outcome for the NHS-number alias: active_alias, latest_valid_alias, ambiguous (more than one distinct active NHS number) or no_alias.",  # SDI_MRN_POOL_V1/silver:
     "record_status": "Derived person-row status: active only when map_person.active_ind is 1 and end_effective_dt_tm is null or not earlier than 2100-01-01; otherwise superseded, including a missing active_ind. This is a normalized row-status label, not the source numeric ACTIVE_IND.",
     "record_status_effective_from": "Source person active-status timestamp carried from `active_status_dt_tm` without a fallback timestamp.",
     "record_status_effective_to": "Source `end_effective_dt_tm` when earlier than 2100-01-01; otherwise null, including missing or open-ended sentinel timestamps.",
@@ -338,7 +362,7 @@ def _lifecycle_source_person():
     # Assemble person rows with lifecycle and source evidence for the public product and its
     # internal metadata.
     s = read_source(SRC_PERSON)
-    mrn = _person_alias_selection("MRN").alias("mrn")
+    mrn = _person_alias_selection("MRN", MRN_POOL_PREFERENCE).alias("mrn")  # SDI_MRN_POOL_V1/silver:
     nhs = _person_alias_selection("NHS").alias("nhs")
     ended = F.coalesce(
         s.end_effective_dt_tm < F.lit("2100-01-01").cast("timestamp"),
@@ -367,7 +391,12 @@ def _lifecycle_source_person():
         s.marital_type_display.alias("marital_status_display"),
         s.religion_cd.cast("string").alias("religion_code"),
         s.religion_display.alias("religion_display"),
-        (s.deceased_dt_tm.isNotNull() | (F.coalesce(s.deceased_cd, F.lit(0)) != 0)).alias("deceased_ind"),
+        # SDI_DECEASED_V1/silver: DECEASED_CD 684730 displays 'No'; only a date or the 'Deceased' code counts.
+        (s.deceased_dt_tm.isNotNull()
+         | F.coalesce(F.upper(F.trim(s.deceased_display)) == F.lit("DECEASED"), F.lit(False))).alias("deceased_ind"),
+        F.when(s.deceased_dt_tm.isNotNull(), F.lit("death_date"))
+         .when(F.upper(F.trim(s.deceased_display)) == F.lit("DECEASED"), F.lit("deceased_code"))
+         .alias("deceased_ind_source"),
         s.deceased_dt_tm.alias("deceased_datetime"),
         s.deceased_dt_tm_precision_flag.cast("string").alias("deceased_datetime_precision"),
         s.confid_level_cd.cast("string").alias("confidentiality_code"),
@@ -378,6 +407,7 @@ def _lifecycle_source_person():
         F.col("mrn._value").alias("current_mrn"),
         F.col("mrn._value_status").alias("current_mrn_status"),
         F.coalesce(F.col("mrn._selection_status"), F.lit("no_alias")).alias("mrn_selection_status"),
+        F.col("mrn._pool_label").alias("current_mrn_pool"),  # SDI_MRN_POOL_V1/silver:
         F.col("nhs._value").alias("nhs_number"),
         F.col("nhs._value_status").alias("nhs_number_status"),
         F.coalesce(F.col("nhs._selection_status"), F.lit("no_alias")).alias("nhs_number_selection_status"),
@@ -1024,6 +1054,7 @@ def encounter_identifier_lifecycle():
 # COMMAND ----------
 
 SRC_CARE_SITE      = "4_prod.bronze.map_care_site"
+SRC_LOCATION_UNIT  = "4_prod.bronze.map_location_unit"  # SDI_LOCATION_LANE_V1
 
 def _location_projection():
     # Derive the facility, building, unit and room location hierarchy from care-site evidence.
@@ -1124,7 +1155,47 @@ def _location_projection():
         F.date_format(s.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"),
         s.ADC_UPDT.alias("loaded_at"),
     )
-    return facilities.unionByName(buildings).unionByName(units)
+    care = facilities.unionByName(buildings).unionByName(units)
+
+    # SDI_LOCATION_LANE_V1: map_care_site holds 438 of the 977 nurse-unit codes encounters reference, so 38M of 44M
+    # encounter locations and most stays and appointments could not decode. Every other Millennium location (nurse
+    # units without a care-site row, rooms, beds, theatres/ancillary, radiology, ambulatory, facilities and buildings)
+    # comes from map_location_unit; a code already published from map_care_site keeps that row. Keys hash in the
+    # namespace consumers use: facility and building levels their own, every other level nurse_unit.
+    def _key_namespace(level):
+        return (F.when(level == "facility", F.lit("location:mill:facility"))
+                 .when(level == "building", F.lit("location:mill:building"))
+                 .otherwise(F.lit("location:mill:nurse_unit")))
+
+    u = read_source(SRC_LOCATION_UNIT).where(F.col("LOCATION_CD") > 0)
+    care_codes = care.select(F.col("location_code").alias("_code"), F.col("location_level").alias("_level"))
+    other = u.join(care_codes.select("_code").distinct(), F.col("LOCATION_CD").cast("string") == F.col("_code"), "left_anti")
+    parents = (care_codes.unionByName(other.select(F.col("LOCATION_CD").cast("string").alias("_code"),
+                                                   F.col("LOCATION_LEVEL").alias("_level")))
+               .groupBy(F.col("_code").alias("_parent_code")).agg(F.min("_level").alias("_parent_level")))
+    level = F.col("LOCATION_LEVEL")
+    lane = other.join(parents, F.col("PARENT_LOCATION_CD").cast("string") == F.col("_parent_code"), "left").select(
+        stable_id(_key_namespace(level), F.col("LOCATION_CD")).alias("location_key"),
+        F.col("LOCATION_CD").cast("string").alias("location_code"),
+        F.when(F.col("_parent_level").isNotNull(),
+               stable_id(_key_namespace(F.col("_parent_level")), F.col("PARENT_LOCATION_CD"))).alias("parent_location_key"),
+        level.alias("location_level"),
+        F.col("LOCATION_CD").cast("string").alias("source_location_code"),
+        F.col("LOCATION_DISPLAY").alias("name"),
+        F.when(F.col("ACTIVE_IND") & F.col("SOURCE_PRESENT_IND"), F.lit("active")).otherwise(F.lit("inactive")).alias("status"),
+        F.lit(None).cast("bigint").alias("organization_id"),
+        F.when(level == "nurse_unit", F.lit("wa")).when(level == "room", F.lit("ro")).when(level == "bed", F.lit("bd"))
+         .when(level == "facility", F.lit("si")).when(level == "building", F.lit("bu")).alias("physical_type_code"),
+        F.col("BEG_EFFECTIVE_DT_TM").alias("valid_from"),
+        F.col("END_EFFECTIVE_DT_TM").alias("valid_to"),
+        F.lit(None).cast("double").alias("latitude"), F.lit(None).cast("double").alias("longitude"),
+        F.lit(None).cast("string").alias("address_city"), F.lit(None).cast("string").alias("address_postcode_masked"),
+        F.lit(SRC_LOCATION_UNIT).alias("source_table"),
+        F.col("LOCATION_CD").cast("string").alias("source_row_id"),
+        F.date_format("ADC_UPDT", "yyyyMMddHHmmss").alias("load_batch_id"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+    )
+    return care.unionByName(lane)
 
 # COMMAND ----------
 
@@ -1136,13 +1207,13 @@ def _location_projection():
 LOCATION_COLUMN_COMMENTS = {
     "location_key": "Deterministic SHA-256 key across location levels.",
     "location_code": "Native Millennium location code; primary key together with location_level.",
-    "parent_location_key": "Deterministic SHA-256 key of the parent facility or building.",
-    "location_level": "Derived hierarchy level.",
+    "parent_location_key": "Deterministic SHA-256 key of the parent location: the facility or building for care-site rows; for map_location_unit rows the key of PARENT_LOCATION_CD (a bed's room, a room's nurse unit, a nurse unit's building, otherwise the Millennium location-group parent). Null when the parent is not published.",  # SDI_LOCATION_LANE_V1
+    "location_level": "Hierarchy level. map_care_site rows: facility, building or nurse_unit. map_location_unit rows: its LOCATION_LEVEL -- nurse_unit, room, bed, or the lower-cased Millennium location type (e.g. ancilsurg, rad, ambulatory, waitroom, facility, building); unclassified when the type is unknown.",  # SDI_LOCATION_LANE_V1
     "source_location_code": "Source Millennium location code.",
     "name": "Source location name.",
     "status": "Source-derived location status.",
     "organization_id": "Millennium ORGANIZATION_ID as BIGINT when available.",
-    "physical_type_code": "FHIR physical location type code.",
+    "physical_type_code": "FHIR physical location type code: si facility, bu building, wa nurse unit, ro room, bd bed; null for other Millennium location types.",  # SDI_LOCATION_LANE_V1
     "valid_from": "Source validity start.",
     "valid_to": "Source validity end.",
     "latitude": "Source address latitude.",
@@ -1151,7 +1222,7 @@ LOCATION_COLUMN_COMMENTS = {
     "address_postcode_masked": "Privacy-aware source postcode.",
     "source_table": "Fully qualified bronze source table.",
     "source_row_id": "Stable source row identifier.",
-    "loaded_at": "From map_care_site: maximum ADC_UPDT per facility_cd for facility rows, maximum ADC_UPDT per building_cd for building rows, and the individual source row's ADC_UPDT for nurse-unit rows. The hierarchy union adds no parent clock or cross-level aggregation; this is bronze ingestion provenance, not location validity time or Silver refresh time.",
+    "loaded_at": "From map_care_site: maximum ADC_UPDT per facility_cd for facility rows, maximum ADC_UPDT per building_cd for building rows, and the individual source row's ADC_UPDT for nurse-unit rows. The hierarchy union adds no parent clock or cross-level aggregation; this is bronze ingestion provenance, not location validity time or Silver refresh time. map_location_unit rows carry that row's ADC_UPDT.",  # SDI_LOCATION_LANE_V1
 }
 
 LOCATION_LIFECYCLE_FIELDS = [
@@ -1177,7 +1248,7 @@ def _lifecycle_source_location():
 
 @materialized_view(
     name=_n("journey_reference.location"),
-    comment="Effective-dated facility, building, and nurse-unit hierarchy derived from bronze care sites.",
+    comment="Effective-dated Millennium location hierarchy: facilities, buildings and nurse units from bronze care sites, and every other location code (rooms, beds, theatres, radiology, ambulatory) from bronze map_location_unit.",  # SDI_LOCATION_LANE_V1
     refresh_policy="incremental",
     column_comments=LOCATION_COLUMN_COMMENTS,
 )
@@ -1685,7 +1756,8 @@ def _event_index_projection(
     # contract v2: carry the v2 event key and derive each typed-fact row key from that same immutable key
     return df.select(
         "patient_event_key", "subject_key", "subject_id_system", "person_id", "identity_status",
-        "encounter_id", "event_datetime", "event_end_datetime",
+        "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
+        # TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
         F.lit(event_type).alias("event_type"),
         F.lit(fact_category).alias("fact_category"),
         sys_col.alias("source_system"), obj_col.alias("source_object"),
@@ -1737,6 +1809,8 @@ def _s3b_public_event_index_projection(df, event_type, fact_table, axis, source_
         optional("encounter_id", "string").alias("encounter_id"),
         optional("event_datetime", "timestamp").alias("event_datetime"),
         optional("event_end_datetime", "timestamp").alias("event_end_datetime"),
+        optional("event_datetime_local", "timestamp").alias("event_datetime_local"),
+        optional("event_end_datetime_local", "timestamp").alias("event_end_datetime_local"),
         F.lit(event_type).alias("event_type"), F.lit("clinical").alias("fact_category"),
         F.coalesce(source_system_col, F.lit("S3b Silver component")).alias("source_system"),
         F.coalesce(source_object_col, F.lit(source_object)).alias("source_object"),
@@ -2610,6 +2684,8 @@ PATIENT_EVENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Clinical or administrative event time.",
     "event_end_datetime": "Event end when the source supplies one.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "event_type": "Fact kind (condition",
     "fact_category": "Clinical versus administrative fact.",
     "fact_table": "Typed fact table holding the event's values.",
@@ -2678,6 +2754,8 @@ def _lifecycle_source_patient_event():
             F.col("e.encounter_id").alias("encounter_id"),
             F.col("e.event_datetime").alias("event_datetime"),
             F.col("e.event_end_datetime").alias("event_end_datetime"),
+            F.col("e.event_datetime_local").alias("event_datetime_local"),
+            F.col("e.event_end_datetime_local").alias("event_end_datetime_local"),
             F.col("e.event_type").alias("event_type"),
             F.col("e.fact_category").alias("fact_category"),
             F.col("e.fact_table").alias("fact_table"),
@@ -2777,6 +2855,8 @@ def _pharmacy_issue_canonical():
         F.lit(None).cast("string").alias("encounter_id"),
         s.ISSUE_DTTM.alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        s.ISSUE_DTTM.alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:jac:issue_type").alias("source_coding_system"),
         s.ISSUE_TYPE.alias("source_code"),
         s.ISSUE_CATEGORY.alias("source_display"),
@@ -3150,6 +3230,8 @@ def _numeric_excluded_canonical():
         F.when(s.ENCNTR_ID.isNotNull(), stable_id("encounter:mill", s.ENCNTR_ID)).alias("encounter_id"),
         F.coalesce(s.PERFORMED_DT_TM, s.EVENT_START_DT_TM).alias("event_datetime"),
         s.EVENT_END_DT_TM.alias("event_end_datetime"),
+        F.coalesce(s.PERFORMED_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:event_cd").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"),
         F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY).alias("source_display"),
@@ -3202,10 +3284,18 @@ ENCOUNTER_PUBLIC_COLUMNS = [
     'status_display',
     'period_start',
     'period_end',
+    'period_start_local',
+    'period_end_local',
     'arrival_method',
     'arrival_confidence',
     'departure_method',
     'departure_confidence',
+    'class_actcode',  # SDI_ENCOUNTER_STATE_V1
+    'class_actcode_display',  # SDI_ENCOUNTER_STATE_V1
+    'class_actcode_method',  # SDI_ENCOUNTER_STATE_V1
+    'departure_rejected_reason',  # SDI_ENCOUNTER_STATE_V1
+    'last_activity_datetime',  # SDI_ENCOUNTER_STATE_V1
+    'encounter_close_state',  # SDI_ENCOUNTER_STATE_V1
     'length_of_stay_minutes',
     'scheduled_start',
     'scheduled_end',
@@ -3253,7 +3343,7 @@ ENCOUNTER_COLUMN_COMMENTS = {
     "parent_encounter_id": "Governed containment parent when supplied by source evidence.",
     "parentage_status": "Provenance state for encounter containment.",
     "encounter_level": "Rules-light source-classified encounter level.",
-    "class_code": "Source encounter class code.",
+    "class_code": "Source (local Cerner) encounter class code; see class_actcode for the HL7 ActCode.",  # SDI_ENCOUNTER_STATE_V1
     "class_display": "Source encounter class display.",
     "type_code": "Source encounter type code.",
     "type_display": "Source encounter type display.",
@@ -3263,10 +3353,18 @@ ENCOUNTER_COLUMN_COMMENTS = {
     "status_display": "Native encounter status display.",
     "period_start": "Best observed encounter start.",
     "period_end": "Best observed encounter end.",
+    "period_start_local": "period_start in Europe/London wall-clock time (map_encounter.ARRIVAL_DT_TM_BEST_LOCAL). Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
+    "period_end_local": "period_end in Europe/London wall-clock time (map_encounter.DEPARTURE_DT_TM_BEST_LOCAL). Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
     "arrival_method": "Method selecting period_start.",
     "arrival_confidence": "Source-derived confidence for period_start.",
     "departure_method": "Method selecting period_end.",
     "departure_confidence": "Source-derived confidence for period_end.",
+    "class_actcode": "HL7 v3 ActCode for the encounter class (the vocabulary FHIR Encounter.class uses): IMP, AMB, EMER or PRENC. From encounter_level for spell/outpatient_attendance/emergency_visit/preadmission (the type class is the stronger signal); from the source class display for recurring_contact and other; NULL for results_only, waiting_list_placeholder and unmapped classes (Wait List has no ActCode). Local codes are never relabelled; class_code stays the Cerner code.",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_display": "HL7 ActCode display for class_actcode.",  # SDI_ENCOUNTER_STATE_V1
+    "class_actcode_method": "How class_actcode was assigned: encounter_level_crosswalk, source_class_crosswalk or no_class (class_actcode NULL). Never NULL.",  # SDI_ENCOUNTER_STATE_V1
+    "departure_rejected_reason": "Why bronze refused the winning departure candidate, leaving period_end NULL: BEFORE_ARRIVAL (it preceded the arrival), ADMINISTRATIVE_CLOSE (a nightly inactivity-timeout close) or FIXED_WINDOW_CLOSE (the 60-day outpatient close job). NULL when no candidate was refused. map_encounter.DEPARTURE_REJECTED_REASON.",  # SDI_ENCOUNTER_STATE_V1
+    "last_activity_datetime": "Latest recorded activity on the encounter (UTC instant): greatest of the last current clinical event, last active order and last nurse-unit arrival. NULL when none exists. Use it to judge whether an encounter with no departure is still live.",  # SDI_ENCOUNTER_STATE_V1
+    "encounter_close_state": "Whether the encounter is known to be closed, in precedence order: departed (period_end is set); source_closed_no_observed_departure (an administrative or fixed-window job closed it, departure time unknown); departure_evidence_invalid (a departure stamp precedes arrival, closure unknown); open_ward_interval (the latest nurse-unit interval has no end); no_departure_recorded (no departure evidence; open or abandoned, judge with last_activity_datetime). Never NULL; no reference to the current date.",  # SDI_ENCOUNTER_STATE_V1
     "length_of_stay_minutes": "Source-productised encounter duration.",
     "scheduled_start": "Scheduled arrival timestamp.",
     "scheduled_end": "Scheduled departure timestamp.",
@@ -3284,7 +3382,7 @@ ENCOUNTER_COLUMN_COMMENTS = {
     "responsible_service_display": "Best available label for MED_SERVICE_CD.",
     "specialty_code": "Source specialty-unit code.",
     "specialty_display": "Source specialty-unit display.",
-    "current_location_key": "Source current nurse-unit code.",
+    "current_location_key": "Deterministic key of the encounter's current nurse unit (joins reference_location.location_key); null when map_encounter.LOC_NURSE_UNIT_CD is null or 0 (no unit recorded).",  # SDI_LOCATION_ZERO_V1
     "organization_id": "Source encounter organization reference.",
     "service_provider_organization_key": "Source organization primarily responsible for the encounter.",
     "reason_for_visit": "Verbatim source reason for visit.",
@@ -3352,6 +3450,13 @@ def _location_stay_canonical():
             F.max("HISTORY_EVENT_SEQUENCE").alias("last_history_event_sequence"),
             F.min("LOCATION_STOP_START_DT_TM").alias("stay_start"),
             F.max("LOCATION_STOP_END_DT_TM").alias("stay_end"),
+            # VDB_SILVER_OCCUPANCY_V1: map_patient_journey occupancy bounds are stop-level, so min/max return the stop value.
+            F.min("LOCATION_OCCUPANCY_START_DT_TM").alias("occupancy_start"),
+            F.max("LOCATION_OCCUPANCY_END_DT_TM").alias("occupancy_end"),
+            F.max("LOCATION_OCCUPANCY_START_BASIS").alias("occupancy_start_basis"),
+            F.max("LOCATION_OCCUPANCY_END_BASIS").alias("occupancy_end_basis"),
+            F.min("LOCATION_OCCUPANCY_START_DT_TM_LOCAL").alias("occupancy_start_local"),
+            F.max("LOCATION_OCCUPANCY_END_DT_TM_LOCAL").alias("occupancy_end_local"),
             F.max("LOC_NURSE_UNIT_CD").alias("nurse_unit_cd"),
             F.max("NURSE_UNIT_DESC").alias("nurse_unit_display"),
             F.max("LOC_BUILDING_CD").alias("building_cd"),
@@ -3383,10 +3488,6 @@ def _location_stay_canonical():
         SRC_LOCATION_HISTORY,
         source_row_id,
     )
-    ended = F.coalesce(
-        F.col("stay_end") < F.lit("2100-01-01").cast("timestamp"),
-        F.lit(False),
-    )
     # contract v2: publish native encounter/person/location values while retaining only the modelled stop hash as a key
     projected = grouped.select(
         stable_id("location_stay:mill", F.col("ENCNTR_ID"), F.col("_stop_discriminator"))
@@ -3395,17 +3496,25 @@ def _location_stay_canonical():
         skey.alias("subject_key"),
         ssys.alias("subject_id_system"),
         F.col("PERSON_ID").cast("bigint").alias("person_id"),
-        F.when(F.col("nurse_unit_cd").isNotNull(),
+        # SDI_LOCATION_ZERO_V1: code 0 is Millennium's "no location" (12.8M stops carry nurse unit 0); it must fall
+        # through to the building or facility instead of hashing a key that can never resolve.
+        F.when(F.col("nurse_unit_cd") > 0,
                stable_id("location:mill:nurse_unit", F.col("nurse_unit_cd")))
-         .when(F.col("building_cd").isNotNull(),
+         .when(F.col("building_cd") > 0,
                stable_id("location:mill:building", F.col("building_cd")))
-         .when(F.col("facility_cd").isNotNull(),
+         .when(F.col("facility_cd") > 0,
                stable_id("location:mill:facility", F.col("facility_cd")))
          .alias("_candidate_location_key"),
-        F.coalesce(F.col("nurse_unit_cd"), F.col("building_cd"), F.col("facility_cd"))
+        F.coalesce(*[F.when(F.col(c) > 0, F.col(c)) for c in ("nurse_unit_cd", "building_cd", "facility_cd")])
          .cast("string").alias("_candidate_location_code"),
         F.col("stay_start").alias("period_start"),
         F.col("stay_end").alias("period_end"),
+        F.col("occupancy_start"),
+        F.col("occupancy_end"),
+        F.col("occupancy_start_basis"),
+        F.col("occupancy_end_basis"),
+        F.col("occupancy_start_local"),
+        F.col("occupancy_end_local"),
         F.col("nurse_unit_cd").cast("string").alias("nurse_unit_code"),
         F.col("nurse_unit_display"),
         F.col("building_cd").cast("string").alias("building_code"),
@@ -3425,8 +3534,10 @@ def _location_stay_canonical():
         F.col("last_history_event_sequence").cast("int").alias("last_history_event_sequence"),
         F.col("confidentiality_code").cast("string").alias("confidentiality_code"),
         (F.coalesce(F.col("vip_code"), F.lit(0)) != 0).alias("vip_ind"),
-        F.when(ended, F.lit("superseded")).otherwise(F.lit("active")).alias("record_status"),
-        F.when(ended, F.col("stay_end")).alias("record_status_effective_to"),
+        # SDI_STAY_STATUS_V1: map_patient_journey has no lifecycle flag that retracts or supersedes a stop; an ended
+        # stop is still the current record of that stop (its end is period_end), so it is not "superseded".
+        F.lit("active").alias("record_status"),
+        F.lit(None).cast("timestamp").alias("record_status_effective_to"),
         F.lit(SRC_LOCATION_HISTORY).alias("source_table"),
         source_row_id.alias("source_row_id"),
         F.date_format("loaded_at", "yyyyMMddHHmmss").alias("load_batch_id"),
@@ -3456,6 +3567,12 @@ LOCATION_STAY_COLUMN_COMMENTS = {
     "location_code": "Native Millennium location code resolved against reference_location.",
     "period_start": "Earliest `LOCATION_STOP_START_DT_TM` across the source history rows grouped into this encounter location stop.",
     "period_end": "Latest `LOCATION_STOP_END_DT_TM` across the source history rows grouped into this encounter location stop; the grouped source timestamp is retained without sentinel removal.",
+    "occupancy_start": "Earliest `LOCATION_OCCUPANCY_START_DT_TM` across the stop's source history rows: when the patient was physically at the location. Null when the stop has no attendance evidence or ended before the encounter arrival; see occupancy_start_basis. Outpatient/day-case period_start is a booking transaction, so use this for time at the location.",
+    "occupancy_end": "Latest `LOCATION_OCCUPANCY_END_DT_TM` across the stop's source history rows: period_end without the encounter's administrative or fixed-window close. Null when the stop is open, its end was that close, or the end precedes occupancy_start; see occupancy_end_basis.",
+    "occupancy_start_basis": "`LOCATION_OCCUPANCY_START_BASIS` for the stop: LOC_ARRIVE, ENCOUNTER_ARRIVAL_BEST, STOP_START, or (occupancy_start null) NO_ATTENDANCE_EVIDENCE / PRE_ATTENDANCE.",
+    "occupancy_end_basis": "`LOCATION_OCCUPANCY_END_BASIS` for the stop: NEXT_STOP_START, LOC_DEPART, FINITE_EFFECTIVE_END, or (occupancy_end null) REJECTED_ENCOUNTER_CLOSE / END_BEFORE_OCCUPANCY_START / NO_STOP_END.",
+    "occupancy_start_local": "occupancy_start in Europe/London wall-clock time (`LOCATION_OCCUPANCY_START_DT_TM_LOCAL`). Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
+    "occupancy_end_local": "occupancy_end in Europe/London wall-clock time (`LOCATION_OCCUPANCY_END_DT_TM_LOCAL`). Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
     "nurse_unit_code": "Historical nurse-unit code.",
     "nurse_unit_display": "Historical nurse-unit display.",
     "building_code": "Historical building code.",
@@ -3477,8 +3594,8 @@ LOCATION_STAY_COLUMN_COMMENTS = {
     "vip_ind": "Source VIP indicator.",
     "source_table": "Fully qualified bronze source table.",
     "source_row_id": "Deterministic grouped source-row identity.",
-    "record_status": "Derived location-stop status: superseded when the grouped maximum map_patient_journey.LOCATION_STOP_END_DT_TM is earlier than 2100-01-01; otherwise active, including an all-null or open-ended maximum. Grouping is by ENCNTR_ID and the stop discriminator. This is a status label, not an end timestamp or a comparison with the current wall clock.",
-    "record_status_effective_to": "Maximum map_patient_journey.LOCATION_STOP_END_DT_TM within the encounter/stop-discriminator group, returned only when that maximum is earlier than 2100-01-01. Otherwise null, including all-null or open-ended maxima. This uses the grouped stop end, not the earliest contributing boundary.",
+    "record_status": "Literal active: map_patient_journey carries no lifecycle flag that retracts or supersedes a location stop, so every published stop is the current record of that stop. Whether the patient has left is period_end / occupancy_end, not this status.",  # SDI_STAY_STATUS_V1
+    "record_status_effective_to": "Always null: a location stop has no record-lifecycle end. The stop's own end is period_end.",  # SDI_STAY_STATUS_V1
     "loaded_at": "Maximum map_patient_journey.ADC_UPDT within the ENCNTR_ID and stop-discriminator group. The discriminator uses LOCATION_STOP_SEQUENCE when present, otherwise ENCNTR_LOC_HIST_ID. This is contributing ingestion provenance, not the Silver refresh time; null when all contributing ADC_UPDT values are null.",
 }
 
@@ -3558,23 +3675,99 @@ def _care_participation_projection(df, practitioner_col, role, start_col):
           )
     )
 
+# OGR_PARTICIPATION_V1: ENCNTR_PRSNL_RELTN care roles and registered GP (PERSON_PRSNL_RELTN 1115).
+ENCOUNTER_ROLE_BY_CODE = {
+    1119: "attending", 1116: "admitting", 1121: "consulting", 1126: "referring",
+    673962: "locum_attending", 673961: "locum_admitting", 435702461: "mental_health_attending",
+}
+
+
+def _role_from_code(code_col):
+    expr = F.lit(None).cast("string")
+    for code, role in sorted(ENCOUNTER_ROLE_BY_CODE.items(), reverse=True):
+        expr = F.when(code_col == code, F.lit(role)).otherwise(expr)
+    return expr
+
+
+def _relationship_rows(df, id_col):
+    present = F.coalesce(F.col("SOURCE_PRESENT_IND").cast("boolean"), F.lit(True))
+    return df.where((F.col("ACTIVE_IND") == 1) & present
+                    & F.col("PRSNL_PERSON_ID").isNotNull() & (F.col("PRSNL_PERSON_ID") != 0)
+                    & F.col(id_col).isNotNull())
+
+
+def _encounter_practitioner_participation():
+    # Encounter-scoped relationship roles; subject/person follow the canonical encounter row.
+    r = _relationship_rows(read_source(SRC_ENCOUNTER_PRACTITIONER), "ENCNTR_PRSNL_RELTN_ID").drop("PERSON_ID")
+    e = _encounter_canonical().select(
+        F.col("encounter_id").cast("bigint").alias("_cp_encounter_id"),
+        "subject_key", "subject_id_system", "person_id",
+    )
+    role = _role_from_code(F.col("ENCNTR_PRSNL_R_CD").cast("bigint"))
+    return (
+        r.join(e, F.col("ENCNTR_ID").cast("bigint") == F.col("_cp_encounter_id"), "inner")
+        .where(role.isNotNull())
+        .select(
+            stable_id("care_participation:mill_eprl", F.col("ENCNTR_PRSNL_RELTN_ID")).alias("care_participation_key"),
+            "subject_key", "subject_id_system", "person_id",
+            F.col("_cp_encounter_id").alias("encounter_id"),
+            F.lit(None).cast("string").alias("journey_key"),
+            F.lit(None).cast("string").alias("service_id"),
+            F.col("PRSNL_PERSON_ID").cast("bigint").alias("practitioner_id"),
+            role.alias("role"),
+            F.col("BEG_EFFECTIVE_DT_TM").cast("timestamp").alias("valid_from"),
+            F.col("END_EFFECTIVE_DT_TM").cast("timestamp").alias("valid_to"),
+            F.lit("encounter_prsnl_reltn").alias("construction_rule"),
+            F.lit("0.5.0").alias("construction_version"),
+            F.lit(SRC_ENCOUNTER_PRACTITIONER).alias("source_table"),
+            F.col("ENCNTR_PRSNL_RELTN_ID").cast("string").alias("source_row_id"),
+            F.date_format(F.col("ADC_UPDT"), "yyyyMMddHHmmss").alias("load_batch_id"),
+            F.col("ADC_UPDT").alias("loaded_at"),
+        )
+    )
+
+
+def _registered_gp_participation():
+    # Person-scoped registered GP; encounter_id is NULL by design.
+    g = _relationship_rows(read_source(SRC_PERSON_GP), "PERSON_PRSNL_RELTN_ID")
+    source_row_id = F.col("PERSON_PRSNL_RELTN_ID").cast("string")
+    skey, ssys = subject_key_with_system([("urn:cerner:person_id", F.col("PERSON_ID"))], SRC_PERSON_GP, source_row_id)
+    return g.select(
+        stable_id("care_participation:mill_gp", F.col("PERSON_PRSNL_RELTN_ID")).alias("care_participation_key"),
+        skey.alias("subject_key"), ssys.alias("subject_id_system"),
+        F.col("PERSON_ID").cast("bigint").alias("person_id"),
+        F.lit(None).cast("bigint").alias("encounter_id"),
+        F.lit(None).cast("string").alias("journey_key"),
+        F.lit(None).cast("string").alias("service_id"),
+        F.col("PRSNL_PERSON_ID").cast("bigint").alias("practitioner_id"),
+        F.lit("registered_gp").alias("role"),
+        F.col("BEG_EFFECTIVE_DT_TM").cast("timestamp").alias("valid_from"),
+        F.col("END_EFFECTIVE_DT_TM").cast("timestamp").alias("valid_to"),
+        F.lit("person_prsnl_reltn").alias("construction_rule"),
+        F.lit("0.5.0").alias("construction_version"),
+        F.lit(SRC_PERSON_GP).alias("source_table"),
+        source_row_id.alias("source_row_id"),
+        F.date_format(F.col("ADC_UPDT"), "yyyyMMddHHmmss").alias("load_batch_id"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+    )
+
 CARE_PARTICIPATION_COLUMN_COMMENTS = {
     "care_participation_key": "Deterministic SHA-256 participation key.",
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT; NULL for person-scoped registered_gp rows.",  # OGR_PARTICIPATION_V1
     "journey_key": "Deterministic journey key when available.",
     "service_id": "Service-registration context when available.",
     "practitioner_id": "Millennium personnel PERSON_ID as BIGINT.",
-    "role": "Source-field-derived participation role.",
-    "valid_from": "Participation validity start.",
-    "valid_to": "Participation validity end.",
+    "role": "Participation role: registrar, recorder, discharger (encounter source fields); attending, admitting, consulting, referring, locum_attending, locum_admitting, mental_health_attending (ENCNTR_PRSNL_RELTN, code set 333); registered_gp (PERSON_PRSNL_RELTN code 1115, person-scoped).",  # OGR_PARTICIPATION_V1
+    "valid_from": "Participation validity start: role start for source-field rows; BEG_EFFECTIVE_DT_TM (Millennium UTC) for relationship rows.",  # OGR_PARTICIPATION_V1
+    "valid_to": "Participation validity end: NULL for source-field rows; END_EFFECTIVE_DT_TM (Millennium UTC; 2100-12-31 means open) for relationship rows.",  # OGR_PARTICIPATION_V1
     "construction_rule": "Governed derivation rule.",
     "construction_version": "Governed derivation-rule version.",
     "source_table": "Fully qualified bronze source table.",
-    "source_row_id": "Source encounter row identity.",
-    "loaded_at": "map_encounter.ADC_UPDT inherited unchanged through the canonical encounter row for each registrar, recorder or discharger participation. This is encounter ingestion provenance, not a practitioner update, role-validity timestamp or Silver refresh time; a missing source timestamp remains null.",
+    "source_row_id": "Source row identity: encounter id for source-field rows; ENCNTR_PRSNL_RELTN_ID or PERSON_PRSNL_RELTN_ID for relationship rows.",  # OGR_PARTICIPATION_V1
+    "loaded_at": "Bronze ADC_UPDT of the contributing row: map_encounter for registrar, recorder and discharger; map_encounter_practitioner or map_person_gp for relationship rows. Ingestion provenance, not a role-validity timestamp or Silver refresh time; a missing source timestamp remains null.",  # OGR_PARTICIPATION_V1
 }
 
 CARE_PARTICIPATION_LIFECYCLE_FIELDS = [
@@ -3603,11 +3796,13 @@ def _lifecycle_source_care_participation():
         .unionByName(
             _care_participation_projection(e, "_discharge_practitioner_id", "discharger", "_discharge_role_start")
         )
+        .unionByName(_encounter_practitioner_participation())  # OGR_PARTICIPATION_V1
+        .unionByName(_registered_gp_participation())
     )
 
 @materialized_view(
     name=_n("journey_spine.care_participation"),
-    comment="Encounter-scoped practitioner participation from registration, creation, and discharge source fields.",
+    comment="Practitioner participation: encounter source fields, ENCNTR_PRSNL_RELTN care roles and the registered GP (person-scoped).",  # OGR_PARTICIPATION_V1
     refresh_policy="incremental",
     column_comments=CARE_PARTICIPATION_COLUMN_COMMENTS,
 )
@@ -4388,6 +4583,8 @@ def _research_enrollment_canonical():
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         s.ON_STUDY_DT_TM_CLEAN.alias("event_datetime"),
         s.OFF_STUDY_DT_TM_CLEAN.alias("event_end_datetime"),
+        s.ON_STUDY_DT_TM_CLEAN_LOCAL.alias("event_datetime_local"),
+        s.OFF_STUDY_DT_TM_CLEAN_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:research-status").alias("source_coding_system"),
         s.STATUS_ENUM.cast("long").cast("string").alias("source_code"),
         s.STATUS_DESC.alias("source_display"),
@@ -4440,6 +4637,8 @@ RESEARCH_ENROLLMENT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -4481,6 +4680,8 @@ RESEARCH_ENROLLMENT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -4527,6 +4728,8 @@ RESEARCH_ENROLLMENT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each research enrollment record. It is derived from bronze field `ON_STUDY_DT_TM_CLEAN` in `4_prod.bronze.map_research_subject`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each research enrollment record. It is derived from bronze field `OFF_STUDY_DT_TM_CLEAN` in `4_prod.bronze.map_research_subject`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each research enrollment record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Number to indicate the current status of the enrolled patient(1: On Study,2:OnTreatment, 3:Off Treatment,4-OnFollowup,5-OffStudy)",
     "source_display": "Human-readable label supplied by the source system for the source code for each research enrollment record. It is derived from bronze field `STATUS_DESC` in `4_prod.bronze.map_research_subject`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -5058,6 +5261,22 @@ DEVICE_MAPPING_COLUMN_COMMENTS = {
     "normalization_version": "Description normalization version.",
     "brand_rules_version": "Boundary-aware phrase-rule version.",
     "mapped_at": "Timestamp when this event was last evaluated.",
+    # PMS_DEVICE_IDENTITY_V1
+    "gmdn_implantable": "GMDN reference implantable flag for the mapped GMDN term, carried from bronze; null when the term has no reference row.",
+    "gmdn_definition": "GMDN reference definition text for the mapped GMDN term.",
+    "gmdn_code_status": "GMDN reference status (active/obsolete) of the mapped term.",
+    "gmdn_mapping_provenance": "How the GMDN term was reached (method and source), carried from bronze.",
+    "gmdn_reference_present_ind": "True when the mapped GMDN code exists in the loaded GMDN reference.",
+    "gudid_primary_di": "FDA GUDID primary device identifier matched for this implant; null when no GUDID match.",
+    "gudid_brand_name": "GUDID brand name for the matched device identifier.",
+    "gudid_model_number": "GUDID version or model number for the matched device identifier.",
+    "gudid_company_name": "GUDID labeler (company) name for the matched device identifier.",
+    "gudid_catalogue_number": "GUDID catalogue number for the matched device identifier.",
+    "gudid_device_status": "GUDID device record status for the matched identifier.",
+    "gudid_distribution_status": "GUDID commercial distribution status for the matched identifier.",
+    "source_catalogue_number": "Catalogue number recorded in SurgiNet for this implant, as entered.",
+    "source_manufacturer": "Manufacturer recorded in SurgiNet for this implant, as entered.",
+    "mapped_device_name": "Device name chosen by the mapping (GUDID or GMDN side) for display.",
     "_source_system": "Value describing source system for the device mapping record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "_source_table": "Value describing source table for the device mapping record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "_source_row_id": "Source implant description event identifier.",
@@ -5108,6 +5327,22 @@ def _lifecycle_source_device_mapping():
         s.MAPPING_SCHEMA_VERSION.alias("mapping_schema_version"),
         s.NORMALIZATION_VERSION.alias("normalization_version"),
         s.BRAND_RULES_VERSION.alias("brand_rules_version"), s.MAPPED_AT.alias("mapped_at"),
+        # PMS_DEVICE_IDENTITY_V1: device identity columns already computed in bronze.
+        s.GMDN_IMPLANTABLE.alias("gmdn_implantable"),
+        s.GMDN_DEFINITION.alias("gmdn_definition"),
+        s.GMDN_CODE_STATUS.alias("gmdn_code_status"),
+        s.GMDN_MAPPING_PROVENANCE.alias("gmdn_mapping_provenance"),
+        s.GMDN_REFERENCE_PRESENT_IND.alias("gmdn_reference_present_ind"),
+        s.GUDID_PRIMARY_DI.alias("gudid_primary_di"),
+        s.GUDID_BRAND_NAME.alias("gudid_brand_name"),
+        s.GUDID_MODEL_NUMBER.alias("gudid_model_number"),
+        s.GUDID_COMPANY_NAME.alias("gudid_company_name"),
+        s.GUDID_CATALOGUE_NUMBER.alias("gudid_catalogue_number"),
+        s.GUDID_DEVICE_STATUS.alias("gudid_device_status"),
+        s.GUDID_DISTRIBUTION_STATUS.alias("gudid_distribution_status"),
+        s.SOURCE_CATALOGUE_NUMBER.alias("source_catalogue_number"),
+        s.SOURCE_MANUFACTURER.alias("source_manufacturer"),
+        s.MAPPED_DEVICE_NAME.alias("mapped_device_name"),
         s.PIPELINE_LOADED_AT.alias("loaded_at"), F.lit("millennium").alias("_source_system"),
         F.lit(SRC_DEVICE_MAPPING).alias("_source_table"),
         s.EVENT_ID.cast("string").alias("_source_row_id"),
@@ -5589,3 +5824,55 @@ def person_attribute():
     # Build the declared dataset: Allowlisted person attributes; NO_FIXED_ABODE and
     # CHILD_IN_PUBLIC_CARE are IG-sensitive.
     return _lifecycle_source_person_attribute().drop(*PERSON_ATTRIBUTE_LIFECYCLE_FIELDS, *PERSON_ATTRIBUTE_RETIRED_COLUMNS)
+
+# COMMAND ----------
+
+# ==== journey_reference.person_gp_registration ==== PMS_P1_T5_SILVER_V1
+SRC_GP_REGISTRATION = "4_prod.bronze.map_person_gp_registration"
+
+def gp_registration_body(s):
+    """Shared body: bronze map_person_gp_registration -> silver reference_person_gp_registration."""
+    return s.select(
+        F.col("PERSON_ID").cast("bigint").alias("person_id"),
+        F.col("PERSON_ORG_RELTN_ID").cast("bigint").alias("person_org_reltn_id"),
+        F.col("ORGANIZATION_ID").cast("bigint").alias("organization_id"),
+        F.col("PRACTICE_ODS_CODE").alias("practice_ods_code"),
+        F.col("PRACTICE_NAME").alias("practice_name"),
+        F.col("BEG_EFFECTIVE_DT_TM").alias("registration_start"),
+        F.col("END_EFFECTIVE_DT_TM").alias("registration_end"),
+        (F.col("ACTIVE_IND") == 1).alias("active_ind"),
+        F.col("CURRENT_IND").alias("current_ind"),
+        (F.col("FREE_TEXT_IND") == 1).alias("free_text_ind"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+        F.lit("millennium").alias("_source_system"),
+        F.lit("bronze.map_person_gp_registration").alias("_source_table"),
+        F.col("PERSON_ORG_RELTN_ID").cast("string").alias("_source_row_id"),
+    )
+
+GP_COMMENTS = {
+    "person_gp_registration_key": "Deterministic key for the Millennium registered-practice relationship row.",
+    "person_id": "Native Millennium PERSON_ID as BIGINT.",
+    "person_org_reltn_id": "Millennium PERSON_ORG_RELTN_ID; one registration row.",
+    "organization_id": "Millennium ORGANIZATION_ID of the registered practice; null when free-text only.",
+    "practice_ods_code": "NHS ODS code of the practice (ORGANIZATION_ALIAS pool 6031508); null when the organisation carries none.",
+    "practice_name": "Practice name from ORGANIZATION, else the free-text name on the relationship.",
+    "registration_start": "Start of the registration (BEG_EFFECTIVE_DT_TM, UTC).",
+    "registration_end": "End of the registration; null while open (2100 sentinel removed in bronze).",
+    "active_ind": "Source ACTIVE_IND = 1.",
+    "current_ind": "True on the latest-starting active, open registration per person as of the bronze build.",
+    "free_text_ind": "Practice was recorded as free text, not a coded organisation.",
+    "loaded_at": "map_person_gp_registration.ADC_UPDT carried unchanged.",
+    "_source_system": "Always millennium.", "_source_table": "Bronze source table.", "_source_row_id": "PERSON_ORG_RELTN_ID as string.",
+}
+
+@materialized_view(
+    name=_n("journey_reference.person_gp_registration"),
+    comment="Registered GP practice history per person (Millennium Registered Practice relationship); practice code/name are quasi-identifiers.",
+    cluster_by=["person_id"], refresh_policy="incremental",
+    column_comments=GP_COMMENTS,
+)
+def person_gp_registration():
+    # Build the declared dataset: registered GP practice history per person.
+    return gp_registration_body(read_source(SRC_GP_REGISTRATION)).withColumn(
+        "person_gp_registration_key", stable_id("person_gp_registration:mill", F.col("person_org_reltn_id")))
+

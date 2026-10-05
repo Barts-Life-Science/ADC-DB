@@ -422,6 +422,13 @@ try:
                 F.xxhash64(F.to_json(F.struct(*[F.col(column) for column in hash_columns]))),
             )
             .withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
+            # TZ_LOCAL_V1/ordercomment-recovery: the recovery MERGE (UPDATE SET *) needs every target column, companions included.
+            .withColumns({
+                "COMMENT_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("COMMENT_DT_TM_CLEAN"), "Europe/London"),
+                "COMMENT_UPDT_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("COMMENT_UPDT_DT_TM_CLEAN"), "Europe/London"),
+                "COMMENT_DT_TM_LOCAL": F.from_utc_timestamp(F.col("COMMENT_DT_TM"), "Europe/London"),
+                "COMMENT_UPDT_DT_TM_LOCAL": F.from_utc_timestamp(F.col("COMMENT_UPDT_DT_TM"), "Europe/London"),
+            })
         )
         target_columns = spark.table(TARGET).columns
         assert set(out.columns) == set(target_columns), {
@@ -535,4 +542,3 @@ except Exception as exc:
 payload = json.dumps(result, sort_keys=True, default=str)
 print(json.dumps(result, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(payload)
-

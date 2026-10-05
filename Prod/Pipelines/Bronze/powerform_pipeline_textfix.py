@@ -2908,6 +2908,8 @@ def prepare_item_rows(
 
 def merge_item_rows(rows: DataFrame) -> dict:
     assert_unique_non_null(rows, ["DOC_RESPONSE_KEY"], "item merge batch")
+    # TZ_LOCAL_V1/pfitem: Europe/London companions on every item write (new, changed and tombstoned rows).
+    rows = bronze_add_time_companions(rows, TGT_ITEM)
     assignments = {name: f"s.{qident(name)}" for name in rows.columns}
     (
         DeltaTable.forName(spark, TGT_ITEM)
@@ -4949,7 +4951,6 @@ except Exception as exc:
 
 print(bronze_json(FINAL_RESULT))
 dbutils.notebook.exit(bronze_json(FINAL_RESULT))
-
 
 
 

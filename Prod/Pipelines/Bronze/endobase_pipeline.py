@@ -891,7 +891,7 @@ _patient_comment_changes = apply_comments(
 # MAGIC %md
 # MAGIC ## Curated term-map scaffold and candidate queue
 # MAGIC
-# MAGIC The key is `(DGVS_TERM_ID, NORMALIZED_TEXT)`, because `TERM_P` alone is not a stable value key. Pipeline refreshes preserve all human curation fields. Only human-approved mappings that remain valid standard OMOP concepts are applied. Exact-name suggestions remain `PROPOSED`; fuzzy or embedding matches must never auto-approve. Curators must treat negated/situational phrases safely and leave them unmapped unless the mapped concept preserves that meaning.
+# MAGIC The key is `(DGVS_TERM_ID, NORMALIZED_TEXT)`, because `TERM_P` alone is not a stable value key. Pipeline refreshes preserve all human curation fields. Only `APPROVED` mappings that remain valid standard OMOP concepts are applied. Embedding matches are published best-effort with provenance in `CURATED_NOTES` (method, model, cosine, tier); below the 0.62 floor (`endobase_floor_v1`) or on a reproductive/obstetric concept (`endobase_anatomy_guard_v1`) they are `REJECTED` with `reject_rule_id` in `CURATED_NOTES` (DQ4_B3_ENDOBASE_REJECT_V1). Curators must treat negated/situational phrases safely and leave them unmapped unless the mapped concept preserves that meaning.
 
 # COMMAND ----------
 
@@ -1184,7 +1184,7 @@ assert not _invalid_approved, (
 # MAGIC %md
 # MAGIC ## Exam-term publication
 # MAGIC
-# MAGIC **Do not join `EXAM_P` to the patient table.** `ENDOBASE_EXAM_ID` is an opaque foreign key to the un-landed `EXAM_TBL`. The only inputs to this builder are the term snapshot and the approved term map; person linkage remains explicitly gated.
+# MAGIC **Do not join `EXAM_P` to the patient table.** `ENDOBASE_EXAM_ID` is an opaque foreign key to the un-landed `EXAM_TBL`. The only inputs to this builder are the term snapshot and the `APPROVED` term-map rows; `REJECTED` rows (floor/anatomy guard) publish no concept. Person linkage is the patient builder's, never this join.
 
 # COMMAND ----------
 

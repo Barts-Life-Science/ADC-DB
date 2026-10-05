@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from pathology_antibiogram import ANTIBIOGRAM_PARSER_VERSION, parse_antibiogram_json
 from pathology_contracts import contract
-from pathology_pipeline import PipelineConfig, ensure_contracts, merge_contract
+from pathology_pipeline import (
+    PipelineConfig,
+    ensure_contracts,
+    join_specimen_map,
+    merge_contract,
+    normalize_specimen_code,
+    raw_specimen_system,
+    specimen_split_keys,
+)
 
 
 def _imports():
@@ -102,6 +110,18 @@ def build_amr_frames(spark, config: PipelineConfig, *, include_proposed_rules: b
             F.col("b.iso.isolate_ordinal").alias("isolate_ordinal"), F.col("b.iso.isolate_comment").alias("isolate_comment"),
             F.col("b.LIMSNo").alias("lims_no"), F.col("b.iso.parse_status").alias("parse_status"),
             F.lit(ANTIBIOGRAM_PARSER_VERSION).alias("parser_version")))
+
+    # STM_SPECIMEN_TYPE_V1/amr: the result-row code (the source value), keyed like the accession: LIMS namespace, plus :INF
+    # only where the map carries that WkgCode split.
+    isolates = raw_specimen_system(
+        isolates.withColumn("specimen_type_code", normalize_specimen_code(F.col("specimen_type_code")))
+        .withColumn("_wkg", F.lit("INF")),
+        specimen_split_keys(spark, config),
+        "lims_no",
+        "_wkg",
+        "specimen_type_code",
+    ).drop("_wkg")
+    isolates = join_specimen_map(isolates, spark, config)
 
     agents = _dictionary(spark, config, "pathology_antimicrobial_map", "_agent_code")
     tokens = isolates_raw.select(

@@ -282,47 +282,65 @@ def build_diagnosis_context(spark, config: PipelineConfig):
         F.col("OMOP_CONCEPT_ID").cast("long").alias("omop_concept_id"),
         F.col("confirmation_status_desc").alias("confirmation_status"),
     )
-    joined = accessions.alias("a").join(
+    # INDICATIONS_KEYED_CONTEXT_V1: the OR join left person_id as the only equi-key, so every accession met every
+    # diagnosis of the same person before the encounter/window test (2026-10-04: 30.25B candidate pairs, 56.9M for
+    # one person; the full rebuild's indications lane spilled for hours). Two keyed joins give the same pairs: one on
+    # (person, encounter), one on (person, week) with each accession spread over the weeks its -30/+7 day window
+    # touches and the exact window applied after. A pair found by both is ranked once below, as before.
+    by_encounter = accessions.alias("a").join(
         diagnosis.alias("d"),
         (F.col("a.person_id") == F.col("d.diag_person_id"))
-        & (
-            (F.col("a.encounter_id").isNotNull() & (F.col("a.encounter_id") == F.col("d.diag_encounter_id")))
-            | (
-                F.col("a.accession_dt").isNotNull()
-                & F.col("d.diagnosis_dt").between(
-                    F.col("a.accession_dt") - F.expr("INTERVAL 30 DAYS"),
-                    F.col("a.accession_dt") + F.expr("INTERVAL 7 DAYS"),
-                )
-            )
-        ),
+        & F.col("a.encounter_id").isNotNull()
+        & (F.col("a.encounter_id") == F.col("d.diag_encounter_id")),
         "inner",
     )
+    day = lambda c: F.datediff(F.to_date(c), F.lit("1970-01-01"))
+    windowed = accessions.filter(F.col("accession_dt").isNotNull()).withColumn(
+        "_week", F.explode(F.sequence(F.floor((day("accession_dt") - 30) / 7), F.floor((day("accession_dt") + 7) / 7)))
+    )
+    dated = diagnosis.filter(F.col("diagnosis_dt").isNotNull()).withColumn("_week", F.floor(day("diagnosis_dt") / 7))
+    by_window = (
+        windowed.alias("a").join(
+            dated.alias("d"),
+            (F.col("a.person_id") == F.col("d.diag_person_id")) & (F.col("a._week") == F.col("d._week")),
+            "inner",
+        )
+        .filter(
+            F.col("d.diagnosis_dt").between(
+                F.col("a.accession_dt") - F.expr("INTERVAL 30 DAYS"),
+                F.col("a.accession_dt") + F.expr("INTERVAL 7 DAYS"),
+            )
+        )
+        .select("a.*", "d.*")
+        .drop("_week")
+    )
+    joined = by_encounter.unionByName(by_window)
     ranked = joined.withColumn(
         "_context_priority",
-        F.when(F.col("a.encounter_id") == F.col("d.diag_encounter_id"), 0).otherwise(1),
+        F.when(F.col("encounter_id") == F.col("diag_encounter_id"), 0).otherwise(1),
     ).withColumn(
         "_rn",
         F.row_number().over(
-            Window.partitionBy("a.source_accession_id", "d.diagnosis_id").orderBy(
-                "_context_priority", F.abs(F.datediff("d.diagnosis_dt", "a.accession_dt"))
+            Window.partitionBy("source_accession_id", "diagnosis_id").orderBy(
+                "_context_priority", F.abs(F.datediff("diagnosis_dt", "accession_dt"))
             )
         ),
     ).filter(F.col("_rn") == 1)
     return (
         ranked.select(
-            F.sha2(F.concat_ws("|", F.lit("pathology_diagnosis_context"), F.col("a.source_accession_id"), F.col("d.diagnosis_id")), 256).alias("indication_id"),
-            F.col("a.pathology_accession_id").alias("pathology_accession_id"),
-            F.col("a.source_accession_id").alias("source_accession_id"),
+            F.sha2(F.concat_ws("|", F.lit("pathology_diagnosis_context"), F.col("source_accession_id"), F.col("diagnosis_id")), 256).alias("indication_id"),
+            F.col("pathology_accession_id").alias("pathology_accession_id"),
+            F.col("source_accession_id").alias("source_accession_id"),
             F.lit("clinical_context").alias("relation_type"),
             F.lit("map_diagnosis").alias("source_field"),
-            F.col("d.source_text").alias("source_text"),
-            F.col("d.source_text").alias("evidence_text"),
+            F.col("source_text").alias("source_text"),
+            F.col("source_text").alias("evidence_text"),
             F.lit(0).alias("evidence_start"),
-            F.length(F.col("d.source_text")).alias("evidence_end"),
-            F.col("d.snomed_code").alias("snomed_code"),
-            F.col("d.snomed_term").alias("snomed_term"),
-            F.col("d.omop_concept_id").alias("omop_concept_id"),
-            F.when(F.lower(F.coalesce(F.col("d.confirmation_status"), F.lit(""))).rlike("rule out|suspect|possible"), "possible").otherwise("present").alias("assertion"),
+            F.length(F.col("source_text")).alias("evidence_end"),
+            F.col("snomed_code").alias("snomed_code"),
+            F.col("snomed_term").alias("snomed_term"),
+            F.col("omop_concept_id").alias("omop_concept_id"),
+            F.when(F.lower(F.coalesce(F.col("confirmation_status"), F.lit(""))).rlike("rule out|suspect|possible"), "possible").otherwise("present").alias("assertion"),
             F.lit("current").alias("temporality"),
             F.lit("patient").alias("experiencer"),
             F.lit("diagnosis_context_window_v1").alias("rule_id"),

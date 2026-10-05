@@ -35,7 +35,7 @@ for _name, _default in {
     "bootstrap_mode": "false",
     "bootstrap_min_order_id": "",
     "bootstrap_max_order_id": "",
-    "recovery_control_table": "8_dev.bronze.medication_order_recovery_control",
+    "recovery_control_table": "6_mgmt.bronze.medication_order_recovery_control",  # OGR_NO_DEV_V1/medorder
 }.items():
     try:
         dbutils.widgets.get(_name)
@@ -90,7 +90,7 @@ BOOTSTRAP_MAX_ORDER_ID = bronze_value("bootstrap_max_order_id", "")
 RUN_ID = bronze_run_id()
 RECOVERY_CONTROL_TABLE = bronze_value(
     "recovery_control_table",
-    "8_dev.bronze.medication_order_recovery_control",
+    "6_mgmt.bronze.medication_order_recovery_control",
 )
 PIPELINE_LOGIC_VERSION = "2026.08.s4s3a11.recovery-finalize-v2"
 LOGIC_VERSION_INT = 2026080801
@@ -333,7 +333,8 @@ CLUSTER_KEYS = {ORDER: ["ORDER_ID"], ACTION: ["ORDER_ID"], DETAIL: ["ORDER_ID"]}
 def materialize_stage(df: DataFrame, target: str, keys: list[str]) -> DataFrame:
     staging_table = f"{target}_stg"
     staged = (
-        with_row_hash(df)
+        # TZ_LOCAL_V1/medorder: Europe/London companions (no-op for tables without UTC event columns).
+        bronze_add_time_companions(with_row_hash(df), target)
         .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID))
         .withColumn("SOURCE_PRESENT_IND", F.lit(True))
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
@@ -428,7 +429,8 @@ def replace_target_full(df: DataFrame, target: str, keys: list[str]) -> dict:
     """Atomically replace one full target without a many-billion-row MERGE."""
     assert bronze_table_exists(target), f"Recovery replacement requires existing target {target}"
     replacement = (
-        with_row_hash(df)
+        # TZ_LOCAL_V1/medorder: Europe/London companions, as materialize_stage.
+        bronze_add_time_companions(with_row_hash(df), target)
         .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID))
         .withColumn("SOURCE_PRESENT_IND", F.lit(True))
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
@@ -1662,4 +1664,3 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-

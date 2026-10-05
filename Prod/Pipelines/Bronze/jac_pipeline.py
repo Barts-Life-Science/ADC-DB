@@ -1056,7 +1056,12 @@ def build_issue_branch(source_table: str, branch: str) -> DataFrame:
         F.col("lnkpid").alias("LNKPID"),
         F.col("lnkdid").alias("JAC_DRUG_ID"),
         F.col("issue_date").alias("ISSUE_DATE"),
-        F.col("issue_time").alias("ISSUE_DTTM"),
+        # DQ4_B1_JAC_ISSUE_DTTM_V1: issue_time is time-only (it lands on 1970-01-01), so the issue
+        # instant is issue_date plus that time of day. Session-time-zone independent.
+        F.expr(
+            "CASE WHEN issue_date IS NOT NULL AND issue_time IS NOT NULL "
+            "THEN timestamp_seconds(unix_date(issue_date) * 86400 + pmod(unix_seconds(issue_time), 86400)) END"
+        ).alias("ISSUE_DTTM"),
         blank_to_null(F.col("issue_type")).alias("ISSUE_TYPE"),
         blank_to_null(F.col("return")).alias("RETURN_MARKER"),
         blank_to_null(F.col("NFD_issue_reason")).alias("NFD_ISSUE_REASON"),
@@ -1100,7 +1105,7 @@ ISSUE_COMMENTS = {
     "LNKPID": "JAC internal patient link key; not a direct patient identifier.",
     "JAC_DRUG_ID": "JAC drug dimension identifier from lnkdid.",
     "ISSUE_DATE": "Source issue calendar date.",
-    "ISSUE_DTTM": "Source issue timestamp.",
+    "ISSUE_DTTM": "Source issue date plus the time-only issue_time (wall clock as recorded by JAC; rule jac_issue_dttm_v1).",
     "ISSUE_TYPE": "Raw JAC issue type code.",
     "ISSUE_CATEGORY": "Derived category: ISSUE, RETURN_CREDIT, REQUEST, ADJUSTMENT, TRANSFER, or OTHER.",
     "RETURN_MARKER": "Raw JAC return marker.",
@@ -1287,7 +1292,7 @@ HOMECARE_COMMENTS = {
     "DMD_VTM_CONCEPT_ID": "Valid dm+d VTM OMOP concept_id from exact item-description matching.",
     "DMD_VTM_CODE": "Matched dm+d VTM SNOMED CT identifier.",
     "DMD_VTM_NAME": "Matched dm+d VTM preferred name.",
-    "DRUG_MAPPING_METHOD": "VTM_NAME, VTM_SYNONYM, UNMAPPED, DISABLED, or NULL for itemless headers.",
+    "DRUG_MAPPING_METHOD": "VTM_NAME, VTM_SYNONYM, VTM_NAME_COMPOUND ('&' spelled ' + '), NON_DRUG (delivery/charge/consumable/service/nursing line, no concept), UNMAPPED, DISABLED, or NULL for itemless headers.",  # OGR_JAC_VTM_V1
     "CARE_SITE_CD": "map_care_site key from a unique exact location-name match.",
     "CARE_SITE_MATCH_METHOD": "NAME_EXACT, UNMAPPED, or UNAVAILABLE.",
     "ROW_HASH": "SHA-256 of pipeline-managed business columns.",
@@ -1402,34 +1407,45 @@ if _homecare_needed:
         )
     )
     if ENABLE_DMD:
+        # OGR_JAC_VTM_V1: '&' combinations retry with dm+d's ' + ' spelling; unmapped
+        # delivery/charge/consumable/service/nursing lines are marked NON_DRUG (no concept).
+        pool = dmd_vtm_pool().select(
+            "NAME_KEY",
+            F.col("concept_id").cast("long").alias("DMD_VTM_CONCEPT_ID"),
+            F.col("concept_code").alias("DMD_VTM_CODE"),
+            F.col("concept_name").alias("DMD_VTM_NAME"),
+            F.col("MATCH_SOURCE"),
+        )
+        compound = pool.select(
+            F.col("NAME_KEY").alias("COMPOUND_KEY"),
+            F.col("DMD_VTM_CONCEPT_ID").alias("C_CONCEPT_ID"),
+            F.col("DMD_VTM_CODE").alias("C_CODE"),
+            F.col("DMD_VTM_NAME").alias("C_NAME"),
+        )
+        primary_hit = F.col("DMD_VTM_CONCEPT_ID").isNotNull()
+        compound_hit = (~primary_hit) & F.col("C_CONCEPT_ID").isNotNull() & (F.col("COMPOUND_KEY") != F.col("NAME_KEY"))
+        # The predicates read DMD_VTM_CONCEPT_ID, which the replacements below overwrite; freeze the
+        # decision into _COMPOUND_HIT first so CODE/NAME see the same answer as CONCEPT_ID.
+        hit = F.col("_COMPOUND_HIT")
+        non_drug = F.upper(F.col("ITEM_DESCRIPTION")).rlike(r"\b(DELIVERY|CHARGE|CONSUMABLES?|SERVICE|NURSING)\b")
         homecare = (
-            homecare.withColumn(
-                "NAME_KEY",
-                normalise_drug_name(F.col("ITEM_DESCRIPTION")),
-            )
-            .join(
-                dmd_vtm_pool().select(
-                    "NAME_KEY",
-                    F.col("concept_id")
-                    .cast("long")
-                    .alias("DMD_VTM_CONCEPT_ID"),
-                    F.col("concept_code").alias("DMD_VTM_CODE"),
-                    F.col("concept_name").alias("DMD_VTM_NAME"),
-                    F.col("MATCH_SOURCE"),
-                ),
-                "NAME_KEY",
-                "left",
-            )
+            homecare.withColumn("NAME_KEY", normalise_drug_name(F.col("ITEM_DESCRIPTION")))
+            .withColumn("COMPOUND_KEY", F.regexp_replace(F.col("NAME_KEY"), r"\s*&\s*", " + "))
+            .join(pool, "NAME_KEY", "left")
+            .join(compound, "COMPOUND_KEY", "left")
+            .withColumn("_COMPOUND_HIT", F.coalesce(compound_hit, F.lit(False)))
             .withColumn(
                 "DRUG_MAPPING_METHOD",
                 F.when(F.col("ITEM_DESCRIPTION").isNull(), F.lit(None))
-                .when(
-                    F.col("DMD_VTM_CONCEPT_ID").isNotNull(),
-                    F.col("MATCH_SOURCE"),
-                )
+                .when(primary_hit, F.col("MATCH_SOURCE"))
+                .when(hit, F.lit("VTM_NAME_COMPOUND"))
+                .when(non_drug, F.lit("NON_DRUG"))
                 .otherwise(F.lit("UNMAPPED")),
             )
-            .drop("MATCH_SOURCE")
+            .withColumn("DMD_VTM_CONCEPT_ID", F.when(hit, F.col("C_CONCEPT_ID")).otherwise(F.col("DMD_VTM_CONCEPT_ID")))
+            .withColumn("DMD_VTM_CODE", F.when(hit, F.col("C_CODE")).otherwise(F.col("DMD_VTM_CODE")))
+            .withColumn("DMD_VTM_NAME", F.when(hit, F.col("C_NAME")).otherwise(F.col("DMD_VTM_NAME")))
+            .drop("MATCH_SOURCE", "COMPOUND_KEY", "C_CONCEPT_ID", "C_CODE", "C_NAME", "_COMPOUND_HIT")
         )
     else:
         homecare = (

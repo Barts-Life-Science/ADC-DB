@@ -383,6 +383,13 @@ if DRY_RUN:
     dbutils.notebook.exit(json.dumps(result, sort_keys=True))
 else:
     merge_labels_with_retry(merge_sql)
+    # TZ_LOCAL_V1/blob: mill_blob_text has several writers (Blob 3 merge aligns to the target and nulls columns it
+    # does not carry), so the companions are re-synced here, after the last writer of each run.
+    _tz_have = {f.name.upper() for f in spark.table(TARGET).schema.fields}
+    _tz_add = [c + "_LOCAL" for c in ('CLINSIG_DT_TM', 'VALID_FROM_DT_TM', 'VALID_UNTIL_DT_TM', 'UPDT_DT_TM', 'ADC_UPDT') if c + "_LOCAL" not in _tz_have]
+    if _tz_add:
+        spark.sql(f"ALTER TABLE {TARGET} ADD COLUMNS (" + ", ".join(c + " TIMESTAMP" for c in _tz_add) + ")")
+    merge_labels_with_retry(f"UPDATE {TARGET} t SET t.CLINSIG_DT_TM_LOCAL = from_utc_timestamp(t.CLINSIG_DT_TM, 'Europe/London'), t.VALID_FROM_DT_TM_LOCAL = from_utc_timestamp(t.VALID_FROM_DT_TM, 'Europe/London'), t.VALID_UNTIL_DT_TM_LOCAL = from_utc_timestamp(t.VALID_UNTIL_DT_TM, 'Europe/London'), t.UPDT_DT_TM_LOCAL = from_utc_timestamp(t.UPDT_DT_TM, 'Europe/London'), t.ADC_UPDT_LOCAL = from_utc_timestamp(t.ADC_UPDT, 'Europe/London') WHERE NOT (t.CLINSIG_DT_TM_LOCAL <=> from_utc_timestamp(t.CLINSIG_DT_TM, 'Europe/London')) OR NOT (t.VALID_FROM_DT_TM_LOCAL <=> from_utc_timestamp(t.VALID_FROM_DT_TM, 'Europe/London')) OR NOT (t.VALID_UNTIL_DT_TM_LOCAL <=> from_utc_timestamp(t.VALID_UNTIL_DT_TM, 'Europe/London')) OR NOT (t.UPDT_DT_TM_LOCAL <=> from_utc_timestamp(t.UPDT_DT_TM, 'Europe/London')) OR NOT (t.ADC_UPDT_LOCAL <=> from_utc_timestamp(t.ADC_UPDT, 'Europe/London'))")
     result = {
         "status": "COMPLETED",
         "target": TARGET,
@@ -463,6 +470,5 @@ else:
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN SERIES_REF_NBR SET TAGS ('ig_risk'='low', 'ig_severity'='low')
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENRICH_ADC_UPDT COMMENT 'Greatest source ADC_UPDT consumed by the event-label enrichment.'
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENRICH_ADC_UPDT SET TAGS ('ig_risk'='low', 'ig_severity'='low')
-
 
 

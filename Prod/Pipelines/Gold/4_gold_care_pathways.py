@@ -50,6 +50,11 @@ CLINICAL_APPOINTMENT_SELECT = [
     '`requested_practitioner_id` AS `requested_practitioner_id`',
     '`allocated_practitioner_id` AS `allocated_practitioner_id`',
     '`location_code` AS `location_code`',
+    '`location_display` AS `location_display`',  # SDI_APPT_LOCATION_V1
+    '`clinic_resource_code` AS `clinic_resource_code`',  # SDI_APPT_LOCATION_V1
+    '`clinic_resource_display` AS `clinic_resource_display`',  # SDI_APPT_LOCATION_V1
+    '`service_resource_code` AS `service_resource_code`',  # SDI_APPT_LOCATION_V1
+    '`service_resource_display` AS `service_resource_display`',  # SDI_APPT_LOCATION_V1
     '`organization_id` AS `organization_id`',
     '`recurrence_parent_key` AS `recurrence_parent_key`',
     '`recurrence_type_flag` AS `recurrence_type_flag`',
@@ -123,7 +128,12 @@ CLINICAL_APPOINTMENT_COLUMN_COMMENTS = {
     "first_booked_datetime": "First booking timestamp supplied by scheduling.",
     "requested_practitioner_id": "Millennium personnel PERSON_ID for the requested practitioner.",
     "allocated_practitioner_id": "Millennium personnel PERSON_ID for the representative allocated practitioner.",
-    "location_code": "Millennium scheduling location code.",
+    "location_code": "Millennium scheduling location code: the lowest APPT_LOCATION_CD across the appointment's resource rows, else the lowest map_appointment_schedule.LOCATION_CD. Decodes through reference_location (location_code, any level).",  # SDI_APPT_LOCATION_V1
+    "location_display": "Display of location_code from the same side that supplied it: map_appointment_resource.APPT_LOCATION_DESCRIPTION, else coalesce(LOCATION_DESCRIPTION, LOCATION_FREETEXT) from the schedule row with that code. NULL when location_code is NULL.",
+    "clinic_resource_code": "Millennium RESOURCE_CD of the booked primary non-patient resource (PRIMARY_ROLE_IND 1, ROLE_MEANING not PATIENT): the clinic/session resource an outpatient appointment is booked into, or the theatre for a surgical booking. Taken from the latest SCHEDULE_SEQ, lowest code on ties. SCH_CLINIC_ID is 0 at source, so no clinic id is published. Specialty is not carried: join the linked encounter's responsible_service_display.",
+    "clinic_resource_display": "Source RESOURCE_DESCRIPTION for clinic_resource_code.",
+    "service_resource_code": "Millennium SERVICE_RESOURCE_CD from the latest SCHEDULE_SEQ (lowest code on ties); populated for theatre/endoscopy/cath-lab bookings only, NULL for outpatient clinics.",
+    "service_resource_display": "Source SERVICE_RESOURCE_DESCRIPTION for service_resource_code.",
     "organization_id": "Millennium ORGANIZATION_ID for the scheduling organization.",
     "recurrence_parent_key": "Deterministic SHA-256 key of the parent appointment.",
     "recurrence_type_flag": "Raw source recurrence flag.",
@@ -190,6 +200,11 @@ def gold_clinical_appointment():
         '`requested_practitioner_id` AS `requested_practitioner_id`',
         '`allocated_practitioner_id` AS `allocated_practitioner_id`',
         '`location_code` AS `location_code`',
+        '`location_display` AS `location_display`',  # SDI_APPT_LOCATION_V1
+        '`clinic_resource_code` AS `clinic_resource_code`',  # SDI_APPT_LOCATION_V1
+        '`clinic_resource_display` AS `clinic_resource_display`',  # SDI_APPT_LOCATION_V1
+        '`service_resource_code` AS `service_resource_code`',  # SDI_APPT_LOCATION_V1
+        '`service_resource_display` AS `service_resource_display`',  # SDI_APPT_LOCATION_V1
         '`organization_id` AS `organization_id`',
         '`recurrence_parent_key` AS `recurrence_parent_key`',
         '`recurrence_type_flag` AS `recurrence_type_flag`',
@@ -1791,6 +1806,13 @@ CLINICAL_HRG_GROUPING_ADVISORY_RULES = {
     # unknown rate. Seen on 43,005 of 47,137,282 rows (0.0912%) when profiled on 2026-08-24.
     "gold.clinical.hrg_grouping.table.before_birth_event_datetime_person_birth_datetime":
         "NOT COALESCE(event_before_birth, FALSE)",
+
+    # DQ4_G_GOLD_RULES_V1: G3. UZ01Z is the grouper's "data invalid for grouping" HRG: 101,858 of these rows
+    # carry DIAG_01 "is blank", i.e. no primary diagnosis reached the grouper. The HRG is what
+    # the source published, so it is flagged, not replaced. Seen on 353,777 of 47,440,327 rows
+    # when profiled on 2026-09-26.
+    "gold.clinical.hrg_grouping.fce_hrg_cd.uz01z_ungroupable":
+        "NOT COALESCE((fce_hrg_cd = 'UZ01Z' OR spell_hrg_cd = 'UZ01Z'), FALSE)",
 }
 
 CLINICAL_HRG_GROUPING_COLUMN_COMMENTS = {
@@ -4013,6 +4035,3 @@ def _gold_qc_clinical_rtt_pathway_encounter_type():
 def gold_clinical_rtt_pathway_encounter_type():
     """Publish clinical_rtt_pathway_encounter_type without exposing the internal parent-admission marker."""
     return spark.read.table(_n("gold_qc._clinical_rtt_pathway_encounter_type")).drop("__gold_parent_present")
-
-# COMMAND ----------
-

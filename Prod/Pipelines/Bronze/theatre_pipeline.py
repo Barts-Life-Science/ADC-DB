@@ -54,8 +54,8 @@ FORCE_FULL_REFRESH = bronze_bool("force_full_refresh", False)
 FULL_RECONCILIATION = bronze_bool("full_reconciliation", False)
 BOOTSTRAP_MODE = bronze_bool("bootstrap_mode", False)
 RUN_ID = bronze_run_id()
-PIPELINE_LOGIC_VERSION = "2026.08.s3a12"
-LOGIC_VERSION_INT = 2026082801
+PIPELINE_LOGIC_VERSION = "2026.09.pms1"  # PMS_THEATRE_IMPLANT_V1: bump forces one FULL run to backfill implant flags
+LOGIC_VERSION_INT = 2026092901
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 RUN_FUTURE_HORIZON = None
 
@@ -73,6 +73,7 @@ SRC_MODIFIER = f"{RAW}.mill_surg_case_proc_modifier"
 SRC_TIMES = f"{RAW}.mill_case_times"
 SRC_ATTENDANCE = f"{RAW}.mill_case_attendance"
 SRC_IMPLANT = f"{RAW}.mill_sn_implant_log_st"
+SRC_PROC_DETAIL = f"{RAW}.mill_surg_proc_detail"  # PMS_THEATRE_IMPLANT_V1: procedure catalogue (implant flag)
 
 CASE = f"{TARGET_SCHEMA}.map_theatre_case"
 PROCEDURE = f"{TARGET_SCHEMA}.map_theatre_case_procedure"
@@ -142,13 +143,26 @@ LOOKUP_SEMANTIC_CACHE: dict[tuple[str, int, int], bool] = {}
 NOOP_LOOKUP_ADVANCES: set[tuple[str, str]] = set()
 
 
+# THEATRE_TRUST_SCOPE_V1: mill_sn_implant_log_st, mill_surg_case_procedure and mill_surg_case_proc_modifier are
+# whole-table loads that bypass Trust classification, so they carry BHRUT surgery (2026-10-04: 8,638 implants and
+# 49,888 procedures on cases excluded as BHRUT). Keep only rows whose case is in the Trust-classified
+# mill_surgical_case, and modifiers through their kept procedure, so every theatre table and gate covers the same
+# Barts cases. Fixing the landing itself is a separate change.
+_CASE_SCOPED_SOURCES = (SRC_IMPLANT, SRC_PROCEDURE)
+
+
 def source_snapshot(table: str) -> DataFrame:
     if table == LOGIC_SOURCE:
         raise ValueError("Synthetic logic source has no Delta snapshot")
     version = SOURCE_VERSIONS.get(table)
-    if version is None:
-        return spark.table(table)
-    return spark.read.option("versionAsOf", int(version)).table(table)
+    frame = spark.table(table) if version is None else spark.read.option("versionAsOf", int(version)).table(table)
+    if table in _CASE_SCOPED_SOURCES:
+        cases = source_snapshot(SRC_CASE).select(F.col("SURG_CASE_ID").cast("long").alias("_SCOPE_CASE_ID"))
+        frame = frame.join(cases, F.col("SURG_CASE_ID").cast("long") == F.col("_SCOPE_CASE_ID"), "left_semi")
+    elif table == SRC_MODIFIER:
+        procedures = source_snapshot(SRC_PROCEDURE).select(F.col("SURG_CASE_PROC_ID").cast("long").alias("_SCOPE_PROC_ID"))
+        frame = frame.join(procedures, F.col("SURG_CASE_PROC_ID").cast("long") == F.col("_SCOPE_PROC_ID"), "left_semi")
+    return frame
 
 
 def lookup_semantically_changed(
@@ -371,7 +385,8 @@ def ensure_table_features(table: str) -> None:
 def materialize_stage(df: DataFrame, target: str, keys: list[str]) -> DataFrame:
     staging_table = f"{target}_stg"
     staged = (
-        with_row_hash(df)
+        # TZ_LOCAL_V1/theatre: Europe/London companions (no-op for tables without UTC event columns).
+        bronze_add_time_companions(with_row_hash(df), target)
         .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID))
         .withColumn("SOURCE_PRESENT_IND", F.lit(True))
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
@@ -784,6 +799,7 @@ def build_procedure(proc_ids: DataFrame | None, decode_lookup: DataFrame) -> Dat
         F.col("PROC_END_DT_TM").alias("PROC_END_DT_TM_RAW"),
         F.col("PROC_DUR_MIN").cast("double").alias("PROCEDURE_DURATION_MINUTES"),
         F.col("SCHED_SURG_PROC_CD").cast("long").alias("SCHED_SURG_PROC_CD"),
+        F.col("SCHED_IMPLANT_IND").cast("long").alias("SCHED_IMPLANT_IND"),  # PMS_THEATRE_IMPLANT_V1
         F.col("SCHED_DUR").cast("double").alias("SCHEDULED_DURATION_MINUTES"),
         F.col("ACTIVE_IND").cast("long").alias("ACTIVE_IND"),
         F.col("ACTIVE_STATUS_CD").cast("long").alias("ACTIVE_STATUS_CD"),
@@ -814,6 +830,11 @@ def build_procedure(proc_ids: DataFrame | None, decode_lookup: DataFrame) -> Dat
     )
     parent = scoped_case_parent(proc.select("SURG_CASE_ID_RAW", "SURG_CASE_ID").distinct())
     result = proc.join(parent, "SURG_CASE_ID", "left").join(modifiers, "SURG_CASE_PROC_ID", "left")
+    # PMS_THEATRE_IMPLANT_V1: catalogue implant flag; several detail rows per CATALOG_CD, so take the max.
+    catalog_implant = (source_snapshot(SRC_PROC_DETAIL)
+        .groupBy(F.col("CATALOG_CD").cast("long").alias("SURG_PROC_CD"))
+        .agg(F.max(F.col("IMPLANT_IND").cast("long")).alias("CATALOG_IMPLANT_IND")))
+    result = result.join(catalog_implant, "SURG_PROC_CD", "left")
     result = add_performed_timestamp(result, "PROC_START_DT_TM_RAW", "PROC_START_DT_TM")
     result = add_performed_timestamp(result, "PROC_END_DT_TM_RAW", "PROC_END_DT_TM")
     for code, description in [
@@ -1380,5 +1401,4 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 

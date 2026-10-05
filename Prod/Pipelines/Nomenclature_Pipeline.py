@@ -22,6 +22,8 @@ dbutils.widgets.text("expected_dimension", "3072")
 dbutils.widgets.text("similarity_threshold", "0.70")
 dbutils.widgets.dropdown("full_replace", "false", ["false", "true"])
 dbutils.widgets.text("vector_match_batch_size", "128")
+# Comma-separated mapping rule ids whose governed rows are re-mapped this run (DQ4 B4).
+dbutils.widgets.text("rescope_rule_ids", "")
 
 PIPELINE_RUN_ID = dbutils.widgets.get("run_id").strip() or uuid.uuid4().hex
 
@@ -35,9 +37,12 @@ def run_mapping_section():
 
     from delta.tables import DeltaTable
     from pyspark.sql import DataFrame, functions as F
+    import builtins
+
     from pyspark.sql.types import (
         BooleanType,
         DecimalType,
+        DoubleType,
         IntegerType,
         LongType,
         StringType,
@@ -362,6 +367,290 @@ def run_mapping_section():
         cutoff = watermark - timedelta(days=LOOKBACK_DAYS)
         candidates = source.filter(F.col("SOURCE_CHANGE_TS") > F.lit(cutoff))
 
+    # DQ4_B4_ICD10_NONSNOMED_V1
+    # Rule icd10_nonsnomed_target_v1. When an ICD-10 code's OMOP 'Maps to' target is not SNOMED
+    # (Cancer Modifier, OMOP Extension) and TRUD offers several SNOMED codes, the legacy rank took
+    # the lowest concept id, e.g. Z96.0 "Presence of urogenital implants" -> cervical cerclage.
+    # The rule picks the closest common SNOMED parent of the TRUD codes; failing that, the TRUD code
+    # whose terms are most similar to the source string; failing that, the legacy pick. Never NULL.
+    B4_RULE_ID = "icd10_nonsnomed_target_v1"
+    B4_MODEL_VERSION = dbutils.widgets.get("embedding_model_version").strip()
+    B4_MAX_PARENT_HOPS = 3
+    B4_MIN_PARENT_ROOT_DEPTH = 4
+    SNOMED_ROOT = "138875005"
+    RESCOPE_RULE_IDS = {
+        item.strip() for item in dbutils.widgets.get("rescope_rule_ids").split(",") if item.strip()
+    }
+
+
+    def icd10_non_snomed_scope() -> DataFrame:
+        """ICD-10 codes (normalised) whose 'Maps to' has no SNOMED target and TRUD gives 2+ SNOMED codes.
+        WHO ICD10 concepts are preferred over ICD10CM when both exist for a code."""
+        concept = spark.table(CONCEPT_TABLE)
+        icd = concept.filter(
+            F.col("vocabulary_id").isin("ICD10", "ICD10CM") & F.col("invalid_reason").isNull()
+        ).select(
+            F.col("concept_id").alias("ICD_CONCEPT_ID"),
+            F.col("vocabulary_id").alias("ICD_VOCAB"),
+            F.col("concept_name").alias("ICD_NAME"),
+            normalize_code(F.col("concept_code"), "ICD10").alias("ICDN"),
+        )
+        maps = spark.table(RELATIONSHIP_TABLE).filter(
+            (F.col("relationship_id") == "Maps to") & F.col("invalid_reason").isNull()
+        ).select(F.col("concept_id_1").alias("ICD_CONCEPT_ID"), F.col("concept_id_2").alias("concept_id"))
+        mapped = icd.join(maps, "ICD_CONCEPT_ID").join(
+            concept.select("concept_id", F.col("vocabulary_id").alias("TARGET_VOCAB")), "concept_id"
+        )
+        preferred = mapped.withColumn(
+            "_has_who",
+            F.max((F.col("ICD_VOCAB") == "ICD10").cast(IntegerType())).over(Window.partitionBy("ICDN")),
+        ).filter(
+            F.col("ICD_VOCAB") == F.when(F.col("_has_who") == 1, F.lit("ICD10")).otherwise(F.lit("ICD10CM"))
+        )
+        trud = spark.table(ICD_MAP_TABLE).groupBy(
+            normalize_code(F.col("SCUI"), "ICD10").alias("ICDN")
+        ).agg(F.countDistinct(F.trim(F.col("TCUI").cast(StringType()))).alias("_n_trud"))
+        return (
+            preferred.groupBy("ICDN")
+            .agg(
+                F.max((F.col("TARGET_VOCAB") == "SNOMED").cast(IntegerType())).alias("_any_snomed"),
+                F.min("ICD_NAME").alias("ICD_NAME"),
+            )
+            .filter(F.col("_any_snomed") == 0)
+            .join(trud.filter(F.col("_n_trud") >= 2), "ICDN", "inner")
+            .select("ICDN", "ICD_NAME")
+        )
+
+
+    def apply_icd10_non_snomed_target_rule(
+        resolved: DataFrame, candidates: DataFrame, current: DataFrame
+    ) -> DataFrame:
+        """Re-pick SNOMED_CODE/SNOMED_TERM for rows in scope of B4_RULE_ID and add pick provenance
+        (SNOMED_RULE_ID, SNOMED_PICK_METHOD, SNOMED_PICK_SCORE, SNOMED_PICK_MODEL; NULL out of scope).
+        SNOMED_TYPE and SNOMED_MATCH_COUNT keep their meaning: the pick is still among TRUD EXACT maps
+        or their common parent."""
+        import numpy as np
+
+        pick_schema = StructType(
+            [
+                StructField("NOMENCLATURE_ID", DecimalType(38, 18), False),
+                StructField("PICK_CODE", StringType(), True),
+                StructField("SNOMED_PICK_METHOD", StringType(), False),
+                StructField("SNOMED_PICK_SCORE", DoubleType(), True),
+                StructField("SNOMED_PICK_MODEL", StringType(), True),
+            ]
+        )
+        exact = candidates.filter(F.col("BASE_TYPE") == "EXACT").select(
+            "NOMENCLATURE_ID", normalize_code(F.col("CANDIDATE_CODE"), "SNOMED").alias("CANDIDATE_CODE")
+        )
+        in_scope = (
+            current.filter(try_cast_column("SOURCE_VOCABULARY_CD", LongType()).isin(ICD10_VOCAB_CODES))
+            .select("NOMENCLATURE_ID", "SOURCE_STRING", normalize_code(F.col("FOUND_CUI"), "ICD10").alias("ICDN"))
+            .join(F.broadcast(icd10_non_snomed_scope()), "ICDN", "inner")
+            .join(
+                resolved.filter(F.col("SNOMED_TYPE").isin("EXACT", "EXACT_OMOP_ASSISTED")).select("NOMENCLATURE_ID"),
+                "NOMENCLATURE_ID",
+                "left_semi",
+            )
+            .join(exact, "NOMENCLATURE_ID", "inner")
+            .groupBy("NOMENCLATURE_ID", "SOURCE_STRING", "ICD_NAME")
+            .agg(F.sort_array(F.collect_set("CANDIDATE_CODE")).alias("CANDIDATES"))
+            .filter(F.size("CANDIDATES") >= 2)
+        )
+        rows = in_scope.collect()
+        picks = []
+        if rows:
+            # Closest common parent. Hierarchy edges are walked upwards from the candidates on the driver.
+            hier = spark.table(SNOMED_HIER_TABLE).select(
+                F.trim(F.col("CHILD").cast(StringType())).alias("CHILD"),
+                F.trim(F.col("PARENT").cast(StringType())).alias("PARENT"),
+            )
+            parents = {}
+            frontier = {code for row in rows for code in row["CANDIDATES"]}
+            seen = set(frontier)
+            for _ in range(40):
+                if not frontier:
+                    break
+                edges = hier.filter(F.col("CHILD").isin(sorted(frontier))).distinct().collect()
+                frontier = set()
+                for edge in edges:
+                    parents.setdefault(edge["CHILD"], set()).add(edge["PARENT"])
+                    if edge["PARENT"] not in seen:
+                        seen.add(edge["PARENT"])
+                        frontier.add(edge["PARENT"])
+            valid_snomed = {
+                row["concept_code"]
+                for row in valid_concepts.filter(
+                    (F.col("vocabulary_id") == "SNOMED") & F.col("concept_code").isin(sorted(seen))
+                ).select("concept_code").collect()
+            }
+
+            def ancestor_distances(code):
+                distance = {code: 0}
+                queue = [code]
+                for node in queue:
+                    for parent in parents.get(node, ()):
+                        if parent not in distance:
+                            distance[parent] = distance[node] + 1
+                            queue.append(parent)
+                return distance
+
+            unresolved = []
+            for row in rows:
+                per_candidate = [ancestor_distances(code) for code in row["CANDIDATES"]]
+                common = set(per_candidate[0]).intersection(*per_candidate[1:])
+                ranked = sorted(
+                    (
+                        builtins.max(d[node] for d in per_candidate),
+                        builtins.sum(d[node] for d in per_candidate),
+                        int(node),
+                        node,
+                    )
+                    for node in common
+                )
+                chosen = None
+                for hops, _, _, node in ranked:
+                    if hops > B4_MAX_PARENT_HOPS:
+                        break
+                    root_depth = ancestor_distances(node).get(SNOMED_ROOT)
+                    if node in valid_snomed and root_depth is not None and root_depth >= B4_MIN_PARENT_ROOT_DEPTH:
+                        chosen = node
+                        break
+                if chosen is not None:
+                    picks.append((row["NOMENCLATURE_ID"], chosen, "snomed_common_parent", None, None))
+                else:
+                    unresolved.append(row)
+
+            # Embedding similarity: source string (else the ICD-10 name) against each candidate's SNOMED terms.
+            if unresolved:
+                # Terms are keyed exactly as the embedding section stores them: initcap(lower(trim())).
+                queries = spark.createDataFrame(
+                    [
+                        (row["NOMENCLATURE_ID"], rank, basis, text)
+                        for row in unresolved
+                        for rank, basis, text in (
+                            (1, "embedding_similarity", row["SOURCE_STRING"]),
+                            (2, "embedding_similarity_icd_term", row["ICD_NAME"]),
+                        )
+                        if text and text.strip()
+                    ],
+                    "NOMENCLATURE_ID decimal(38,18), RANK int, BASIS string, RAW string",
+                ).withColumn("term", F.initcap(F.lower(F.trim(F.col("RAW")))))
+                code_terms = (
+                    spark.table("3_lookup.trud.snomed_sct")
+                    .select(
+                        F.trim(F.col("CUI").cast(StringType())).alias("CODE"),
+                        F.initcap(F.lower(F.trim(F.col("TERM").cast(StringType())))).alias("term"),
+                    )
+                    .filter(F.col("CODE").isin(sorted({c for r in unresolved for c in r["CANDIDATES"]})))
+                    .filter(F.col("term").isNotNull())
+                    .distinct()
+                )
+                wanted = code_terms.select("term").unionByName(queries.select("term")).distinct()
+                vector_rank = Window.partitionBy("term").orderBy(
+                    F.col("embedded_at").desc_nulls_last(), F.col("ADC_UPDT").desc_nulls_last()
+                )
+                vectors = {}
+                for row in (
+                    spark.table("3_lookup.embeddings.terms")
+                    .filter((F.col("model_version") == B4_MODEL_VERSION) & F.col("embedding_vector").isNotNull())
+                    .join(wanted, "term", "left_semi")
+                    .withColumn("_rank", F.row_number().over(vector_rank))
+                    .filter(F.col("_rank") == 1)
+                    .select("term", "embedding_vector")
+                    .collect()
+                ):
+                    vector = np.asarray(row["embedding_vector"], dtype=np.float64)
+                    norm = np.linalg.norm(vector)
+                    if norm > 0:
+                        vectors[row["term"]] = vector / norm
+                terms_by_code = {}
+                for row in code_terms.collect():
+                    if row["term"] in vectors:
+                        terms_by_code.setdefault(row["CODE"], []).append(vectors[row["term"]])
+                query_by_id = {}
+                for row in queries.orderBy("RANK").collect():
+                    if row["term"] in vectors and row["NOMENCLATURE_ID"] not in query_by_id:
+                        query_by_id[row["NOMENCLATURE_ID"]] = (row["BASIS"], vectors[row["term"]])
+
+                for row in unresolved:
+                    scored = []
+                    method, query = query_by_id.get(row["NOMENCLATURE_ID"], (None, None))
+                    if query is not None:
+                        for code in row["CANDIDATES"]:
+                            sims = [float(np.dot(query, vector)) for vector in terms_by_code.get(code, [])]
+                            if sims:
+                                scored.append((-builtins.max(sims), int(code), code))
+                    if scored:
+                        best = sorted(scored)[0]
+                        picks.append(
+                            (row["NOMENCLATURE_ID"], best[2], method, builtins.round(-best[0], 6), B4_MODEL_VERSION)
+                        )
+                    else:
+                        picks.append((row["NOMENCLATURE_ID"], None, "legacy_rank", None, None))
+
+        pick_df = spark.createDataFrame(picks, pick_schema)
+        method_counts = {}
+        for pick in picks:
+            method_counts[pick[2]] = method_counts.get(pick[2], 0) + 1
+        print(f"Rule {B4_RULE_ID}: {len(picks)} rows in scope; methods={json.dumps(method_counts, sort_keys=True)}")
+
+        pick_terms = (
+            spark.table("3_lookup.trud.snomed_sct")
+            .select(
+                F.trim(F.col("CUI").cast(StringType())).alias("PICK_CODE"),
+                F.col("TERM").cast(StringType()).alias("PICK_TERM"),
+            )
+            .join(F.broadcast(pick_df.select("PICK_CODE").distinct()), "PICK_CODE", "left_semi")
+            .withColumn(
+                "_term_rank",
+                F.row_number().over(
+                    Window.partitionBy("PICK_CODE").orderBy(
+                        F.length("PICK_TERM").asc_nulls_last(), F.col("PICK_TERM").asc_nulls_last()
+                    )
+                ),
+            )
+            .filter(F.col("_term_rank") == 1)
+            .drop("_term_rank")
+        )
+        pick_names = valid_concepts.filter(F.col("vocabulary_id") == "SNOMED").select(
+            F.col("concept_code").alias("PICK_CODE"), F.col("concept_name").alias("PICK_NAME")
+        )
+        picked = (
+            pick_df.join(F.broadcast(pick_terms), "PICK_CODE", "left")
+            .join(pick_names.join(F.broadcast(pick_df.select("PICK_CODE").distinct()), "PICK_CODE", "left_semi"), "PICK_CODE", "left")
+            .withColumn("PICK_TERM", F.coalesce("PICK_TERM", "PICK_NAME"))
+            .drop("PICK_NAME")
+        )
+        out = resolved.join(F.broadcast(picked), "NOMENCLATURE_ID", "left")
+        return out.select(
+            "NOMENCLATURE_ID",
+            F.coalesce(try_cast_column("PICK_CODE", LongType()), F.col("SNOMED_CODE")).alias("SNOMED_CODE"),
+            "SNOMED_TYPE",
+            "SNOMED_MATCH_COUNT",
+            F.when(F.col("PICK_CODE").isNotNull(), F.col("PICK_TERM"))
+            .otherwise(F.col("SNOMED_TERM"))
+            .alias("SNOMED_TERM"),
+            F.when(F.col("SNOMED_PICK_METHOD").isNotNull(), F.lit(B4_RULE_ID)).alias("SNOMED_RULE_ID"),
+            "SNOMED_PICK_METHOD",
+            "SNOMED_PICK_SCORE",
+            "SNOMED_PICK_MODEL",
+        )
+
+
+    if B4_RULE_ID in RESCOPE_RULE_IDS and not FORCE_FULL:
+        governed = source.filter(
+            try_cast_column("SOURCE_VOCABULARY_CD", LongType()).isin(ICD10_VOCAB_CODES)
+        ).join(
+            F.broadcast(icd10_non_snomed_scope().select("ICDN")),
+            normalize_code(F.col("SOURCE_IDENTIFIER"), "ICD10") == F.col("ICDN"),
+            "left_semi",
+        )
+        candidates = candidates.unionByName(
+            governed.join(candidates.select("NOMENCLATURE_ID"), "NOMENCLATURE_ID", "left_anti")
+        )
+        print(f"Rescope {B4_RULE_ID}: added {governed.count()} governed rows to the candidate set")
+
     base_columns = [
         "NOMENCLATURE_ID",
         "SOURCE_IDENTIFIER",
@@ -648,6 +937,7 @@ def run_mapping_section():
         valid_concepts,
         valid_maps,
     )
+    snomed_resolved = apply_icd10_non_snomed_target_rule(snomed_resolved, snomed_candidates, stage_one_current)
     stage_two = stage_one_current.join(snomed_resolved, "NOMENCLATURE_ID", "left")
     assert_unique(stage_two, "NOMENCLATURE_ID", "SNOMED mapping")
     merge_rows(stage_two, TEMP_TWO)
@@ -1637,6 +1927,7 @@ def _med_content_source_clock(source, previous):
     Raw landing/update clocks remain on the raw sources. Lookup provenance remains
     published and changes when the lookup's source content changes.
     """
+    from pyspark.sql import functions as F  # NOMEN_MED_F_IMPORT_V1: helpers run at notebook scope
     prior = previous.select(F.col('SYNONYM_ID').alias('_prior_id'),
                             F.col('SOURCE_ROW_HASH').alias('_prior_hash'),
                             F.col('SOURCE_CHANGE_TS').alias('_prior_stamp'))
@@ -1649,6 +1940,8 @@ def _med_content_source_clock(source, previous):
 
 def _med_content_output_clock(source, previous):
     """Advance ADC only on a real published-payload change, including provenance/score/model."""
+    from pyspark.sql import functions as F  # NOMEN_MED_F_IMPORT_V1: helpers run at notebook scope
+
     columns = [c for c in source.columns if c != 'ADC_UPDT']
     old = previous.select(*[F.col(c).alias('_old_' + c) for c in source.columns])
     same = F.col('_old_SYNONYM_ID').isNotNull()
@@ -2348,4 +2641,3 @@ pipeline_result = {
 }
 print(json.dumps(pipeline_result, default=str))
 dbutils.notebook.exit(json.dumps(pipeline_result, default=str))
-

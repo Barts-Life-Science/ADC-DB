@@ -435,7 +435,14 @@ base,flagged=dq_all_clinical(base,admin_stamps={"SOURCE_COMMENT_ADC_UPDT","SOURC
 admin={"SOURCE_COMMENT_ADC_UPDT","SOURCE_TEXT_ADC_UPDT","PIPELINE_UPDT_DT_TM","ROW_HASH"}
 hash_cols=[c for c in base.columns if c not in admin and not c.endswith(("_FUTURE_IND","_SENTINEL_IND","_CLEAN"))]
 out=(base.withColumn("ROW_HASH",F.xxhash64(F.to_json(F.struct(*[F.col(c) for c in hash_cols]))))
-     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp()))
+     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp())
+     # TZ_LOCAL_V1/ordercomment: Europe/London companions, outside ROW_HASH.
+     .withColumns({
+         "COMMENT_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("COMMENT_DT_TM_CLEAN"), "Europe/London"),
+         "COMMENT_UPDT_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("COMMENT_UPDT_DT_TM_CLEAN"), "Europe/London"),
+         "COMMENT_DT_TM_LOCAL": F.from_utc_timestamp(F.col("COMMENT_DT_TM"), "Europe/London"),
+         "COMMENT_UPDT_DT_TM_LOCAL": F.from_utc_timestamp(F.col("COMMENT_UPDT_DT_TM"), "Europe/London"),
+     }))
 if not spark.catalog.tableExists(TARGET):
     out.limit(0).write.format("delta").mode("overwrite").option("delta.enableChangeDataFeed","true").saveAsTable(TARGET)
 metrics=keyed_upsert(TARGET,["ORDER_ID","ACTION_SEQUENCE","COMMENT_TYPE_CD"],out)
@@ -459,5 +466,4 @@ print("A8b build complete")
 # The mill_long_text repair is an operations dependency but does not block honest promotion.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-
 

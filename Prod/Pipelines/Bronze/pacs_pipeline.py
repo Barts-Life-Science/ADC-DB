@@ -505,9 +505,10 @@ def pacs_update_table(df, target, keys, gates):
     the whole graph re-evaluates each time. The _stg table is dropped on success;
     a leftover from a crashed run is harmless (overwritten next run)."""
     staging_table = f"{target}_stg"
-    (with_row_hash(df)
+    # TZ_LOCAL_V1/pacs: Europe/London companions after ADC_UPDT is stamped (ADC_UPDT_LOCAL derives from it).
+    (bronze_add_time_companions(with_row_hash(df)
      .withColumn("SOURCE_PRESENT_IND", F.lit(True))
-     .withColumn("ADC_UPDT", F.current_timestamp())
+     .withColumn("ADC_UPDT", F.current_timestamp()), target)
      .write.format("delta").mode("overwrite").option("overwriteSchema", "true")
      .saveAsTable(staging_table))
     staged = spark.table(staging_table)

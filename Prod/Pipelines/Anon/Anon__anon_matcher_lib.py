@@ -16,8 +16,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, LongType, StringType, StructField, StructType
 
 
-CONTROL_SCHEMA_DEFAULT = "8_dev.anon"
-NICKNAME_TABLE_DEFAULT = "8_dev.anon.nicknames"
+CONTROL_SCHEMA_DEFAULT = "6_mgmt.anon"  # OGR_NO_DEV_V1/anon
+NICKNAME_TABLE_DEFAULT = "6_mgmt.anon.nicknames"
 DEFAULT_WHITELIST = ["Lady", "Barts", "Bartshealth", "Newham", "Homerton", "Hospital"]
 
 
@@ -772,4 +772,3 @@ if "dbutils" in globals():
         ).write.mode("append").saveAsTable(f"{_control_schema}.matcher_selftest_results")
         if _status != "PASS":
             raise AssertionError(_detail)
-

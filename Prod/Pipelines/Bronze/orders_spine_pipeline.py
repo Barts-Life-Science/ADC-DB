@@ -424,7 +424,12 @@ base,flagged=dq_all_clinical(base,admin_stamps={"SOURCE_ADC_UPDT"})
 admin={"SOURCE_ADC_UPDT","PIPELINE_UPDT_DT_TM","ROW_HASH"}
 hash_cols=[c for c in base.columns if c not in admin and not c.endswith(("_FUTURE_IND","_SENTINEL_IND","_CLEAN"))]
 out=(base.withColumn("ROW_HASH",F.xxhash64(F.to_json(F.struct(*[F.col(c) for c in hash_cols]))))
-     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp()))
+     .withColumn("PIPELINE_UPDT_DT_TM",F.current_timestamp())
+     # TZ_LOCAL_V1/orders: Europe/London companions, outside ROW_HASH.
+     .withColumns({
+         "ORIG_ORDER_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("ORIG_ORDER_DT_TM_CLEAN"), "Europe/London"),
+         "CURRENT_START_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("CURRENT_START_DT_TM_CLEAN"), "Europe/London"),
+     }))
 if not spark.catalog.tableExists(TARGET):
     out.limit(0).write.format("delta").mode("overwrite").option("delta.enableChangeDataFeed","true").saveAsTable(TARGET)
 metrics=keyed_upsert(TARGET,["ORDER_ID"],out)
@@ -538,6 +543,11 @@ if missing_med_order_count:
             ),
         )
         .withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
+        # TZ_LOCAL_V1/orders: Europe/London companions, as the main path.
+        .withColumns({
+            "ORIG_ORDER_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("ORIG_ORDER_DT_TM_CLEAN"), "Europe/London"),
+            "CURRENT_START_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("CURRENT_START_DT_TM_CLEAN"), "Europe/London"),
+        })
     )
     recovered_rows = recovery_out.count()
     assert recovered_rows == missing_med_order_count, (
@@ -574,5 +584,4 @@ print("A8a build complete")
 # seven-day increment cost and integrated weekly-job delta before promotion.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-
 

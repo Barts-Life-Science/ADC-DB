@@ -244,7 +244,12 @@ subject = (reg.select(
     "DIAGNOSIS_TYPE_CD", "DIAGNOSIS_TYPE_DESC",
     F.col("ENROLLING_ORGANIZATION_ID").cast("bigint"),
     "Trust", "BEG_EFFECTIVE_DT_TM", "END_EFFECTIVE_DT_TM", "ADC_UPDT",
-).withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp()))
+).withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
+# TZ_LOCAL_V1/research: Europe/London companions of the on/off-study dates.
+.withColumns({
+    "ON_STUDY_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("ON_STUDY_DT_TM_CLEAN"), "Europe/London"),
+    "OFF_STUDY_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("OFF_STUDY_DT_TM_CLEAN"), "Europe/London"),
+}))
 
 # Consent linkage seam: PT_CONSENT columns join here when S7/B6 lands.
 (subject.write.format("delta")

@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Care pathways
 # MAGIC Journeys, scheduling, referrals, waiting lists, RTT, community care, costing and operational activity.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 4 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -19,6 +19,7 @@ from silver_journey_shared import (
     SRC_EPISODE_ENCOUNTER,
     SRC_MAT_PREGNANCY,
     SRC_THEATRE_CASE,
+    SRC_THEATRE_CASE_PROCEDURE,  # PMS_THEATRE_CASE_V1
     _appointment_canonical,
     _community_care_activity_canonical,
     _community_care_contact_canonical,
@@ -874,11 +875,18 @@ def _appointment_schedule_grouped_query():
         F.coalesce(s.LOCATION_DESCRIPTION, s.LOCATION_FREETEXT).alias("location_display"),
         s.SOURCE_PRESENT_IND.cast("boolean").alias("source_present_ind"),
     )
+    # SDI_APPT_LOCATION_V1: the display of the lowest LOCATION_CD (the code the appointment publishes), rows with a
+    # display first, then the lowest display.
+    s_disp = F.coalesce(s.LOCATION_DESCRIPTION, s.LOCATION_FREETEXT)
+    s_disp = F.when(F.trim(s_disp) != "", s_disp)
+    s_loc = F.min(F.when(s.LOCATION_CD.isNotNull(), F.struct(
+        s.LOCATION_CD.alias("cd"), s_disp.isNull().alias("no_disp"), s_disp.alias("disp"))))
     return (
         s.groupBy("SCH_EVENT_ID")
         .agg(
             F.to_json(F.sort_array(F.collect_list(entry))).alias("_booking_json"),
             F.min("LOCATION_CD").alias("_schedule_location_cd"),
+            s_loc.getField("disp").alias("_schedule_location_display"),  # SDI_APPT_LOCATION_V1
             F.max("SOURCE_ADC_UPDT").alias("_schedule_source_update"),
             F.max("ADC_UPDT").alias("_schedule_loaded_at"),
         )
@@ -919,14 +927,38 @@ def _appointment_resource_grouped_query():
         r.BEG_DT_TM.alias("slot_start"), r.END_DT_TM.alias("slot_end"),
         r.SOURCE_PRESENT_IND.cast("boolean").alias("source_present_ind"),
     )
+    # SDI_APPT_LOCATION_V1: the display of the lowest APPT_LOCATION_CD (the code the appointment publishes); the booked
+    # primary non-patient resource (clinic session, or theatre) and the service resource from the latest SCHEDULE_SEQ,
+    # lowest code on ties.
+    r_disp = F.when(F.trim(r.APPT_LOCATION_DESCRIPTION) != "", r.APPT_LOCATION_DESCRIPTION)
+    r_loc = F.min(F.when(r.APPT_LOCATION_CD.isNotNull(), F.struct(
+        r.APPT_LOCATION_CD.alias("cd"), r_disp.isNull().alias("no_disp"), r_disp.alias("disp"))))
+    r_seq = F.coalesce(r.SCHEDULE_SEQ.cast("long"), F.lit(-1))
+
+    def _latest(keep, code, disp):
+        return F.max(F.when(keep & (code > 0), F.struct(
+            r_seq.alias("seq"), (-code.cast("long")).alias("neg_cd"), code.cast("long").alias("cd"), disp.alias("disp"))))
+
+    r_clinic = _latest((F.coalesce(r.PRIMARY_ROLE_IND.cast("long"), F.lit(0)) == 1)
+                       & (F.coalesce(F.upper(r.ROLE_MEANING), F.lit("")) != "PATIENT"),
+                       r.RESOURCE_CD, r.RESOURCE_DESCRIPTION)
+    r_service = _latest(F.lit(True), r.SERVICE_RESOURCE_CD, r.SERVICE_RESOURCE_DESCRIPTION)
     return (
         r.groupBy("SCH_EVENT_ID")
         .agg(
             F.to_json(F.sort_array(F.collect_list(entry))).alias("_resource_json"),
             F.max("BEG_DT_TM").alias("_slot_start"),
             F.max("END_DT_TM").alias("_slot_end"),
+            F.max("BEG_DT_TM_LOCAL").alias("_slot_start_local"),
+            F.max("END_DT_TM_LOCAL").alias("_slot_end_local"),
+            # TZ_SILVER_LOCAL_V1: Europe/London companions (bronze *_LOCAL for Millennium; local-clock sources unchanged)
             F.min("ALLOCATED_PERSONNEL_ID").alias("_allocated_personnel_id"),
             F.min("APPT_LOCATION_CD").alias("_resource_location_cd"),
+            r_loc.getField("disp").alias("_resource_location_display"),  # SDI_APPT_LOCATION_V1
+            r_clinic.getField("cd").alias("_clinic_resource_cd"),
+            r_clinic.getField("disp").alias("_clinic_resource_display"),
+            r_service.getField("cd").alias("_service_resource_cd"),
+            r_service.getField("disp").alias("_service_resource_display"),
             F.max("SOURCE_ADC_UPDT").alias("_resource_source_update"),
             F.max("ADC_UPDT").alias("_resource_loaded_at"),
         )
@@ -956,6 +988,8 @@ APPOINTMENT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -972,6 +1006,11 @@ APPOINTMENT_PUBLIC_COLUMNS = [
     'requested_practitioner_id',
     'allocated_practitioner_id',
     'location_code',
+    'location_display',  # SDI_APPT_LOCATION_V1
+    'clinic_resource_code',  # SDI_APPT_LOCATION_V1
+    'clinic_resource_display',  # SDI_APPT_LOCATION_V1
+    'service_resource_code',  # SDI_APPT_LOCATION_V1
+    'service_resource_display',  # SDI_APPT_LOCATION_V1
     'organization_id',
     'recurrence_parent_key',
     'recurrence_type_flag',
@@ -1053,6 +1092,8 @@ APPOINTMENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Booked slot start where available",
     "event_end_datetime": "Booked slot end where available.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim appointment-type coding system.",
     "source_code": "Verbatim appointment-type code.",
     "source_display": "Verbatim appointment-type display.",
@@ -1068,7 +1109,12 @@ APPOINTMENT_COLUMN_COMMENTS = {
     "first_booked_datetime": "First booking timestamp supplied by scheduling.",
     "requested_practitioner_id": "Millennium personnel PERSON_ID for the requested practitioner.",
     "allocated_practitioner_id": "Millennium personnel PERSON_ID for the representative allocated practitioner.",
-    "location_code": "Millennium scheduling location code.",
+    "location_code": "Millennium scheduling location code: the lowest APPT_LOCATION_CD across the appointment's resource rows, else the lowest map_appointment_schedule.LOCATION_CD. Decodes through reference_location (location_code, any level).",  # SDI_APPT_LOCATION_V1
+    "location_display": "Display of location_code from the same side that supplied it: map_appointment_resource.APPT_LOCATION_DESCRIPTION, else coalesce(LOCATION_DESCRIPTION, LOCATION_FREETEXT) from the schedule row with that code. NULL when location_code is NULL.",
+    "clinic_resource_code": "Millennium RESOURCE_CD of the booked primary non-patient resource (PRIMARY_ROLE_IND 1, ROLE_MEANING not PATIENT): the clinic/session resource an outpatient appointment is booked into, or the theatre for a surgical booking. Taken from the latest SCHEDULE_SEQ, lowest code on ties. SCH_CLINIC_ID is 0 at source, so no clinic id is published. Specialty is not carried: join the linked encounter's responsible_service_display.",
+    "clinic_resource_display": "Source RESOURCE_DESCRIPTION for clinic_resource_code.",
+    "service_resource_code": "Millennium SERVICE_RESOURCE_CD from the latest SCHEDULE_SEQ (lowest code on ties); populated for theatre/endoscopy/cath-lab bookings only, NULL for outpatient clinics.",
+    "service_resource_display": "Source SERVICE_RESOURCE_DESCRIPTION for service_resource_code.",
     "organization_id": "Millennium ORGANIZATION_ID for the scheduling organization.",
     "recurrence_parent_key": "Deterministic SHA-256 key of the parent appointment.",
     "recurrence_type_flag": "Raw source recurrence flag.",
@@ -1271,6 +1317,8 @@ REFERRAL_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA referral feed supplies no encounter.",
     "event_datetime": "Referral received timestamp.",
     "event_end_datetime": "Event end timestamp; not supplied by LUNA referrals.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim LUNA treatment-function coding system.",
     "source_code": "Verbatim treatment-function code.",
     "source_display": "Verbatim treatment-function display.",
@@ -1425,6 +1473,8 @@ RTT_PATHWAY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -1488,6 +1538,8 @@ RTT_PATHWAY_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA pathway feed supplies no encounter.",
     "event_datetime": "RTT clock-period start timestamp.",
     "event_end_datetime": "RTT clock-period stop timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim LUNA RTT-status coding system.",
     "source_code": "Verbatim current RTT-status code.",
     "source_display": "Verbatim current RTT-status display.",
@@ -1633,6 +1685,8 @@ RTT_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA activity feed supplies no encounter.",
     "event_datetime": "RTT activity timestamp.",
     "event_end_datetime": "Event end timestamp; not supplied by LUNA RTT activities.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim LUNA RTT-status coding system.",
     "source_code": "Verbatim RTT-status code.",
     "source_display": "Verbatim RTT-status display.",
@@ -1733,6 +1787,8 @@ WAITING_LIST_ENTRY_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Recorded waiting-period start timestamp carried from `WAITING_START_DT_TM`.",
     "event_end_datetime": "Recorded waiting-period end timestamp carried from `WAITING_END_DT_TM`.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Verbatim Millennium planned-procedure coding system.",
     "source_code": "Verbatim planned-procedure code.",
     "source_display": "Verbatim planned-procedure display.",
@@ -2046,6 +2102,8 @@ COMMUNITY_CONTACT_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2097,6 +2155,8 @@ COMMUNITY_CONTACT_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2153,6 +2213,8 @@ COMMUNITY_CARE_CONTACT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date of the care contact as submitted in the CSDS CYP201 record.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each community care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coded consultation type submitted with the CSDS CYP201 care contact record.",
     "source_code": "Coded consultation type submitted with the CSDS CYP201 care contact record.",
     "source_display": "Description corresponding to the coded consultation type submitted with the care contact record.",
@@ -2240,6 +2302,8 @@ COMMUNITY_ACTIVITY_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2301,6 +2365,8 @@ COMMUNITY_ACTIVITY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2367,6 +2433,8 @@ COMMUNITY_CARE_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date on which the care activity was recorded as taking place.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each community care activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "CSDS care activity type code recorded for the activity in the source extract.",
     "source_code": "CSDS care activity type code recorded for the activity in the source extract.",
     "source_display": "Description corresponding to the CSDS care activity type code.",
@@ -2461,6 +2529,8 @@ HRG_GROUPING_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2543,6 +2613,8 @@ HRG_GROUPING_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -2635,6 +2707,8 @@ HRG_GROUPING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time the finished consultant episode started.",
     "event_end_datetime": "Date and time the finished consultant episode ended.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "HRG4+ code assigned to this finished consultant episode.",
     "source_code": "HRG4+ code assigned to this finished consultant episode.",
     "source_display": "Description of the episode-level HRG4+ code, mapped from the HRG v4 reference lookup.",
@@ -2892,6 +2966,8 @@ COSTED_ACTIVITY_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -2973,6 +3049,8 @@ COSTED_ACTIVITY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3060,6 +3138,8 @@ COSTED_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Start date and time of the costed activity as supplied by the source PLICS extract (ActivityStartDate).",
     "event_end_datetime": "End date and time of the costed activity as supplied by the source PLICS extract (ActivityEndDate).",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Source point-of-delivery classification; preserved without an invented mapping.",
     "source_code": "Source point-of-delivery classification; preserved without an invented mapping.",
     "source_display": "Human-readable label supplied by the source system for the source code for each costed activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -3251,6 +3331,8 @@ DRUG_EXPENDITURE_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -3347,6 +3429,8 @@ DRUG_EXPENDITURE_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3447,6 +3531,8 @@ DRUG_EXPENDITURE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Effective date/time as supplied; two known rows dated 2122 are retained losslessly.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each drug expenditure record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Strict trimmed all-numeric dm+d code; null for blank or non-numeric source values.",
     "source_code": "Name of the chargeable high-cost drug or device as recorded in the source.",
     "source_display": "Name of the chargeable high-cost drug or device as recorded in the source.",
@@ -3579,6 +3665,8 @@ MEDICATION_SUPPLY_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -3642,6 +3730,8 @@ MEDICATION_SUPPLY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3710,6 +3800,8 @@ MEDICATION_SUPPLY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Source request-created date.",
     "event_end_datetime": "Source request-completed date.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Matched dm+d VTM SNOMED CT identifier.",
     "source_code": "Matched dm+d VTM SNOMED CT identifier.",
     "source_display": "Matched dm+d VTM preferred name.",
@@ -3809,6 +3901,8 @@ ELECTIVE_ACCESS_ENTRY_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -3885,6 +3979,8 @@ ELECTIVE_ACCESS_ENTRY_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -3967,6 +4063,8 @@ ELECTIVE_ACCESS_ENTRY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "B3 bronze field CREATED_DT_TM; source value retained unless documented as derived.",
     "event_end_datetime": "B3 bronze field ADMIT_DT_TM_CLEAN; source value retained unless documented as derived.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "B3 bronze field PROCEDURE_CODE; source value retained unless documented as derived.",
     "source_code": "B3 bronze field PROCEDURE_CODE; source value retained unless documented as derived.",
     "source_display": "B3 bronze field PROCEDURE_DESC; source value retained unless documented as derived.",
@@ -4150,6 +4248,8 @@ PATHWAY_TRACKING_SOURCE_COLUMNS = [
     "encounter_id",
     "event_datetime",
     "event_end_datetime",
+    "event_datetime_local",
+    "event_end_datetime_local",
     "source_coding_system",
     "source_code",
     "source_display",
@@ -4212,6 +4312,8 @@ PATHWAY_TRACKING_PUBLIC_COLUMNS = [
     'encounter_id',
     'event_datetime',
     'event_end_datetime',
+    'event_datetime_local',
+    'event_end_datetime_local',
     'source_coding_system',
     'source_code',
     'source_display',
@@ -4279,6 +4381,8 @@ PATHWAY_TRACKING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "B3 bronze field LATEST_ACTIVITY_DATE_CLEAN; source value retained unless documented as derived.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST), by the same rule as event_datetime_local; null where event_end_datetime is null.",
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -4647,4 +4751,339 @@ def theatre_implant():
     # Build the declared dataset: SurgiNet theatre implant log; serial/lot/batch identifiers are
     # IG-sensitive.
     return _lifecycle_source_theatre_implant().drop(*THEATRE_IMPLANT_LIFECYCLE_FIELDS, *THEATRE_IMPLANT_RETIRED_COLUMNS)
+
+
+# OGR_MATERNITY_SILVER_V1: pregnancy history (gravida/parity/previous outcomes) and birth grain
+# (weight/Apgar/gestation/delivery) from Millennium maternity; no MRN, NHS number or DOB carried.
+# Values are typed but kept as recorded: plausibility is decided downstream (OMOP exclusions), not here.
+def _as_int(col):
+    return F.expr(f"try_cast({col} AS int)")
+
+
+def _pregnancy_history_canonical():
+    p = _mat_pregnancy_dedup()
+    source_row_id = F.col("Pregnancy_ID").cast("string")
+    skey, ssys = subject_key_with_system([("urn:cerner:person_id", F.col("Person_ID"))], SRC_MAT_PREGNANCY, source_row_id)
+    deleted = F.coalesce(F.col("SOURCE_DELETED_IND").cast("boolean"), F.lit(False))
+    return p.select(
+        stable_id("pregnancy_history:mill", F.col("Pregnancy_ID")).alias("pregnancy_history_key"),
+        stable_id("journey:pregnancy", F.col("Pregnancy_ID").cast("string")).alias("journey_pregnancy_key"),
+        source_row_id.alias("pregnancy_id"),
+        skey.alias("subject_key"), ssys.alias("subject_id_system"),
+        F.col("Person_ID").cast("bigint").alias("person_id"),
+        _as_int("Gravida_NBR").alias("gravida"),
+        # MATDQ_SILVER_V1: bronze judges plausibility; silver carries the flag.
+        F.coalesce(F.col("GravidaImplausible_IND").cast("boolean"), F.lit(False)).alias("gravida_implausible_ind"),
+        _as_int("Parity").alias("parity"),
+        _as_int("PrevLiveBirth_NBR").alias("previous_live_births"),
+        _as_int("PrevMiscarriages_NBR").alias("previous_miscarriages"),
+        _as_int("PrevStillBirth_NBR").alias("previous_stillbirths"),
+        _as_int("PreviousCaesareanSections").alias("previous_caesarean_sections"),
+        _as_int("PrevElectiveCaesareans").alias("previous_elective_caesareans"),
+        _as_int("PrevEmergencyCaesareans").alias("previous_emergency_caesareans"),
+        _as_int("PreviousLossesUnder24Weeks").alias("previous_losses_under_24_weeks"),
+        F.to_date("FirstAntenatalAPPTDate").alias("first_antenatal_appointment_date"),
+        F.to_date("ExpectedDeliveryDate").alias("expected_delivery_date"),
+        F.col("ExpectedDeliveryDate_Source").cast("string").alias("expected_delivery_date_source"),
+        F.col("LaborOnsetMethod_CD").cast("bigint").cast("string").alias("labour_onset_method_code"),
+        F.col("LaborOnsetMethod_DESC").alias("labour_onset_method_display"),
+        F.when(deleted, F.lit("superseded")).otherwise(F.lit("active")).alias("record_status"),
+        F.lit("mat-pregnancy-history").alias("construction_rule"),
+        F.lit("0.2.0").alias("construction_version"),
+        F.lit("millennium-maternity").alias("source_system"),
+        F.lit(SRC_MAT_PREGNANCY).alias("source_table"), source_row_id.alias("source_row_id"),
+        F.date_format(F.col("ADC_UPDT"), "yyyyMMddHHmmss").alias("load_batch_id"),
+        F.col("ADC_UPDT").alias("source_update_timestamp"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+    )
+
+
+PREGNANCY_HISTORY_COLUMN_COMMENTS = {
+    "pregnancy_history_key": "Deterministic SHA-256 key of the Millennium Pregnancy_ID (pregnancy_history:mill).",
+    "journey_pregnancy_key": "spine_journey key of the pregnancy (journey:pregnancy over Pregnancy_ID).",
+    "pregnancy_id": "Millennium Pregnancy_ID; native source key.",
+    "subject_key": "Always-populated subject key for the mother.",
+    "subject_id_system": "Identifier system that produced subject_key.",
+    "person_id": "Mother Millennium PERSON_ID as BIGINT.",
+    "gravida": "Gravida_NBR as recorded (integer; implausible values kept, see gravida_implausible_ind).",
+    "gravida_implausible_ind": "True when bronze flags gravida as implausible (below 1, i.e. not recorded, or above 30).",  # MATDQ_SILVER_V1
+    "parity": "Parity as recorded (integer; implausible values kept, judged downstream).",
+    "previous_live_births": "PrevLiveBirth_NBR as recorded (integer; implausible values kept, judged downstream).",
+    "previous_miscarriages": "PrevMiscarriages_NBR as recorded (integer; implausible values kept, judged downstream).",
+    "previous_stillbirths": "PrevStillBirth_NBR as recorded (integer; implausible values kept, judged downstream).",
+    "previous_caesarean_sections": "PreviousCaesareanSections as recorded (integer; implausible values kept, judged downstream).",
+    "previous_elective_caesareans": "PrevElectiveCaesareans as recorded (integer; implausible values kept, judged downstream).",
+    "previous_emergency_caesareans": "PrevEmergencyCaesareans as recorded (integer; implausible values kept, judged downstream).",
+    "previous_losses_under_24_weeks": "PreviousLossesUnder24Weeks as recorded (integer; implausible values kept, judged downstream).",
+    "first_antenatal_appointment_date": "Booking (first antenatal appointment) date.",
+    "expected_delivery_date": "Expected delivery date.",
+    "expected_delivery_date_source": "Source of the expected delivery date as recorded.",
+    "labour_onset_method_code": "Millennium labour onset method code.",
+    "labour_onset_method_display": "Millennium labour onset method display.",
+    "record_status": "active, or superseded when the source row is deleted.",
+    "construction_rule": "Rule that built the row.",
+    "construction_version": "Version of construction_rule.",
+    "source_system": "millennium-maternity.",
+    "source_table": "Bronze table read.",
+    "source_row_id": "Pregnancy_ID as string.",
+    "load_batch_id": "Bronze ADC_UPDT as yyyyMMddHHmmss.",
+    "source_update_timestamp": "Bronze ADC_UPDT of the winning pregnancy row.",
+    "loaded_at": "Bronze ADC_UPDT of the winning pregnancy row; ingestion provenance.",
+}
+
+
+@materialized_view(
+    name=_n("journey_clinical.pregnancy_history"),
+    comment="Obstetric history per pregnancy (gravida, parity, previous births/losses/caesareans, booking and EDD) from Millennium maternity.",
+    cluster_by=["person_id"], refresh_policy="incremental",
+    column_comments=PREGNANCY_HISTORY_COLUMN_COMMENTS,
+)
+def pregnancy_history():
+    return _pregnancy_history_canonical()
+
+
+def _birth_canonical():
+    b = read_source(SRC_MAT_BIRTH)
+    source_row_id = F.col("BirthRow_ID").cast("string")
+    mother_key, mother_sys = subject_key_with_system(
+        [("urn:cerner:person_id", F.col("MotherPerson_ID"))], SRC_MAT_BIRTH, source_row_id)
+    baby_key, _ = subject_key_with_system(
+        [("urn:cerner:person_id", F.col("BabyPerson_ID")),
+         ("https://fhir.nhs.uk/Id/nhs-number", F.col("Baby_NHS")),
+         ("urn:barts:mrn", F.col("Baby_MRN"))],
+        SRC_MAT_BIRTH, source_row_id)
+    deleted = F.coalesce(F.col("PregnancySource_DELETE_IND").cast("long"), F.lit(0)) != 0
+    key = stable_id("birth:mill", F.col("BirthRow_ID"))
+
+    def coded(name):
+        return (F.col(f"{name}_CD").cast("bigint").cast("string"), F.col(f"{name}_DESC"))
+
+    method, outcome, neonatal, preg, pres = (coded(n) for n in
+                                             ("DeliveryMethod", "DeliveryOutcome", "NeonatalOutcome", "PregOutcome", "PresDel"))
+    return b.select(
+        key.alias("birth_key"), key.alias("patient_event_key"),
+        source_row_id.alias("birth_row_id"),
+        stable_id("journey:pregnancy", F.col("Pregnancy_ID").cast("string")).alias("journey_pregnancy_key"),
+        F.col("Pregnancy_ID").cast("string").alias("pregnancy_id"),
+        mother_key.alias("subject_key"), mother_sys.alias("subject_id_system"),
+        F.col("MotherPerson_ID").cast("bigint").alias("person_id"),
+        baby_key.alias("baby_subject_key"),
+        F.col("BabyPerson_ID").cast("bigint").alias("baby_person_id"),
+        F.when(F.col("BabyPerson_ID").isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved"))
+        .alias("baby_identity_status"),
+        F.col("BirthDateTime").cast("timestamp").alias("birth_datetime"),
+        # MATDQ_SILVER_V1: bronze nulls the year-2100 placeholder and flags it.
+        F.coalesce(F.col("BirthDateTimePlaceholder_IND").cast("boolean"), F.lit(False)).alias("birth_datetime_placeholder_ind"),
+        F.expr("try_cast(BirthOrder AS int)").alias("birth_order"),
+        F.expr("try_cast(FetusNumber AS int)").alias("fetus_number"),
+        method[0].alias("delivery_method_code"), method[1].alias("delivery_method_display"),
+        outcome[0].alias("delivery_outcome_code"), outcome[1].alias("delivery_outcome_display"),
+        neonatal[0].alias("neonatal_outcome_code"), neonatal[1].alias("neonatal_outcome_display"),
+        preg[0].alias("pregnancy_outcome_code"), preg[1].alias("pregnancy_outcome_display"),
+        pres[0].alias("presentation_code"), pres[1].alias("presentation_display"),
+        _as_int("GestationWeeks").alias("gestation_weeks"),
+        _as_int("GestationDays").alias("gestation_days"),
+        F.col("GestationRaw").cast("string").alias("gestation_source_value"),
+        F.coalesce(F.col("GestationImplausible_IND").cast("boolean"), F.lit(False)).alias("gestation_implausible_ind"),
+        F.col("BirthWeightGrams").cast("double").alias("birth_weight_grams"),
+        F.coalesce(F.col("BirthWeightImplausible_IND").cast("boolean"), F.lit(False)).alias("birth_weight_implausible_ind"),
+        F.col("BirthWeightSource").cast("string").alias("birth_weight_source"),
+        _as_int("APGAR1Min").alias("apgar_1_minute"),
+        _as_int("APGAR5Min").alias("apgar_5_minute"),
+        _as_int("APGAR10Min").alias("apgar_10_minute"),
+        F.col("BirthSex").cast("string").alias("birth_sex"),
+        F.when(deleted, F.lit("superseded")).otherwise(F.lit("active")).alias("record_status"),
+        F.lit("mat-birth").alias("construction_rule"),
+        F.lit("0.2.0").alias("construction_version"),
+        F.lit("millennium-maternity").alias("source_system"),
+        F.lit(SRC_MAT_BIRTH).alias("source_table"), source_row_id.alias("source_row_id"),
+        F.date_format(F.col("ADC_UPDT"), "yyyyMMddHHmmss").alias("load_batch_id"),
+        F.col("BirthSourceRecordUpdatedDateTime").alias("source_update_timestamp"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+    )
+
+
+BIRTH_COLUMN_COMMENTS = {
+    "birth_key": "Deterministic SHA-256 key of BirthRow_ID (birth:mill).",
+    "patient_event_key": "Same value as birth_key; the OMOP registry key stem (bir:<birth_key>:<item>).",
+    "birth_row_id": "Millennium BirthRow_ID; native source key.",
+    "journey_pregnancy_key": "spine_journey key of the pregnancy (journey:pregnancy over Pregnancy_ID).",
+    "pregnancy_id": "Millennium Pregnancy_ID.",
+    "subject_key": "Always-populated subject key for the mother.",
+    "subject_id_system": "Identifier system that produced subject_key.",
+    "person_id": "Mother Millennium PERSON_ID as BIGINT.",
+    "baby_subject_key": "Subject key for the baby (person id, else NHS number, else MRN); the identifiers themselves stay in bronze.",
+    "baby_person_id": "Baby Millennium PERSON_ID as BIGINT; NULL when the baby has no Millennium person.",
+    "baby_identity_status": "resolved when baby_person_id is set; unresolved otherwise.",
+    "birth_datetime": "Birth date/time as recorded (local wall-clock); NULL when the source held only the year-2100 not-recorded placeholder.",
+    "birth_datetime_placeholder_ind": "True when bronze found the year-2100 not-recorded placeholder instead of a birth time.",  # MATDQ_SILVER_V1
+    "birth_order": "Birth order within the delivery.",
+    "fetus_number": "Number of fetuses in the pregnancy.",
+    "delivery_method_code": "Millennium delivery method code.",
+    "delivery_method_display": "Millennium delivery method display.",
+    "delivery_outcome_code": "Millennium delivery outcome code (live birth, stillbirth, ...).",
+    "delivery_outcome_display": "Millennium delivery outcome display.",
+    "neonatal_outcome_code": "Millennium neonatal outcome code.",
+    "neonatal_outcome_display": "Millennium neonatal outcome display.",
+    "pregnancy_outcome_code": "Millennium pregnancy outcome code.",
+    "pregnancy_outcome_display": "Millennium pregnancy outcome display.",
+    "presentation_code": "Millennium presentation at delivery code.",
+    "presentation_display": "Millennium presentation at delivery display.",
+    "gestation_weeks": "Completed gestation weeks as recorded (implausible values kept, see gestation_implausible_ind).",
+    "gestation_days": "Gestation days beyond the completed weeks as recorded (NULL when not recorded; never defaulted).",
+    "gestation_source_value": "Bronze GestationRaw: the gestation text weeks/days were parsed from.",
+    "gestation_implausible_ind": "True when bronze flags the gestation as impossible (weeks below 1 or above 45, or days outside 0-6); weeks under 20 are not flagged.",  # MATDQ_SILVER_V1
+    "birth_weight_grams": "Birth weight in grams as recorded.",
+    "birth_weight_implausible_ind": "True when bronze flags the birth weight as implausible.",
+    "birth_weight_source": "Source of the birth weight as recorded.",
+    "apgar_1_minute": "Apgar score at 1 minute as recorded (integer; out-of-range values kept, judged downstream).",
+    "apgar_5_minute": "Apgar score at 5 minutes as recorded (integer; out-of-range values kept, judged downstream).",
+    "apgar_10_minute": "Apgar score at 10 minutes as recorded (integer; out-of-range values kept, judged downstream).",
+    "birth_sex": "Baby sex at birth as recorded.",
+    "record_status": "active, or superseded when the source pregnancy row is deleted.",
+    "construction_rule": "Rule that built the row.",
+    "construction_version": "Version of construction_rule.",
+    "source_system": "millennium-maternity.",
+    "source_table": "Bronze table read.",
+    "source_row_id": "BirthRow_ID as string.",
+    "load_batch_id": "Bronze ADC_UPDT as yyyyMMddHHmmss.",
+    "source_update_timestamp": "Birth source record update time.",
+    "loaded_at": "Bronze ADC_UPDT; ingestion provenance.",
+}
+
+
+@materialized_view(
+    name=_n("journey_clinical.birth"),
+    comment="One row per Millennium birth: delivery method/outcome, birth weight, Apgar, gestation and baby identity linkage.",
+    cluster_by=["person_id"], refresh_policy="incremental",
+    column_comments=BIRTH_COLUMN_COMMENTS,
+)
+def birth():
+    return _birth_canonical()
+
+
+# PMS_THEATRE_CASE_V1: parent case product for theatre_implant / milestone / attendance, with implant-expected flags.
+THEATRE_CASE_COLUMN_COMMENTS = {
+    "theatre_case_key": "SurgiNet SURG_CASE_ID as string; the same value children carry in theatre_case_key.",
+    "surgical_case_number": "Formatted SurgiNet case number as displayed to staff.",
+    "person_id": "Native Millennium PERSON_ID as BIGINT.",
+    "encounter_id": "Native Millennium ENCNTR_ID as BIGINT.",
+    "case_status": "Case status derived in bronze: PERFORMED, CANCELLED or SCHEDULED_ONLY.",
+    "active_ind": "Millennium ACTIVE_IND for the case row.",
+    "source_present_ind": "Whether the case row was present in the latest raw snapshot.",
+    "scheduled_start": "Scheduled case start as a UTC instant (Millennium); use scheduled_start_local for Europe/London wall-clock time.",
+    "scheduled_start_local": "scheduled_start in Europe/London wall-clock time (GMT/BST), from the bronze *_LOCAL companion.",
+    "checkin_datetime": "Patient check-in to theatres as a UTC instant (Millennium).",
+    "surgery_start": "Surgery start as a UTC instant (Millennium); use surgery_start_local for Europe/London wall-clock time.",
+    "surgery_start_local": "surgery_start in Europe/London wall-clock time (GMT/BST), from the bronze *_LOCAL companion.",
+    "surgery_start_quality": "Bronze quality flag for surgery_start (e.g. milestone vs fallback).",
+    "surgery_stop": "Surgery stop as a UTC instant (Millennium).",
+    "surgery_duration_minutes": "Surgery stop minus start in minutes, as derived in bronze.",
+    "scheduled_duration_minutes": "Scheduled case duration in minutes.",
+    "performed_milestone_ind": "Whether a performed milestone was recorded for the case.",
+    "add_on_ind": "SurgiNet add-on flag: case added to a list after scheduling (emergency/urgent proxy).",
+    "asa_class_code": "Millennium code value for ASA physical status class.",
+    "asa_class_display": "ASA physical status class description.",
+    "wound_class_code": "Millennium code value for wound class.",
+    "wound_class_display": "Wound class description (clean, clean-contaminated, ...).",
+    "anaesthesia_type_code": "Millennium code value for anaesthesia type.",
+    "anaesthesia_type_display": "Anaesthesia type description.",
+    "case_level_code": "Millennium code value for case level.",
+    "case_level_display": "Case level description.",
+    "patient_type_code": "Millennium code value for patient type.",
+    "patient_type_display": "Patient type description (inpatient, day case, ...).",
+    "surgical_specialty_id": "SurgiNet surgical specialty (prsnl_group) id.",
+    "surgeon_practitioner_id": "Native Millennium personnel PERSON_ID of the primary surgeon.",
+    "anaesthetist_practitioner_id": "Native Millennium personnel PERSON_ID of the anaesthetist.",
+    "institution_display": "Institution (hospital site) description.",
+    "department_display": "Theatre department description.",
+    "surgical_area_display": "Surgical area description.",
+    "operating_location_display": "Operating room description.",
+    "cancel_datetime": "Case cancellation time as a UTC instant (Millennium); null when not cancelled.",
+    "cancel_reason_code": "Millennium code value for the cancellation reason.",
+    "cancel_reason_display": "Cancellation reason description.",
+    "implant_expected_ind": "True when any active procedure on the case is implant-flagged at scheduling or in the procedure catalogue; null when the case has no procedure rows.",
+    "implant_expected_source": "scheduled_procedure when any procedure was implant-flagged at scheduling, else procedure_catalogue; null when not expected.",
+    "loaded_at": "map_theatre_case.ADC_UPDT carried unchanged; bronze ingestion provenance, not case time.",
+    "_source_system": "Constant surginet.",
+    "_source_table": "Bronze source table for the case row.",
+    "_source_row_id": "Bronze SURG_CASE_ID.",
+}
+
+THEATRE_CASE_LIFECYCLE_FIELDS = [
+]
+
+THEATRE_CASE_RETIRED_COLUMNS = [
+
+]
+
+def _theatre_case_implant_expected():
+    # Active procedures only; the max over the source strings prefers scheduled_procedure.
+    p = read_source(SRC_THEATRE_CASE_PROCEDURE).where(F.coalesce(F.col("ACTIVE_IND"), F.lit(1)) == 1)
+    src = (F.when(F.col("SCHED_IMPLANT_IND") == 1, F.lit("scheduled_procedure"))
+           .when(F.col("CATALOG_IMPLANT_IND") == 1, F.lit("procedure_catalogue")))
+    return p.groupBy(F.col("SURG_CASE_ID").alias("_ie_surg_case_id")).agg(
+        F.max(src.isNotNull()).alias("_implant_expected_ind"), F.max(src).alias("_implant_expected_source"))
+
+# contract v2: one canonical DataFrame feeds the research table and any internal metadata projection.
+def _lifecycle_source_theatre_case():
+    # Assemble one row per SurgiNet case with the case covariates and the implant-expected denominator.
+    c = read_source(SRC_THEATRE_CASE).alias("c")
+    d = c.join(_theatre_case_implant_expected(), c.SURG_CASE_ID == F.col("_ie_surg_case_id"), "left")
+    return d.select(
+        c.SURG_CASE_ID.cast("string").alias("theatre_case_key"),
+        c.SURG_CASE_NBR_FORMATTED.alias("surgical_case_number"),
+        c.PERSON_ID.cast("bigint").alias("person_id"),
+        c.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        c.CASE_STATUS.alias("case_status"),
+        c.ACTIVE_IND.alias("active_ind"),
+        c.SOURCE_PRESENT_IND.alias("source_present_ind"),
+        c.SCHED_START_DT_TM.alias("scheduled_start"),
+        c.SCHED_START_DT_TM_LOCAL.alias("scheduled_start_local"),
+        c.CHECKIN_DT_TM.alias("checkin_datetime"),
+        c.SURG_START_DT_TM.alias("surgery_start"),
+        c.SURG_START_DT_TM_LOCAL.alias("surgery_start_local"),
+        c.SURG_START_DT_TM_QUALITY.alias("surgery_start_quality"),
+        c.SURG_STOP_DT_TM.alias("surgery_stop"),
+        c.SURGERY_DURATION_MINUTES.alias("surgery_duration_minutes"),
+        c.SCHEDULED_DURATION_MINUTES.alias("scheduled_duration_minutes"),
+        c.PERFORMED_MILESTONE_IND.alias("performed_milestone_ind"),
+        c.ADD_ON_IND.alias("add_on_ind"),
+        c.ASA_CLASS_CD.cast("string").alias("asa_class_code"),
+        c.ASA_CLASS_DESCRIPTION.alias("asa_class_display"),
+        c.WOUND_CLASS_CD.cast("string").alias("wound_class_code"),
+        c.WOUND_CLASS_DESCRIPTION.alias("wound_class_display"),
+        c.ANESTH_TYPE_CD.cast("string").alias("anaesthesia_type_code"),
+        c.ANESTH_TYPE_DESCRIPTION.alias("anaesthesia_type_display"),
+        c.CASE_LEVEL_CD.cast("string").alias("case_level_code"),
+        c.CASE_LEVEL_DESCRIPTION.alias("case_level_display"),
+        c.PAT_TYPE_CD.cast("string").alias("patient_type_code"),
+        c.PAT_TYPE_DESCRIPTION.alias("patient_type_display"),
+        c.SURG_SPECIALTY_ID.cast("bigint").alias("surgical_specialty_id"),
+        c.SURGEON_PERSONNEL_ID.cast("bigint").alias("surgeon_practitioner_id"),
+        c.ANAESTHETIST_PERSONNEL_ID.cast("bigint").alias("anaesthetist_practitioner_id"),
+        c.INST_DESCRIPTION.alias("institution_display"),
+        c.DEPT_DESCRIPTION.alias("department_display"),
+        c.SURG_AREA_DESCRIPTION.alias("surgical_area_display"),
+        c.SURG_OP_LOCATION_DESCRIPTION.alias("operating_location_display"),
+        c.CANCEL_DT_TM.alias("cancel_datetime"),
+        c.CANCEL_REASON_CD.cast("string").alias("cancel_reason_code"),
+        c.CANCEL_REASON_DESCRIPTION.alias("cancel_reason_display"),
+        F.col("_implant_expected_ind").alias("implant_expected_ind"),
+        F.col("_implant_expected_source").alias("implant_expected_source"),
+        c.ADC_UPDT.alias("loaded_at"),
+        F.lit("surginet").alias("_source_system"),
+        F.lit(SRC_THEATRE_CASE).alias("_source_table"),
+        c.SURG_CASE_ID.cast("string").alias("_source_row_id"),
+    )
+
+@materialized_view(
+    name=_n("journey_reference.theatre_case"),
+    comment="One SurgiNet surgical case with case covariates (ASA, wound class, anaesthesia, urgency, times) and the implant-expected flag.",
+    cluster_by=["person_id"], refresh_policy="incremental",
+    column_comments=THEATRE_CASE_COLUMN_COMMENTS,
+)
+def theatre_case():
+    # Build the declared dataset: one SurgiNet surgical case.
+    return _lifecycle_source_theatre_case().drop(*THEATRE_CASE_LIFECYCLE_FIELDS, *THEATRE_CASE_RETIRED_COLUMNS)
 

@@ -130,6 +130,16 @@ ABSENCE_STRINGS = [
 ]
 
 def build_frame(since=None):
+    # TZ_LOCAL_V1/allergy: the full overwrite and the UPDATE SET * / INSERT * merge both take the companions from here.
+    return _build_frame_utc(since).withColumns({
+        "ONSET_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("ONSET_DT_TM_CLEAN"), "Europe/London"),
+        "CREATED_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("CREATED_DT_TM_CLEAN"), "Europe/London"),
+        "CANCEL_DT_TM_CLEAN_LOCAL": F.from_utc_timestamp(F.col("CANCEL_DT_TM_CLEAN"), "Europe/London"),
+        "END_EFFECTIVE_DT_TM_LOCAL": F.from_utc_timestamp(F.col("END_EFFECTIVE_DT_TM"), "Europe/London"),
+    })
+
+
+def _build_frame_utc(since=None):
     a = spark.table("4_prod.raw.mill_allergy")
     if since is not None:
         changed = (a.filter(F.col("ADC_UPDT") > F.lit(since))
@@ -167,6 +177,10 @@ def build_frame(since=None):
         F.col("SUBSTANCE_NOM_ID").cast("bigint") == F.col("NOMENCLATURE_ID"),
         "left",
     )
+    # PMS_ALLERGY_BLANK_V1: Millennium stores an absent free-text substance as a single space
+    # (2.12M of 2.21M rows); publish it as NULL so display fallbacks reach the nomenclature strings.
+    df = df.withColumns({c: F.when(F.trim(F.col(c)) != "", F.col(c))
+                         for c in ("SUBSTANCE_FTDESC", "SUBSTANCE_SHORT_STRING", "SUBSTANCE_SOURCE_STRING")})
     for c, o in [
         ("SUBSTANCE_TYPE_CD", "SUBSTANCE_TYPE_DESC"),
         ("REACTION_CLASS_CD", "REACTION_CLASS_DESC"),

@@ -29,6 +29,7 @@ import uuid
 from datetime import date, timedelta
 from functools import reduce
 
+from databricks.sdk import WorkspaceClient
 from delta.tables import DeltaTable
 from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame
@@ -299,6 +300,9 @@ EXPECTED_TARGET_SCHEMA.update({
     "SOURCE_PRESENT_IND": "boolean",
     "SOURCE_ABSENT_DETECTED_TS": "timestamp",
     "ADC_UPDT": "timestamp",
+    # TZ_LOCAL_V1/waitlist: Europe/London companions, last (ADD COLUMNS appends them in this order).
+    "WAITING_START_DT_TM_LOCAL": "timestamp",
+    "WAITING_END_DT_TM_LOCAL": "timestamp",
 })
 
 SNAPSHOT_COLUMNS = [
@@ -1335,6 +1339,7 @@ def materialize_main_stage(df: DataFrame) -> DataFrame:
         if name not in {
             "ROW_HASH", "PIPELINE_RUN_ID", "PIPELINE_ATTEMPT_ID", "PIPELINE_PROCESSED_TS",
             "SOURCE_PRESENT_IND", "SOURCE_ABSENT_DETECTED_TS", "ADC_UPDT",
+            "WAITING_START_DT_TM_LOCAL", "WAITING_END_DT_TM_LOCAL",
         }
     }
     validate_schema_contract(
@@ -1355,6 +1360,7 @@ def materialize_main_stage(df: DataFrame) -> DataFrame:
         .withColumn("SOURCE_PRESENT_IND", F.lit(True))
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
         .withColumn("ADC_UPDT", F.lit(WRITE_TS).cast("timestamp"))
+        .transform(lambda frame: bronze_add_time_companions(frame, TARGET))
         .select(*EXPECTED_TARGET_SCHEMA.keys())
     )
     snapshot = write_attempt_stage(staged, MAIN_STAGE, "map_waiting_list")
@@ -2141,6 +2147,7 @@ def validate_after_merge(
 
 CLASSIFICATION_CONTROL = "4_prod.tmp.trust_classification_control_v3"
 CLASSIFICATION_TABLE_LOG = "6_mgmt.logs.trust_classification_table_log_v2"
+CLASSIFIER_NOTEBOOK = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Trust Identification/Trust Classification Incremental"
 ACCOUNTING_CATEGORIES = (
     "raw", "staging_residue", "excluded_archive", "abandoned_archive",
 )
@@ -2256,9 +2263,10 @@ def full_drain_accounting() -> dict:
                    .where((F.col("version") <= end)
                           & (F.col("timestamp") > F.lit(control["staged_at_watermark"]))
                           & (F.col("timestamp") <= F.lit(log["logged_at"]))).collect())
-        # The classifier identified from this incident's Delta history. A changed
-        # writer must be investigated, rather than borrowing another writer's CDF.
-        writer_id = "2566476679767010"
+        # TLA_BRONZE_FIX_V1: the classifier's commits are identified by its notebook id, resolved from
+        # its fixed path, because re-importing the notebook (as on 2026-09-25) mints a new id. Any other
+        # writer still fails the checks below rather than lending its CDF.
+        writer_id = str(WorkspaceClient().workspace.get_status(CLASSIFIER_NOTEBOOK).object_id)
         mutations = [r for r in history if r["operation"] == "MERGE"
                      and r["notebook"] and str(r["notebook"]["notebookId"]) == writer_id]
         if not mutations:
@@ -3216,7 +3224,6 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 
 
 
