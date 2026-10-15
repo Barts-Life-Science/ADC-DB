@@ -2223,9 +2223,16 @@ def full_drain_accounting() -> dict:
     Candidate routes overlap, so staged_rows is a UNION ALL row count. The
     SUCCESS log's resolved_keys is the deduplicated key count. Prove that count
     against time-travel staging, deletion CDF, archives and pinned raw payloads.
+
+    WL_MULTI_LEDGER_DRAIN_V1: the classifier can run more than once between two
+    landings (a same-job rerun of the remainder, or a later manual or maintenance
+    run). Every SUCCESS ledger since the landing owns the classifier commits up to
+    its own log time; each ledger is proven on its own staging versions, and the
+    ledgers must chain: each ledger's input is the previous ledger's remainder.
     """
     heartbeat_run_lock("physical classifier key accounting")
     results = {}
+    writer_id = None
     for source, key in ((SRC_CURRENT, "PM_WAIT_LIST_ID"), (SRC_HIST, "PM_WAIT_LIST_HIST_ID")):
         basename = source.split(".")[-1]
         staging = f"4_prod.staging.{basename}"
@@ -2236,45 +2243,64 @@ def full_drain_accounting() -> dict:
         control = controls[0].asDict()
         ledger = control["run_id"]
         end = int(control["staging_version"])
-        logs = (spark.table(CLASSIFICATION_TABLE_LOG)
-                .where((F.col("run_id") == ledger)
-                       & normalized_table_match(F.col("table_name"), basename)
-                       & (F.upper(F.trim("status")) == "SUCCESS")
-                       & (F.col("logged_at") <= F.lit(control["updated_at"]))).collect())
-        if len(logs) != 1:
+        # Every SUCCESS ledger since the landing watermark, oldest first; the control's ledger must be the last.
+        logs = sorted(
+            (r.asDict() for r in spark.table(CLASSIFICATION_TABLE_LOG)
+             .where(normalized_table_match(F.col("table_name"), basename)
+                    & (F.upper(F.trim("status")) == "SUCCESS")
+                    & (F.col("logged_at") > F.lit(control["staged_at_watermark"]))
+                    & (F.col("logged_at") <= F.lit(control["updated_at"]))).collect()),
+            key=lambda r: r["logged_at"])
+        if len({r["run_id"] for r in logs}) != len(logs):
+            fail(f"{basename}: a classifier ledger logged SUCCESS twice")
+        if not logs:
             fail(f"{basename}: expected one matching SUCCESS ledger")
-        log = logs[0].asDict()
+        # The classifier advances the control row without a table log when it finds staging empty
+        # ("skipped; no staging or mapping content changed"). That run is authoritative only if it wrote
+        # no log for this table and the last ledger left nothing behind; the checks below prove both.
+        control_skipped = logs[-1]["run_id"] != ledger
+        if control_skipped and (spark.table(CLASSIFICATION_TABLE_LOG)
+                                .where((F.col("run_id") == ledger) & normalized_table_match(F.col("table_name"), basename))
+                                .limit(1).count()):
+            fail(f"{basename}: expected one matching SUCCESS ledger")
         names = ("staged_rows", "resolved_keys", "promoted_keys", "excluded_keys", "abandoned_keys", "remaining_rows")
-        if any(log.get(n) is None or int(log[n]) < 0 for n in names):
-            fail(f"{basename}: missing or negative ledger term")
-        terms = {n: int(log[n]) for n in names}
+        for log in logs:
+            if any(log.get(n) is None or int(log[n]) < 0 for n in names):
+                fail(f"{basename}: missing or negative ledger term")
+            terms = {n: int(log[n]) for n in names}
+            if terms["abandoned_keys"]:
+                fail(f"{basename}: null/abandoned keys require separate reconciliation")
+            if terms["resolved_keys"] != sum(terms[n] for n in ("promoted_keys", "excluded_keys", "remaining_rows")):
+                fail(f"{basename}: resolved-key accounting identity failed")
+            if terms["staged_rows"] < terms["resolved_keys"]:
+                fail(f"{basename}: candidate rows cannot be fewer than resolved keys")
+            log["terms"] = terms
         # Preserve the pre-existing cumulative row-count/history protection.
         cumulative_proof = derive_incremental_cumulative_rows(source, last_checkpoint(source))
         if cumulative_proof["cumulative_rows"] != int(PINNED_SOURCE_METRICS[source]["rows"]):
             fail(f"{basename}: retained history does not reconcile pinned cumulative raw rows")
-        if terms["abandoned_keys"]:
-            fail(f"{basename}: null/abandoned keys require separate reconciliation")
-        if terms["resolved_keys"] != sum(terms[n] for n in ("promoted_keys", "excluded_keys", "remaining_rows")):
-            fail(f"{basename}: resolved-key accounting identity failed")
-        if terms["staged_rows"] < terms["resolved_keys"]:
-            fail(f"{basename}: candidate rows cannot be fewer than resolved keys")
 
         history = (spark.sql(f"DESCRIBE HISTORY {qname(staging)}")
                    .where((F.col("version") <= end)
                           & (F.col("timestamp") > F.lit(control["staged_at_watermark"]))
-                          & (F.col("timestamp") <= F.lit(log["logged_at"]))).collect())
+                          & (F.col("timestamp") <= F.lit(logs[-1]["logged_at"]))).collect())
         # TLA_BRONZE_FIX_V1: the classifier's commits are identified by its notebook id, resolved from
         # its fixed path, because re-importing the notebook (as on 2026-09-25) mints a new id. Any other
         # writer still fails the checks below rather than lending its CDF.
-        writer_id = str(WorkspaceClient().workspace.get_status(CLASSIFIER_NOTEBOOK).object_id)
+        if writer_id is None:
+            writer_id = str(WorkspaceClient().workspace.get_status(CLASSIFIER_NOTEBOOK).object_id)
         mutations = [r for r in history if r["operation"] == "MERGE"
                      and r["notebook"] and str(r["notebook"]["notebookId"]) == writer_id]
         if not mutations:
             fail(f"{basename}: no retained classifier staging commits")
+        # Each classifier commit belongs to the first ledger logged at or after it.
+        owned = {log["run_id"]: [] for log in logs}
+        for row in mutations:
+            owner = next((log for log in logs if row["timestamp"] <= log["logged_at"]), None)
+            if owner is None:
+                fail(f"{basename}: classifier commit after the last SUCCESS ledger")
+            owned[owner["run_id"]].append(row)
         start = min(int(r["readVersion"]) for r in mutations)
-        mutation_jobs = {str(r["job"]["jobRunId"]) for r in mutations if r["job"]}
-        if len(mutation_jobs) != 1:
-            fail(f"{basename}: ambiguous classifier run window")
         window = [r for r in history if start < int(r["version"]) <= end]
         if {int(r["version"]) for r in window} != set(range(start + 1, end + 1)):
             fail(f"{basename}: incomplete staging history window")
@@ -2290,8 +2316,6 @@ def full_drain_accounting() -> dict:
         def pinned(table, version):
             return spark.read.option("versionAsOf", int(version)).table(table)
 
-        before = pinned(staging, start)
-        after = pinned(staging, end)
         def checked_keys(frame, expected, label):
             parsed = F.expr(f"try_cast(`{key}` AS BIGINT)")
             checked = frame.select(parsed.alias(key),
@@ -2302,71 +2326,102 @@ def full_drain_accounting() -> dict:
                 fail(f"{basename}: {label} has null/duplicate/missing keys: {m.asDict()}, expected={expected}")
             return checked.select(key)
 
-        before_keys = checked_keys(before, terms["resolved_keys"], "physical classifier input")
-        after_keys = checked_keys(after, terms["remaining_rows"], "physical classifier remainder")
-        if after_keys.join(before_keys, key, "left_anti").limit(1).count():
-            fail(f"{basename}: remainder contains a key absent from input")
-        deleted = spark.sql(
-            f"SELECT * FROM table_changes('{staging}', {start + 1}, {end}) WHERE _change_type='delete'"
-        )
-        deleted_keys = checked_keys(deleted, terms["promoted_keys"] + terms["excluded_keys"], "deleted staging rows")
-        expected_deleted = before_keys.join(after_keys, key, "left_anti")
-        if (deleted_keys.join(expected_deleted, key, "left_anti").limit(1).count()
-                or expected_deleted.join(deleted_keys, key, "left_anti").limit(1).count()):
-            fail(f"{basename}: deletion CDF does not equal input minus remainder")
-
+        raw_pinned = pinned(source, SOURCE_VERSIONS[source])
         archive = f"4_prod.staging_excluded.{basename}"
-        if terms["excluded_keys"]:
-            archive_version = source_version(archive)
-            excluded = pinned(archive, archive_version).where(F.col("_run_id") == ledger)
-            if excluded.where(F.col("_archived_at").isNull() | (F.col("_archived_at") > F.lit(log["logged_at"]))).limit(1).count():
-                fail(f"{basename}: archive rows lack or postdate the SUCCESS timestamp")
-            excluded_keys = checked_keys(excluded, terms["excluded_keys"], "excluded archive")
-            if excluded_keys.join(deleted_keys, key, "left_anti").limit(1).count():
-                fail(f"{basename}: excluded archive is not a subset of deletion CDF")
-        else:
-            excluded_keys = before_keys.limit(0)
-            archive_version = None
-        promoted_keys = deleted_keys.join(excluded_keys, key, "left_anti")
-        checked_keys(promoted_keys, terms["promoted_keys"], "promoted keys")
-        promoted = before.join(F.broadcast(promoted_keys), key, "inner")
-        raw = pinned(source, SOURCE_VERSIONS[source]).join(F.broadcast(promoted_keys), key, "inner")
-        checked_keys(raw, terms["promoted_keys"], "raw coverage of promoted keys")
+        archive_version = source_version(archive) if any(log["terms"]["excluded_keys"] for log in logs) else None
+        segments = []
+        previous_end = start
+        for log in logs:
+            terms, owned_rows = log["terms"], owned[log["run_id"]]
+            if not owned_rows:
+                # A ledger that found nothing staged commits nothing; anything else is unaccounted.
+                if terms["resolved_keys"] or terms["staged_rows"]:
+                    fail(f"{basename}: ledger {log['run_id']} has no staging commits")
+                segments.append({"ledger_run_id": log["run_id"], "table_log": terms,
+                                 "staging_before_version": previous_end, "staging_after_version": previous_end})
+                continue
+            seg_start = min(int(r["readVersion"]) for r in owned_rows)
+            seg_end = max(int(r["version"]) for r in owned_rows)
+            # Ledgers chain: only OPTIMIZE commits may sit between one ledger's last commit and the next one's input.
+            gap = [r for r in window if previous_end < int(r["version"]) <= seg_start]
+            if seg_start < previous_end or any(r["operation"] != "OPTIMIZE" for r in gap):
+                fail(f"{basename}: classifier ledgers do not chain at version {seg_start}")
+            before = pinned(staging, seg_start)
+            after = pinned(staging, seg_end)
+            before_keys = checked_keys(before, terms["resolved_keys"], "physical classifier input")
+            after_keys = checked_keys(after, terms["remaining_rows"], "physical classifier remainder")
+            if after_keys.join(before_keys, key, "left_anti").limit(1).count():
+                fail(f"{basename}: remainder contains a key absent from input")
+            deleted = spark.sql(
+                f"SELECT * FROM table_changes('{staging}', {seg_start + 1}, {seg_end}) WHERE _change_type='delete'"
+            )
+            deleted_keys = checked_keys(deleted, terms["promoted_keys"] + terms["excluded_keys"], "deleted staging rows")
+            expected_deleted = before_keys.join(after_keys, key, "left_anti")
+            if (deleted_keys.join(expected_deleted, key, "left_anti").limit(1).count()
+                    or expected_deleted.join(deleted_keys, key, "left_anti").limit(1).count()):
+                fail(f"{basename}: deletion CDF does not equal input minus remainder")
 
-        # A submitted MERGE key may already have the same/newer record in raw.
-        # Compare source counters first; equal counters require equal business
-        # payload, except the three fields filled by trust classification.
-        shared = sorted(set(promoted.columns) & set(raw.columns))
-        counters = [c for c in ("UPDT_CNT", "LAST_UTC_TS", "UPDT_DT_TM") if c in shared]
-        if not counters:
-            fail(f"{basename}: no source counters for no-op proof")
-        a = F.struct(*[F.col(f"a.`{c}`") for c in counters])
-        b = F.struct(*[F.col(f"b.`{c}`") for c in counters])
-        same_payload = F.lit(True)
-        excluded_fields = {key, "ADC_UPDT", "Trust", "TRUST", "ORGANIZATION_ID", "ENCNTR_ID"}
-        for c in shared:
-            if c not in excluded_fields and not c.startswith("_"):
-                same_payload = same_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
-        comparison = promoted.alias("a").join(raw.alias("b"), key)
-        if comparison.where(~F.coalesce((b > a) | (b.eqNullSafe(a) & same_payload), F.lit(False))).limit(1).count():
-            fail(f"{basename}: promoted raw row is older or differs at equal source counters")
+            if terms["excluded_keys"]:
+                excluded = pinned(archive, archive_version).where(F.col("_run_id") == log["run_id"])
+                if excluded.where(F.col("_archived_at").isNull() | (F.col("_archived_at") > F.lit(log["logged_at"]))).limit(1).count():
+                    fail(f"{basename}: archive rows lack or postdate the SUCCESS timestamp")
+                excluded_keys = checked_keys(excluded, terms["excluded_keys"], "excluded archive")
+                if excluded_keys.join(deleted_keys, key, "left_anti").limit(1).count():
+                    fail(f"{basename}: excluded archive is not a subset of deletion CDF")
+            else:
+                excluded_keys = before_keys.limit(0)
+            promoted_keys = deleted_keys.join(excluded_keys, key, "left_anti")
+            checked_keys(promoted_keys, terms["promoted_keys"], "promoted keys")
+            promoted = before.join(F.broadcast(promoted_keys), key, "inner")
+            raw = raw_pinned.join(F.broadcast(promoted_keys), key, "inner")
+            checked_keys(raw, terms["promoted_keys"], "raw coverage of promoted keys")
 
-        if terms["excluded_keys"]:
-            archive_payload = F.lit(True)
-            for c in sorted(set(before.columns) & set(excluded.columns)):
-                if not c.startswith("_") and c != "ADC_UPDT":
-                    archive_payload = archive_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
-            if before.alias("a").join(excluded.alias("b"), key).where(~archive_payload).limit(1).count():
-                fail(f"{basename}: excluded archive payload differs from classifier input")
+            # A submitted MERGE key may already have the same/newer record in raw.
+            # Compare source counters first; equal counters require equal business
+            # payload, except the three fields filled by trust classification.
+            shared = sorted(set(promoted.columns) & set(raw.columns))
+            counters = [c for c in ("UPDT_CNT", "LAST_UTC_TS", "UPDT_DT_TM") if c in shared]
+            if not counters:
+                fail(f"{basename}: no source counters for no-op proof")
+            a = F.struct(*[F.col(f"a.`{c}`") for c in counters])
+            b = F.struct(*[F.col(f"b.`{c}`") for c in counters])
+            same_payload = F.lit(True)
+            excluded_fields = {key, "ADC_UPDT", "Trust", "TRUST", "ORGANIZATION_ID", "ENCNTR_ID"}
+            for c in shared:
+                if c not in excluded_fields and not c.startswith("_"):
+                    same_payload = same_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
+            comparison = promoted.alias("a").join(raw.alias("b"), key)
+            if comparison.where(~F.coalesce((b > a) | (b.eqNullSafe(a) & same_payload), F.lit(False))).limit(1).count():
+                fail(f"{basename}: promoted raw row is older or differs at equal source counters")
+
+            if terms["excluded_keys"]:
+                archive_payload = F.lit(True)
+                for c in sorted(set(before.columns) & set(excluded.columns)):
+                    if not c.startswith("_") and c != "ADC_UPDT":
+                        archive_payload = archive_payload & F.col(f"a.`{c}`").eqNullSafe(F.col(f"b.`{c}`"))
+                if before.alias("a").join(excluded.alias("b"), key).where(~archive_payload).limit(1).count():
+                    fail(f"{basename}: excluded archive payload differs from classifier input")
+            segments.append({"ledger_run_id": log["run_id"], "table_log": terms,
+                             "staging_before_version": seg_start, "staging_after_version": seg_end})
+            previous_end = seg_end
+        if previous_end != end:
+            fail(f"{basename}: the last ledger does not end at the control staging version")
+        if control_skipped and (segments[-1]["table_log"]["remaining_rows"] or pinned(staging, end).limit(1).count()):
+            fail(f"{basename}: control run skipped the table but staging was not empty")
+
+        first, last = segments[0]["table_log"], segments[-1]["table_log"]
         results[source] = {
-            "status": "PASS", "ledger_run_id": ledger, "table_log": terms,
-            "accounting_mode": "PHYSICAL_DISTINCT_KEYS_AND_RAW_PAYLOAD",
+            "status": "PASS", "ledger_run_id": ledger, "table_log": last, "control_run_skipped_table": control_skipped,
+            "accounting_mode": "PHYSICAL_DISTINCT_KEYS_AND_RAW_PAYLOAD_CHAINED_LEDGERS",
             "staging_before_version": start, "staging_after_version": end,
             "raw_version": int(SOURCE_VERSIONS[source]), "archive_version": archive_version,
-            "candidate_route_duplicate_rows": terms["staged_rows"] - terms["resolved_keys"],
+            "ledger_segments": segments,
+            "candidate_route_duplicate_rows": sum(s["table_log"]["staged_rows"] - s["table_log"]["resolved_keys"]
+                                                  for s in segments),
             "promoted_raw_payload_verified": True,
             "cumulative_history_proof": cumulative_proof,
-            "key_ownership": {"pairwise_disjoint": True, "union_total": terms["resolved_keys"]},
+            "key_ownership": {"pairwise_disjoint": True, "union_total": first["resolved_keys"],
+                              "final_remainder": last["remaining_rows"]},
         }
     ledgers = {r["ledger_run_id"] for r in results.values()}
     if len(ledgers) != 1:
@@ -3224,7 +3279,6 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 
 
 

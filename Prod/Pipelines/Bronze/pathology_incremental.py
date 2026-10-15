@@ -50,6 +50,72 @@ def _read_changes(spark, table_name: str, start_version: int, end_version: int):
     )
 
 
+
+# PATH_EXPANSION_LANES_V1: map_pathology columns each expansion lane reads, derived from the code by AST (functions that
+# read config.map_pathology_table, their same-module helpers, and the output contracts they pass mp.* into) and checked
+# against Unity Catalog column lineage (~/path_expansion_hash_fix_20261011/analysis/derive_read_sets.py). A
+# map_pathology update re-expands its parent only when a core column changed. When only an equivalence column changed
+# (measurement_concept_id, ucum_code, unit_source_value), only map_pathology_result_equivalence is recomputed for the
+# parent's accessions. Updates touching neither (concept names, SNOMED/LOINC codes, tiers, mapping provenance,
+# canonical units, ...) re-expand nothing. No stored state changes: the hashes compare each update's pre- and post-image.
+EXPANSION_CORE_COLUMNS = ('ENCNTR_ID', 'LIMSNo', 'MRN', 'NHS_Number', 'PERSON_ID', 'ReportDate', 'WkgCode', 'authentic_flag', 'body_site_code', 'code', 'description', 'lab_no', 'measurement_datetime', 'order_id', 'order_no', 'performed_dt_tm', 'person_match_status', 'report_section', 'request_dt', 'result_status', 'sample_dt', 'source_code', 'source_parent_key', 'source_record_key', 'source_sequence_end', 'source_sequence_start', 'source_table', 'specimen_category', 'specimen_type_code', 'urgent_flag', 'value_source_value', 'verified_dt_tm')
+EXPANSION_EQUIVALENCE_COLUMNS = ('code', 'measurement_concept_id', 'measurement_datetime', 'source_parent_key', 'source_record_key', 'source_table', 'ucum_code', 'unit_source_value', 'value_source_value')
+_EQUIVALENCE_ONLY = [None]
+
+
+def _lane_payload(changes, columns):
+    _, F = _imports()
+    present = [column for column in columns if column in changes.columns]
+    return F.xxhash64(*[F.col(column) for column in present])
+
+
+def _equivalence_only_parent_changes(changes):
+    """(source_table, source_parent_key, source_record_key) of map_pathology updates whose core columns are unchanged
+    but whose equivalence columns changed."""
+    if changes is None:
+        return None
+    _, F = _imports()
+    prepared = changes.filter(F.col('_change_type').isin('update_preimage', 'update_postimage')).select(
+        'source_record_key', 'source_table', 'source_parent_key',
+        F.col('_commit_version').alias('_commit_version'), F.col('_change_type').alias('_change_type'),
+        _lane_payload(changes, EXPANSION_CORE_COLUMNS).alias('_CORE'),
+        _lane_payload(changes, EXPANSION_EQUIVALENCE_COLUMNS).alias('_EQ'),
+    )
+    before = prepared.filter(F.col('_change_type') == 'update_preimage').alias('b')
+    after = prepared.filter(F.col('_change_type') == 'update_postimage').alias('a')
+    return (
+        before.join(after, F.col('b.source_record_key').eqNullSafe(F.col('a.source_record_key'))
+                    & (F.col('b._commit_version') == F.col('a._commit_version')), 'inner')
+        .where(F.col('b._CORE').eqNullSafe(F.col('a._CORE')) & ~F.col('b._EQ').eqNullSafe(F.col('a._EQ')))
+        .select(F.col('a.source_table').alias('source_table'), F.col('a.source_parent_key').alias('source_parent_key'),
+                F.col('a.source_record_key').alias('source_record_key'))
+        .filter(F.col('source_parent_key').isNotNull()).dropDuplicates()
+    )
+
+
+def _run_equivalence_only_lane(spark, config, core_touched, run_id):
+    """Recompute map_pathology_result_equivalence alone for the equivalence-only parents of this run (parents the
+    core run already recomputed are skipped). Returns the lane metrics, or None when there is nothing to do."""
+    changed = _EQUIVALENCE_ONLY[0]
+    if changed is None:
+        return None
+    _, F = _imports()
+    parents = changed.select(
+        F.when(F.col('source_table') == 'raw', 'TFC_LIMS').otherwise('CERNER').alias('source_system'), 'source_parent_key'
+    ).dropDuplicates()
+    if core_touched is not None:
+        parents = parents.join(core_touched.select('source_system', 'source_parent_key'),
+                               ['source_system', 'source_parent_key'], 'left_anti')
+    count = parents.count()
+    if count == 0:
+        return None
+    from pathology_pipeline import run_result_equivalence_only
+    records = changed.select('source_record_key').dropDuplicates()
+    metrics = run_result_equivalence_only(spark, config, parents, record_keys=records)
+    log_run(spark, config, run_id=run_id, mode='INCREMENTAL', status='SUCCESS', stage='result_equivalence_only',
+            message=str(metrics)[:8000], source_parent_count=count)
+    return metrics
+
 def _semantic_map_parent_changes(changes):
     """Discard map_pathology updates that changed only operational provenance."""
     if changes is None:
@@ -60,7 +126,7 @@ def _semantic_map_parent_changes(changes):
         'ADC_UPDT', 'source_adc_updt', 'mapping_updated_at', 'loaded_at',
         'source_payload_hash',
     }
-    semantic_columns = [column for column in changes.columns if column not in ignored]
+    semantic_columns = [column for column in EXPANSION_CORE_COLUMNS if column in changes.columns and column not in ignored]  # PATH_EXPANSION_LANES_V1
     payload = F.xxhash64(*[F.col(column) for column in semantic_columns])
     prepared = changes.select(
         'source_record_key', 'source_table', 'source_parent_key',
@@ -124,6 +190,7 @@ def changed_parent_keys(spark, config: PipelineConfig):
     """
 
     _, F = _imports()
+    _EQUIVALENCE_ONLY[0] = None  # PATH_EXPANSION_LANES_V1
     state = _state(spark, config)
     sources = _state_sources(config)
     versions = {name: current_delta_version(spark, table) for name, table in sources.items()}
@@ -137,6 +204,7 @@ def changed_parent_keys(spark, config: PipelineConfig):
     )
     if map_changes is not None:
         semantic_map_changes = _semantic_map_parent_changes(map_changes)
+        _EQUIVALENCE_ONLY[0] = _equivalence_only_parent_changes(map_changes)  # PATH_EXPANSION_LANES_V1
         frames.append(
             semantic_map_changes.select(
                 F.when(F.col("source_table") == "raw", "TFC_LIMS")
@@ -345,6 +413,7 @@ def run_incremental_core(
         count = touched.count()
         mode = "INCREMENTAL"
         if count == 0:
+            _run_equivalence_only_lane(spark, config, None, run_id)  # PATH_EXPANSION_LANES_V1
             commit_state(spark, config, versions, run_id)
             log_run(
                 spark,
@@ -374,6 +443,8 @@ def run_incremental_core(
             touched_parent_keys=touched,
             validate_stage_keys=validate_stage_keys,
         )
+    if touched is not None:
+        _run_equivalence_only_lane(spark, config, touched, run_id)  # PATH_EXPANSION_LANES_V1
     commit_state(spark, config, versions, run_id)
     log_run(
         spark,

@@ -1082,12 +1082,13 @@ ig_tag_table(TARGET_REL, REL_IG)
 
 result = run_gates(state_start, report_stats)
 
-# Every source is Delta; recheck all versions after the build so a mid-run commit cannot be
-# recorded as the state this build reflects.
+# SOURCE_PIN_DRIFT_V1: every source read is pinned to the start versions, so a commit made during the build
+# (OPTIMIZE, COMPUTE STATS, SET TBLPROPERTIES or new data from a parallel task) cannot change this result. The
+# start state is what gets recorded; if the sources moved, it no longer matches and the next run rebuilds. The old
+# fatal check failed the 2026-10-05 catch-up on exactly such commits.
 state_end, signature_end = source_state()
-assert signature_end == source_signature, (
-    f"source drift during build: {source_signature} -> {signature_end}; state not committed"
-)
+if signature_end != source_signature:
+    print(f"[B12][SOURCE_MOVED] {source_signature} -> {signature_end}; recorded the pinned start state, next run rebuilds")
 
 set_target_properties({
     "b12.logic_version": LOGIC_VERSION,
@@ -1135,4 +1136,3 @@ dbutils.notebook.exit(json.dumps(summary, default=str, sort_keys=True))
 #    (EFFECTIVE_CURRENT_DECISION='text_version_ambiguous' OR TEXT_INTEGRITY_STATUS='text_integrity_unknown').
 
 # PACS_TEXT_BRIDGE_V4_PATCHED
-

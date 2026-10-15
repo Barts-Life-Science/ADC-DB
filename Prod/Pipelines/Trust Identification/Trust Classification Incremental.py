@@ -118,8 +118,13 @@ PAYLOAD_CHANGE_ONLY_TABLES = {
 # accompanying UPDT_CNT/LAST_UTC_TS/UPDT_DT_TM change. On an equal-order tie,
 # staging is authoritative for this column only. Every other payload difference
 # still fails closed.
+# TCI_ORDER_ACTION_EQUAL_ORDER_V1: ORDER_ACTION.NEEDS_VERIFY_IND and
+# NEED_CLIN_REVIEW_FLAG are rewritten in place when pharmacy verification
+# supersedes an action (seen 2026-10-10: 1/1 -> 2/5 with UPDT_CNT still 0 and
+# UPDT_DT_TM unchanged). Staging wins for these two columns only.
 EQUAL_ORDER_SOURCE_WINS_COLUMNS = {
     "mill_order_detail": {"OE_FIELD_VALUE"},
+    "mill_order_action": {"NEEDS_VERIFY_IND", "NEED_CLIN_REVIEW_FLAG"},
 }
 
 

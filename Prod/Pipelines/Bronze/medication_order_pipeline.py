@@ -7,8 +7,9 @@
 # MAGIC
 # MAGIC Contract decisions verified 2026-08-08:
 # MAGIC - Pharmacy domain is decoded `ACTIVITY_TYPE_CD=705` (`Pharmacy`); Pharmacy Consults are excluded.
-# MAGIC - `mill_order_action` is a declared HISTORICAL lane capped at 2024-09-17. A later clinical update/action timestamp
-# MAGIC   deliberately fails until a controlled history backfill is approved.
+# MAGIC - `mill_order_action` is a LIVE lane (ORDER_ACTION_LIVE_V1, 2026-10-08). It stopped landing on 2024-09-17; the DAR064
+# MAGIC   raw recovery backfilled it to 2026-09-19 and it is now an IncrUpdtV2 feed (UPDT_DT_TM watermark).
+# MAGIC   `HISTORICAL_FEED_IND` marks the rows the old feed landed (raw ADC_UPDT on or before 2024-09-17).
 # MAGIC - `map_medication_order_detail` is latest-`ACTION_SEQUENCE` long format. Historical action-level
 # MAGIC   order detail is an explicit bronze-contract exclusion, not an implicit downstream raw read.
 # MAGIC - Exact scale profile: 363,043,691 pharmacy orders; 457,718,185 pharmacy actions;
@@ -25,6 +26,7 @@
 # COMMAND ----------
 
 # BRONZE_FIX_857469999366132_V1
+# ORDER_ACTION_LIVE_V1
 # BRONZE_REPAIR_272860676151023_V1
 
 for _name, _default in {
@@ -122,11 +124,12 @@ LOCK_KEY = "__RUN_LOCK__"
 LOCK_TTL_HOURS = 12
 
 PHARMACY_ACTIVITY_TYPE_CD = 705
-ACTION_HISTORY_CEILING = "2024-09-17 23:59:59.999999"
+# ORDER_ACTION_LIVE_V1: the old mill_order_action feed stopped here; rows it landed carry HISTORICAL_FEED_IND.
+ACTION_HISTORICAL_FEED_END = "2024-09-17 23:59:59.999999"
 
 SOURCE_SLA = {
     SRC_ORDER: (2, "LIVE"),
-    SRC_ACTION: (2, "HISTORICAL"),
+    SRC_ACTION: (2, "LIVE"),
     SRC_INGREDIENT: (2, "LIVE"),
     SRC_DETAIL: (2, "LIVE"),
     CODE_VALUE: (365, "REFERENCE"),
@@ -859,22 +862,23 @@ for _table, _columns in EXPECTED_COLUMNS.items():
     assert bronze_table_exists(_table), f"Missing source {_table}"
     assert_expected_columns(_table, _columns)
 
-_action_ceiling = datetime.fromisoformat("2024-09-17 23:59:59.999999")
 
 # COMMAND ----------
 
 _ACTION_HISTORY_PROOFS = {}
 
-def assert_action_history_ceiling():
+def action_history_extent():
+    """Latest source update and action time of the live mill_order_action version this run reads, recorded in the
+    run metadata. A source update more than a day in the future means a broken clock or load, so it stops the run."""
     version = int(SOURCE_VERSIONS[SRC_ACTION])
     if version not in _ACTION_HISTORY_PROOFS:
         row = (spark.read.option("versionAsOf", version).table(SRC_ACTION)
                .agg(F.max("UPDT_DT_TM").alias("source_updated"),
                     F.max("ACTION_DT_TM").alias("action_time")).first())
-        values = [v.replace(tzinfo=None) for v in row if v is not None]
-        assert values, "mill_order_action: no clinical source timestamp"
-        assert builtins.max(values) <= _action_ceiling, (
-            "mill_order_action clinical history advanced beyond 2024-09-17; controlled backfill required"
+        assert row.source_updated is not None, "mill_order_action: no source update timestamp"
+        latest_allowed = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+        assert row.source_updated.replace(tzinfo=None) <= latest_allowed, (
+            f"mill_order_action: source update {row.source_updated} is in the future"
         )
         _ACTION_HISTORY_PROOFS[version] = {k: str(v) for k, v in row.asDict().items()}
     return _ACTION_HISTORY_PROOFS[version]
@@ -981,7 +985,7 @@ def build_action(affected_orders: DataFrame | None, decode_lookup: DataFrame) ->
         "CLINICAL_DISPLAY_LINE", "ORDER_DETAIL_DISPLAY_LINE", "SIMPLIFIED_DISPLAY_LINE",
         "ORDER_DT_TM", "ACTION_DT_TM", "EFFECTIVE_DT_TM", "ACTION_INITIATED_DT_TM",
         "PROJECTED_STOP_DT_TM", "NEXT_DOSE_DT_TM", "VALID_DOSE_DT_TM", "CURRENT_START_DT_TM",
-        F.lit(True).alias("HISTORICAL_FEED_IND"),
+        (F.col("ADC_UPDT") <= F.lit(ACTION_HISTORICAL_FEED_END).cast("timestamp")).alias("HISTORICAL_FEED_IND"),
         # S3-A11 BEGIN: child and parent source provenance fill forward.
         F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
         F.col("ORDER_SOURCE_ADC_UPDT").alias("ORDER_SOURCE_ADC_UPDT"),
@@ -1337,9 +1341,9 @@ def run_incremental_suite(modes: dict[str, str], metrics: dict[str, dict]) -> di
         max_action_source = spark.table(f"{ACTION}_stg").agg(
             F.max("SOURCE_ADC_UPDT").alias("watermark")
         ).collect()[0]["watermark"]
-        assert_action_history_ceiling()
+        action_history_extent()
         result["action_ingestion_watermark"] = str(max_action_source)
-        result["action_history_proof"] = assert_action_history_ceiling()
+        result["action_history_proof"] = action_history_extent()
     return result
 
 
@@ -1392,12 +1396,12 @@ def run_full_parity_suite(modes: dict[str, str]) -> dict:
         max_action_source = spark.table(ACTION).agg(
             F.max("SOURCE_ADC_UPDT").alias("watermark")
         ).collect()[0]["watermark"]
-        assert_action_history_ceiling()
+        action_history_extent()
         result["targets"][ACTION] = {
             "present_rows": int(present_action),
             "expected_rows": int(expected_action),
             "action_ingestion_watermark": str(max_action_source),
-            "action_history_proof": assert_action_history_ceiling(),
+            "action_history_proof": action_history_extent(),
         }
 
     if modes[INGREDIENT] in FULL_MODES:
@@ -1468,10 +1472,10 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         ACTION,
-        "S10 medication_order state-history feeder. The source is historical and hard-capped at 2024-09-17; S3-A11 retains parent-order contributor stamps and source counters.",
+        "S10 medication_order state-history feeder. Live since 2026-10-08 (the source stopped landing 2024-09-17 until the DAR064 raw recovery backfilled it); S3-A11 retains parent-order contributor stamps and source counters.",
         {
-            "HISTORICAL_FEED_IND": "S10 provenance flag; true while mill_order_action remains frozen.",
-            "SOURCE_ADC_UPDT": "S10 ingestion timestamp, including trust enrichment. The historical ceiling applies to raw UPDT_DT_TM and ACTION_DT_TM.",
+            "HISTORICAL_FEED_IND": "S10 provenance flag; true for rows the original mill_order_action feed landed (raw ADC_UPDT on or before 2024-09-17), false for recovered and live rows.",
+            "SOURCE_ADC_UPDT": "S10 ingestion timestamp, including trust enrichment.",
         },
         "S10 medication_order ordered status history",
     )
@@ -1512,7 +1516,7 @@ def run_pipeline() -> dict:
             if freshness_mode == "LIVE":
                 raise AssertionError(message)
             print(f"[WARN] {message}")
-    action_history_proof = assert_action_history_ceiling()
+    action_history_proof = action_history_extent()
     RUN_FUTURE_HORIZON = builtins.max(
         health["watermark"] for health in SOURCE_HEALTH.values() if health["watermark"] is not None
     ) + timedelta(days=2)

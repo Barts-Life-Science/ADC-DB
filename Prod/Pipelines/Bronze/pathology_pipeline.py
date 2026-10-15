@@ -1773,3 +1773,33 @@ def run_core(
                     f"[PATHOLOGY][WARN] scratch cleanup failed for "
                     f"{table_name}: {cleanup_error}"
                 )
+
+
+# PATH_EXPANSION_LANES_V1: result equivalence alone, for parents whose map_pathology updates changed only the columns
+# that lane reads (measurement_concept_id / ucum_code / unit_source_value). Same builder, same contract, same scoped
+# stale reconciliation as run_core's last stage, fed from the persisted accession sources and reports.
+def run_result_equivalence_only(spark, config: PipelineConfig, parent_keys, record_keys=None) -> dict[str, int]:
+    """Recompute map_pathology_result_equivalence for `parent_keys`. With raw/linked pairing off
+    (config.enable_result_equivalence False, the production setting) every row depends only on its own map_pathology row,
+    its parent's accession and its report version, so only `record_keys` are rewritten. With pairing on, every current
+    accession of the parents is recomputed and stale rows inside them reconciled, exactly as run_core's last stage."""
+    _, _, F, _ = _imports()
+    ensure_contracts(spark, config)
+    sources = spark.table(f"{config.bronze_schema}.map_pathology_accession_source").filter(F.col("is_current") == True)
+    keys = parent_keys.select("source_system", "source_parent_key").dropDuplicates()
+    accessions = sources.join(keys, ["source_system", "source_parent_key"], "inner").select("pathology_accession_id").dropDuplicates()
+    record_scoped = record_keys is not None and not config.enable_result_equivalence
+    source_stage = sources.join(keys if record_scoped else accessions,
+                                ["source_system", "source_parent_key"] if record_scoped else "pathology_accession_id", "inner")
+    reports = spark.table(f"{config.bronze_schema}.map_pathology_report").join(accessions, "pathology_accession_id", "inner")
+    rows = build_result_equivalence_rows(spark, source_stage, reports, config)
+    if record_scoped:
+        rows = rows.join(record_keys.select("source_record_key").dropDuplicates(), "source_record_key", "left_semi")
+    name = "map_pathology_result_equivalence"
+    table_name = f"{config.bronze_schema}.{name}"
+    metrics = merge_contract(spark, table_name, rows, contract(name), validate_stage_keys=False)
+    if not record_scoped:
+        metrics["stale_reconciled"] = reconcile_scoped_stale(
+            spark, table_name, rows, contract(name), accessions, "pathology_accession_id", mark_inactive=False
+        )
+    return metrics

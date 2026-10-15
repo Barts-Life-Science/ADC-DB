@@ -13,7 +13,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install openai pyarrow
+# MAGIC %pip install openai pyarrow anthropic
 
 # COMMAND ----------
 
@@ -2278,12 +2278,96 @@ def seed_legacy_embedding_match_cache(
     )
     seeded_count = updates.count()
     if seeded_count:
+        updates = _mlg_gate_device_df(updates, contexts)  # MAP_LLM_GATE_V1
         _merge_embedding_match_dataframe(updates, config, update_existing=False)
         print(
             f"[EMBEDDING] revalidated {seeded_count:,} legacy match contexts; "
             "current false-positive and procedure-threshold rules were applied."
         )
     return seeded_count
+
+
+
+# ==== MAP_LLM_GATE_V1: Claude Haiku 5.5 verifies every GMDN embedding match before it is cached ====
+# Layer 5 maps implant descriptions to GMDN terms by cosine similarity. The match cache is the decision, so a
+# proposal is verified (accept / choose another of the top valid candidates / reject) by the shared module
+# map_llm_gate.py before it is written there. A rejection is cached as MATCH_STATUS 'LLM_REJECTED'; a context the
+# verifier could not reach is not cached, so the next run recomputes and verifies it.
+MLG_MODULE_PATH = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Bronze/map_llm_gate.py"
+MLG_DEVICE_TOP_K = 5
+_MLG_DEVICE_CANDIDATES = {}
+_MLG = None
+
+
+def _mlg():
+    """The shared gate module, loaded once from the Bronze folder."""
+    global _MLG
+    if _MLG is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("map_llm_gate", MLG_MODULE_PATH)
+        _MLG = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_MLG)
+        _MLG.reset_run()
+    return _MLG
+
+
+def _mlg_device_items(rows, keywords):
+    """Verifier items for matched rows: (row index, item, candidates)."""
+    out = []
+    for i, row in enumerate(rows):
+        if row["MATCH_STATUS"] not in ("MATCHED", "MATCHED_BOOSTED"):
+            continue
+        cands = _MLG_DEVICE_CANDIDATES.get(row["CACHE_KEY"]) or [(row["gmdncode"], row["gmdn_name"], row["SIMILARITY_SCORE"])]
+        item = {"id": row["CACHE_KEY"], "key": {"cache_key": row["CACHE_KEY"]}, "proposed": 0,
+                "context": {"implant description": row["CLEANED_DESCRIPTION"],
+                            "procedure keywords": ", ".join(sorted(keywords.get(row["CACHE_KEY"], [])))},
+                "candidates": [{"id": int(c[0]), "name": c[1], "similarity": float(c[2])} for c in cands]}
+        out.append((i, item, cands))
+    return out
+
+
+def _mlg_apply_device(rows, keywords):
+    """Apply verdicts to cache rows (dicts). Held rows are dropped so the next run recomputes them."""
+    staged = _mlg_device_items(rows, keywords)
+    m = _mlg()
+    if not m.values_allowed("device_gmdn"):  # descriptions may not leave the tenant: hold (not cached, recomputed)
+        verdicts = {s[1]["id"]: m.held_verdict("values_not_permitted") for s in staged}
+    else:
+        verdicts = m.verify("device_gmdn", [s[1] for s in staged]) if staged else {}
+    cands = {s[1]["id"]: s[2] for s in staged}
+    out = []
+    for row in rows:
+        v = verdicts.get(row["CACHE_KEY"])
+        if v is None or v["decision"] == "accept":
+            out.append(row)
+        elif v["decision"] == "choose":
+            code, name, score = cands[row["CACHE_KEY"]][v["rank"] - 1]
+            support = any(k.lower() in name.lower() for k in keywords.get(row["CACHE_KEY"], []))
+            out.append(dict(row, gmdncode=int(code), gmdn_name=name, SIMILARITY_SCORE=float(score),
+                            PROCEDURE_SUPPORT_IND=bool(support), MATCH_STATUS="MATCHED_BOOSTED" if support else "MATCHED"))
+        elif v["decision"] == "reject":
+            out.append(dict(row, gmdncode=None, gmdn_name=None, MATCH_STATUS="LLM_REJECTED"))
+    print(f"MAP_LLM_GATE_V1 device: {len(staged)} verified, "
+          f"{ {d: sum(1 for v in verdicts.values() if v['decision'] == d) for d in ('accept','choose','reject','held')} }")
+    return out
+
+
+def _mlg_keywords(contexts):
+    return {r.CACHE_KEY: list(r.PROCEDURE_KEYWORDS or []) for r in contexts.select("CACHE_KEY", "PROCEDURE_KEYWORDS").collect()}
+
+
+def _mlg_gate_device_rows(rows, contexts):
+    """Gate the freshly computed match tuples (EMBEDDING_MATCH_CACHE_SCHEMA order)."""
+    names = EMBEDDING_MATCH_CACHE_SCHEMA.fieldNames()
+    gated = _mlg_apply_device([dict(zip(names, r)) for r in rows], _mlg_keywords(contexts))
+    return [tuple(d[n] for n in names) for d in gated]
+
+
+def _mlg_gate_device_df(updates, contexts):
+    """Gate revalidated legacy matches (a DataFrame in cache schema) before they are seeded."""
+    names = EMBEDDING_MATCH_CACHE_SCHEMA.fieldNames()
+    gated = _mlg_apply_device([r.asDict() for r in updates.select(*names).collect()], _mlg_keywords(contexts))
+    return spark.createDataFrame([tuple(d[n] for n in names) for d in gated], EMBEDDING_MATCH_CACHE_SCHEMA)
 
 
 def _compute_embedding_match_rows(
@@ -2367,12 +2451,17 @@ def _compute_embedding_match_rows(
             description = row.CLEANED_DESCRIPTION or ""
             keywords = set(row.PROCEDURE_KEYWORDS or [])
             selected = None
+            _mlg_valid = []  # MAP_LLM_GATE_V1: the top valid candidates go to the verifier
             for candidate_index in candidate_indices[position]:
                 name = names[int(candidate_index)]
                 if _valid_embedding_match(description, name):
                     score = float(similarities[position, int(candidate_index)])
-                    selected = (int(codes[int(candidate_index)]), name, score)
-                    break
+                    _mlg_valid.append((int(codes[int(candidate_index)]), name, score))
+                    if len(_mlg_valid) >= MLG_DEVICE_TOP_K:
+                        break
+            if _mlg_valid:
+                selected = _mlg_valid[0]
+            _MLG_DEVICE_CANDIDATES[row.CACHE_KEY] = _mlg_valid
             if selected is None:
                 code = None
                 name = None
@@ -2510,6 +2599,7 @@ def build_embedding_candidates(
             gmdn_reference_version,
             config,
         )
+        match_rows = _mlg_gate_device_rows(match_rows, missing_contexts)  # MAP_LLM_GATE_V1
         _merge_embedding_match_rows(match_rows, config)
 
     matches = (

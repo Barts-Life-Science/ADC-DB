@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from pathology_contracts import contract
-from pathology_pipeline import PipelineConfig, ensure_contracts, merge_contract
+from pathology_pipeline import PipelineConfig, ensure_contracts, merge_contract, reconcile_scoped_stale
+
+# INDICATIONS_INCREMENTAL_V1: the diagnosis context of an accession depends only on its own canonical row and its
+# patient's diagnoses, so a run can rebuild just the accessions whose patient or row changed. Before this, every
+# map_diagnosis version change rebuilt and full-merged all 3.39B context rows (6.5 h on 2026-10-05); a typical
+# week touches ~4% of them. The full reconcile stays for forced/periodic runs, change-feed gaps and large changes.
+DIAGNOSIS_TABLE = "4_prod.bronze.map_diagnosis"
+INCREMENTAL_MAX_PATIENT_FRACTION = 0.25
 
 
 def _imports():
@@ -218,7 +225,7 @@ def build_rule_indications(
     )
 
 
-def build_diagnosis_context(spark, config: PipelineConfig):
+def build_diagnosis_context(spark, config: PipelineConfig, accession_scope=None):
     """Attach coded diagnoses as context without calling them indications."""
 
     Window, F, _ = _imports()
@@ -244,6 +251,9 @@ def build_diagnosis_context(spark, config: PipelineConfig):
             F.coalesce("sample_dt", "request_dt", "report_dt").alias("accession_dt"),
         )
     )
+    if accession_scope is not None:
+        # Incremental run: only the affected accessions (all their candidate rows, so the canonical pick is unchanged).
+        accession_candidates = accession_candidates.join(accession_scope, "source_accession_id", "left_semi")
     # map_pathology_accession_source is keyed by source parent, so a source
     # accession can legitimately have repeated candidate rows. An unordered
     # dropDuplicates() made the selected accession date depend on task order,
@@ -271,7 +281,7 @@ def build_diagnosis_context(spark, config: PipelineConfig):
         .agg(F.max_by(payload, total_order).alias("_canonical"))
         .select("source_accession_id", "_canonical.*")
     )
-    diagnosis = spark.table("4_prod.bronze.map_diagnosis").select(
+    diagnosis = spark.table(DIAGNOSIS_TABLE).select(
         F.col("DIAGNOSIS_ID").cast("long").alias("diagnosis_id"),
         F.col("PERSON_ID").cast("long").alias("diag_person_id"),
         F.col("ENCNTR_ID").cast("long").alias("diag_encounter_id"),
@@ -282,6 +292,10 @@ def build_diagnosis_context(spark, config: PipelineConfig):
         F.col("OMOP_CONCEPT_ID").cast("long").alias("omop_concept_id"),
         F.col("confirmation_status_desc").alias("confirmation_status"),
     )
+    if accession_scope is not None:
+        # Only those accessions' patients' diagnoses can pair with them.
+        patients = accessions.select(F.col("person_id").alias("diag_person_id")).distinct()
+        diagnosis = diagnosis.join(patients, "diag_person_id", "left_semi")
     # INDICATIONS_KEYED_CONTEXT_V1: the OR join left person_id as the only equi-key, so every accession met every
     # diagnosis of the same person before the encounter/window test (2026-10-04: 30.25B candidate pairs, 56.9M for
     # one person; the full rebuild's indications lane spilled for hours). Two keyed joins give the same pairs: one on
@@ -354,6 +368,67 @@ def build_diagnosis_context(spark, config: PipelineConfig):
     )
 
 
+def _change_feed(spark, table, first_version, last_version):
+    """Rows of a Delta table's change feed between two versions (inclusive); None if there is nothing to read."""
+    if first_version > last_version:
+        return None
+    return (spark.read.format("delta").option("readChangeFeed", "true")
+            .option("startingVersion", int(first_version)).option("endingVersion", int(last_version)).table(table))
+
+
+def changed_scope(spark, config: PipelineConfig, diagnosis_versions, accession_versions):
+    """The accessions whose diagnosis context may have changed, for an incremental run.
+
+    diagnosis_versions / accession_versions are (first, last) versions of map_diagnosis and
+    map_pathology_accession_source to read changes over. Returns (scope DataFrame of source_accession_id, stats), or
+    (None, stats) when only a full reconcile is safe: versions unknown, a change feed unreadable (vacuumed, or the
+    table was replaced), or more than INCREMENTAL_MAX_PATIENT_FRACTION of patients changed.
+    """
+    _, F, _ = _imports()
+    if diagnosis_versions is None or accession_versions is None:
+        return None, {"reason": "no stored versions (first incremental run)"}
+    source = f"{config.bronze_schema}.map_pathology_accession_source"
+    try:
+        diagnosis_changes = _change_feed(spark, DIAGNOSIS_TABLE, *diagnosis_versions)
+        accession_changes = _change_feed(spark, source, *accession_versions)
+        frames = []
+        if diagnosis_changes is not None:
+            frames.append(diagnosis_changes.select(F.col("PERSON_ID").cast("long").alias("person_id")))
+        if accession_changes is not None:
+            frames.append(accession_changes.select(F.col("person_id").cast("long").alias("person_id")))
+        if not frames:
+            return spark.createDataFrame([], "source_accession_id string"), {"reason": "no new versions", "patients": 0}
+        changed = frames[0]
+        for frame in frames[1:]:
+            changed = changed.unionByName(frame)
+        changed = changed.where(F.col("person_id").isNotNull()).distinct()
+        changed_count = changed.count()
+    except Exception as exc:  # AnalysisException for a vacuumed or replaced range
+        return None, {"reason": f"change feed unreadable: {type(exc).__name__}: {str(exc)[:200]}"}
+    current = spark.table(source).filter(
+        (F.col("is_current") == True)
+        & (F.col("person_projection_status") == "eligible")
+        & F.col("person_id").isNotNull()
+    )
+    total = current.select("person_id").distinct().count()
+    stats = {"reason": "incremental", "patients": changed_count, "eligible_patients": total}
+    if changed_count > INCREMENTAL_MAX_PATIENT_FRACTION * max(total, 1):
+        return None, {**stats, "reason": "too many changed patients for incremental"}
+    # The changed patients' current accessions, plus any accession whose own row changed (moved patient, left scope).
+    scope = current.join(changed, "person_id", "left_semi").select("source_accession_id")
+    if accession_changes is not None:
+        scope = scope.unionByName(accession_changes.select("source_accession_id"))
+    return scope.where(F.col("source_accession_id").isNotNull()).distinct(), stats
+
+
+def _has_active_rules(spark, config: PipelineConfig, include_proposed_rules: bool) -> bool:
+    """Whether any indication rule is active (the rule branch then has rows an incremental run does not rebuild)."""
+    _, F, _ = _imports()
+    statuses = ["APPROVED"] + (["PROPOSED"] if include_proposed_rules else [])
+    return bool(spark.table(f"{config.lookup_schema}.pathology_indication_rule")
+                .filter(F.upper(F.col("status")).isin(*statuses)).limit(1).collect())
+
+
 def run_indications(
     spark,
     config: PipelineConfig | None = None,
@@ -362,9 +437,22 @@ def run_indications(
     include_diagnosis_context: bool = True,
     full_reconcile: bool = True,
     validate_stage_keys: bool = True,
+    accession_scope=None,
 ):
     config = config or PipelineConfig()
     ensure_contracts(spark, config)
+    table = f"{config.bronze_schema}.map_pathology_indication"
+    if (accession_scope is not None and include_diagnosis_context
+            and not _has_active_rules(spark, config, include_proposed_rules)):
+        # Incremental: rebuild the scoped accessions' context, merge it, then delete their rows it no longer produces.
+        if not accession_scope.limit(1).collect():
+            return {"mode": "incremental", "affected_accessions": 0, "inserted": 0, "updated": 0, "deleted": 0}
+        context = build_diagnosis_context(spark, config, accession_scope=accession_scope)
+        item = contract("map_pathology_indication")
+        result = merge_contract(spark, table, context, item, delete_not_matched=False,
+                                validate_stage_keys=validate_stage_keys)
+        result["deleted"] = reconcile_scoped_stale(spark, table, context, item, accession_scope, "source_accession_id")
+        return {"mode": "incremental", **result}
     explicit = build_rule_indications(
         spark, config, include_proposed_rules=include_proposed_rules
     )
@@ -373,7 +461,7 @@ def run_indications(
         output = output.unionByName(build_diagnosis_context(spark, config), allowMissingColumns=True)
     return merge_contract(
         spark,
-        f"{config.bronze_schema}.map_pathology_indication",
+        table,
         output,
         contract("map_pathology_indication"),
         delete_not_matched=full_reconcile,

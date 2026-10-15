@@ -11,6 +11,7 @@
 
 # Shared projections also serve the patient event index.
 from silver_journey_shared import (
+    declare_s3_domain_stages,
     CONDITION_PRIMITIVE_COLUMNS,
     F,
     IMAGING_ACCESSION_MEMBER_COLUMNS,
@@ -7438,6 +7439,33 @@ for old_name, axes in S3_TABLE_AXIS_SPECS["clinical_condition_stage"].items():
 
 for old_name, axes in S3_TABLE_AXIS_SPECS["clinical_endoscopy_finding"].items():
     _s3_replace_public_variant(ENDOSCOPY_FINDING_PUBLIC_COLUMNS, old_name, axes)
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## S3 mapping domain stages (S3_DOMAIN_STAGES_V1)
+# MAGIC These public tables map their codes through a chain of lookups too deep for Lakeflow to plan incrementally in
+# MAGIC one materialized view. The chain runs once per distinct mapping input, in small private stages
+# MAGIC (`tmp._clinical_s3_dom_<model>_<n>`), and each public table joins its rows to the last stage. The arguments
+# MAGIC are the ones each public table passes to `_cross_qc_public`; a mismatch fails the graph build.
+
+# COMMAND ----------
+
+declare_s3_domain_stages("imaging_exam", "journey_clinical._qc_imaging_exam", {"exam_code": "_qc_exam_code_json"},
+                         IMAGING_EXAM_PUBLIC_COLUMNS, IMAGING_EXAM_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("medication_admin", "journey_clinical._qc_medication_admin", {"medication_code": "_qc_medication_code_json"},
+                         MEDICATION_ADMIN_PUBLIC_COLUMNS, MEDICATION_ADMIN_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("medication_order", "journey_clinical._qc_medication_order", {"medication_code": "_qc_medication_code_json"},
+                         MEDICATION_ORDER_PUBLIC_COLUMNS, MEDICATION_ORDER_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("medication_dispense", "journey_clinical._qc_medication_dispense", {"medication_code": "_qc_medication_code_json"},
+                         MEDICATION_DISPENSE_PUBLIC_COLUMNS, MEDICATION_DISPENSE_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("procedure", "journey_clinical._qc_procedure", {"procedure_code": "_procedure_code_json"},
+                         PROCEDURE_PUBLIC_COLUMNS, PROCEDURE_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("vital_sign", "journey_clinical._qc_vital_sign", {"vital_code": "_qc_vital_code_json"},
+                         VITAL_PUBLIC_COLUMNS, VITAL_LIFECYCLE_COLUMNS)
+declare_s3_domain_stages("pathology_result", "journey_clinical._qc_pathology_result", {"result_code": "_result_code_json"},
+                         RESULT_PUBLIC_COLUMNS, RESULT_LIFECYCLE_COLUMNS)
 
 # COMMAND ----------
 

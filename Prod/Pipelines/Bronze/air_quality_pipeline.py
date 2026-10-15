@@ -41,6 +41,7 @@ for _name, _default in {
     "full_history": "false",
     "as_of_date": "",
     "allow_production_write": "false",
+    "max_source_outage_days": "21",  # AQ_SOURCE_OUTAGE_V1
 }.items():
     try:
         dbutils.widgets.text(_name, _default)
@@ -107,6 +108,7 @@ if not all(_is_dev(s) for s in (TARGET_SCHEMA, LANDING_SCHEMA, CONTROL_SCHEMA)):
 
 for required in (LANDING, SITES, SITE_TARGET, ADDRESS_TARGET, ADDRESS_SOURCE):
     assert bronze_table_exists(required), f"missing required table {required}"
+
 # COMMAND ----------
 
 spark.sql(f"""
@@ -168,6 +170,10 @@ def _one(sql):
 # AIR_QUALITY_RETRY_V1: the network hosts have short outages. On 2026-10-04 one 502 from airqualityengland.co.uk
 # failed the first-ever prod run (a full-history bootstrap of ~108 files) twice, because three attempts 5-10 s apart
 # gave up within 15 s. Transient failures now back off for up to ~8 minutes per file; anything else still fails fast.
+class SourceUnavailable(RuntimeError):
+    """AQ_SOURCE_OUTAGE_V1: a file stayed unreachable (5xx/408/429/network) after every retry."""
+
+
 _RETRY_DELAYS = (15, 30, 60, 120, 240)
 _RETRYABLE_HTTP = {408, 429}
 
@@ -196,7 +202,62 @@ def _download(url):
                 wait = max(wait, min(int(retry_after), 600))
             print(f"[air_quality] {url}: {last_error}; retry {attempt + 1}/{len(_RETRY_DELAYS)} in {wait}s")
             time.sleep(wait)
-    raise RuntimeError(f"download failed after {len(_RETRY_DELAYS) + 1} attempts: {url}: {last_error}")
+    raise SourceUnavailable(f"download failed after {len(_RETRY_DELAYS) + 1} attempts: {url}: {last_error}")
+
+
+# AQ_SOURCE_OUTAGE_V1: outage clocks live in the control table as source_outage:<file> rows (latest row wins, '' = cleared).
+MAX_SOURCE_OUTAGE_DAYS = int(bronze_value("max_source_outage_days", "21"))
+_KEPT = object()
+_OUTAGE_CLOCKS = None
+
+
+def _outage_clocks():
+    """file key -> ISO date the current outage was first seen."""
+    rows = spark.sql(f"""
+        SELECT control_key, max_by(control_value, updated_at) AS since FROM {CONTROL}
+        WHERE control_key LIKE 'source_outage:%' GROUP BY control_key
+    """).collect()
+    return {r_["control_key"].split(":", 1)[1]: r_["since"] for r_ in rows if r_["since"]}
+
+
+def _set_outage(file_key, since):
+    """Start ('YYYY-MM-DD') or clear ('') a file's outage clock."""
+    spark.createDataFrame(
+        [(f"source_outage:{file_key}", since, RUN_ID)], "control_key STRING, control_value STRING, run_id STRING"
+    ).withColumn("updated_at", F.current_timestamp()).write.mode("append").saveAsTable(CONTROL)
+    CTX["control_writes"].append(f"source_outage:{file_key}={since or 'cleared'}")
+
+
+def _fetch_or_keep(file_key, url, landed):
+    """Bytes (None on 404), or _KEPT when an already-landed file is unreachable within the outage allowance."""
+    global _OUTAGE_CLOCKS
+    if _OUTAGE_CLOCKS is None:
+        _OUTAGE_CLOCKS = _outage_clocks()
+    clocks = _OUTAGE_CLOCKS
+    try:
+        payload = _download(url)
+    except SourceUnavailable as exc:
+        since = clocks.get(file_key) or TODAY.isoformat()
+        age = (TODAY - date.fromisoformat(since)).days
+        if not landed:
+            raise RuntimeError(f"{file_key} unreachable and never landed: {exc}") from exc
+        if age > MAX_SOURCE_OUTAGE_DAYS:
+            raise RuntimeError(
+                f"{file_key} unreachable since {since} ({age} days > max_source_outage_days="
+                f"{MAX_SOURCE_OUTAGE_DAYS}): {exc}"
+            ) from exc
+        if file_key not in clocks:
+            _set_outage(file_key, since)
+            clocks[file_key] = since
+        CTX["details"].setdefault("source_unavailable_kept_prior", []).append(
+            {"file": file_key, "url": url, "unavailable_since": since, "days": age}
+        )
+        print(f"[air_quality] WARNING {file_key} unreachable since {since}; keeping the landed copy: {exc}")
+        return _KEPT
+    if file_key in clocks:
+        _set_outage(file_key, "")
+        clocks.pop(file_key)
+    return payload
 
 
 def _read_r(payload, suffix):
@@ -265,6 +326,7 @@ def _schema_version(table_name):
 
 _audit("RUNNING")
 print(bronze_json({"run_id": RUN_ID, "target": TARGET_SCHEMA, "landing": LANDING_SCHEMA, **CTX["details"]}))
+
 # COMMAND ----------
 
 def phase_fetch():
@@ -282,7 +344,10 @@ def phase_fetch():
     for source in NETWORKS:
         for year in YEARS:
             url = monthly_url(source, year)
-            payload = _download(url)
+            payload = _fetch_or_keep(f"{source}_{year}", url, (source, year) in PRIOR_STATE)  # AQ_SOURCE_OUTAGE_V1
+            if payload is _KEPT:
+                unchanged.append(f"{source}_{year}")
+                continue
             if payload is None:
                 if year in REQUIRED:
                     failures.append(f"{source} {year}: required file missing (404) {url}")
@@ -360,13 +425,17 @@ def phase_fetch():
         "landing_years_published": sorted(f"{i['source']}_{i['year']}" for i in publish),
     })
     return pending, publish, replace_predicate
+
 # COMMAND ----------
 
 def phase_sites():
     CTX["phase"] = "sites"
     meta_rows = []
     for source in NETWORKS:
-        payload = _download(metadata_url(source))
+        landed = bool(spark.table(SITES).where(F.col("source") == source).take(1))
+        payload = _fetch_or_keep(f"{source}_metadata", metadata_url(source), landed)  # AQ_SOURCE_OUTAGE_V1
+        if payload is _KEPT:
+            continue
         assert payload is not None, f"metadata missing for {source}: {metadata_url(source)}"
         meta_rows.extend(site_rows(_read_r(payload, ".RData"), source))
     (
@@ -425,6 +494,7 @@ def phase_sites():
         "sites_new": new_sites, "site_coordinate_drift": drift, "unresolved_sites": unresolved,
     })
     return new_sites, unresolved
+
 # COMMAND ----------
 
 def phase_bronze_stage():
@@ -534,6 +604,7 @@ def phase_bronze_stage():
     """)
     CTX["details"].update({"site_month": site_counts, "address_cell": address_counts})
     return {"site_month": site_counts, "address_cell": address_counts, "site_key": site_key}
+
 # COMMAND ----------
 
 def phase_validate(unresolved, counts):
@@ -560,6 +631,7 @@ def phase_validate(unresolved, counts):
             failures.append(problem)
     CTX["details"]["validation_failures"] = failures
     assert not failures, "air-quality validation failed before publish: " + "; ".join(failures)
+
 # COMMAND ----------
 
 def phase_publish(publish, replace_predicate, new_sites, counts):
@@ -610,6 +682,7 @@ def phase_publish(publish, replace_predicate, new_sites, counts):
                 f"('air_quality_schema_version' = '{AIR_QUALITY_SCHEMA_VERSION}')"
             )
             CTX["published"].append(f"property:{table_name.rsplit('.', 1)[-1]}")
+
 # COMMAND ----------
 
 def phase_verify(pending, publish, replace_predicate):
@@ -675,6 +748,7 @@ def freshness_alarm():
         for n in ("aurn", "aqe", "local")
         if latest.get(n) is None or latest[n] < floor
     ]
+
 # COMMAND ----------
 
 stale = []
@@ -695,8 +769,9 @@ except Exception as exc:
     raise
 
 status = "STALE_SOURCE" if stale else ("SUCCESS" if CTX["published"] else "NO_CHANGE")
+if not stale and CTX["details"].get("source_unavailable_kept_prior"):
+    status = "DEGRADED_SOURCE"  # AQ_SOURCE_OUTAGE_V1: published what was reachable; the rest kept its landed copy
 CTX["phase"] = "done"
 _audit(status, "; ".join(stale) or None)
 assert not stale, f"air-quality source freshness alarm: {stale}"
 dbutils.notebook.exit(bronze_json({"status": status, "published": CTX["published"], **CTX["details"]}))
-

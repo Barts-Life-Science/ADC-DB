@@ -523,7 +523,9 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
         F.col("status").alias("_s3_head_status"),
     )
     source_row_key = "source_" + row_key
-    if allow_split and source_row_key not in df.columns:
+    # S3_DOMAIN_STAGES_V1: a domain stage (one row per distinct mapping input) has no event key.
+    domain = "_s3d_key" in df.columns
+    if allow_split and not domain and source_row_key not in df.columns:
         df = df.withColumn(source_row_key, F.col(row_key))
     df = df.join(heads, key_col == F.col("_s3_key"), "left")
     existing_rule = F.coalesce(F.col(f"{axis}_map_rule_id"), F.lit(""))
@@ -601,7 +603,13 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
         f"{axis}_map_version",
         F.when(use_outcome, governed_version).otherwise(F.col(f"{axis}_map_version")),
     )
-    if allow_split:
+    if allow_split and domain:
+        # Record the split for _s3_domain_join, which rewrites each row's event key and clears its shared quantities.
+        split = F.coalesce(use_outcome & (F.col("_s3_component_index") > 1), F.lit(False))
+        df = (df.withColumn("_s3d_split_axis", F.when(split, F.lit(axis)).otherwise(F.col("_s3d_split_axis")))
+              .withColumn("_s3d_split_identity", F.when(split, F.col("_s3_component_identity")).otherwise(F.col("_s3d_split_identity")))
+              .withColumn("_s3d_split_quantities", F.col("_s3d_split_quantities") | split))
+    elif allow_split:
         df = df.withColumn(
             row_key,
             F.when(use_outcome & (F.col("_s3_component_index") > 1),
@@ -1124,7 +1132,9 @@ def _sdi_imaging_body_site(df):
               .drop("_sdi_exam_id", "_sdi_rank", "_sdi_site", "_sdi_sites"))
 
 
-def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
+def _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
+    """Rows of a public clinical table before its S3 mapping chain: validated, flattened, direct axes, bronze
+    provenance and the medication bronze joins. Everything here is per row."""
     # contract v2: lifecycle columns are validated here but never appended to the public parent.
     # Read the internal stage and reconstruct the public schema, rejecting lifecycle fields in
     # the public column list.
@@ -1200,99 +1210,6 @@ def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifec
                 .withColumn("device_snomed_display", F.lit(None).cast("string")))
     # Freeze bronze provenance before authoritative lookups decide whether a row is replaceable.
     df = _s3_apply_bronze_snomed_provenance(df, model_name)
-    # Deterministic S3 lookups fill only an otherwise unmapped axis. Each lookup
-    # is reduced to one explicitly ranked row before the left join.
-    if model_name == "family_history":
-        df = _s3_lookup_axis(
-            df, "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True)
-    elif model_name == "imaging_exam":
-        df = _s3_lookup_axis(df, "exam", SRC_S3_NICIP_MAP, "urn:nhs:nicip", F.upper(F.trim(F.col("source_code"))), model_name=model_name)
-        norm_display = F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " ")))
-        df = _s3_lookup_axis(df, "exam", SRC_S3C_IMAGING_NAME_MAP, "urn:cerner:radiology-exam",
-                             F.when(F.col("source_coding_system") == "urn:cerner:radiology-exam", norm_display), model_name=model_name, replace_inferior=True)
-        df = _s3_lookup_axis(df, "exam", SRC_S3C_IMAGING_NAME_MAP, "urn:sectra:examination-code",
-                             F.when(F.col("source_coding_system") == "urn:sectra:examination-code", norm_display), model_name=model_name, replace_inferior=True)
-        df = _s3_lookup_axis(df, "exam", SRC_S3B_IMAGING_LOCAL_MAP_V2, "urn:barts:imaging-local-exam",
-                             F.concat_ws("|", F.col("exam_source_system"), F.col("exam_source_code")), model_name=model_name)
-    elif model_name == "allergy_intolerance":
-        df = _s3_lookup_axis(df, "substance", SRC_S3_ALLERGY_MAP, "urn:cerner:allergy-substance-text",
-                             F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))), model_name=model_name)
-    elif model_name == "clinical_finding":
-        df = _s3_lookup_axis(df, "value", SRC_S3_VALUE_TEXT_MAP, "urn:cerner:nomenclature:answer-text",
-                             F.lower(F.trim(F.regexp_replace(F.coalesce(F.col("value_display"), F.col("value_text")), r"\s+", " "))), model_name=model_name)
-    elif model_name == "condition_stage":
-        df = _s3_lookup_axis(df, "stage_group", SRC_S3_STAGE_MAP, "urn:barts:aria:stage-of-disease",
-                             F.lower(F.trim(F.regexp_replace(F.col("stage_of_disease"), r"\s+", " "))), model_name=model_name)
-        df = _s3_lookup_axis(
-            df, "stage_diagnosis", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("stage_diagnosis_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("stage_diagnosis_source_code")), r"[^A-Z0-9]", "")),
-            model_name=model_name, replace_inferior=True)
-    elif model_name == "condition":
-        df = _s3_lookup_axis(
-            df, "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True)
-    elif model_name == "procedure":
-        df = _s3_lookup_axis(
-            df, "procedure", SRC_S3_OPCS4_MAP, "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
-            F.when(F.col("procedure_source_system") == "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
-                   F.regexp_replace(F.upper(F.col("procedure_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True)
-        df = _s3_lookup_axis(
-            df, "procedure", SRC_S3_ENDOBASE_EXAM_MAP, "urn:barts:endobase:exam-type",
-            F.when(F.col("source_object") == "endobase_exam",
-                   F.lower(F.trim(F.regexp_replace(F.col("procedure_source_code"), r"\s+", " ")))), model_name=model_name)
-        df = _s3_lookup_axis(
-            df, "procedure", SRC_S3B_PROCEDURE_TEXT_MAP, "urn:barts:procedure-text",
-            F.sha2(F.concat_ws("|",
-                F.when(F.col("source_object") == "endobase_exam", F.lit("urn:barts:endobase-exam-type"))
-                 .when(F.col("source_object").contains("implant"), F.lit("urn:barts:implant-primary-procedure"))
-                 .otherwise(F.lit("urn:barts:surginet-procedure")),
-                F.lower(F.trim(F.regexp_replace(F.col("procedure_source_display"), r"\s+", " ")))), 256),
-            allow_split=True, model_name=model_name)
-    elif model_name == "pathology_result":
-        df = _s3_lookup_axis(
-            df, "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:cerner_testcode",
-            F.when(F.lower(F.col("test_source_system")).contains("cerner-testcode"), F.col("test_source_code")), model_name=model_name)
-        df = _s3_lookup_axis(
-            df, "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:tfc",
-            F.when(F.lower(F.col("test_source_system")).contains("tfc"), F.col("test_source_code")), model_name=model_name)
-    elif model_name == "specimen":
-        # STM_SPECIMEN_TYPE_V1/silver-specimen: the only specimen-type mapping; keyed on the bronze namespace|code carried on the row.
-        df = _s3_lookup_axis(df, "specimen_type", SRC_S3_SPECIMEN_MAP_V2, "urn:barts:pathology:specimen-type",
-                             F.col("_specimen_type_lookup_key"), model_name=model_name)
-    elif model_name == "presenting_complaint":
-        df = _s3_direct_axis(df, "complaint", F.col("source_coding_system"), F.col("source_code"), F.col("source_display"))
-        df = _s3_lookup_axis(
-            df, "complaint", SRC_S3C_ECDS_COMPLAINT_MAP,
-            "urn:cerner:nomenclature:ed-presenting-complaint",
-            F.when(F.col("source_object").isin("ed_presenting_complaint", "ed_presenting_complaint_text"),
-                   F.col("source_code")), model_name=model_name)
-        df = _s3_lookup_axis(
-            df, "complaint", SRC_S3B_COMPLAINT_TEXT_MAP, "urn:barts:complaint-text",
-            F.when(F.col("source_object").isin("registration_reason_for_visit", "ed_presenting_complaint_text"),
-                   F.col("complaint_text_normalised")), allow_split=True, model_name=model_name)
-    elif model_name == "vital_sign":
-        df = _s3_lookup_axis(
-            df, "unit", SRC_S3B_VITAL_UNIT_MAP, "urn:barts:vital:unit",
-            F.lower(F.trim(F.regexp_replace(F.col("unit_source_value"), r"\s+", " "))),
-            model_name=model_name,
-        )
-        for _axis, _value in (
-            ("method", F.col("method_display")),
-            ("body_site", F.col("body_site_display")),
-            ("interpretation", F.col("interpretation_display")),
-        ):
-            df = _s3_lookup_axis(
-                df, _axis, SRC_S3B_MEASUREMENT_CONTEXT_MAP, f"urn:barts:vital:{_axis}",
-                F.lower(F.trim(F.regexp_replace(_value, r"\s+", " "))),
-                model_name=model_name,
-            )
     if model_name == "medication_order":
         b=(read_source("4_prod.bronze.map_medication_order").select(
             F.col("ORDER_ID").cast("bigint").alias("_s3_order_id"),
@@ -1360,53 +1277,320 @@ def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifec
                 .withColumn("medication_map_competing_count", F.col("medication_map_candidate_count"))
                 .withColumn("medication_map_component_index", F.when(med_source, F.lit(1)).cast("int"))
                 .withColumn("medication_map_component_count", F.when(med_source, F.lit(1)).cast("int")))
-        if model_name in ("medication_admin", "medication_order"):
-            df = _s3_lookup_axis(df, "medication", SRC_S3C_RXNORM_MULTUM_MAP, "urn:cerner:multum",
-                                 F.col("_s3c_multum"), allow_split=False, model_name=model_name, replace_inferior=True)
-            df = _s3_lookup_axis(df, "medication", SRC_S3C_RXNORM_CLASS_MAP, "urn:cerner:multum:class",
-                                 F.col("_s3c_multum"), allow_split=True, model_name=model_name, replace_inferior=True)
-        if model_name == "medication_dispense":
-            df = _s3_lookup_axis(df, "medication", SRC_S3C_DMD_ID_MAP, "urn:nhs:dmd",
-                                 F.col("_dmd_code"), model_name=model_name, replace_inferior=True)
-        df = _s3_lookup_axis(df, "medication", SRC_S3C_DMD_NAME_MAP, "urn:cerner:medication-text:strength",
-                             s3c_strength_key(F.col("medication_source_display")), allow_split=True, model_name=model_name)
-        if "_s3c_multum" in df.columns:
-            df = df.drop("_s3c_multum")
-        df = _s3_lookup_axis(
-            df, "medication", SRC_S3B_MED_TEXT_MAP, "urn:cerner:medication-text",
-            F.lower(F.trim(F.regexp_replace(F.col("medication_source_display"), r"\s+", " "))),
-            allow_split=True, model_name=model_name)
-    if model_name == "pathology_result":
-        df = _s3_apply_tier_rescore(
-            df, "test", "bronze_pathology_test_auto_high",
-            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_high"), F.col("test_source_display")))
-        df = _s3_apply_tier_rescore(
-            df, "test", "bronze_pathology_test_auto_low",
-            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_low"), F.col("test_source_display")))
-        df = _s3_apply_tier_rescore(df, "result", "bronze_pathology_result_auto", F.col("result_source_display"))
+    return df
+
+
+class _S3Step:
+    """One step of the S3 mapping chain: the axis it maps, the joins it adds to a plan and the function applying it."""
+
+    def __init__(self, axis, joins, apply, allow_split=False):
+        self.axis, self.joins, self.apply, self.allow_split = axis, joins, apply, allow_split
+
+
+def _s3_lookup_step(axis, *args, allow_split=False, **kwargs):
+    """A _s3_lookup_axis call as a step: two joins, three when it can split a row into components."""
+    return _S3Step(axis, 3 if allow_split else 2,
+                   lambda df: _s3_lookup_axis(df, axis, *args, allow_split=allow_split, **kwargs), allow_split)
+
+
+def _s3_crosswalk_steps(axis):
+    """SNOMED recovery from the OMOP id, then the OMOP standard-target check, for one axis."""
+    return [_S3Step(axis, 1, lambda df: _s3_snomed_from_omop(df, axis)),
+            _S3Step(axis, 1, lambda df: _s3_enforce_omop_standard_target(df, axis))]
+
+
+def _s3_mapping_steps(model_name):
+    """The S3 mapping chain of a public clinical table, in the order _cross_qc_public applies it: deterministic
+    lookups (they fill only an otherwise unmapped axis; each lookup is reduced to one explicitly ranked row before
+    the left join), tier rescores, the OMOP crosswalk and standard-target checks, and imaging body site."""
+    steps = []
+    if model_name == "family_history":
+        steps.append(_s3_lookup_step(
+            "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
+            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
+                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
+            allow_split=True, model_name=model_name, replace_inferior=True))
+    elif model_name == "imaging_exam":
+        steps.append(_s3_lookup_step("exam", SRC_S3_NICIP_MAP, "urn:nhs:nicip", F.upper(F.trim(F.col("source_code"))), model_name=model_name))
+        norm_display = F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " ")))
+        steps.append(_s3_lookup_step("exam", SRC_S3C_IMAGING_NAME_MAP, "urn:cerner:radiology-exam",
+                                     F.when(F.col("source_coding_system") == "urn:cerner:radiology-exam", norm_display), model_name=model_name, replace_inferior=True))
+        steps.append(_s3_lookup_step("exam", SRC_S3C_IMAGING_NAME_MAP, "urn:sectra:examination-code",
+                                     F.when(F.col("source_coding_system") == "urn:sectra:examination-code", norm_display), model_name=model_name, replace_inferior=True))
+        steps.append(_s3_lookup_step("exam", SRC_S3B_IMAGING_LOCAL_MAP_V2, "urn:barts:imaging-local-exam",
+                                     F.concat_ws("|", F.col("exam_source_system"), F.col("exam_source_code")), model_name=model_name))
+    elif model_name == "allergy_intolerance":
+        steps.append(_s3_lookup_step("substance", SRC_S3_ALLERGY_MAP, "urn:cerner:allergy-substance-text",
+                                     F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))), model_name=model_name))
+    elif model_name == "clinical_finding":
+        steps.append(_s3_lookup_step("value", SRC_S3_VALUE_TEXT_MAP, "urn:cerner:nomenclature:answer-text",
+                                     F.lower(F.trim(F.regexp_replace(F.coalesce(F.col("value_display"), F.col("value_text")), r"\s+", " "))), model_name=model_name))
+    elif model_name == "condition_stage":
+        steps.append(_s3_lookup_step("stage_group", SRC_S3_STAGE_MAP, "urn:barts:aria:stage-of-disease",
+                                     F.lower(F.trim(F.regexp_replace(F.col("stage_of_disease"), r"\s+", " "))), model_name=model_name))
+        steps.append(_s3_lookup_step(
+            "stage_diagnosis", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
+            F.when(F.col("stage_diagnosis_source_system") == "http://hl7.org/fhir/sid/icd-10",
+                   F.regexp_replace(F.upper(F.col("stage_diagnosis_source_code")), r"[^A-Z0-9]", "")),
+            model_name=model_name, replace_inferior=True))
+    elif model_name == "condition":
+        steps.append(_s3_lookup_step(
+            "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
+            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
+                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
+            allow_split=True, model_name=model_name, replace_inferior=True))
     elif model_name == "procedure":
-        df = _s3_apply_tier_rescore(df, "device", "bronze_implant_layer5", F.col("implant_description"))
+        steps.append(_s3_lookup_step(
+            "procedure", SRC_S3_OPCS4_MAP, "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
+            F.when(F.col("procedure_source_system") == "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
+                   F.regexp_replace(F.upper(F.col("procedure_source_code")), r"[^A-Z0-9]", "")),
+            allow_split=True, model_name=model_name, replace_inferior=True))
+        steps.append(_s3_lookup_step(
+            "procedure", SRC_S3_ENDOBASE_EXAM_MAP, "urn:barts:endobase:exam-type",
+            F.when(F.col("source_object") == "endobase_exam",
+                   F.lower(F.trim(F.regexp_replace(F.col("procedure_source_code"), r"\s+", " ")))), model_name=model_name))
+        steps.append(_s3_lookup_step(
+            "procedure", SRC_S3B_PROCEDURE_TEXT_MAP, "urn:barts:procedure-text",
+            F.sha2(F.concat_ws("|",
+                F.when(F.col("source_object") == "endobase_exam", F.lit("urn:barts:endobase-exam-type"))
+                 .when(F.col("source_object").contains("implant"), F.lit("urn:barts:implant-primary-procedure"))
+                 .otherwise(F.lit("urn:barts:surginet-procedure")),
+                F.lower(F.trim(F.regexp_replace(F.col("procedure_source_display"), r"\s+", " ")))), 256),
+            allow_split=True, model_name=model_name))
+    elif model_name == "pathology_result":
+        steps.append(_s3_lookup_step(
+            "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:cerner_testcode",
+            F.when(F.lower(F.col("test_source_system")).contains("cerner-testcode"), F.col("test_source_code")), model_name=model_name))
+        steps.append(_s3_lookup_step(
+            "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:tfc",
+            F.when(F.lower(F.col("test_source_system")).contains("tfc"), F.col("test_source_code")), model_name=model_name))
+    elif model_name == "specimen":
+        # STM_SPECIMEN_TYPE_V1/silver-specimen: the only specimen-type mapping; keyed on the bronze namespace|code carried on the row.
+        steps.append(_s3_lookup_step("specimen_type", SRC_S3_SPECIMEN_MAP_V2, "urn:barts:pathology:specimen-type",
+                                     F.col("_specimen_type_lookup_key"), model_name=model_name))
+    elif model_name == "presenting_complaint":
+        steps.append(_S3Step("complaint", 0, lambda df: _s3_direct_axis(
+            df, "complaint", F.col("source_coding_system"), F.col("source_code"), F.col("source_display"))))
+        steps.append(_s3_lookup_step(
+            "complaint", SRC_S3C_ECDS_COMPLAINT_MAP,
+            "urn:cerner:nomenclature:ed-presenting-complaint",
+            F.when(F.col("source_object").isin("ed_presenting_complaint", "ed_presenting_complaint_text"),
+                   F.col("source_code")), model_name=model_name))
+        steps.append(_s3_lookup_step(
+            "complaint", SRC_S3B_COMPLAINT_TEXT_MAP, "urn:barts:complaint-text",
+            F.when(F.col("source_object").isin("registration_reason_for_visit", "ed_presenting_complaint_text"),
+                   F.col("complaint_text_normalised")), allow_split=True, model_name=model_name))
+    elif model_name == "vital_sign":
+        steps.append(_s3_lookup_step(
+            "unit", SRC_S3B_VITAL_UNIT_MAP, "urn:barts:vital:unit",
+            F.lower(F.trim(F.regexp_replace(F.col("unit_source_value"), r"\s+", " "))),
+            model_name=model_name,
+        ))
+        for _axis, _value in (
+            ("method", F.col("method_display")),
+            ("body_site", F.col("body_site_display")),
+            ("interpretation", F.col("interpretation_display")),
+        ):
+            steps.append(_s3_lookup_step(
+                _axis, SRC_S3B_MEASUREMENT_CONTEXT_MAP, f"urn:barts:vital:{_axis}",
+                F.lower(F.trim(F.regexp_replace(_value, r"\s+", " "))),
+                model_name=model_name,
+            ))
+    if model_name in ("medication_admin", "medication_order", "medication_dispense"):
+        if model_name in ("medication_admin", "medication_order"):
+            steps.append(_s3_lookup_step("medication", SRC_S3C_RXNORM_MULTUM_MAP, "urn:cerner:multum",
+                                         F.col("_s3c_multum"), allow_split=False, model_name=model_name, replace_inferior=True))
+            steps.append(_s3_lookup_step("medication", SRC_S3C_RXNORM_CLASS_MAP, "urn:cerner:multum:class",
+                                         F.col("_s3c_multum"), allow_split=True, model_name=model_name, replace_inferior=True))
+        if model_name == "medication_dispense":
+            steps.append(_s3_lookup_step("medication", SRC_S3C_DMD_ID_MAP, "urn:nhs:dmd",
+                                         F.col("_dmd_code"), model_name=model_name, replace_inferior=True))
+        steps.append(_s3_lookup_step("medication", SRC_S3C_DMD_NAME_MAP, "urn:cerner:medication-text:strength",
+                                     s3c_strength_key(F.col("medication_source_display")), allow_split=True, model_name=model_name))
+        steps.append(_S3Step("medication", 0, lambda df: df.drop("_s3c_multum") if "_s3c_multum" in df.columns else df))
+        steps.append(_s3_lookup_step(
+            "medication", SRC_S3B_MED_TEXT_MAP, "urn:cerner:medication-text",
+            F.lower(F.trim(F.regexp_replace(F.col("medication_source_display"), r"\s+", " "))),
+            allow_split=True, model_name=model_name))
+    if model_name == "pathology_result":
+        steps.append(_S3Step("test", 1, lambda df: _s3_apply_tier_rescore(
+            df, "test", "bronze_pathology_test_auto_high",
+            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_high"), F.col("test_source_display")))))
+        steps.append(_S3Step("test", 1, lambda df: _s3_apply_tier_rescore(
+            df, "test", "bronze_pathology_test_auto_low",
+            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_low"), F.col("test_source_display")))))
+        steps.append(_S3Step("result", 1, lambda df: _s3_apply_tier_rescore(df, "result", "bronze_pathology_result_auto", F.col("result_source_display"))))
+    elif model_name == "procedure":
+        steps.append(_S3Step("device", 1, lambda df: _s3_apply_tier_rescore(df, "device", "bronze_implant_layer5", F.col("implant_description"))))
     elif model_name == "device":
-        df = _s3_apply_tier_rescore(df, "device", "bronze_mediconnect_device", F.col("device_source_display"))
-        unscorable = ((F.col("device_map_method") == "embedding_proposed") &
-                      (F.length(F.trim(F.coalesce(F.col("device_source_display"), F.lit("")))) == 0) &
-                      F.col("device_target_code").isNotNull())
-        df = (df.withColumn("device_map_method", F.when(unscorable, F.lit("rule")).otherwise(F.col("device_map_method")))
-              .withColumn("device_map_rule_id", F.when(unscorable, F.lit("lookup.mediconnect_device_type_map:approved_without_text_score"))
-                          .otherwise(F.col("device_map_rule_id")))
-              .withColumn("device_map_status_reason", F.when(unscorable, F.lit("blank source display; governed source-code mapping retained"))
-                          .otherwise(F.col("device_map_status_reason"))))
-    for _old_name, (_axis, _source_only) in retired.items():
+        steps.append(_S3Step("device", 1, lambda df: _s3_apply_tier_rescore(df, "device", "bronze_mediconnect_device", F.col("device_source_display"))))
+
+        def unscorable_device(df):
+            # A governed device-type mapping with a blank source display has no text to score: keep it as a rule.
+            unscorable = ((F.col("device_map_method") == "embedding_proposed") &
+                          (F.length(F.trim(F.coalesce(F.col("device_source_display"), F.lit("")))) == 0) &
+                          F.col("device_target_code").isNotNull())
+            return (df.withColumn("device_map_method", F.when(unscorable, F.lit("rule")).otherwise(F.col("device_map_method")))
+                  .withColumn("device_map_rule_id", F.when(unscorable, F.lit("lookup.mediconnect_device_type_map:approved_without_text_score"))
+                              .otherwise(F.col("device_map_rule_id")))
+                  .withColumn("device_map_status_reason", F.when(unscorable, F.lit("blank source display; governed source-code mapping retained"))
+                              .otherwise(F.col("device_map_status_reason"))))
+        steps.append(_S3Step("device", 0, unscorable_device))
+    for _old_name, (_axis, _source_only) in S3_PUBLIC_CODED_AXES.get(model_name, {}).items():
         if not _source_only:
-            df = _s3_snomed_from_omop(df, _axis)
-            df = _s3_enforce_omop_standard_target(df, _axis)
+            steps += _s3_crosswalk_steps(_axis)
     if model_name in ("pathology_result", "clinical_finding", "condition_stage"):
         _extra_axis = {"pathology_result":"result", "clinical_finding":"value", "condition_stage":"stage_group"}[model_name]
-        df = _s3_snomed_from_omop(df, _extra_axis)
-        df = _s3_enforce_omop_standard_target(df, _extra_axis)
-    if model_name == "imaging_exam":  # SDI_DICOM_MODALITY_V1 / SDI_IMAGING_BODY_SITE_V1
-        df = _sdi_imaging_body_site(_sdi_imaging_modality(df))
+        steps += _s3_crosswalk_steps(_extra_axis)
+    if model_name == "imaging_exam":  # SDI_IMAGING_BODY_SITE_V1: keyed on the mapped examination concept
+        steps.append(_S3Step("exam", 2, _sdi_imaging_body_site))
+    return steps
+
+
+def _cross_qc_finish(df, model_name, public_columns):
+    """The per-row steps after the mapping chain, and the public column list."""
+    if model_name == "imaging_exam":  # SDI_DICOM_MODALITY_V1: keyed on the row's linked PACS examination
+        df = _sdi_imaging_modality(df)
     return df.select(*public_columns)
+
+
+# S3_DOMAIN_STAGES_V1
+# Public clinical tables whose mapping chain is too deep for Lakeflow to plan incrementally in one MV (planning cost
+# grows ~9x per chained lookup axis; three axes exhausted a 45 GiB driver on 100 rows, 2026-10-09). For these the
+# chain on `axes` runs once per distinct mapping input, in private stages of at most S3_STAGE_JOIN_BUDGET joins, and
+# the public MV joins its rows to the last stage. `inputs` are the non-axis columns the chain reads; an omission fails
+# at graph build, because a stage holds only the declared columns. pathology_result maps only its test axis this way:
+# its result axis keys on free-text values, so it stays per row.
+S3_DOMAIN_MODELS = {
+    "imaging_exam": {"axes": ("exam",), "inputs": ("source_code", "source_display", "source_coding_system")},
+    "medication_admin": {"axes": ("medication",), "inputs": ("_s3c_multum",)},
+    "medication_order": {"axes": ("medication",), "inputs": ("_s3c_multum",)},
+    "medication_dispense": {"axes": ("medication",), "inputs": ("_dmd_code",)},
+    "procedure": {"axes": ("procedure", "device"), "inputs": ("source_object", "implant_description")},
+    "vital_sign": {"axes": ("unit", "method", "body_site", "interpretation", "vital"),
+                   "inputs": ("unit_source_value", "method_display", "body_site_display", "interpretation_display")},
+    "pathology_result": {"axes": ("test",), "inputs": ()},
+}
+
+S3_STAGE_JOIN_BUDGET = 3
+
+# variant_json_columns each domain was declared with; the public MV must pass the same.
+S3_DOMAIN_DECLARED = {}
+
+
+def _s3_domain_inputs(df, model_name):
+    """The columns a model's domain chain reads, sorted: every column of its axes, its declared inputs, and the
+    legacy SNOMED column of an axis when the rows already carry one."""
+    spec = S3_DOMAIN_MODELS[model_name]
+    columns = [c for axis in spec["axes"] for c in axis_columns(axis)] + list(spec["inputs"])
+    columns += [f"{axis}_legacy_snomed_code" for axis in spec["axes"] if f"{axis}_legacy_snomed_code" in df.columns]
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{model_name}: S3 domain inputs missing from the rows: {missing}")
+    return sorted(set(columns))
+
+
+def _s3_domain_key(columns):
+    """SHA-256 of the input values, nulls included, so equal inputs share one domain row."""
+    return F.sha2(F.to_json(F.struct(*[F.col(c) for c in columns]), {"ignoreNullFields": "false"}), 256)
+
+
+def _s3_domain_stages(model_name):
+    """The domain steps of a model, in chain order, packed into stages of at most S3_STAGE_JOIN_BUDGET joins."""
+    axes = S3_DOMAIN_MODELS[model_name]["axes"]
+    stages, current, joins = [], [], 0
+    for step in _s3_mapping_steps(model_name):
+        if step.axis not in axes:
+            continue
+        if current and joins + step.joins > S3_STAGE_JOIN_BUDGET:
+            stages.append(current)
+            current, joins = [], 0
+        current.append(step)
+        joins += step.joins
+    if current:
+        stages.append(current)
+    return stages
+
+
+def _s3_domain_stage_name(model_name, index):
+    """Published name of domain stage `index` (0 = the distinct inputs)."""
+    return _n(f"journey_clinical._s3_dom_{model_name}_{index}")
+
+
+def declare_s3_domain_stages(model_name, twin_name, variant_json_columns, public_columns, lifecycle_columns):
+    """S3_DOMAIN_STAGES_V1: declare the private domain stages a public clinical table joins to. Call once at
+    notebook level, with the arguments its public MV passes to _cross_qc_public."""
+    S3_DOMAIN_DECLARED[model_name] = dict(variant_json_columns)
+    stages = _s3_domain_stages(model_name)
+    names = [_s3_domain_stage_name(model_name, i) for i in range(len(stages) + 1)]
+
+    def distinct_inputs():
+        # One row per distinct mapping input of the prepared rows, with the split markers the chain fills in.
+        rows = _cross_qc_prepare(spark.read.table(_n(twin_name)), model_name, variant_json_columns,
+                                 public_columns, lifecycle_columns)
+        columns = _s3_domain_inputs(rows, model_name)
+        return (rows.select(*columns).distinct()
+                .withColumn("_s3d_key", _s3_domain_key(columns))
+                .withColumn("_s3d_split_axis", F.lit(None).cast("string"))
+                .withColumn("_s3d_split_identity", F.lit(None).cast("string"))
+                .withColumn("_s3d_split_quantities", F.lit(False)))
+
+    distinct_inputs.__name__ = f"_s3_dom_{model_name}_0"
+    materialized_view(name=names[0], refresh_policy="incremental",
+                      comment=f"S3 mapping inputs of {model_name}: one row per distinct input, keyed by _s3d_key.")(distinct_inputs)
+    for index, stage in enumerate(stages, start=1):
+        def apply_stage(previous=names[index - 1], stage=stage):
+            # The next steps of the mapping chain, applied to the previous stage.
+            df = spark.read.table(previous)
+            for step in stage:
+                df = step.apply(df)
+            return df
+
+        apply_stage.__name__ = f"_s3_dom_{model_name}_{index}"
+        materialized_view(name=names[index], refresh_policy="incremental",
+                          comment=f"S3 mapping chain of {model_name}, stage {index} of {len(stages)}.")(apply_stage)
+
+
+def _s3_domain_join(df, model_name):
+    """Give each row its mapped domain axes from the last domain stage, then apply the component splits the chain
+    recorded: a new event key from the source event key, and shared quantities cleared, as _s3_lookup_axis does."""
+    columns = _s3_domain_inputs(df, model_name)
+    domain = spark.read.table(_s3_domain_stage_name(model_name, len(_s3_domain_stages(model_name))))
+    rows = df.withColumn("_s3d_key", _s3_domain_key(columns))
+    rows = rows.drop(*[c for c in domain.columns if c != "_s3d_key" and c in rows.columns])
+    axes = S3_DOMAIN_MODELS[model_name]["axes"]
+    splits = any(s.allow_split for s in _s3_mapping_steps(model_name) if s.axis in axes)
+    if splits and "source_patient_event_key" not in rows.columns:
+        rows = rows.withColumn("source_patient_event_key", F.col("patient_event_key"))
+    df = rows.join(domain, "_s3d_key")
+    if splits:
+        split = F.col("_s3d_split_axis").isNotNull()
+        df = df.withColumn("patient_event_key", F.when(split, stable_id(
+            "s3b_component", F.col("source_patient_event_key"), F.col("_s3d_split_axis"), F.col("_s3d_split_identity")))
+            .otherwise(F.col("patient_event_key")))
+        for quantity in S3B_SHARED_QUANTITIES.get(model_name, ()):
+            if quantity in df.columns:
+                df = df.withColumn(quantity, F.when(
+                    F.col("_s3d_split_quantities"), F.lit(None).cast(df.schema[quantity].dataType),
+                ).otherwise(F.col(quantity)))
+    return df.drop("_s3d_key", "_s3d_split_axis", "_s3d_split_identity", "_s3d_split_quantities")
+
+
+def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
+    # contract v2: lifecycle columns are validated here but never appended to the public parent.
+    # Read the internal stage and reconstruct the public schema: per-row preparation, the S3 mapping chain, then
+    # the per-row finish. S3_DOMAIN_STAGES_V1: models in S3_DOMAIN_MODELS take their domain axes from the domain
+    # stages and run only their remaining steps here.
+    df = _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, lifecycle_columns)
+    steps = _s3_mapping_steps(model_name)
+    if model_name in S3_DOMAIN_MODELS:
+        assert S3_DOMAIN_DECLARED.get(model_name) == dict(variant_json_columns), \
+            f"{model_name}: declare_s3_domain_stages was not called with these variant_json_columns"
+        df = _s3_domain_join(df, model_name)
+        steps = [step for step in steps if step.axis not in S3_DOMAIN_MODELS[model_name]["axes"]]
+    for step in steps:
+        df = step.apply(df)
+    return _cross_qc_finish(df, model_name, public_columns)
 
 
 
@@ -2512,11 +2696,18 @@ def _encounter_canonical():
     # Bronze declares LAST_WARD_STILL_OPEN_IND but does not publish it; same rule from the two published columns.
     ward_open = s.LAST_WARD_IN_DT_TM.isNotNull() & (
         s.LAST_WARD_OUT_DT_TM.isNull() | (s.LAST_WARD_OUT_DT_TM < s.LAST_WARD_IN_DT_TM))
+    # ENCOUNTER_SOURCE_STATUS_CLOSE_V1: the source encounter status (code set 261) closes encounters that never ran or were discharged
+    # without a departure stamp: 855 Cancelled, 666807 Cancelled Pending Arrival, 666809 Rejected Pending Arrival,
+    # 666808 Pending Arrival, 856 Discharged.
+    status_cd = s.ENCNTR_STATUS_CD.cast("bigint")
     close_state = (
         F.when(s.DEPARTURE_DT_TM_BEST.isNotNull(), F.lit("departed"))
          .when(s.DEPARTURE_REJECTED_REASON.isin("ADMINISTRATIVE_CLOSE", "FIXED_WINDOW_CLOSE"),
                F.lit("source_closed_no_observed_departure"))
+         .when(status_cd.isin(855, 666807, 666809), F.lit("source_cancelled"))
+         .when(status_cd == 666808, F.lit("source_not_arrived"))
          .when(s.DEPARTURE_REJECTED_REASON == "BEFORE_ARRIVAL", F.lit("departure_evidence_invalid"))
+         .when(status_cd == 856, F.lit("source_closed_no_observed_departure"))
          .when(ward_open, F.lit("open_ward_interval"))
          .otherwise(F.lit("no_departure_recorded"))
     )

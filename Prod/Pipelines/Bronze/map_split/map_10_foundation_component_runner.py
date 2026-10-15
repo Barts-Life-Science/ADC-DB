@@ -46,7 +46,7 @@ import json as _map_split_json
 import time as _map_split_time
 _MAP_SPLIT_GROUP = 'map_10_foundation'
 _MAP_SPLIT_ALLOWED_COMPONENTS = ['map_address', 'map_person', 'map_care_site', 'map_medical_personnel', 'map_encounter']
-_MAP_SPLIT_COMPONENT_TARGETS = {'map_address': ['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc'], 'map_person': ['4_prod.bronze.map_person'], 'map_care_site': ['4_prod.bronze.map_care_site'], 'map_medical_personnel': ['4_prod.bronze.map_medical_personnel'], 'map_encounter': ['4_prod.bronze.map_encounter'], 'map_diagnosis': ['4_prod.bronze.map_diagnosis'], 'map_problem': ['4_prod.bronze.map_problem'], 'map_med_admin': ['4_prod.bronze.map_med_admin'], 'map_procedure': ['4_prod.bronze.map_procedure'], 'map_death': ['4_prod.bronze.map_death'], 'map_numeric_events': ['4_prod.bronze.map_numeric_events'], 'map_text_events': ['4_prod.bronze.map_text_events'], 'map_date_events': ['4_prod.bronze.map_date_events'], 'map_nomen_events': ['4_prod.bronze.map_nomen_events'], 'map_coded_events': ['4_prod.bronze.map_coded_events'], 'map_mat_pregnancy': ['4_prod.bronze.map_mat_pregnancy'], 'map_mat_birth': ['4_prod.bronze.map_mat_birth'], 'map_mat_vte_assessment': ['4_prod.bronze.map_mat_vte_assessment'], 'map_family_history': ['4_prod.bronze.map_family_history'], 'map_patient_journey': ['4_prod.bronze.map_patient_journey'], 'map_implant_details': ['4_prod.bronze.map_implant_details'], 'map_pathology': ['4_prod.bronze.map_pathology']}
+_MAP_SPLIT_COMPONENT_TARGETS = {'map_address': ['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc', '4_prod.bronze.map_address_area'], 'map_person': ['4_prod.bronze.map_person'], 'map_care_site': ['4_prod.bronze.map_care_site'], 'map_medical_personnel': ['4_prod.bronze.map_medical_personnel'], 'map_encounter': ['4_prod.bronze.map_encounter'], 'map_diagnosis': ['4_prod.bronze.map_diagnosis'], 'map_problem': ['4_prod.bronze.map_problem'], 'map_med_admin': ['4_prod.bronze.map_med_admin'], 'map_procedure': ['4_prod.bronze.map_procedure'], 'map_death': ['4_prod.bronze.map_death'], 'map_numeric_events': ['4_prod.bronze.map_numeric_events'], 'map_text_events': ['4_prod.bronze.map_text_events'], 'map_date_events': ['4_prod.bronze.map_date_events'], 'map_nomen_events': ['4_prod.bronze.map_nomen_events'], 'map_coded_events': ['4_prod.bronze.map_coded_events'], 'map_mat_pregnancy': ['4_prod.bronze.map_mat_pregnancy'], 'map_mat_birth': ['4_prod.bronze.map_mat_birth'], 'map_mat_vte_assessment': ['4_prod.bronze.map_mat_vte_assessment'], 'map_family_history': ['4_prod.bronze.map_family_history'], 'map_patient_journey': ['4_prod.bronze.map_patient_journey'], 'map_implant_details': ['4_prod.bronze.map_implant_details'], 'map_pathology': ['4_prod.bronze.map_pathology']}
 _MAP_SPLIT_SELECTED_COMPONENT = str(dbutils.widgets.get('map_component')).strip()
 if _MAP_SPLIT_SELECTED_COMPONENT not in _MAP_SPLIT_ALLOWED_COMPONENTS:
     raise ValueError(
@@ -117,6 +117,7 @@ if _map_split_component_selected('map_address'):
     _pipeline_component_start("map_address")
 if _map_split_component_selected('map_address'):
     _pipeline_component_start("map_address_epc", set_current=False)
+    _pipeline_component_start("map_address_area", set_current=False)  # GEO_AREA_ENRICHMENT_V1
 _pipeline_shared_update_table = globals().get('update_table')
 _pipeline_shared_table_exists = globals().get('table_exists')
 _pipeline_shared_get_max_timestamp = globals().get('get_max_timestamp')
@@ -138,6 +139,7 @@ from pyspark.sql.window import Window
 RAW_ADDRESS_TABLE = '4_prod.raw.mill_address'
 MAP_ADDRESS_TABLE = '4_prod.bronze.map_address'
 MAP_ADDRESS_EPC_TABLE = '4_prod.bronze.map_address_epc'
+MAP_ADDRESS_AREA_TABLE = '4_prod.bronze.map_address_area'  # GEO_AREA_ENRICHMENT_V1
 CODE_VALUE_TABLE = '3_lookup.mill.mill_code_value'
 ADDRESSBASE_TABLE = '3_lookup.ons.addressbase_consolidated'
 POSTCODE_MAP_TABLE = '3_lookup.imd.postcode_maps'
@@ -705,6 +707,140 @@ def create_address_epc_mapping(full_refresh: Optional[bool]=None) -> DataFrame:
     _register_cache(MAP_ADDRESS_EPC_TABLE, addresses, epc)
     return result
 
+# ---- GEO_AREA_ENRICHMENT_V1: area enrichment at ADDRESS_ID grain ------------------------------------------------------
+# Each address with a 2021 output area, an LSOA or a location gets the English Indices of Deprivation 2025 (LSOA21),
+# the UKHSA/BGS indicative radon class of its 1 km OS grid square, and a curated set of Census 2021 output-area measures.
+# The radon square comes from the UPRN's AddressBase coordinates when the address has an accepted UPRN, otherwise from
+# the output area's centroid (mean grid reference of its live ONSPD postcodes; output areas average ~125 households).
+# Recomputed in full each run and merged on ADDRESS_ID: unchanged rows are not rewritten, vanished addresses are
+# deleted. IMD 2019 stays on map_address unchanged.
+IOD_2025_TABLE = '3_lookup.geo.iod_2025_lsoa'
+RADON_ATLAS_TABLE = '3_lookup.geo.radon_indicative_atlas_v3'
+CENSUS_OA_TABLE = '3_lookup.geo.census2021_oa_ts'
+ONSPD_TABLE = '3_lookup.ons.onspd'
+ADDRESSBASE_BLPU_TABLE = '3_lookup.ons.addressbase_blpu'
+AREA_SCHEMA_VERSION = 'geo_area_v1'
+map_address_area_comment = ('Bronze area enrichment at ADDRESS_ID grain: English Indices of Deprivation 2025 for the '
+                            'address LSOA, the indicative radon potential of its 1 km grid square, and curated Census 2021 '
+                            'output-area measures. Addresses with no output area, LSOA or location are absent. Area values '
+                            'describe the neighbourhood, not the household. IoD covers England only; the census covers '
+                            'England and Wales; the radon atlas covers Great Britain.')
+_IOD_DOMAINS = [('income', 'Income'), ('employment', 'Employment'), ('education', 'Education, Skills and Training'),
+                ('health', 'Health Deprivation and Disability'), ('crime', 'Crime'),
+                ('barriers', 'Barriers to Housing and Services'), ('living_environment', 'Living Environment'),
+                ('idaci', 'Income Deprivation Affecting Children Index'),
+                ('idaopi', 'Income Deprivation Affecting Older People Index')]
+# (column, numerator census columns, denominator census columns, comment). Output-area counts are perturbed by ONS
+# for disclosure control, so a share can rarely fall slightly outside 0-100.
+_CENSUS_SHARES = [
+    ('CENSUS_PCT_HH_DEPRIVED_ANY', ['ts011_total_all_households', '-ts011_household_is_not_deprived_in_any_dimension'],
+     ['ts011_total_all_households'], 'Percent of households deprived in at least one of the four Census 2021 household deprivation dimensions (TS011).'),
+    ('CENSUS_PCT_HH_DEPRIVED_3PLUS', ['ts011_household_is_deprived_in_three_dimensions', 'ts011_household_is_deprived_in_four_dimensions'],
+     ['ts011_total_all_households'], 'Percent of households deprived in three or four dimensions (TS011).'),
+    ('CENSUS_PCT_HH_OVERCROWDED', ['ts052_occupancy_rating_of_bedrooms_1_005', 'ts052_occupancy_rating_of_bedrooms_2_or_less'],
+     ['ts052_total_all_households'], 'Percent of households with a bedroom occupancy rating of -1 or less, i.e. fewer bedrooms than the standard requires (TS052).'),
+    ('CENSUS_PCT_HH_SOCIAL_RENTED', ['ts054_social_rented'], ['ts054_total_all_households'], 'Percent of households renting socially (TS054).'),
+    ('CENSUS_PCT_HH_PRIVATE_RENTED', ['ts054_private_rented'], ['ts054_total_all_households'], 'Percent of households renting privately (TS054).'),
+    ('CENSUS_PCT_HH_NO_CAR', ['ts045_no_cars_or_vans_in_household'], ['ts045_total_all_households'], 'Percent of households with no car or van (TS045).'),
+    ('CENSUS_PCT_HH_NO_CENTRAL_HEATING', ['ts046_no_central_heating'], ['ts046_total_all_households'], 'Percent of households with no central heating (TS046).'),
+    ('CENSUS_PCT_BAD_HEALTH', ['ts037_bad_health', 'ts037_very_bad_health'], ['ts037_total_all_usual_residents'],
+     'Percent of usual residents reporting bad or very bad general health (TS037).'),
+    ('CENSUS_PCT_DISABLED', ['ts038_disabled_under_the_equality_act'], ['ts038_total_all_usual_residents'],
+     'Percent of usual residents disabled under the Equality Act (TS038).'),
+    ('CENSUS_PCT_NO_QUALIFICATIONS', ['ts067_no_qualifications'], ['ts067_total_all_usual_residents_aged_16_years_and_over'],
+     'Percent of usual residents aged 16+ with no qualifications (TS067).'),
+    ('CENSUS_PCT_UNEMPLOYED', ['ts066_economically_active_excluding_full_time_students_unemployed', 'ts066_economically_active_and_a_full_time_student_unemployed'],
+     ['ts066_economically_active_excluding_full_time_students', 'ts066_economically_active_and_a_full_time_student'],
+     'Unemployed as a percent of economically active usual residents aged 16+, students included (TS066).'),
+    ('CENSUS_PCT_LONG_TERM_SICK', ['ts066_economically_inactive_long_term_sick_or_disabled'], ['ts066_total_all_usual_residents_aged_16_years_and_over'],
+     'Percent of usual residents aged 16+ economically inactive through long-term sickness or disability (TS066).'),
+    ('CENSUS_PCT_LIMITED_ENGLISH', ['ts029_main_language_is_not_english_english_or_welsh_in_wales_cannot_speak_english_well', 'ts029_main_language_is_not_english_english_or_welsh_in_wales_cannot_speak_english'],
+     ['ts029_total_all_usual_residents_aged_3_years_and_over'], 'Percent of usual residents aged 3+ who cannot speak English well or at all (TS029).'),
+    ('CENSUS_PCT_ETHNIC_WHITE', ['ts021_white'], ['ts021_total_all_usual_residents'], 'Percent of usual residents in the White ethnic group (TS021).'),
+    ('CENSUS_PCT_ETHNIC_ASIAN', ['ts021_asian_asian_british_or_asian_welsh'], ['ts021_total_all_usual_residents'], 'Percent of usual residents in the Asian, Asian British or Asian Welsh ethnic group (TS021).'),
+    ('CENSUS_PCT_ETHNIC_BLACK', ['ts021_black_black_british_black_welsh_caribbean_or_african'], ['ts021_total_all_usual_residents'], 'Percent of usual residents in the Black, Black British, Black Welsh, Caribbean or African ethnic group (TS021).'),
+    ('CENSUS_PCT_ETHNIC_MIXED', ['ts021_mixed_or_multiple_ethnic_groups'], ['ts021_total_all_usual_residents'], 'Percent of usual residents in the Mixed or Multiple ethnic group (TS021).'),
+    ('CENSUS_PCT_ETHNIC_OTHER', ['ts021_other_ethnic_group'], ['ts021_total_all_usual_residents'], 'Percent of usual residents in the Other ethnic group (TS021).'),
+]
+schema_map_address_area = StructType(
+    [_sf('ADDRESS_ID', LongType(), 'Primary key and foreign key to map_address.', nullable=False),
+     _sf('OA21CD', StringType(), '2021 Output Area code from map_address; joins to the Census 2021 reference table.'),
+     _sf('LSOA', StringType(), 'LSOA21 code from map_address; joins to the IoD 2025 reference table.'),
+     _sf('IMD2025_SCORE', DoubleType(), 'English Index of Multiple Deprivation 2025 score of the LSOA.'),
+     _sf('IMD2025_RANK', IntegerType(), 'IMD 2025 rank of the LSOA (1 = most deprived in England).'),
+     _sf('IMD2025_DECILE', IntegerType(), 'IMD 2025 decile (1 = most deprived 10% of LSOAs in England).'),
+     _sf('IMD2025_QUINTILE', IntegerType(), 'IMD 2025 quintile derived from the decile (1 = most deprived).')]
+    + [_sf(f'IMD2025_{d.upper()}_DECILE', IntegerType(), f'IoD 2025 {label} domain decile of the LSOA (1 = most deprived).')
+       for d, label in _IOD_DOMAINS]
+    + [_sf('IOD_RELEASE', StringType(), 'IoD release the IMD 2025 values come from.'),
+       _sf('RADON_CLASS_MAX', IntegerType(), 'Indicative radon class (1-6) of the 1 km grid square: the maximum class in the square.'),
+       _sf('RADON_POTENTIAL_BAND', StringType(), 'Estimated percentage of homes in the square above the radon Action Level, as a band.'),
+       _sf('RADON_PCT_LOWER', DoubleType(), 'Lower bound of the radon potential band, percent of homes.'),
+       _sf('RADON_PCT_UPPER', DoubleType(), 'Upper bound of the radon potential band, percent of homes.'),
+       _sf('RADON_TILE_REF', StringType(), 'OS 1 km grid square the radon class comes from.'),
+       _sf('RADON_LOCATION_METHOD', StringType(), 'How the grid square was found: UPRN_POINT (AddressBase coordinates of the accepted UPRN) or OA_CENTROID (output-area centroid).'),
+       _sf('RADON_ATLAS_VERSION', StringType(), 'Radon atlas version.'),
+       _sf('CENSUS_USUAL_RESIDENTS', LongType(), 'Census 2021 usual residents of the output area (TS001).'),
+       _sf('CENSUS_PERSONS_PER_SQ_KM', DoubleType(), 'Census 2021 population density of the output area, persons per square kilometre (TS006).')]
+    + [_sf(name, DoubleType(), comment) for name, _, _, comment in _CENSUS_SHARES]
+    + [_sf('ADDRESS_ADC_UPDT', TimestampType(), 'ADC_UPDT of the map_address row.'),
+       _sf('ADC_UPDT', TimestampType(), 'Greatest update timestamp of the address row and the area lookups used.'),
+       _sf('PIPELINE_LOADED_AT', TimestampType(), 'Timestamp this row was inserted or materially updated.')])
+
+
+def _area_sum(columns):
+    terms = [(-F.col(c[1:]) if c.startswith('-') else F.col(c)).cast('double') for c in columns]
+    return reduce(lambda x, y: x + y, terms)
+
+
+def _prepare_area_census() -> DataFrame:
+    shares = [F.when(_area_sum(den) > 0, F.round(F.lit(100.0) * _area_sum(num) / _area_sum(den), 2)).alias(name)
+              for name, num, den, _ in _CENSUS_SHARES]
+    return spark.table(CENSUS_OA_TABLE).select(
+        F.col('oa21cd').alias('_census_oa'), F.col('ts001_total').cast('long').alias('CENSUS_USUAL_RESIDENTS'),
+        F.col('ts006_persons_per_square_kilometre').cast('double').alias('CENSUS_PERSONS_PER_SQ_KM'), *shares,
+        F.col('ADC_UPDT').alias('_census_adc_updt'))
+
+
+def create_address_area_mapping() -> DataFrame:
+    addresses = spark.table(MAP_ADDRESS_TABLE).select(
+        F.col('ADDRESS_ID').cast('long').alias('ADDRESS_ID'), F.col('UPRN').cast('long').alias('_uprn'), 'OA21CD', 'LSOA',
+        F.col('ADC_UPDT').alias('ADDRESS_ADC_UPDT'))
+    blpu = spark.table(ADDRESSBASE_BLPU_TABLE).select(F.col('UPRN').cast('long').alias('_blpu_uprn'),
+                                                      F.col('X_COORDINATE').alias('_uprn_x'), F.col('Y_COORDINATE').alias('_uprn_y'))
+    centroids = (spark.table(ONSPD_TABLE)
+                 .where(F.col('doterm').isNull() & F.col('oa21').isNotNull() & F.col('oseast1m').isNotNull() & F.col('osnrth1m').isNotNull())
+                 .groupBy(F.col('oa21').alias('_centroid_oa'))
+                 .agg(F.avg('oseast1m').alias('_oa_x'), F.avg('osnrth1m').alias('_oa_y')))
+    iod = spark.table(IOD_2025_TABLE).select(
+        F.col('lsoa21_code').alias('_iod_lsoa'), F.col('imd_score').alias('IMD2025_SCORE'), F.col('imd_rank').alias('IMD2025_RANK'),
+        F.col('imd_decile').alias('IMD2025_DECILE'), F.col('imd_quintile').alias('IMD2025_QUINTILE'),
+        *[F.col(f'{d}_decile').alias(f'IMD2025_{d.upper()}_DECILE') for d, _ in _IOD_DOMAINS],
+        F.col('iod_release').alias('IOD_RELEASE'), F.col('ADC_UPDT').alias('_iod_adc_updt'))
+    radon = spark.table(RADON_ATLAS_TABLE).select(
+        F.col('tile_easting').alias('_tile_e'), F.col('tile_northing').alias('_tile_n'), F.col('tile_ref').alias('RADON_TILE_REF'),
+        F.col('radon_class_max').alias('RADON_CLASS_MAX'), F.col('radon_potential_band').alias('RADON_POTENTIAL_BAND'),
+        F.col('radon_pct_lower').alias('RADON_PCT_LOWER'), F.col('radon_pct_upper').alias('RADON_PCT_UPPER'),
+        F.col('atlas_version').alias('RADON_ATLAS_VERSION'), F.col('ADC_UPDT').alias('_radon_adc_updt'))
+    located = (addresses.join(blpu, F.col('_uprn') == F.col('_blpu_uprn'), 'left')
+               .join(F.broadcast(centroids), F.col('OA21CD') == F.col('_centroid_oa'), 'left')
+               .withColumn('_method', F.when(F.col('_uprn_x').isNotNull(), F.lit('UPRN_POINT'))
+                           .when(F.col('_oa_x').isNotNull(), F.lit('OA_CENTROID')))
+               .withColumn('_x', F.coalesce('_uprn_x', '_oa_x')).withColumn('_y', F.coalesce('_uprn_y', '_oa_y'))
+               .withColumn('_cell_e', (F.floor(F.col('_x') / 1000) * 1000).cast('int'))
+               .withColumn('_cell_n', (F.floor(F.col('_y') / 1000) * 1000).cast('int')))
+    joined = (located.join(F.broadcast(iod), F.col('LSOA') == F.col('_iod_lsoa'), 'left')
+              .join(F.broadcast(_prepare_area_census()), F.col('OA21CD') == F.col('_census_oa'), 'left')
+              .join(F.broadcast(radon), (F.col('_cell_e') == F.col('_tile_e')) & (F.col('_cell_n') == F.col('_tile_n')), 'left')
+              .where(F.col('_iod_lsoa').isNotNull() | F.col('_census_oa').isNotNull() | F.col('RADON_TILE_REF').isNotNull())
+              .withColumn('RADON_LOCATION_METHOD', F.when(F.col('RADON_TILE_REF').isNotNull(), F.col('_method')))
+              .withColumn('ADC_UPDT', F.greatest('ADDRESS_ADC_UPDT', '_iod_adc_updt', '_census_adc_updt', '_radon_adc_updt'))
+              .withColumn('PIPELINE_LOADED_AT', F.current_timestamp()))
+    _PENDING_TABLE_OPTIONS[MAP_ADDRESS_AREA_TABLE] = {'full_sync': True,
+                                                      'properties': {'pipeline.area.schema_version': AREA_SCHEMA_VERSION}}
+    return _schema_select(joined, schema_map_address_area)
+
+
 def run_map_updates(force_full_address: bool=False, force_full_epc: bool=False, include_sensitive_address_columns: bool=False, validate_keys: bool=False):
     address_updates = create_address_mapping_incr(full_refresh=True if force_full_address else None, include_sensitive_address_columns=include_sensitive_address_columns)
     if address_updates is not None:
@@ -717,6 +853,9 @@ def run_map_updates(force_full_address: bool=False, force_full_epc: bool=False, 
         update_table(epc_updates, MAP_ADDRESS_EPC_TABLE, 'ADDRESS_ID', schema_map_address_epc, map_address_epc_comment)
     else:
         raise ValueError('map_address_epc update aborted because duplicate ADDRESS_ID values were found')
+    # GEO_AREA_ENRICHMENT_V1: full recompute, merged on ADDRESS_ID (unchanged rows untouched, vanished ones deleted).
+    update_table(create_address_area_mapping(), MAP_ADDRESS_AREA_TABLE, 'ADDRESS_ID', schema_map_address_area,
+                 map_address_area_comment, full_sync=True)
 
 def run_post_deployment_checks() -> Dict[str, int]:
     source_rows = (
@@ -772,8 +911,8 @@ def _widget_bool(name: str, default: bool=False) -> bool:
 if _map_split_component_selected('map_address'):
     try:
         run_map_updates(force_full_address=_PIPELINE_FULL_REFRESH, force_full_epc=_PIPELINE_FULL_REFRESH, include_sensitive_address_columns=False, validate_keys=False)
-        _PIPELINE_UPDATED_TARGETS.extend(['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc'])
-        _pipeline_mark_component_complete('map_address', ['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc'])
+        _PIPELINE_UPDATED_TARGETS.extend(['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc', '4_prod.bronze.map_address_area'])
+        _pipeline_mark_component_complete('map_address', ['4_prod.bronze.map_address', '4_prod.bronze.map_address_epc', '4_prod.bronze.map_address_area'])
         _pipeline_audit(None, 'COMPONENT_END', {'component': 'map_address'})
     except Exception as exc:
         _pipeline_record_error(None, exc)

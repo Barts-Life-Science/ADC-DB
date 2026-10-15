@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathology_amr import run_amr
 from pathology_genetics import run_genetics
 from pathology_incremental import run_incremental_core
-from pathology_indications import run_indications
+from pathology_indications import changed_scope, run_indications
 from pathology_pipeline import PipelineConfig, create_views
 from pathology_runtime import register_runtime_artifact
 
@@ -86,15 +86,21 @@ def periodic_lane_state(force_full_refresh: bool) -> dict[str, object]:
 # not only every fourth ISO week. The version it ran against is kept on map_pathology_indication.
 INDICATIONS_DIAGNOSIS_SOURCE = "4_prod.bronze.map_diagnosis"
 INDICATIONS_VERSION_PROPERTY = "pathology.indications.map_diagnosis_version"
+# INDICATIONS_INCREMENTAL_V1: with the accession-source version also stored, a later run can read both change feeds
+# from where this one stopped and rebuild only the affected accessions (see pathology_indications.changed_scope).
+INDICATIONS_ACCESSION_VERSION_PROPERTY = "pathology.indications.accession_source_version"
 
 
 def indications_lane_state(periodic: dict[str, object], target_schema: str) -> dict[str, object]:
     current = int(spark.sql(f"DESCRIBE HISTORY {INDICATIONS_DIAGNOSIS_SOURCE} LIMIT 1").first()["version"])
+    current_accession = int(spark.sql(
+        f"DESCRIBE HISTORY {target_schema}.map_pathology_accession_source LIMIT 1").first()["version"])
     table = f"{target_schema}.map_pathology_indication"
-    last = None
+    last = last_accession = None
     if spark.catalog.tableExists(table):
         props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
         last = props.get(INDICATIONS_VERSION_PROPERTY)
+        last_accession = props.get(INDICATIONS_ACCESSION_VERSION_PROPERTY)
     if periodic["enabled"]:
         enabled, reason = True, periodic["reason"]
     elif periodic["mode"] in {"false", "no", "off"}:
@@ -103,10 +109,14 @@ def indications_lane_state(periodic: dict[str, object], target_schema: str) -> d
         enabled, reason = True, "explicit_indications"
     elif last is None or int(last) != current:
         enabled, reason = True, "map_diagnosis_version_changed"
+    elif last_accession is None or int(last_accession) != current_accession:
+        # New or changed accessions need context too; the incremental path keeps this cheap.
+        enabled, reason = True, "accession_source_version_changed"
     else:
         enabled, reason = False, "map_diagnosis_unchanged"
     return {"enabled": enabled, "reason": reason, "map_diagnosis_version": current,
-            "last_map_diagnosis_version": last}
+            "last_map_diagnosis_version": last, "accession_source_version": current_accession,
+            "last_accession_source_version": last_accession}
 
 
 # STM_SPECIMEN_TYPE_V1/runner: isolates carry map_pathology_specimen_type columns, so the AMR lane also runs whenever the map
@@ -199,6 +209,18 @@ if amr_lane["enabled"] and "status" not in amr:
     )
 indications_lane = indications_lane_state(periodic, target_schema)
 if indications_lane["enabled"]:
+    # Forced and periodic runs reconcile in full; otherwise only the accessions whose inputs changed since the
+    # versions stored on the target (changed_scope falls back to full when that is not safe).
+    scope, scope_stats = None, {"reason": "full: forced or periodic run"}
+    if not force_full_refresh and not periodic["enabled"]:
+        diagnosis_from = indications_lane["last_map_diagnosis_version"]
+        accession_from = indications_lane["last_accession_source_version"]
+        scope, scope_stats = changed_scope(
+            spark, config,
+            (int(diagnosis_from) + 1, indications_lane["map_diagnosis_version"]) if diagnosis_from is not None else None,
+            (int(accession_from) + 1, indications_lane["accession_source_version"]) if accession_from is not None else None,
+        )
+    print("[INDICATIONS] scope:", scope_stats)
     indications = run_indications(
         spark,
         config,
@@ -206,10 +228,13 @@ if indications_lane["enabled"]:
         include_diagnosis_context=True,
         full_reconcile=True,
         validate_stage_keys=False,
+        accession_scope=scope,
     )
+    indications = {**indications, "scope": scope_stats}
     spark.sql(
         f"ALTER TABLE {target_schema}.map_pathology_indication SET TBLPROPERTIES "
-        f"('{INDICATIONS_VERSION_PROPERTY}' = '{indications_lane['map_diagnosis_version']}')"
+        f"('{INDICATIONS_VERSION_PROPERTY}' = '{indications_lane['map_diagnosis_version']}', "
+        f"'{INDICATIONS_ACCESSION_VERSION_PROPERTY}' = '{indications_lane['accession_source_version']}')"
     )
 else:
     indications = {"status": "SKIPPED_DIAGNOSIS_UNCHANGED", **indications_lane}

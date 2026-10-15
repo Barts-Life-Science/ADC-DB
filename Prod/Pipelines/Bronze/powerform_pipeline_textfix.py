@@ -64,6 +64,7 @@ for _widget_name, _widget_default in {
     "full_build_shards": "128",
     "max_shards_per_run": "1",
     "max_incremental_candidates": "5000000",
+    "max_incremental_batches": "8",  # PF_SOURCE_SEMANTIC_CDF_V1
     "min_lane_coverage": "0.98",
     "max_lane_schedule_skew_hours": "36",
     "max_context_conflict_count": "1000",
@@ -122,6 +123,13 @@ FULL_BUILD_SHARDS = int(bronze_value("full_build_shards", "128"))
 MAX_SHARDS_PER_RUN = int(bronze_value("max_shards_per_run", "1"))
 MAX_INCREMENTAL_CANDIDATES = int(
     bronze_value("max_incremental_candidates", "5000000")
+)
+# PF_SOURCE_SEMANTIC_CDF_V1: above the candidate bound the run works in up to this many bounded batches.
+MAX_INCREMENTAL_BATCHES = int(bronze_value("max_incremental_batches", "8"))
+# PF_SOURCE_SEMANTIC_CDF_V1: publisher provenance on mill_form_activity; a change only here is not a PowerForm change.
+SOURCE_PROVENANCE_COLUMNS = (
+    "ADC_UPDT", "PIPELINE_RUN_ID", "PIPELINE_PROCESSED_DT_TM",
+    "SOURCE_ACTIVITY_ADC_UPDT", "SOURCE_EVENT_ADC_UPDT", "SOURCE_LABEL_ADC_UPDT",
 )
 MIN_LANE_COVERAGE = float(bronze_value("min_lane_coverage", "0.98"))
 MAX_LANE_SKEW_HOURS = int(bronze_value("max_lane_schedule_skew_hours", "36"))
@@ -971,7 +979,11 @@ def begin_run(run_id: str, run_type: str, versions: Dict[str, int]) -> None:
         if existing["STATUS"] == "running":
             return
         resumable_full = run_type == "full_rebuild" and existing["STATUS"] == "partial"
-        if not resumable_full and not OVERRIDE_RUNNING_LOCK:
+        # POWERFORM_RETRY_FAILED_INCREMENTAL_V1: a failed incremental wrote no state (write_state runs only on
+        # success/noop) and its candidate rows merge on (RUN_ID, key, REASON), so the same run id can try again. A job
+        # repair reuses {{job.run_id}}, which previously made every repair of a failed PowerForm task fail too.
+        retryable_incremental = run_type == "incremental" and existing["STATUS"] == "failed"
+        if not resumable_full and not retryable_incremental and not OVERRIDE_RUNNING_LOCK:
             raise RuntimeError(
                 f"run_id={run_id} already exists with status={existing['STATUS']}; "
                 "use a new pipeline_run_id or explicitly override"
@@ -1167,6 +1179,24 @@ def candidate_scope(run_id: str) -> DataFrame:
             ),
             F.min("SHARD_ID").alias("SHARD_ID"),
         )
+    )
+
+
+def mark_candidate_keys(run_id: str, scope: DataFrame, status: str) -> None:
+    """PF_SOURCE_SEMANTIC_CDF_V1: set the status of one batch's open candidates (all reasons of the batch's DOC_RESPONSE_KEYs)."""
+    assignments = {"STATUS": F.lit(status)}
+    if status == "completed":
+        assignments["PROCESSED_AT"] = F.current_timestamp()
+    (
+        DeltaTable.forName(spark, CANDIDATE_TABLE)
+        .alias("t")
+        .merge(
+            scope.select("DOC_RESPONSE_KEY").distinct().alias("s"),
+            f"t.RUN_ID = '{run_id}' AND t.DOC_RESPONSE_KEY = s.DOC_RESPONSE_KEY "
+            "AND t.STATUS IN ('pending', 'processing')",
+        )
+        .whenMatchedUpdate(set=assignments)
+        .execute()
     )
 
 
@@ -3866,6 +3896,40 @@ def candidates_for_changed_concepts(
     return item_candidates, map_candidates
 
 
+def meaningful_source_changes(cdf: DataFrame) -> DataFrame:
+    """PF_SOURCE_SEMANTIC_CDF_V1: source CDF rows whose consumed content changed in their commit (inserts, deletes, real updates).
+    Same rule as changed_lane_candidates: hash the columns the build reads, compare pre and post per key and commit."""
+    changes = cdf.where(
+        F.col("_change_type").isin("insert", "delete", "update_preimage", "update_postimage")
+    )
+    semantic = [
+        name for name, _ in SOURCE_COLUMN_TYPES
+        if name in changes.columns and name not in SOURCE_PROVENANCE_COLUMNS and name != "DOC_RESPONSE_KEY"
+    ]
+    fallback_time = F.when(
+        F.coalesce(F.col("LAST_DOCUMENTED_DT_TM"), F.col("DOCUMENTATION_DT_TM")).isNull(),
+        F.col("ADC_UPDT"),
+    )
+    payload = F.sha2(
+        F.to_json(
+            F.struct(*[F.col(name).alias(name) for name in semantic], fallback_time.alias("_FALLBACK_TIME")),
+            {"ignoreNullFields": "false"},
+        ),
+        256,
+    )
+    hashed = changes.withColumn("_SEMANTIC_HASH", payload)
+    commits = hashed.groupBy("DOC_RESPONSE_KEY", "_commit_version").agg(
+        F.max(F.when(F.col("_change_type").isin("update_preimage", "delete"), F.col("_SEMANTIC_HASH"))).alias("_PRE_HASH"),
+        F.max(F.when(F.col("_change_type").isin("update_postimage", "insert"), F.col("_SEMANTIC_HASH"))).alias("_POST_HASH"),
+    )
+    meaningful = commits.where(~F.col("_PRE_HASH").eqNullSafe(F.col("_POST_HASH"))).select(
+        "DOC_RESPONSE_KEY", "_commit_version"
+    )
+    return hashed.where(F.col("_change_type").isin("insert", "update_postimage", "delete")).join(
+        meaningful, ["DOC_RESPONSE_KEY", "_commit_version"], "left_semi"
+    )
+
+
 def incremental_candidates(
     versions: Dict[str, int], previous: Dict[str, int]
 ) -> Tuple[Optional[DataFrame], dict]:
@@ -3900,10 +3964,9 @@ def incremental_candidates(
             previous[SRC_POWERFORM] + 1,
             versions[SRC_POWERFORM],
         )
-        source_changes = source_cdf.where(
-            F.col("_change_type").isin("insert", "update_postimage", "delete")
-        )
-        frames.append(candidate_frame(source_changes, "POWERFORM_SOURCE_CDF"))
+        frames.append(
+            candidate_frame(meaningful_source_changes(source_cdf), "POWERFORM_SOURCE_CDF")
+        )  # PF_SOURCE_SEMANTIC_CDF_V1
 
     lane_specs = [
         (SRC_NOMEN, "NOMEN"),
@@ -4738,16 +4801,29 @@ def run_incremental_build(
         candidates.select("DOC_RESPONSE_KEY").distinct().count()
     )
     write_candidate_rows(candidates)
-    if candidate_count > MAX_INCREMENTAL_CANDIDATES:
+    # PF_SOURCE_SEMANTIC_CDF_V1: bounded batches instead of refusing. Only this run's pending/processing candidates are batched, so
+    # a retry of the same run (same pipeline_run_id) skips batches already completed.
+    remaining = int(candidate_scope(POWERFORM_RUN_ID).count())
+    batch_count = max(1, -(-remaining // MAX_INCREMENTAL_CANDIDATES))
+    if batch_count > MAX_INCREMENTAL_BATCHES:
         raise RuntimeError(
-            f"incremental candidate count {candidate_count:,} exceeds "
-            f"max_incremental_candidates={MAX_INCREMENTAL_CANDIDATES:,}. "
-            "Candidates remain pending; use a classic recode/full-rebuild recovery run."
+            f"incremental candidate count {remaining:,} needs {batch_count} batches of "
+            f"{MAX_INCREMENTAL_CANDIDATES:,}, over max_incremental_batches={MAX_INCREMENTAL_BATCHES}. "
+            "Candidates remain pending; a sharded full_rebuild is cheaper at this size."
         )
-    mark_candidates(POWERFORM_RUN_ID, "processing")
-    scope = candidate_scope(POWERFORM_RUN_ID)
-    processing = process_candidate_batch(scope, versions)
-    mark_candidates(POWERFORM_RUN_ID, "completed")
+    batches = []
+    for batch_id in range(batch_count):
+        scope = candidate_scope(POWERFORM_RUN_ID).where(
+            F.pmod(F.xxhash64(F.col("DOC_RESPONSE_KEY")), F.lit(batch_count)) == batch_id
+        )
+        mark_candidate_keys(POWERFORM_RUN_ID, scope, "processing")
+        batch = process_candidate_batch(scope, versions)
+        mark_candidate_keys(POWERFORM_RUN_ID, scope, "completed")
+        powerform_run_progress(
+            POWERFORM_RUN_ID, "incremental_batch_completed", batch=batch_id + 1, batches=batch_count
+        )
+        batches.append(batch)
+    processing = batches[0] if batch_count == 1 else {"batches": batches, "batch_count": batch_count}
     post_validation = None
     if RUN_POST_CHECKS:
         post_validation = validate_final_outputs(

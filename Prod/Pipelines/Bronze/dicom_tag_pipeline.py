@@ -409,7 +409,7 @@ def version_properties(versions):
 # COMMAND ----------
 
 # Gates are defined before the build and can be run with action=pre_gates.
-def run_gates(recompute_fingerprint=True):
+def run_gates(recompute_fingerprint=True, versions=None):
     assert spark.catalog.tableExists(TARGET), f"G0 target absent: {TARGET}"
     props = table_properties(TARGET)
     required_metrics = [
@@ -493,7 +493,8 @@ def run_gates(recompute_fingerprint=True):
         F.col("BURNED_IN_PII_TIER").isNull() |
         ~F.col("BURNED_IN_PII_TIER").isin("SAFE_SKIP", "GREY", "MUST_OCR", "UNTIERED")
     ).limit(1).count() == 0
-    tier = spark.table(SOURCE_TIER)
+    pins = versions or source_versions()  # SOURCE_PIN_DRIFT_V1: G4 reads the versions the build used
+    tier = pinned_table(SOURCE_TIER, pins)
     tier_shape = tier.agg(
         F.count("*").alias("n"),
         F.countDistinct("dicom_path").alias("files"),
@@ -502,7 +503,7 @@ def run_gates(recompute_fingerprint=True):
     tier_acc = tier.select(F.trim("accession_nbr").alias("ACCESSION_NBR")).where(
         F.col("ACCESSION_NBR").isNotNull() & (F.col("ACCESSION_NBR") != "")
     ).distinct()
-    exam_acc = (spark.table(SOURCE_EXAM)
+    exam_acc = (pinned_table(SOURCE_EXAM, pins)
                 .where(F.col("SOURCE_PRESENT_IND"))
                 .select(F.trim("REQUEST_ID_STRING").alias("ACCESSION_NBR"))
                 .where(F.col("ACCESSION_NBR").isNotNull())
@@ -981,7 +982,7 @@ if ACTION == "pre_gates":
 if ACTION == "gates":
     gate_versions = source_versions()
     assert not build_is_due(gate_versions), "target source-version properties do not match live sources"
-    result = run_gates(recompute_fingerprint=True)
+    result = run_gates(recompute_fingerprint=True, versions=gate_versions)
     record_shared_versions(gate_versions)
     dbutils.notebook.exit(json.dumps({
         "status": "PASS", "run_id": RUN_ID, "gates": result,
@@ -1066,14 +1067,15 @@ except Exception as exc:
         "cluster": cluster_evidence(),
     })
     raise
+# SOURCE_PIN_DRIFT_V1: every source read is pinned to the start versions, so a commit made during the build
+# (OPTIMIZE, COMPUTE STATS, SET TBLPROPERTIES or new data from a parallel task) cannot change this result. The
+# start state is what gets recorded; if the sources moved, it no longer matches and the next run rebuilds. The old
+# fatal check failed the 2026-10-05 catch-up on exactly such commits.
 versions_end = source_versions()
-assert versions_end == versions_start, {
-    "source_drift_invalidates_run": True,
-    "start": versions_start,
-    "end": versions_end,
-}
+if versions_end != versions_start:
+    print(f"[S6][SOURCE_MOVED] {versions_start} -> {versions_end}; recorded the pinned start versions, next run rebuilds")
 
-gates = run_gates(recompute_fingerprint=True)
+gates = run_gates(recompute_fingerprint=True, versions=versions_start)
 record_shared_versions(versions_start)
 target_version_after = table_version(TARGET)
 history = (spark.sql(f"DESCRIBE HISTORY {TARGET}")

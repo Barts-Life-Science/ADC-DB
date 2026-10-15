@@ -1,7 +1,7 @@
 # Databricks notebook source
 # BRONZE_PERF_946452877034658_V2
 # Generated Map split runner. Do not edit; regenerate from the validated source group.
-%pip install openai pyarrow
+%pip install openai pyarrow anthropic
 
 # COMMAND ----------
 
@@ -1063,6 +1063,10 @@ def _prepare_incremental_scope(state: dict[str, dict], cutoffs: dict[str, dict],
     native_result_scope = target_with_result.filter(F.col('value_as_concept_id').isNull() & ~F.col('result_status').isin('numeric', 'datetime', 'missing'))
     linked_ids.append(native_result_scope.filter(F.col('source_table') == 'linked').join(native_result.filter(F.col('_nr_type') == 'EVENT_CD'), (F.col('EVENT_CD').cast('string') == F.col('_nr_value')) & F.col('_target_result_normalized').eqNullSafe(F.col('_nr_result')), 'left_semi').select(F.col('source_event_id').cast('long').alias('EVENT_ID')))
     raw_keys.append(native_result_scope.filter(F.col('source_table') == 'raw').join(native_result.filter(F.col('_nr_type') == 'NLMC_ID'), F.col('nlmc_id').eqNullSafe(F.col('_nr_value')) & F.col('_target_result_normalized').eqNullSafe(F.col('_nr_result')), 'left_semi').select('LIMSNo', F.col('lab_no').alias('LabNo')))
+    # MAP_CORRECTION_SCOPED_V1: rows whose concept came through a fallback that has since changed.
+    drift_linked, drift_raw = _mcs_fallback_drift_scope(target)
+    linked_ids.append(drift_linked)
+    raw_keys.append(drift_raw)
     linked_scope = reduce(lambda left, right: left.unionByName(right), linked_ids).filter(F.col('EVENT_ID').isNotNull()).dropDuplicates(['EVENT_ID'])
     raw_scope = reduce(lambda left, right: left.unionByName(right), raw_keys).dropDuplicates(['LIMSNo', 'LabNo'])
     linked_scope.createOrReplaceTempView('mp_v2_linked_scope')
@@ -1071,6 +1075,74 @@ def _prepare_incremental_scope(state: dict[str, dict], cutoffs: dict[str, dict],
     raw_parents = raw_scope.select(F.lit('raw').alias('source_table'), F.concat_ws('|', F.lit('raw'), F.coalesce(F.col('LIMSNo').cast('string'), F.lit('∅')), F.coalesce(F.col('LabNo'), F.lit('∅'))).alias('source_parent_key'), F.lit(None).cast('long').alias('source_event_id'), F.col('LIMSNo').cast('int').alias('LIMSNo'), F.col('LabNo').cast('string').alias('lab_no'))
     parents = linked_parents.unionByName(raw_parents).dropDuplicates(['source_parent_key'])
     return (parents, modes)
+
+# MAP_CORRECTION_SCOPED_V1: the fallback half of a mapping correction's reach. The key-level scope in
+# _prepare_incremental_scope re-projects rows on a changed test/result/unit key (and safe_code rows, which it joins on
+# code alone). A row can also take its concept from a native crosswalk entry (EVENT_CD / NLMC_ID, built from accepted
+# mappings) or from an SDI cross-arm donor (the TFC arm concept for the same display). When a correction changes the
+# crosswalk or the donor, those rows must be re-projected too; this finds them by comparing each fallback-mapped row
+# with the fallback as it stands now (the crosswalks are refreshed before the scope is built), plus unmapped linked
+# rows that a donor now covers. Same joins as _mp_build_select.
+def _mcs_fallback_drift_scope(target: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """(linked EVENT_IDs, raw (LIMSNo, LabNo)) whose fallback mapping no longer matches the current fallbacks."""
+    native_type = F.when(F.col('source_table') == 'linked', F.lit('EVENT_CD')).otherwise(F.lit('NLMC_ID'))
+    native_key = F.when(F.col('source_table') == 'linked', F.col('EVENT_CD').cast('string')).otherwise(F.col('nlmc_id'))
+    rows = target.select('source_table', 'source_event_id', 'LIMSNo', 'lab_no', 'description', 'EVENT_CD_DISPLAY',
+                         'measurement_concept_id', 'test_mapping_match_type', 'value_as_concept_id',
+                         'result_mapping_match_type', native_type.alias('_mcs_type'), native_key.alias('_mcs_key'),
+                         F.lower(F.trim(F.regexp_replace(F.col('value_source_value'), '\\s+', ' '))).alias('_mcs_result'))
+    native_test = spark.table(MP_NATIVE_TEST).select(F.col('key_type').alias('_nt_type'), F.col('key_value').alias('_nt_value'),
+                                                     F.col('measurement_concept_id').alias('_nt_cid'))
+    test_drift = rows.filter(F.col('test_mapping_match_type').isin('native_event_cd', 'native_nlmc')) \
+        .join(native_test, (F.col('_nt_type') == F.col('_mcs_type')) & F.col('_nt_value').eqNullSafe(F.col('_mcs_key')), 'left') \
+        .filter(~F.col('_nt_cid').eqNullSafe(F.col('measurement_concept_id')))
+    native_result = spark.table(MP_NATIVE_RESULT).select(F.col('key_type').alias('_nr_type'), F.col('key_value').alias('_nr_value'),
+                                                         F.col('result_normalized').alias('_nr_result'),
+                                                         F.col('value_as_concept_id').alias('_nr_cid'))
+    result_drift = rows.filter(F.col('result_mapping_match_type') == 'native_context') \
+        .join(native_result, (F.col('_nr_type') == F.col('_mcs_type')) & F.col('_nr_value').eqNullSafe(F.col('_mcs_key'))
+              & F.col('_nr_result').eqNullSafe(F.col('_mcs_result')), 'left') \
+        .filter(~F.col('_nr_cid').eqNullSafe(F.col('value_as_concept_id')))
+    donors = spark.sql(f"""
+        WITH test_map_ranked AS (
+          SELECT * FROM (
+            SELECT tm.*, ROW_NUMBER() OVER (
+                PARTITION BY code_system,code,description
+                ORDER BY CASE confidence_tier WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2
+                                              WHEN 'auto_low' THEN 3 ELSE 9 END,
+                         mapping_version DESC NULLS LAST,mapped_at DESC NULLS LAST) rn
+            FROM {_qn(TEST_MAP)} tm
+            WHERE confidence_tier IN {_tier_sql(TEST_TIERS)} AND measurement_concept_id IS NOT NULL
+          ) WHERE rn=1
+        ),
+        src AS (
+          SELECT {_sdi_path_xarm_key_sql('description')} AS xarm_key, measurement_concept_id,
+            CASE confidence_tier WHEN 'curated' THEN 1 WHEN 'auto_high' THEN 2 ELSE 3 END AS xarm_rank
+          FROM test_map_ranked WHERE code_system='TFC'
+        )
+        SELECT d.xarm_key AS _x_key, MIN(d.measurement_concept_id) AS _x_cid
+        FROM src d
+        JOIN (SELECT xarm_key, MIN(xarm_rank) AS xarm_rank FROM src GROUP BY xarm_key) br
+          ON br.xarm_key=d.xarm_key AND br.xarm_rank=d.xarm_rank
+        WHERE d.xarm_key<>''
+        GROUP BY d.xarm_key
+        HAVING COUNT(DISTINCT d.measurement_concept_id)=1
+        """)
+    linked_rows = rows.filter(F.col('source_table') == 'linked') \
+        .withColumn('_mcs_xarm', F.expr(_sdi_path_xarm_key_sql('COALESCE(description,EVENT_CD_DISPLAY)')))
+    donor_drift = linked_rows.filter((F.col('test_mapping_match_type') == 'cross_arm_display')
+                                     | (F.col('measurement_concept_id').isNull()
+                                        & F.col('test_mapping_match_type').isin('unmapped', 'placeholder_code'))) \
+        .join(donors, F.col('_x_key') == F.col('_mcs_xarm'), 'left') \
+        .filter(~F.col('_x_cid').eqNullSafe(F.col('measurement_concept_id')))
+    drift = test_drift.select('source_table', 'source_event_id', 'LIMSNo', 'lab_no') \
+        .unionByName(result_drift.select('source_table', 'source_event_id', 'LIMSNo', 'lab_no')) \
+        .unionByName(donor_drift.select('source_table', 'source_event_id', 'LIMSNo', 'lab_no'))
+    linked = drift.filter(F.col('source_table') == 'linked').select(F.col('source_event_id').cast('long').alias('EVENT_ID'))
+    raw = drift.filter(F.col('source_table') == 'raw').select(F.col('LIMSNo').cast('int').alias('LIMSNo'),
+                                                             F.col('lab_no').cast('string').alias('LabNo'))
+    return linked, raw
+
 
 def _scope_from_parent_keys(parents: DataFrame) -> DataFrame:
     """Register source scope views from a target-derived set of parent keys."""
@@ -1240,6 +1312,36 @@ def _full_replace(stage_table: str) -> None:
     bronze_project_contract(
         spark.table(stage_table), MP_TARGET
     ).write.format('delta').mode('overwrite').option('overwriteSchema', 'true').option('delta.enableChangeDataFeed', 'true').option('delta.enableRowTracking', 'true').saveAsTable(MP_TARGET)
+    _apply_table_metadata()
+
+def _full_merge(stage_table: str) -> None:
+    """MAP_PATHOLOGY_CORRECTION_MERGE_V1: publish a full rebuild by writing only what differs.
+
+    A row is rewritten only when a column other than its load stamps differs from the target, new rows are inserted
+    and target rows missing from the candidate are deleted, so the table equals a replace except that unchanged rows
+    keep their earlier load stamps. Every column is compared, not just the two payload hashes: on the 2026-10-08
+    rebuild test_mapping_match_type/rule_id and person columns changed on rows whose hashes did not. A candidate
+    whose columns differ from the target's is a contract change: it falls back to the replace."""
+    source = bronze_project_contract(spark.table(stage_table), MP_TARGET)
+    if set(source.columns) != _column_names(MP_TARGET):
+        print('[map_pathology_v3] candidate columns differ from the target; publishing by replace')
+        _full_replace(stage_table)
+        return
+    assignments = {column_name: F.col(f's.{column_name}') for column_name in source.columns}
+    # Load stamps change on every build; source_adc_updt is provenance the incremental path also leaves alone.
+    stamps = {'ADC_UPDT', 'loaded_at', 'mapping_updated_at', 'source_adc_updt'}
+    differs = ' OR '.join(f'NOT (t.`{c}` <=> s.`{c}`)' for c in sorted(source.columns) if c not in stamps)
+    DeltaTable.forName(spark, MP_TARGET).alias('t').merge(
+        source.alias('s'),
+        't.source_record_key=s.source_record_key',
+    ).whenMatchedUpdate(
+        condition=differs,
+        set=assignments,
+    ).whenNotMatchedInsert(values=assignments).whenNotMatchedBySourceDelete().execute()
+    metrics = _latest_operation_metrics(MP_TARGET)
+    print('[map_pathology_v3] published by merge: '
+          f"updated={metrics.get('numTargetRowsUpdated', 0):,} inserted={metrics.get('numTargetRowsInserted', 0):,} "
+          f"deleted={metrics.get('numTargetRowsDeleted', 0):,}")
     _apply_table_metadata()
 
 def _merge_and_reconcile(stage_table: str, touched_parents: DataFrame) -> dict[str, int]:
@@ -2621,7 +2723,7 @@ def _full_build_bucket_metrics(manifest: dict) -> list[dict]:
         raise RuntimeError(f'Expected {expected} completed pathology buckets, found {_mp_builtins.len(rows)}')
     return [{'branch': 'linked' if row['stage_name'] == 'LINKED_BUCKET' else 'raw', 'bucket_id': int(row['bucket_id']), 'table_name': row['table_name'], 'row_count': int(row['row_count'] or 0), 'parent_count': int(row['parent_count'] or 0)} for row in rows]
 
-def _run_restartable_full_build(manifest: dict) -> dict:
+def _run_restartable_full_build(manifest: dict, publish_by_merge: bool=False) -> dict:
     originals: dict = {}
     views: list[str] = []
     try:
@@ -2641,7 +2743,10 @@ def _run_restartable_full_build(manifest: dict) -> dict:
                 raise RuntimeError('The manifest says CANDIDATE_COMPLETE but the durable candidate table or completion marker is missing. Abandon the build explicitly.')
             candidate_metrics = {'row_count': int(completed.get('row_count') or 0), 'parent_count': int(completed.get('parent_count') or 0)}
         if not _phase_reached(manifest, 'PUBLISHED'):
-            _full_replace(candidate_table)
+            if publish_by_merge:
+                _full_merge(candidate_table)
+            else:
+                _full_replace(candidate_table)
             target_rows = int(spark.table(MP_TARGET).count())
             if target_rows != int(candidate_metrics['row_count']):
                 raise RuntimeError(f"Published pathology row count differs from the validated candidate: target={target_rows}, candidate={candidate_metrics['row_count']}")
@@ -2660,6 +2765,88 @@ def _cleanup_full_build_stages(build_id: str) -> None:
         except Exception as exc:
             print(f'[map_pathology_v3] stage cleanup warning for {table_name}: {str(exc).splitlines()[0][:500]}')
 
+
+# PATH_SPECIMEN_V1: per-key specimen and unit evidence for the remap guard. TFC descriptions rarely name the specimen
+# ("Urea level" is serum, "Sodium level" under UNA is urine) and the embedding text is "code | description", so the
+# cosine picked a specimen by a ~0.005 margin (UREA -> Urine urea measurement, 16M rows). The evidence comes from the
+# rows themselves: the STM SNOMED specimen of each row's specimen_type_code (LIMS + work section, then LIMS), the LIMS
+# code, any specimen named in the description, and the unit class. discover_new_keys_from_stage adds each run's staged
+# rows; _remap_test rejects candidates whose specimen or property conflicts with it.
+PATH_KEY_EVIDENCE = f'{MAP_SCHEMA}.pathology_test_key_evidence'
+PATH_SPEC_CLASSES = ('BLOOD', 'URINE', 'CSF', 'FAECES', 'FLUID', 'OTHER')
+PATH_UNIT_CLASSES = ('SCNC', 'MCNC', 'NCNC', 'UNITS', 'RATE', 'PCT', 'PRES')
+
+
+# PATH_SPEC_CELL_WORDS_V1: a cell name (rbc, wbc, leukocyte, platelet, white/red blood cell) is not a specimen; CSF, fluid and urine cell counts read as blood.
+def _path_spec_sql(x: str) -> str:
+    return "CASE WHEN {x} IS NULL THEN NULL WHEN lower({x}) RLIKE 'blood gas' THEN 'BLOOD' WHEN lower({x}) RLIKE '\\\\bcord' THEN 'CORD' WHEN lower({x}) RLIKE 'pulmonary art' THEN 'PULM_ART' WHEN lower({x}) RLIKE '\\\\burin(e|ary)' THEN 'URINE' WHEN lower({x}) RLIKE 'cerebrospinal|\\\\bcsf\\\\b|cerebral spinal' THEN 'CSF' WHEN lower({x}) RLIKE '\\\\bfaec|\\\\bfecal|\\\\bfeces|\\\\bstool' THEN 'FAECES' WHEN lower({x}) RLIKE 'pleural|peritoneal|ascit|synovial|body fl|\\\\bfluid|\\\\bdrain|dialys|pericard|amniotic' THEN 'FLUID' WHEN lower({x}) RLIKE '\\\\bsweat' THEN 'SWEAT' WHEN lower({x}) RLIKE '\\\\bsaliva|oral fluid' THEN 'SALIVA' WHEN lower({x}) RLIKE '\\\\bair\\\\b|\\\\bbreath|exhaled|\\\\bgas\\\\b' THEN 'GAS' WHEN lower({x}) RLIKE '\\\\bwater\\\\b' THEN 'WATER' WHEN lower({x}) RLIKE '\\\\btissue\\\\b(?! transglutaminase)|\\\\bbiopsy' THEN 'TISSUE' WHEN regexp_replace(lower({x}), '(white|red) blood (cell|count)s?', '') RLIKE 'serum|plasma|blood|\\\\bbld\\\\b|ser/plas|venous|arterial|capillary' THEN 'BLOOD' END".replace('{x}', x)
+
+
+PATH_UNIT_CLASS_SQL = (
+    "CASE WHEN u IS NULL OR u = '' THEN NULL "
+    "WHEN u RLIKE '/ ?24 ?h|/day|per 24|24 ?hr|/d$' THEN 'RATE' WHEN u RLIKE 'kpa|mmhg' THEN 'PRES' "
+    "WHEN u RLIKE '10\\\\^|x10|10\\\\*|/ul$|/mm3' THEN 'NCNC' WHEN u RLIKE 'mol' THEN 'SCNC' "
+    "WHEN u RLIKE '^(g|mg|ug|ng|pg|microgram|milligram|nanogram|picogram|gram|grams)s?/|g/l|g/dl' THEN 'MCNC' "
+    "WHEN u RLIKE '^(iu|u|units?|unit|international unit|ku|kiu|mu|miu|milliunits|kilounits)s?/|unit/l' THEN 'UNITS' "
+    "WHEN u RLIKE '%|percent' THEN 'PCT' END")
+PATH_TFC_CODE_SPEC_SQL = (
+    "CASE WHEN st IN ('BLOOD','B','BLD','S','SCR','SER','SERUM','PLASMA','VSER','EDTA','CLOT','SV') THEN 'BLOOD' "
+    "WHEN st IN ('UR','URINE','U','URIV','VURI','UCC','UC','MSU','CSU','EMU','UR24') THEN 'URINE' "
+    "WHEN st IN ('CSF','VCSF') THEN 'CSF' WHEN st IN ('FAE','FAECES','VSTO','STOV','STOOL') THEN 'FAECES' "
+    "WHEN st IN ('FLUI','PF','ASC') THEN 'FLUID' END")
+
+
+# PATH_SPEC_CELL_WORDS_V1: a cell name in the description is a weak blood hint, used only when the row has no
+# specimen code (Cerner rows) and the description names no specimen.
+PATH_CELL_WORD_SPEC_SQL = "CASE WHEN lower(description) RLIKE '\\\\brbc\\\\b|\\\\bwbc\\\\b|erythrocyte|leukocyte|platelet|(white|red) blood (cell|count)' THEN 'BLOOD' END"
+
+
+def _path_key_evidence_merge(rows) -> None:
+    """Add each test key's specimen-class and unit-class row counts from `rows` (map_pathology-shaped) to
+    PATH_KEY_EVIDENCE (created on first use). Counts accumulate across runs; only shares are read."""
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {_qn(PATH_KEY_EVIDENCE)} (
+        code_system STRING, code STRING, description STRING, desc_spec STRING, n_rows BIGINT, n_numeric BIGINT,
+        n_spec BIGINT, n_blood BIGINT, n_urine BIGINT, n_csf BIGINT, n_faeces BIGINT, n_fluid BIGINT, n_other BIGINT,
+        n_unit BIGINT, n_scnc BIGINT, n_mcnc BIGINT, n_ncnc BIGINT, n_units BIGINT, n_rate BIGINT, n_pct BIGINT,
+        n_pres BIGINT, updated_at TIMESTAMP) USING DELTA""")
+    r = rows.where(F.col('code').isNotNull() & F.col('description').isNotNull()).select(
+        'code_system', 'code', 'description', 'LIMSNo', 'WkgCode', 'value_as_number',
+        F.upper(F.trim('specimen_type_code')).alias('st'), F.lower(F.trim('unit_source_value')).alias('u'))
+    stm_name = f'{TARGET_SCHEMA}.map_pathology_specimen_type'
+    if _table_exists(stm_name):
+        stm = spark.table(stm_name)
+        s1 = stm.select(F.col('specimen_type_source_system').alias('sys1'), F.upper('specimen_type_code').alias('st1'),
+                        F.col('specimen_type_snomed_display').alias('d1'))
+        s2 = stm.select(F.col('specimen_type_source_system').alias('sys2'), F.upper('specimen_type_code').alias('st2'),
+                        F.col('specimen_type_snomed_display').alias('d2'))
+        lims = F.concat(F.lit('urn:barts:pathology:specimen-type:tfc:lims'), F.col('LIMSNo').cast('string'))
+        r = (r.join(F.broadcast(s1), (F.col('sys1') == F.concat(lims, F.lit(':'), F.col('WkgCode'))) & (F.col('st1') == F.col('st')), 'left')
+              .join(F.broadcast(s2), (F.col('sys2') == lims) & (F.col('st2') == F.col('st')), 'left'))
+    else:
+        r = r.withColumn('d1', F.lit(None).cast('string')).withColumn('d2', F.lit(None).cast('string'))
+    r = (r.withColumn('desc_spec', F.expr(_path_spec_sql('description')))
+          .withColumn('row_spec', F.expr(f"CASE WHEN code_system = 'TFC' THEN coalesce(desc_spec, {_path_spec_sql('coalesce(d1, d2)')}, {PATH_TFC_CODE_SPEC_SQL}, {PATH_CELL_WORD_SPEC_SQL}) "
+                                         f"ELSE coalesce(desc_spec, {_path_spec_sql('code')}, {PATH_CELL_WORD_SPEC_SQL}) END"))
+          .withColumn('u_cls', F.expr(PATH_UNIT_CLASS_SQL)))
+    cnt = lambda col, v: F.sum(F.when(F.col(col) == F.lit(v), 1).otherwise(0))
+    agg = r.groupBy('code_system', 'code', 'description').agg(
+        F.max('desc_spec').alias('desc_spec'), F.count(F.lit(1)).alias('n_rows'), F.count('value_as_number').alias('n_numeric'),
+        F.count('row_spec').alias('n_spec'), cnt('row_spec', 'BLOOD').alias('n_blood'), cnt('row_spec', 'URINE').alias('n_urine'),
+        cnt('row_spec', 'CSF').alias('n_csf'), cnt('row_spec', 'FAECES').alias('n_faeces'), cnt('row_spec', 'FLUID').alias('n_fluid'),
+        F.sum(F.when(F.col('row_spec').isNotNull() & ~F.col('row_spec').isin('BLOOD', 'URINE', 'CSF', 'FAECES', 'FLUID'), 1).otherwise(0)).alias('n_other'),
+        F.count('u_cls').alias('n_unit'), cnt('u_cls', 'SCNC').alias('n_scnc'), cnt('u_cls', 'MCNC').alias('n_mcnc'),
+        cnt('u_cls', 'NCNC').alias('n_ncnc'), cnt('u_cls', 'UNITS').alias('n_units'), cnt('u_cls', 'RATE').alias('n_rate'),
+        cnt('u_cls', 'PCT').alias('n_pct'), cnt('u_cls', 'PRES').alias('n_pres'))
+    agg.createOrReplaceTempView('_path_key_evidence_delta')
+    counts = ['n_rows', 'n_numeric', 'n_spec', 'n_blood', 'n_urine', 'n_csf', 'n_faeces', 'n_fluid', 'n_other', 'n_unit',
+              'n_scnc', 'n_mcnc', 'n_ncnc', 'n_units', 'n_rate', 'n_pct', 'n_pres']
+    spark.sql(f"""MERGE INTO {_qn(PATH_KEY_EVIDENCE)} t USING _path_key_evidence_delta s
+        ON t.code_system = s.code_system AND t.code = s.code AND t.description = s.description
+        WHEN MATCHED THEN UPDATE SET {', '.join(f't.{c} = t.{c} + s.{c}' for c in counts)},
+             t.desc_spec = coalesce(s.desc_spec, t.desc_spec), t.updated_at = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT (code_system, code, description, desc_spec, {', '.join(counts)}, updated_at)
+             VALUES (s.code_system, s.code, s.description, s.desc_spec, {', '.join('s.' + c for c in counts)}, current_timestamp())""")
+
 def discover_new_keys_from_stage(stage_table: str) -> dict[str, int]:
     """
     Queue unmapped keys from the exact rows already materialized for this run.
@@ -2672,6 +2859,7 @@ def discover_new_keys_from_stage(stage_table: str) -> dict[str, int]:
     if not _table_exists(queue_name):
         raise RuntimeError(f'Embedding queue does not exist: {queue_name}')
     stage = spark.table(stage_table)
+    _path_key_evidence_merge(stage)  # PATH_SPECIMEN_V1
     tests = stage.filter(F.col('measurement_concept_id').isNull() & F.col('code').isNotNull() & F.col('description').isNotNull()).select('code_system', 'code', 'description', F.lit(None).cast('string').alias('result_normalized'), F.concat_ws(' | ', F.lower(F.col('code')), F.lower(F.col('description'))).alias('term'), F.lit('test').alias('kind')).dropDuplicates(['code_system', 'code', 'description', 'kind'])
     results = stage.filter(F.col('value_as_concept_id').isNull() & (F.col('result_parse_status') == 'text') & (F.col('result_status') == 'free_text') & F.col('value_source_value').isNotNull()).withColumn('result_normalized', F.lower(F.trim(F.regexp_replace(F.col('value_source_value'), '\\s+', ' ')))).filter((F.col('result_normalized') != '') & F.col('result_normalized').rlike('[a-z0-9]')).select('code_system', 'code', 'description', 'result_normalized', F.concat_ws(' | ', F.lower(F.coalesce(F.col('description'), F.col('code'))), F.col('result_normalized')).alias('term'), F.lit('result').alias('kind')).dropDuplicates(['code_system', 'code', 'description', 'result_normalized', 'kind'])
     candidates = tests.unionByName(results).withColumn('term_norm', F.lower(F.col('term'))).withColumn('embed_text', F.when(F.col('kind') == 'result', F.col('result_normalized')).otherwise(F.col('term')))
@@ -2812,11 +3000,13 @@ def _run_embedding_and_mapping_reconciliation(discovery_stage: str, run_id: str,
     metrics['additive_map_keys'] = delta['n_additive_keys']
     metrics['correction_map_keys'] = delta['n_correction_keys']
     metrics['metadata_map_keys'] = delta['n_metadata_keys']
+    # MAP_CORRECTION_SCOPED_V1: a correction no longer flags a full rebuild. Corrections made before this run were in
+    # its change-feed scope (key-level plus fallback drift) and are already re-projected; one the embed loop made
+    # during the run is re-projected by the next run, because hold_map_cutoffs keeps the map cutoffs where they started.
+    metrics['hold_map_cutoffs'] = 0
     if delta['n_correction_keys'] > 0:
-        _set_rebuild_flag(True)
-        print(f"[map_pathology_v3] {delta['n_correction_keys']} mapping corrections detected; a true full rebuild is flagged for the next run.")
-        None
-        return metrics
+        metrics['hold_map_cutoffs'] = 1
+        print(f"[map_pathology_v3] {delta['n_correction_keys']} mapping corrections; re-projected by the change-feed scope, map cutoffs held for this run's own writes (no full rebuild).")
     if delta['n_additive_keys'] or delta['n_metadata_keys']:
         print(f"[map_pathology_v3] applying mapping-only changes directly; no source re-scan or parent reconstruction. {delta['n_additive_keys']:,} additive and {delta['n_metadata_keys']:,} metadata keys")
         merge_metrics = _apply_mapping_delta_direct(delta_df, run_id, scratch_tables, full_manifest)
@@ -2981,7 +3171,10 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
     try:
         state = _read_state()
         state_complete = _mp_builtins.all((name in state for name in SOURCE_TABLES))
-        full = bool(force_full) or not _target_is_v2() or (not _table_exists(MP_BASELINE)) or (not state_complete) or _read_rebuild_flag()
+        structural_full = bool(force_full) or not _target_is_v2() or (not _table_exists(MP_BASELINE)) or (not state_complete)
+        full = structural_full or _read_rebuild_flag()
+        # MAP_PATHOLOGY_CORRECTION_MERGE_V1: a rebuild caused only by mapping corrections keeps unchanged rows.
+        publish_by_merge = full and not structural_full
         mode = 'FULL_REBUILD' if full else 'INCREMENTAL'
         if full:
             _ensure_full_build_control_tables()
@@ -2996,13 +3189,13 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
             started_at = incremental_manifest['started_at']
             cutoffs = incremental_manifest['cutoffs']
             state = incremental_manifest['state']
-        print(f'[map_pathology_v3] {mode}; run_id={run_id}')
+        print(f'[map_pathology_v3] {mode}; run_id={run_id}' + ('; publish by merge (corrections only)' if full and publish_by_merge else ''))
         if full_manifest is not None and _phase_reached(full_manifest, 'PUBLISHED'):
             print('[map_pathology_v3] post-publication resume: deferring native crosswalk refresh')
         else:
             _refresh_native_crosswalks()
         if full:
-            full_metrics = _run_restartable_full_build(full_manifest)
+            full_metrics = _run_restartable_full_build(full_manifest, publish_by_merge=publish_by_merge)
             source_stage = full_metrics['source_stage']
             source_parent_count = int(full_metrics['parent_count'])
             staged_row_count = int(full_metrics['row_count'])
@@ -3046,7 +3239,8 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
                 incremental_manifest, 'MAPPING_COMPLETE'
             )
         _refresh_tier_lane_rescore()
-        _refresh_map_cutoffs(cutoffs)
+        if not mapping_metrics.get('hold_map_cutoffs'):  # MAP_CORRECTION_SCOPED_V1
+            _refresh_map_cutoffs(cutoffs)
         _advance_state(cutoffs)
         if full_manifest is not None:
             _update_full_build_phase(full_manifest, 'SUCCESS')
@@ -3732,7 +3926,11 @@ def embed_pending_capped(max_terms=MAX_EMBED_TERMS, max_cost_usd=None, dry_run=F
                          MAX(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS is_new,
                          MAX(CASE WHEN kind='test' THEN 1 ELSE 0 END) AS is_test,
                          COUNT(*) AS n_keys
-                  FROM {QUEUE}
+                  FROM (SELECT embed_text, status, kind FROM {QUEUE}
+                        UNION ALL  -- PATH_MEMBER_TEXT_V1: linked test keys also need their bare description
+                        SELECT LOWER(TRIM(description)), CASE WHEN status='vector_ready' THEN 'pending' ELSE status END, kind
+                        FROM {QUEUE} WHERE kind='test' AND code_system='CERNER_TESTCODE'
+                          AND status IN ('pending','deferred','vector_ready') AND description IS NOT NULL)
                   WHERE embed_text IS NOT NULL AND (status='pending' OR (status='deferred' AND kind='test'))
                   GROUP BY LOWER(embed_text))
     SELECT p.* FROM pend p
@@ -3811,6 +4009,317 @@ PATH_PROPERTY_GUARD_SQL = (
     r" AND lower(description) RLIKE '\\bcount\\b|^(rbcs?|wbcs?|red (blood )?cells?|white (blood )?cells?|red blood count|platelets?)$')"
 )
 
+# PATH_MEMBER_TEXT_V1: a linked (CERNER_TESTCODE) key embeds "order mnemonic | description". A full order name in
+# that text pulls the cosine to the order's own test (FBC|Haemoglobin -> Complete blood count, LFT|Albumin Serum ->
+# Hepatic function panel) or below the floor (UE|Sodium Serum stays unmapped). Linked keys are therefore also scored
+# on their bare description, each candidate keeping its better similarity, and a panel/profile concept never maps a
+# linked member analyte; it stays available to panel, header and comment descriptions and to TFC keys, whose code
+# is a short LIMS mnemonic. Panel candidates are removed from the scored pool, so no rejection is recorded.
+PATH_MEMBER_PANEL_SQL = (
+    r"(code_system = 'CERNER_TESTCODE' AND lower(concept_name) RLIKE '\\b(panel|profile|electrolytes|function tests?|blood count|hemogram|work-?up|battery)\\b'"
+    r" AND NOT lower(description) RLIKE '\\b(panel|profile|electrolytes|function tests?|blood count|ha?emogram|screen|comments?|interpretation|report)\\b')"
+)
+
+
+# PATH_SPECIMEN_V1: a candidate is incompatible when its specimen (SNOMED Has specimen / LOINC system, else the name)
+# conflicts with the key's evidence (a specimen named in the description, else >=80% of rows on one class covering >=50%
+# of rows), when it names a special specimen (pulmonary artery, cord blood, gas, water) the key does not, or when its
+# property (LOINC property / time aspect) conflicts with the key's dominant unit class (concentration vs 24-hour rate,
+# count vs concentration, partial pressure or fraction vs concentration, a ratio for a non-ratio test, or a
+# qualitative concept for a numeric result).
+PATH_KEY_EVIDENCE_VIEW_SQL = (
+    "SELECT code_system, code, description, desc_spec, n_rows, n_numeric, n_spec, n_unit, "
+    "CASE greatest(n_blood, n_urine, n_csf, n_faeces, n_fluid, n_other) WHEN 0 THEN NULL WHEN n_blood THEN 'BLOOD' WHEN n_urine THEN 'URINE' "
+    "WHEN n_csf THEN 'CSF' WHEN n_faeces THEN 'FAECES' WHEN n_fluid THEN 'FLUID' ELSE 'OTHER' END AS spec_mode, "
+    "greatest(n_blood, n_urine, n_csf, n_faeces, n_fluid, n_other) / greatest(n_spec, 1) AS spec_share, "
+    "CASE greatest(n_scnc, n_mcnc, n_ncnc, n_units, n_rate, n_pct, n_pres) WHEN 0 THEN NULL WHEN n_scnc THEN 'SCNC' WHEN n_mcnc THEN 'MCNC' "
+    "WHEN n_ncnc THEN 'NCNC' WHEN n_units THEN 'UNITS' WHEN n_rate THEN 'RATE' WHEN n_pct THEN 'PCT' ELSE 'PRES' END AS unit_mode "
+    "FROM {table} WHERE n_rows > 0")
+PATH_SPECIMEN_CONFLICT_SQL = (
+    "coalesce(("
+    "(ca.c_spec IN ('PULM_ART','CORD','GAS','WATER') AND coalesce(ev.desc_spec, {desc_spec}, '') <> ca.c_spec) "
+    "OR (ca.c_spec IS NOT NULL AND coalesce(ev.desc_spec, {desc_spec}, CASE WHEN ev.n_spec >= 0.5 * ev.n_rows AND ev.spec_share >= 0.8 THEN ev.spec_mode END) <> ca.c_spec) "
+    "OR (ev.n_unit >= 0.5 * ev.n_rows AND ("
+    "(ca.c_prop = 'RATE' AND ev.unit_mode IN ('SCNC','MCNC','NCNC','UNITS')) OR (ev.unit_mode = 'RATE' AND ca.c_prop IN ('SCNC','MCNC','NCNC','UNITS')) "
+    "OR (ca.c_prop = 'NCNC' AND ev.unit_mode IN ('SCNC','MCNC','UNITS')) OR (ev.unit_mode = 'NCNC' AND ca.c_prop IN ('SCNC','MCNC','UNITS')) "
+    "OR (ca.c_prop IN ('PRES','PCT') AND ev.unit_mode IN ('SCNC','MCNC')) "
+    "OR (ca.is_ratio AND NOT lower(s.description) RLIKE 'ratio|/|:') "
+    "OR (ca.c_prop = 'QUAL' AND ev.n_numeric >= 0.8 * ev.n_rows)))"
+    "), FALSE)").replace('{desc_spec}', _path_spec_sql('s.description'))
+
+
+def _path_concept_spec_attrs() -> str:
+    """Specimen class, property class and ratio flag of every concept in TEST_INDEX, from SNOMED 'Has specimen' and
+    LOINC 'Has system' / 'Has property' / 'Has time aspect' / 'Has scale type' (else the name). Returns the table name."""
+    out = f"{EMB_MAP_SCHEMA}._tmp_concept_spec_attrs"
+    rel = EMB_CONCEPT.rsplit('.', 1)[0] + '.concept_relationship'
+    spec_expr = _path_spec_sql("coalesce(a.snomed_specimen, a.loinc_system, nullif(regexp_extract(c.concept_name, ' in ([^\\\\]]+)$', 1), ''), c.concept_name)")
+    spark.sql(f"""CREATE OR REPLACE TABLE {out} USING DELTA AS
+      WITH c AS (SELECT DISTINCT c.concept_id, c.concept_name FROM {EMB_CONCEPT} c JOIN {TEST_INDEX} i ON i.concept_id = c.concept_id),
+      a AS (SELECT r.concept_id_1 AS concept_id,
+                   max(CASE WHEN r.relationship_id = 'Has specimen' THEN c2.concept_name END) AS snomed_specimen,
+                   max(CASE WHEN r.relationship_id = 'Has system' THEN c2.concept_name END) AS loinc_system,
+                   max(CASE WHEN r.relationship_id = 'Has property' THEN c2.concept_name END) AS loinc_property,
+                   max(CASE WHEN r.relationship_id = 'Has time aspect' THEN c2.concept_name END) AS loinc_time,
+                   max(CASE WHEN r.relationship_id = 'Has scale type' THEN c2.concept_name END) AS loinc_scale
+            FROM {rel} r JOIN {EMB_CONCEPT} c2 ON c2.concept_id = r.concept_id_2
+            WHERE r.invalid_reason IS NULL AND r.relationship_id IN ('Has specimen','Has system','Has property','Has time aspect','Has scale type')
+              AND r.concept_id_1 IN (SELECT concept_id FROM c)
+            GROUP BY r.concept_id_1)
+      SELECT c.concept_id,
+             {spec_expr} AS c_spec,
+             CASE WHEN a.loinc_time RLIKE '24H|24 hour' OR lower(c.concept_name) RLIKE '24 hour|output|excretion' OR a.loinc_property RLIKE '(?i)rate' THEN 'RATE'
+                  WHEN a.loinc_property RLIKE '(?i)substance concentration' OR c.concept_name RLIKE 'Moles/volume' THEN 'SCNC'
+                  WHEN a.loinc_property RLIKE '(?i)mass concentration' OR c.concept_name RLIKE 'Mass/volume' THEN 'MCNC'
+                  WHEN a.loinc_property RLIKE '(?i)number concentration' OR c.concept_name RLIKE '#/volume' THEN 'NCNC'
+                  WHEN a.loinc_property RLIKE '(?i)catalytic|arbitrary|enzymatic' OR c.concept_name RLIKE 'Units/volume|Enzymatic activity/volume' THEN 'UNITS'
+                  WHEN a.loinc_property RLIKE '(?i)fraction' THEN 'PCT'
+                  WHEN a.loinc_property RLIKE '(?i)partial pressure' THEN 'PRES'
+                  WHEN a.loinc_scale IN ('Ord','Nom','Nar','Doc') OR c.concept_name RLIKE '\\\\[(Presence|Identifier|Type|Interpretation)\\\\]' THEN 'QUAL' END AS c_prop,
+             c.concept_name RLIKE '(?i)/(Creatinine|Leukocytes|Protein\\\\.total|Amino acids\\\\.total|Globulin|Hemoglobin\\\\.total|Erythrocytes)|ratio|:creatinine' AS is_ratio
+      FROM c LEFT JOIN a ON a.concept_id = c.concept_id""")
+    return out
+
+
+# ==== MAP_LLM_GATE_V1: Claude Haiku 5.5 verifies every embedding-proposed mapping before it is committed ====
+# The test remap and the result arms below propose mappings from cosine similarity. Before a proposal reaches
+# EMB_TEST_MAP / EMB_RESULT_MAP it is verified (accept / choose another candidate / reject) by the shared module
+# map_llm_gate.py; rule, override and deterministic mappings bypass it. A rejection is committed as unmapped with
+# provenance (llm_* columns, reject_rule_id llm_gate_v1); a key the verifier could not reach is parked as
+# 'llm_held' in the queue and retried next run, never committed unverified.
+MLG_MODULE_PATH = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Bronze/map_llm_gate.py"
+MLG_LLM_COLUMNS = ["llm_verdict", "llm_model", "llm_prompt_version", "llm_reason", "llm_prompt_hash", "llm_verified_at"]
+MLG_GATED_TEST = f"{EMB_MAP_SCHEMA}._tmp_mlg_gated_test"
+MLG_RESULT_EMBED_SOURCES = "result_mapping_source LIKE 'embedding%'"
+_MLG = None
+
+
+def _mlg():
+    """The shared gate module, loaded once from the Bronze folder."""
+    global _MLG
+    if _MLG is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("map_llm_gate", MLG_MODULE_PATH)
+        _MLG = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_MLG)
+        _MLG.reset_run()
+    return _MLG
+
+
+def _mlg_require_columns(table):
+    """The gate writes provenance columns; a map without them must stop the run, not skip the gate."""
+    have = {c.lower() for c in spark.table(table).columns}
+    missing = [c for c in MLG_LLM_COLUMNS if c not in have]
+    assert not missing, f"{table} lacks {missing}; run the MAP_LLM_GATE_V1 setup before mapping"
+
+
+def _mlg_release_held(kind):
+    """Keys held back last run (verifier unreachable or over budget) become remappable again."""
+    spark.sql(f"UPDATE {QUEUE} SET status='vector_ready' WHERE kind='{kind}' AND status='llm_held'")
+
+
+def _mlg_verdict_df(verdicts, key_cols, extra=None):
+    """A small DataFrame of verdicts keyed like the map (extra: per-id dict of additional columns)."""
+    rows = []
+    for item_id, v in verdicts.items():
+        key = json.loads(item_id)
+        row = [key[c] for c in key_cols] + [v["decision"], v["rank"], v["model"], v["prompt_version"], v["reason"],
+                                            v["prompt_hash"], v["verified_at"]]
+        rows.append(tuple(row + list((extra or {}).get(item_id, ()))))
+    schema = ", ".join(f"{c} string" for c in key_cols) + (
+        ", llm_verdict string, llm_rank int, llm_model string, llm_prompt_version string, llm_reason string, "
+        "llm_prompt_hash string, llm_verified_at timestamp")
+    return rows, schema
+
+
+def _mlg_gate_test(new_df, tier_sql, chunk):
+    """Verify this chunk's embedding-proposed test mappings. Returns the gated proposal (llm_* columns added);
+    held keys are removed from it and from `chunk`, and parked as llm_held in the queue."""
+    import json as _json
+    m = _mlg()
+    _mlg_require_columns(EMB_TEST_MAP)
+    base_tbl = MLG_GATED_TEST + "_in"
+    new_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(base_tbl)
+    gate = ("test_mapping_source LIKE 'embedding%' AND confidence_tier IN ('auto_high','auto_low') "
+            "AND measurement_concept_id IS NOT NULL")
+    todo = spark.table(base_tbl).where(gate).collect()
+    items, cand_by_id = [], {}
+    if todo:
+        head = tier_sql.rsplit("\n          SELECT u.code_system,u.code,u.description,", 1)
+        assert len(head) == 2, "MAP_LLM_GATE_V1: tiering SQL shape changed"
+        cand_sql = head[0] + """
+          SELECT code_system, code, description, concept_id, max(concept_name) AS concept_name,
+                 max(vocabulary_id) AS vocabulary_id, max(sim) AS sim
+          FROM scored GROUP BY code_system, code, description, concept_id"""
+        spark.sql(cand_sql).createOrReplaceTempView("_mlg_cands_all")
+        keys = spark.createDataFrame([(r.code_system, r.code, r.description) for r in todo],
+                                     "code_system string, code string, description string")
+        keys.createOrReplaceTempView("_mlg_keys")
+        cands = spark.sql(f"""
+          SELECT c.*, k.concept_class_id, k.domain_id FROM (
+            SELECT a.* FROM _mlg_cands_all a JOIN _mlg_keys q USING (code_system, code, description)
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY code_system, code, description ORDER BY sim DESC, concept_id) <= {m.TOP_K}
+          ) c LEFT JOIN {EMB_CONCEPT} k ON k.concept_id = c.concept_id""").collect()
+        by_key = {}
+        for c in cands:
+            by_key.setdefault((c.code_system, c.code, c.description), []).append(c)
+        ev = {}
+        ev_tbl = globals().get("PATH_KEY_EVIDENCE")
+        if ev_tbl and spark.catalog.tableExists(ev_tbl) and globals().get("PATH_KEY_EVIDENCE_VIEW_SQL"):
+            for e in spark.sql(PATH_KEY_EVIDENCE_VIEW_SQL.format(table=ev_tbl)).join(keys, ["code_system", "code", "description"], "left_semi").collect():
+                ev[(e.code_system, e.code, e.description)] = e
+        for r in todo:
+            k = (r.code_system, r.code, r.description)
+            cl = sorted(by_key.get(k, []), key=lambda c: (-c.sim, c.concept_id))
+            if not any(c.concept_id == r.measurement_concept_id for c in cl):
+                cl = [type("C", (), dict(concept_id=r.measurement_concept_id, concept_name=r.concept_name,
+                                         vocabulary_id=r.concept_vocabulary_id, sim=r.similarity_score,
+                                         concept_class_id=None, domain_id=None))()] + cl[: m.TOP_K - 1]
+            e = ev.get(k)
+            ctx = {"code system": "Cerner order mnemonic + event description" if r.code_system == "CERNER_TESTCODE"
+                   else "LIMS (TFC) test code + description",
+                   "code": r.code, "description": r.description}
+            if e is not None:
+                ctx["specimen evidence"] = (f"{e.spec_mode} on {e.spec_share:.0%} of rows with a specimen" if e.spec_mode and e.spec_share is not None else e.spec_mode)
+                ctx["specimen named in description"] = e.desc_spec
+                ctx["dominant unit class"] = e.unit_mode
+                ctx["numeric results"] = f"{(e.n_numeric or 0) / builtins.max(e.n_rows or 1, 1):.0%} of {e.n_rows or 0:,} rows"
+            item_id = _json.dumps({"code_system": r.code_system, "code": r.code, "description": r.description})
+            cand_by_id[item_id] = cl
+            items.append({"id": item_id, "key": {"code_system": r.code_system, "code": r.code, "description": r.description},
+                          "context": ctx, "proposed": [c.concept_id for c in cl].index(r.measurement_concept_id),
+                          "candidates": [{"id": int(c.concept_id), "name": c.concept_name, "vocabulary": c.vocabulary_id,
+                                          "concept_class": c.concept_class_id, "domain": c.domain_id,
+                                          "similarity": None if c.sim is None else float(c.sim)} for c in cl]})
+    verdicts = m.verify("pathology_test", items) if items else {}
+    extra = {}
+    for item_id, v in verdicts.items():
+        c = cand_by_id[item_id][v["rank"] - 1] if v["rank"] else None
+        extra[item_id] = (None if c is None else int(c.concept_id), None if c is None else c.concept_name,
+                          None if c is None else c.vocabulary_id, None if c is None or c.sim is None else float(c.sim))
+    rows, schema = _mlg_verdict_df(verdicts, ["code_system", "code", "description"], extra)
+    schema += ", chosen_id bigint, chosen_name string, chosen_vocab string, chosen_sim double"
+    spark.createDataFrame(rows, schema).createOrReplaceTempView("_mlg_verdicts")
+    spark.sql(f"""
+      CREATE OR REPLACE TABLE {MLG_GATED_TEST} USING DELTA AS
+      SELECT b.code_system, b.code, b.description,
+             CASE WHEN v.llm_verdict = 'choose' THEN v.chosen_id WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS BIGINT)
+                  ELSE b.measurement_concept_id END AS measurement_concept_id,
+             CASE WHEN v.llm_verdict = 'choose' THEN v.chosen_vocab WHEN v.llm_verdict = 'reject' THEN b.concept_vocabulary_id
+                  ELSE b.concept_vocabulary_id END AS concept_vocabulary_id,
+             CASE WHEN v.llm_verdict = 'choose' THEN v.chosen_name WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS STRING)
+                  ELSE b.concept_name END AS concept_name,
+             CASE WHEN v.llm_verdict = 'choose' THEN CASE WHEN v.chosen_vocab = 'LOINC' THEN 'embedding_loinc' ELSE 'embedding_snomed' END
+                  ELSE b.test_mapping_source END AS test_mapping_source,
+             CASE WHEN v.llm_verdict = 'choose' THEN v.chosen_sim WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS DOUBLE)
+                  ELSE b.similarity_score END AS similarity_score,
+             CASE WHEN v.llm_verdict = 'choose' THEN CASE WHEN v.chosen_sim >= {SIM_HIGH} THEN 'auto_high' ELSE 'auto_low' END
+                  WHEN v.llm_verdict = 'reject' THEN 'unmapped' ELSE b.confidence_tier END AS confidence_tier,
+             CASE WHEN v.llm_verdict IN ('choose','reject') THEN b.measurement_concept_id ELSE b.rejected_candidate_concept_id END
+                  AS rejected_candidate_concept_id,
+             CASE WHEN v.llm_verdict IN ('choose','reject') THEN b.similarity_score ELSE b.rejected_candidate_similarity END
+                  AS rejected_candidate_similarity,
+             CASE WHEN v.llm_verdict IN ('choose','reject') THEN 'llm_gate_v1' ELSE b.reject_rule_id END AS reject_rule_id,
+             b.mapping_rule_id,
+             v.llm_verdict, v.llm_model, v.llm_prompt_version, v.llm_reason, v.llm_prompt_hash, v.llm_verified_at
+      FROM {base_tbl} b
+      LEFT JOIN _mlg_verdicts v USING (code_system, code, description)
+      WHERE v.llm_verdict IS NULL OR v.llm_verdict <> 'held'""")
+    held = spark.table("_mlg_verdicts").where("llm_verdict = 'held'").select("code_system", "code", "description")
+    if held.take(1):
+        held.createOrReplaceTempView("_mlg_held")
+        spark.sql(f"""MERGE INTO {QUEUE} t USING _mlg_held h
+          ON t.kind='test' AND t.code_system=h.code_system AND t.code=h.code AND t.description=h.description
+          WHEN MATCHED AND t.status='vector_ready' THEN UPDATE SET t.status='llm_held'""")
+        spark.sql(f"""MERGE INTO {chunk} t USING _mlg_held h
+          ON t.code_system=h.code_system AND t.code=h.code AND t.description=h.description WHEN MATCHED THEN DELETE""")
+    print(f"MAP_LLM_GATE_V1 test chunk: {len(items)} verified, "
+          f"{ {d: sum(1 for v in verdicts.values() if v['decision'] == d) for d in ('accept','choose','reject','held')} }")
+    return spark.table(MLG_GATED_TEST)
+
+
+def _mlg_stamp_test():
+    """Write the chunk's verifier provenance onto the map rows (NULL for keys the gate did not touch)."""
+    sets = ", ".join(f"t.{c} = s.{c}" for c in MLG_LLM_COLUMNS)
+    spark.sql(f"""MERGE INTO {EMB_TEST_MAP} t USING {MLG_GATED_TEST} s
+      ON t.code_system=s.code_system AND t.code=s.code AND t.description=s.description
+      WHEN MATCHED THEN UPDATE SET {sets}""")
+
+
+def _mlg_gate_result(src_tbl):
+    """Verify an arm's embedding-proposed result mappings that would fill a still-unmapped 4-tuple. Returns the
+    name of the gated arm table; rejected rows carry a NULL concept, held 4-tuples are dropped and parked."""
+    import json as _json
+    m = _mlg()
+    _mlg_require_columns(EMB_RESULT_MAP)
+    k4 = ["code_system", "code", "description", "result_normalized"]
+    arm = spark.table(src_tbl)
+    filled = spark.table(EMB_RESULT_MAP).where("confidence_tier <> 'unmapped'").select(*k4)
+    todo = (arm.where(f"{MLG_RESULT_EMBED_SOURCES} AND value_as_concept_id IS NOT NULL")
+               .join(filled, k4, "left_anti").collect())
+    test_names = {}
+    if todo:
+        tk = spark.createDataFrame([(r.code_system, r.code, r.description) for r in todo],
+                                   "code_system string, code string, description string").distinct()
+        for t in spark.table(EMB_TEST_MAP).join(tk, ["code_system", "code", "description"], "left_semi").collect():
+            test_names[(t.code_system, t.code, t.description)] = t.concept_name
+    items, verdicts = [], {}
+    allowed = m.values_allowed("pathology_result")
+    for r in todo:
+        item_id = _json.dumps({c: r[c] for c in k4})
+        if not allowed:  # result text may not leave the tenant: hold, so enabling it later verifies these
+            verdicts[item_id] = m.held_verdict("values_not_permitted")
+            continue
+        if not m.result_text_sendable(r.result_normalized):
+            verdicts[item_id] = dict(decision="reject", rank=0, reason="privacy_screen", model=m.MODEL,
+                                     prompt_version=m.PROMPT_VERSION, prompt_hash=None, verified_at=None)
+            continue
+        items.append({"id": item_id, "key": {c: r[c] for c in k4}, "proposed": 0,
+                      "context": {"test code": r.code, "test description": r.description,
+                                  "test concept": test_names.get((r.code_system, r.code, r.description)),
+                                  "result value": r.result_normalized, "mapping arm": r.result_mapping_source},
+                      "candidates": [{"id": int(r.value_as_concept_id), "name": r.concept_name,
+                                      "vocabulary": r.concept_vocabulary_id,
+                                      "similarity": None if r.similarity_score is None else float(r.similarity_score)}]})
+    if items:
+        verdicts.update(m.verify("pathology_result", items))
+    rows, schema = _mlg_verdict_df(verdicts, k4)
+    spark.createDataFrame(rows, schema).createOrReplaceTempView("_mlg_rverdicts")
+    out = src_tbl + "_mlg"
+    spark.sql(f"""
+      CREATE OR REPLACE TABLE {out} USING DELTA AS
+      SELECT a.code_system, a.code, a.description, a.result_normalized,
+             CASE WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS BIGINT) ELSE a.value_as_concept_id END AS value_as_concept_id,
+             a.concept_vocabulary_id,
+             CASE WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS STRING) ELSE a.concept_name END AS concept_name,
+             a.result_mapping_source,
+             CASE WHEN v.llm_verdict = 'reject' THEN CAST(NULL AS DOUBLE) ELSE a.similarity_score END AS similarity_score,
+             CASE WHEN v.llm_verdict = 'reject' THEN 'unmapped' ELSE a.confidence_tier END AS confidence_tier,
+             v.llm_verdict, v.llm_model, v.llm_prompt_version, v.llm_reason, v.llm_prompt_hash, v.llm_verified_at
+      FROM {src_tbl} a LEFT JOIN _mlg_rverdicts v USING (code_system, code, description, result_normalized)
+      WHERE v.llm_verdict IS NULL OR v.llm_verdict <> 'held'""")
+    held = spark.table("_mlg_rverdicts").where("llm_verdict = 'held'").select(*k4)
+    if held.take(1):
+        held.createOrReplaceTempView("_mlg_rheld")
+        spark.sql(f"""MERGE INTO {QUEUE} t USING _mlg_rheld h
+          ON t.kind='result' AND t.code_system=h.code_system AND t.code=h.code AND t.description=h.description
+             AND t.result_normalized=h.result_normalized
+          WHEN MATCHED AND t.status='vector_ready' THEN UPDATE SET t.status='llm_held'""")
+    print(f"MAP_LLM_GATE_V1 result arm {src_tbl}: {len(items)} verified, "
+          f"{ {d: sum(1 for v in verdicts.values() if v['decision'] == d) for d in ('accept','reject','held')} }")
+    return out
+
+
+def _mlg_stamp_result(gated_tbl):
+    """Provenance onto the result-map rows this arm now owns (same concept and arm)."""
+    sets = ", ".join(f"t.{c} = s.{c}" for c in MLG_LLM_COLUMNS)
+    spark.sql(f"""MERGE INTO {EMB_RESULT_MAP} t USING {gated_tbl} s
+      ON t.code_system=s.code_system AND t.code=s.code AND t.description=s.description
+         AND t.result_normalized=s.result_normalized
+      WHEN MATCHED AND t.value_as_concept_id <=> s.value_as_concept_id AND t.result_mapping_source <=> s.result_mapping_source
+        THEN UPDATE SET {sets}""")
+
+
 def _remap_test(dry_run=False):
     """Stage 3a — map vector_ready TEST keys into EMB_TEST_MAP via a serverless Spark cross-join dot-product
     (aggregate(zip_with(qv,cv,*))), chunked at REMAP_CHUNK with the cross-join materialised once per
@@ -3826,7 +4335,9 @@ def _remap_test(dry_run=False):
     if dry_run:
         return n_vr  # dry-run: count only, no scratch/merge
 
+    _mlg_release_held("test")  # MAP_LLM_GATE_V1
     CHUNK  = f"{EMB_MAP_SCHEMA}._tmp_remap_chunk_test"
+    SPEC_ATTRS = _path_concept_spec_attrs()  # PATH_SPECIMEN_V1
     SCORED = f"{EMB_MAP_SCHEMA}._tmp_remap_scored_test"
     n_remapped = 0
     while True:
@@ -3836,6 +4347,8 @@ def _remap_test(dry_run=False):
           SELECT eq.code_system, eq.code, eq.description, LOWER(eq.term) AS term
           FROM {QUEUE} eq
           WHERE eq.kind='test' AND eq.status='vector_ready'
+            AND (eq.code_system <> 'CERNER_TESTCODE' OR LOWER(TRIM(eq.description)) IN (
+                 SELECT LOWER(term) FROM {EMBEDDINGS_TABLE} WHERE embedding_vector IS NOT NULL))  -- PATH_MEMBER_TEXT_V1
           ORDER BY eq.code_system, eq.code, eq.description
           LIMIT {REMAP_CHUNK}
         """)
@@ -3857,9 +4370,12 @@ def _remap_test(dry_run=False):
               OR (ov.match_mode='contains' AND lower(q.description) LIKE concat('%',ov.pattern,'%'))
             GROUP BY q.code_system, q.code, q.description
           ),
+          q_text AS (SELECT code_system, code, description, term AS qtext FROM q
+                     UNION SELECT code_system, code, description, LOWER(TRIM(description)) FROM q
+                     WHERE code_system = 'CERNER_TESTCODE'),  -- PATH_MEMBER_TEXT_V1
           remaining AS (
             SELECT q.code_system,q.code,q.description, e.embedding_vector AS qv
-            FROM q JOIN {EMBEDDINGS_TABLE} e ON q.term=LOWER(e.term)
+            FROM q_text q JOIN {EMBEDDINGS_TABLE} e ON q.qtext=LOWER(e.term)
             LEFT JOIN override_hits o ON q.code_system=o.code_system AND q.code=o.code AND q.description=o.description
             WHERE e.embedding_vector IS NOT NULL AND o.code_system IS NULL
           ),
@@ -3873,11 +4389,12 @@ def _remap_test(dry_run=False):
                  -- dot product == cosine: embedding_vector is L2-unit-normalized (text-embedding-3-large default); the 0.85/0.80/0.82/0.70 thresholds depend on this.
                  aggregate(zip_with(r.qv,c.cv,(x,y)->x*y),CAST(0.0 AS DOUBLE),(a,x)->a+x) AS sim
           FROM remaining r CROSS JOIN cand c
+          WHERE NOT ({PATH_MEMBER_PANEL_SQL})  -- PATH_MEMBER_TEXT_V1
         """)
 
         # 3) tiering + projection read the scratch `scored` table (cross-join NOT re-evaluated) +
         #    re-derive override_hits from the tiny CHUNK table (no cross-join) -> new_df
-        new_df = spark.sql(f"""
+        _mlg_tier_sql = f"""
           WITH q AS (SELECT code_system, code, description, term FROM {CHUNK}),
           ov AS (SELECT pattern, concept_id, concept_name, match_mode FROM {TEST_OVERRIDES}),
           override_hits AS (
@@ -3896,8 +4413,12 @@ def _remap_test(dry_run=False):
                      concept_id AS rejected_candidate_concept_id, sim AS rejected_candidate_similarity
                      FROM scored_all WHERE guard_incompatible QUALIFY ROW_NUMBER() OVER
                      (PARTITION BY code_system,code,description ORDER BY sim DESC, concept_id)=1),
-          scored AS (SELECT code_system,code,description,concept_id,concept_name,vocabulary_id,sim
-                     FROM scored_all WHERE NOT guard_incompatible),
+          key_ev AS ({PATH_KEY_EVIDENCE_VIEW_SQL.format(table=PATH_KEY_EVIDENCE) if _table_exists(PATH_KEY_EVIDENCE) else 'SELECT CAST(NULL AS STRING) code_system, CAST(NULL AS STRING) code, CAST(NULL AS STRING) description, CAST(NULL AS STRING) desc_spec, 0L n_rows, 0L n_numeric, 0L n_spec, 0L n_unit, CAST(NULL AS STRING) spec_mode, 0D spec_share, CAST(NULL AS STRING) unit_mode WHERE FALSE'}),
+          scored AS (SELECT s.code_system,s.code,s.description,s.concept_id,s.concept_name,s.vocabulary_id,s.sim
+                     FROM scored_all s
+                     LEFT JOIN key_ev ev ON ev.code_system=s.code_system AND ev.code=s.code AND ev.description=s.description
+                     LEFT JOIN {SPEC_ATTRS} ca ON ca.concept_id=s.concept_id
+                     WHERE NOT s.guard_incompatible AND NOT {PATH_SPECIMEN_CONFLICT_SQL}),  -- PATH_SPECIMEN_V1
           per_vocab_top AS (SELECT * FROM scored QUALIFY ROW_NUMBER() OVER
             (PARTITION BY code_system,code,description,vocabulary_id ORDER BY sim DESC)=1),
           loinc_hit AS (SELECT * FROM per_vocab_top WHERE vocabulary_id='LOINC' AND sim>={SIM_HIGH}),
@@ -3942,7 +4463,9 @@ def _remap_test(dry_run=False):
           LEFT JOIN guard_rejected g ON g.code_system=u.code_system AND g.code=u.code AND g.description=u.description
             AND (u.sim IS NULL OR g.rejected_candidate_similarity > u.sim)
           LEFT JOIN {EMB_CONCEPT} c ON c.concept_id=u.concept_id
-        """)
+        """
+        new_df = spark.sql(_mlg_tier_sql)
+        new_df = _mlg_gate_test(new_df, _mlg_tier_sql, CHUNK)  # MAP_LLM_GATE_V1
         new_df = (new_df.withColumn("mapping_version", F.lit(1))
                         .withColumn("mapped_at", F.current_timestamp())
                         .withColumn("ADC_UPDT", F.current_timestamp()))
@@ -3964,6 +4487,7 @@ def _remap_test(dry_run=False):
                  "reject_rule_id":"s.reject_rule_id","mapping_rule_id":"s.mapping_rule_id",
                  "mapping_version":"t.mapping_version + 1","mapped_at":"current_timestamp()","ADC_UPDT":"current_timestamp()"})
          .whenNotMatchedInsertAll().execute())
+        _mlg_stamp_test()  # MAP_LLM_GATE_V1
         n_chunk = spark.sql(f"SELECT COUNT(*) c FROM {CHUNK}").first()["c"]
         # n_remapped counts PROCESSED chunk keys (incl. those that mapped to 'unmapped'), not rows the map changed; the real map-change counts come from Task 9's run-log via the into-map MERGE.
         n_remapped += n_chunk
@@ -4509,6 +5033,7 @@ def _firewall_merge_result(src_tbl):
     4-tuples (confidence_tier='unmapped' — curated/auto_high/auto_low and already-filled open-set rows are
     NEVER overwritten -> first-writer wins = bulk precedence). Inserts genuinely new 4-tuples. Explicit
     insert column set matching the dev map's 13 columns (NO is_suspected/growth_grade — clone-only)."""
+    src_tbl = _mlg_gate_result(src_tbl)  # MAP_LLM_GATE_V1
     src = (spark.table(src_tbl)
            .withColumn("mapping_version", F.lit(1))
            .withColumn("mapped_at", F.current_timestamp()).withColumn("ADC_UPDT", F.current_timestamp()))
@@ -4529,6 +5054,7 @@ def _firewall_merge_result(src_tbl):
         "result_mapping_source":"s.result_mapping_source","similarity_score":"s.similarity_score",
         "confidence_tier":"s.confidence_tier",
         "mapping_version":"s.mapping_version","mapped_at":"s.mapped_at","ADC_UPDT":"s.ADC_UPDT"}).execute())
+    _mlg_stamp_result(src_tbl)  # MAP_LLM_GATE_V1
 
 def _compose_and_merge_result(fused, loinc_prop, value_prop):
     """Stage 3b-v. Compose the result-value arms into EMB_RESULT_MAP in the bulk integrate order (each MERGE
@@ -4586,6 +5112,8 @@ def _remap_result(dry_run=False):
     FLAG_DICTs, compose into EMB_RESULT_MAP with the bulk three-MERGE firewall precedence, then flip
     vector_ready->done (keyed on the lossless result_normalized). Returns the finding proposal table name
     for the finding backfill (Stage 5), or None on an empty run. The legacy nearest-context arm is RETIRED."""
+    if not dry_run:
+        _mlg_release_held("result")  # MAP_LLM_GATE_V1
     n_vr = spark.sql(f"SELECT COUNT(*) c FROM {QUEUE} WHERE kind='result' AND status='vector_ready'").first()["c"]
     if dry_run:
         return n_vr
