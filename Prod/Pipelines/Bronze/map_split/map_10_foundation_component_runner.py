@@ -265,12 +265,20 @@ def _persist_stage_materialize(frame: Optional[DataFrame]) -> Optional[DataFrame
     try:
         frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
     except Exception as stage_error:
-        print(f'[WARN] persist stage write failed for {stage_table}; continuing unmaterialized: {str(stage_error)[:500]}')
+        # PERSIST_STAGE_FAIL_CLOSED_V1 (2026-10-18): retry once, then fail. Continuing unstaged re-ran the whole upstream
+        # lineage at every later action (map_text 2026-10-18: 20.7 of 23.8 MERGE minutes) and hid the failure.
+        print(f'[WARN] persist stage write failed for {stage_table}; retrying once: {str(stage_error)[:500]}')
         try:
             spark.sql(f'DROP TABLE IF EXISTS {_sql_table(stage_table)}')
-        except Exception:
-            pass
-        return frame
+            frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
+        except Exception as retry_error:
+            try:
+                spark.sql(f'DROP TABLE IF EXISTS {_sql_table(stage_table)}')
+            except Exception:
+                pass
+            raise RuntimeError(
+                f'persist stage {stage_table} failed twice; failing the component instead of recomputing unstaged'
+            ) from retry_error
     staged = spark.table(stage_table)
     _PERSIST_STAGES[id(staged)] = (staged, stage_table)
     return staged

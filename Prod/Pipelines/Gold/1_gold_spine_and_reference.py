@@ -211,6 +211,8 @@ SPINE_ENCOUNTER_SELECT = [
     '`status_display` AS `status_display`',
     '`period_start` AS `period_start`',
     '`period_end` AS `period_end`',
+    '`period_start_local` AS `period_start_local`',  # GOLD_COLUMN_PARITY_V1
+    '`period_end_local` AS `period_end_local`',  # GOLD_COLUMN_PARITY_V1
     '`arrival_method` AS `arrival_method`',
     '`arrival_confidence` AS `arrival_confidence`',
     '`departure_method` AS `departure_method`',
@@ -272,6 +274,8 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
     "status_display": "Native encounter status display.",
     "period_start": "Best observed encounter start.",
     "period_end": "Best observed encounter end.",
+    "period_start_local": "Best observed encounter start converted from UTC to Europe/London wall-clock time (GMT/BST).",  # GOLD_COLUMN_PARITY_V1
+    "period_end_local": "Best observed encounter end converted from UTC to Europe/London wall-clock time (GMT/BST).",  # GOLD_COLUMN_PARITY_V1
     "arrival_method": "Method selecting period_start.",
     "arrival_confidence": "Source-derived confidence for period_start.",
     "departure_method": "Method selecting period_end.",
@@ -450,6 +454,8 @@ def gold_spine_encounter():
         '`status_display` AS `status_display`',
         '`period_start` AS `period_start`',
         '`period_end` AS `period_end`',
+        '`period_start_local` AS `period_start_local`',  # GOLD_COLUMN_PARITY_V1
+        '`period_end_local` AS `period_end_local`',  # GOLD_COLUMN_PARITY_V1
         '`arrival_method` AS `arrival_method`',
         '`arrival_confidence` AS `arrival_confidence`',
         '`departure_method` AS `departure_method`',
@@ -1214,6 +1220,12 @@ SPINE_LOCATION_STAY_SELECT = [
     '`location_code` AS `location_code`',
     "CASE WHEN CAST(`period_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_start` AS DATE)) < 9999 OR CAST(`period_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `period_start` END AS `period_start`",
     "CASE WHEN CAST(`period_end` AS DATE) = DATE'2100-12-31' OR CAST(`period_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_end` AS DATE)) < 9999 THEN NULL ELSE `period_end` END AS `period_end`",
+    "CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR CAST(`occupancy_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `occupancy_start` END AS `occupancy_start`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN CAST(`occupancy_end` AS DATE) = DATE'2100-12-31' OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END AS `occupancy_end`",  # GOLD_COLUMN_PARITY_V1
+    '`occupancy_start_basis` AS `occupancy_start_basis`',  # GOLD_COLUMN_PARITY_V1
+    '`occupancy_end_basis` AS `occupancy_end_basis`',  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `occupancy_start` IS NOT NULL AND (CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR CAST(`occupancy_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `occupancy_start` END) IS NULL THEN NULL ELSE `occupancy_start_local` END AS `occupancy_start_local`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `occupancy_end` IS NOT NULL AND (CASE WHEN CAST(`occupancy_end` AS DATE) = DATE'2100-12-31' OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END) IS NULL THEN NULL ELSE `occupancy_end_local` END AS `occupancy_end_local`",  # GOLD_COLUMN_PARITY_V1
     "CASE WHEN UPPER(TRIM(CAST(`nurse_unit_code` AS STRING))) = '0' THEN NULL ELSE `nurse_unit_code` END AS `nurse_unit_code`",
     '`nurse_unit_display` AS `nurse_unit_display`',
     "CASE WHEN UPPER(TRIM(CAST(`building_code` AS STRING))) = '0' THEN NULL ELSE `building_code` END AS `building_code`",
@@ -1273,6 +1285,12 @@ SPINE_LOCATION_STAY_COLUMN_COMMENTS = {
     "location_code": "Native Millennium location code resolved against reference_location.",
     "period_start": "Earliest `LOCATION_STOP_START_DT_TM` across the source history rows grouped into this encounter location stop.",
     "period_end": "Latest `LOCATION_STOP_END_DT_TM` across the source history rows grouped into this encounter location stop; the grouped source timestamp is retained without sentinel removal.",
+    "occupancy_start": "Physical occupancy start of the location stop, taken from the location arrival or else the stop start clamped to the best encounter arrival, and null where there is no attendance evidence or the stop ended before arrival. Gold: the period_start sentinel rule applies (2100-12-31 and post-2100 typo years become NULL).",  # GOLD_COLUMN_PARITY_V1
+    "occupancy_end": "Physical occupancy end of the location stop, taken from the stop end, and null where that end is an administrative or fixed-window encounter close or precedes the occupancy start. Gold: the period_end sentinel rule applies (2100-12-31 and post-2100 typo years become NULL).",  # GOLD_COLUMN_PARITY_V1
+    "occupancy_start_basis": "Rule label identifying how occupancy_start was derived or why it is null.",  # GOLD_COLUMN_PARITY_V1
+    "occupancy_end_basis": "Rule label identifying how occupancy_end was derived or why it is null.",  # GOLD_COLUMN_PARITY_V1
+    "occupancy_start_local": "Occupancy start converted from UTC to Europe/London wall-clock time, for use when deriving local calendar dates and clock times. Gold: NULL wherever Gold nulls occupancy_start.",  # GOLD_COLUMN_PARITY_V1
+    "occupancy_end_local": "Occupancy end converted from UTC to Europe/London wall-clock time, for use when deriving local calendar dates and clock times. Gold: NULL wherever Gold nulls occupancy_end.",  # GOLD_COLUMN_PARITY_V1
     "nurse_unit_code": "Historical nurse-unit code.",
     "nurse_unit_display": "Historical nurse-unit display.",
     "building_code": "Historical building code.",
@@ -1343,6 +1361,12 @@ def gold_spine_location_stay():
         '`location_code` AS `location_code`',
         '`period_start` AS `period_start`',
         '`period_end` AS `period_end`',
+        '`occupancy_start` AS `occupancy_start`',  # GOLD_COLUMN_PARITY_V1
+        '`occupancy_end` AS `occupancy_end`',  # GOLD_COLUMN_PARITY_V1
+        '`occupancy_start_basis` AS `occupancy_start_basis`',  # GOLD_COLUMN_PARITY_V1
+        '`occupancy_end_basis` AS `occupancy_end_basis`',  # GOLD_COLUMN_PARITY_V1
+        '`occupancy_start_local` AS `occupancy_start_local`',  # GOLD_COLUMN_PARITY_V1
+        '`occupancy_end_local` AS `occupancy_end_local`',  # GOLD_COLUMN_PARITY_V1
         '`nurse_unit_code` AS `nurse_unit_code`',
         '`nurse_unit_display` AS `nurse_unit_display`',
         '`building_code` AS `building_code`',
@@ -2533,6 +2557,8 @@ REFERENCE_GENE_TESTED_SELECT = [
     '`test_scope` AS `test_scope`',
     '`panel_version_inferred` AS `panel_version_inferred`',
     '`confidence` AS `confidence`',
+    '`assessment_status` AS `assessment_status`',  # GEN4_GOLD_V1
+    '`coverage_gap_regions_raw` AS `coverage_gap_regions_raw`',  # GEN4_GOLD_V1
     '`loaded_at` AS `loaded_at`',
 ]
 
@@ -2549,6 +2575,8 @@ REFERENCE_GENE_TESTED_COLUMN_COMMENTS = {
     "test_scope": "Reported exon/region/coverage scope when available.",
     "panel_version_inferred": "Whether membership used an inferred panel version.",
     "confidence": "Deterministic normalization confidence.",
+    "assessment_status": 'What the lab says about this gene for this assay: reported, dedicated_assay, panel_assessed, panel_not_assessed, insufficient_coverage, test_not_completed.',
+    "coverage_gap_regions_raw": 'Regions of this gene the lab could not assess, as reported (chr:start-end;...; coordinates as printed by the lab).',
     "loaded_at": "map_pathology_gene_tested.ADC_UPDT carried unchanged for the assay-gene membership row. The parent assay key is derived without joining or adding its timestamp; this is bronze load provenance, not a genomic-test event time or Silver refresh time.",
 }
 
@@ -2589,6 +2617,8 @@ def gold_reference_gene_tested():
         '`test_scope` AS `test_scope`',
         '`panel_version_inferred` AS `panel_version_inferred`',
         '`confidence` AS `confidence`',
+        '`assessment_status` AS `assessment_status`',  # GEN4_GOLD_V1
+        '`coverage_gap_regions_raw` AS `coverage_gap_regions_raw`',  # GEN4_GOLD_V1
         '`loaded_at` AS `loaded_at`',
     )
     return _with_comments(df, REFERENCE_GENE_TESTED_COLUMN_COMMENTS)
@@ -4651,4 +4681,3 @@ def gold_reference_person_gp_registration():
     """Contract-v2 public twin of reference_person_gp_registration."""
     df = spark.read.table(_n("gold_qc._reference_person_gp_registration")).selectExpr(*REFERENCE_PERSON_GP_REGISTRATION_SELECT)
     return _with_comments(df, REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS)
-

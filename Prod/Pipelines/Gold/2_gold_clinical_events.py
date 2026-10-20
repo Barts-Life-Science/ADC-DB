@@ -38,6 +38,8 @@ CLINICAL_ALLERGY_INTOLERANCE_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -107,6 +109,8 @@ CLINICAL_ALLERGY_INTOLERANCE_COLUMN_COMMENTS = {
     "encounter_id": "Recording encounter reference when supplied.",
     "event_datetime": "Allergy onset timestamp from `ONSET_DT_TM_CLEAN`, falling back to `CREATED_DT_TM_CLEAN` when onset is absent; null when both cleaned timestamps are absent.",
     "event_end_datetime": "Reaction-status end when resolved or cancelled.",
+    "event_datetime_local": "Allergy or intolerance onset date and time expressed in local time, corresponding to the sentinel-cleaned onset in event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time end date and time of the allergy or intolerance when its reaction status is resolved or cancelled, corresponding to event_end_datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim substance code system.",
     "source_code": "Substance code (SNOMED then source identifier then nomenclature id)",
     "source_display": "Verbatim substance display text.",
@@ -170,6 +174,8 @@ def gold_clinical_allergy_intolerance():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -215,6 +221,8 @@ CLINICAL_CLINICAL_FINDING_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 OR CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     "CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END AS `event_end_datetime`",
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 OR CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`",  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -299,6 +307,8 @@ CLINICAL_CLINICAL_FINDING_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinically relevant finding timestamp.",
     "event_end_datetime": "Source effective end timestamp.",
+    "event_datetime_local": "Local-time representation of the clinically relevant timestamp for the clinical finding. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the source effective end timestamp for the clinical finding. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim source event coding system.",
     "source_code": "Verbatim source event code.",
     "source_display": "Verbatim source event display.",
@@ -367,6 +377,8 @@ def gold_clinical_clinical_finding():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -416,6 +428,8 @@ CLINICAL_CLINICAL_SCORE_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END AS `event_datetime`",
     'CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NULL THEN `event_datetime_local` WHEN (CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL WHEN CAST((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) AS TIMESTAMP) = CAST(`event_datetime` AS TIMESTAMP) THEN `event_datetime_local` WHEN `event_datetime_local` = from_utc_timestamp(`event_datetime`, 'Europe/London') THEN from_utc_timestamp((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END), 'Europe/London') ELSE `event_datetime_local` + (CAST((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) AS TIMESTAMP) - CAST(`event_datetime` AS TIMESTAMP)) END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -498,6 +512,8 @@ CLINICAL_CLINICAL_SCORE_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinical start date and time of the event as recorded on the Millennium CLINICAL_EVENT row.",
     "event_end_datetime": "Score end timestamp.",
+    "event_datetime_local": "Local-time representation of the clinical score event timestamp. Gold: NULL wherever Gold nulls event_datetime; where Gold repairs a millisecond-epoch event_datetime, the repaired time in Europe/London.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the clinical score end timestamp. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each clinical score record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Source score code.",
     "source_display": "Source score display.",
@@ -563,6 +579,8 @@ def gold_clinical_clinical_score():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -607,14 +625,25 @@ CLINICAL_CONDITION_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     'CASE WHEN NOT `person_id_resolved` THEN NULL ELSE `person_id` END AS `person_id`',
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
+    # ENCOUNTER_SLICE_V1: a slice belongs to its encounter, so it is nulled wherever encounter_id is.
+    'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_slice_id` END AS `encounter_slice_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`abatement_datetime_local` AS `abatement_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`condition_code` AS `condition_code`',
     "CASE WHEN UPPER(TRIM(CAST(`category_code` AS STRING))) = '0' THEN NULL ELSE `category_code` END AS `category_code`",
     '`category_display` AS `category_display`',
+    # DIAG_PRIORITY_V1: Millennium diagnosis ranking. 0 means "not ranked" in both priority fields and in RANKING_CD, so
+    # it is nulled here (the same treatment as category_code '0'); silver keeps the verbatim value.
+    "CASE WHEN `diag_priority` = 0 THEN NULL ELSE `diag_priority` END AS `diag_priority`",
+    "CASE WHEN `clinical_diag_priority` = 0 THEN NULL ELSE `clinical_diag_priority` END AS `clinical_diag_priority`",
+    "CASE WHEN UPPER(TRIM(CAST(`ranking_code` AS STRING))) = '0' THEN NULL ELSE `ranking_code` END AS `ranking_code`",
+    '`ranking_display` AS `ranking_display`',
     '`clinical_status_code` AS `clinical_status_code`',
     '`clinical_status_display` AS `clinical_status_display`',
     "CASE WHEN UPPER(TRIM(CAST(`verification_status_code` AS STRING))) = '0' THEN NULL ELSE `verification_status_code` END AS `verification_status_code`",
@@ -652,6 +681,11 @@ CLINICAL_CONDITION_MANDATORY_RULES = {
 }
 
 CLINICAL_CONDITION_ADVISORY_RULES = {
+    # NDC_DISPLAY_SUFFIX_V1 regression guard: Millennium's retired-term suffix ("... 07-SEP-2022 18:17:27<$>")
+    # is stripped upstream in Nomenclature_Pipeline, so this should read zero forever.
+    "gold.clinical.condition.source_display.no_retired_term_suffix":
+        "NOT COALESCE(`source_display` LIKE '%<$>', FALSE)",
+
     # Kept as a regression guard on the accepted set ('resolved', 'provisional',
     # 'unresolved'): the research-surface filter already removes every row that fails it, so
     # this expectation should read zero forever and is worth watching for the day it does
@@ -697,14 +731,24 @@ CLINICAL_CONDITION_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    # ENCOUNTER_SLICE_V1
+    "encounter_slice_id": "Millennium ENCNTR_SLICE_ID as BIGINT: the encounter slice (consultant episode) the diagnosis was coded against. Clinical coders record one ranked diagnosis list per slice, so diag_priority is ranked within it. Diagnosis arm only; null on the problem and maternity arms. Gold: NULL wherever Gold nulls encounter_id.",
     "event_datetime": "Primary assertion timestamp.",
     "event_end_datetime": "Source effective end where supplied.",
+    "event_datetime_local": "Primary condition assertion timestamp expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Source effective end timestamp for the condition assertion expressed in local time, where supplied. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "abatement_datetime_local": "Source abatement or effective-end timestamp for the condition expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim source coding system.",
     "source_code": "Source condition code",
     "source_display": "Verbatim source condition display.",
     "condition_code": "Source and mapped condition codings.",
     "category_code": "Source condition category code.",
     "category_display": "Source condition category display.",
+    # DIAG_PRIORITY_V1
+    "diag_priority": "Millennium DIAGNOSIS.DIAG_PRIORITY, verbatim: the clinical coder's sequence number for the diagnosis within its consultant episode (encounter_slice_id), 1 = primary diagnosis of that episode; Gold nulls 0 (not ranked). Set on coded Final and Principal ICD-10 diagnoses. A spell with several consultant episodes has one rank-1 diagnosis per episode. Null on the problem and maternity arms.",
+    "clinical_diag_priority": "Millennium DIAGNOSIS.CLINICAL_DIAG_PRIORITY, verbatim: the clinician's ordering of diagnoses recorded at the point of care, 1 = first listed; Gold nulls 0 (not ranked). Set mainly on clinician-entered Discharge, Working and Admitting diagnoses; null on coded Final and Principal diagnoses and on the problem and maternity arms.",
+    "ranking_code": "Millennium RANKING_CD, verbatim (code set 12034: 3310 Primary, 3311 Secondary, 684907 Tertiary); Gold nulls '0' (not ranked). Rarely set on diagnoses (about 68,000 of 46.6 million rows); set on about 119,000 problems. Null on the maternity arm.",
+    "ranking_display": "Display for ranking_code from bronze map_problem.ranking_desc. Null on the diagnosis arm, because bronze map_diagnosis carries no ranking description, and on the maternity arm.",
     "clinical_status_code": "Source clinical-status code.",
     "clinical_status_display": "Source clinical-status display.",
     "verification_status_code": "Source verification-status code.",
@@ -725,9 +769,9 @@ CLINICAL_CONDITION_COLUMN_COMMENTS = {
     "vip_ind": "Source VIP indicator.",
     "withheld_identity_ind": "Identity-withholding status is not populated by the current source projections; null does not mean identity was not withheld.",
     "source_feed": "Registered source feed owning the assertion.",
-    "record_status": "Diagnosis and problem arms are superseded when their END_EFFECTIVE_DT_TM is before 2100-01-01, otherwise active; a null end defaults to not-ended. The maternity-diagnosis arm is always active. No arm emits retracted here, and clinical status, source-presence flags and problem-history revision flags do not determine this label.",
+    "record_status": "Always active. Inactive, deleted and end-dated (superseded) diagnosis and problem rows are not brought into silver (ACTIVE_ROWS_V1, silver_active_rows.py); the maternity-diagnosis arm is always active.",
     "record_status_effective_from": "ACTIVE_STATUS_DT_TM from map_diagnosis or map_problem on the corresponding Millennium arm; DIAGDATE_CLEAN from map_maternity_diagnosis on the maternity arm. Values are carried unchanged without a fallback. The maternity value is a diagnosis-date proxy rather than an independently observed row-status change.",
-    "record_status_effective_to": "END_EFFECTIVE_DT_TM from the diagnosis or problem row only when it is before 2100-01-01; otherwise null. Always null on the maternity-diagnosis arm. No problem-history end, pregnancy end or ingestion timestamp is substituted.",
+    "record_status_effective_to": "Always null: end-dated diagnosis and problem rows are not brought into silver (ACTIVE_ROWS_V1).",
     "source_update_timestamp": "Source application update datetime.",
     "loaded_at": "Diagnosis and maternity arms carry their own ADC_UPDT. The problem arm takes greatest(map_problem.ADC_UPDT, maximum map_problem_history.ADC_UPDT for that PROBLEM_ID), across all retained revisions rather than only the latest. Problem-history UPDT_DT_TM is not added to the parent's source_update_timestamp, which remains its own UPDT_DT_TM; diagnosis uses its own UPDT_DT_TM and maternity uses RECORD_UPDATED_DT. The maternity identity join adds no pregnancy-spine clock, and the union adds no cross-arm timestamp maximum.",
 }
@@ -748,7 +792,7 @@ def _gold_qc_clinical_condition():
     name=_n("gold_clinical.condition"),
     comment=(
         "One diagnosis or problem assertion from a registered source feed, without cross-feed "
-        "deduplication. Gold QC twin of the silver product: 13 columns are repaired or "
+        "deduplication. Gold QC twin of the silver product: 17 columns are repaired or "
         "nulled, 1 rule(s) drop rows, 4 check(s) are advisory. Each rule states its reason in "
         "the pipeline notebook, and Lakeflow expectation metrics report what every rule "
         "matched on each update."
@@ -768,14 +812,23 @@ def gold_clinical_condition():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_slice_id` AS `encounter_slice_id`',  # ENCOUNTER_SLICE_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`abatement_datetime_local` AS `abatement_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_condition_code` AS `condition_code`',
         '`category_code` AS `category_code`',
         '`category_display` AS `category_display`',
+        # DIAG_PRIORITY_V1: diagnosis ranking.
+        '`diag_priority` AS `diag_priority`',
+        '`clinical_diag_priority` AS `clinical_diag_priority`',
+        '`ranking_code` AS `ranking_code`',
+        '`ranking_display` AS `ranking_display`',
         '`clinical_status_code` AS `clinical_status_code`',
         '`clinical_status_display` AS `clinical_status_display`',
         '`verification_status_code` AS `verification_status_code`',
@@ -819,6 +872,8 @@ CLINICAL_CONDITION_STAGE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -888,6 +943,8 @@ CLINICAL_CONDITION_STAGE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Sentinel-cleaned diagnosis onset timestamp.",
     "event_end_datetime": "Sentinel-cleaned resolution timestamp.",
+    "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST).",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "event_end_datetime in Europe/London wall-clock time (GMT/BST). Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "ICD-10 coding system.",
     "source_code": "ICD diagnosis code with diagnosis-name fallback.",
     "source_display": "Diagnosis name or description.",
@@ -951,6 +1008,8 @@ def gold_clinical_condition_stage():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -993,6 +1052,8 @@ CLINICAL_DEVICE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1069,6 +1130,8 @@ CLINICAL_DEVICE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Sentinel-cleaned implantation timestamp.",
     "event_end_datetime": "Device lifecycle end timestamp when available.",
+    "event_datetime_local": "Implantation event timestamp expressed in local time, derived from the device QC bridge.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Device lifecycle end timestamp expressed in local time, when available.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "MediConnect device-type coding system.",
     "source_code": "Device type with type/model display fallback for unknown type zero.",
     "source_display": "Device type or model display.",
@@ -1133,6 +1196,8 @@ def gold_clinical_device():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1178,6 +1243,8 @@ CLINICAL_ENDOSCOPY_FINDING_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1235,6 +1302,8 @@ CLINICAL_ENDOSCOPY_FINDING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Parent exam time",
     "event_end_datetime": "Finding end timestamp when supplied.",
+    "event_datetime_local": "Parent exam event timestamp expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Finding end timestamp expressed in local time when supplied.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "DGVS term coding system.",
     "source_code": "DGVS term identifier with term-text fallback.",
     "source_display": "Endobase term text.",
@@ -1297,6 +1366,8 @@ def gold_clinical_endoscopy_finding():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1339,6 +1410,8 @@ CLINICAL_FAMILY_HISTORY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1397,6 +1470,8 @@ CLINICAL_FAMILY_HISTORY_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ORIGINATING_ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Source family-history effective start.",
     "event_end_datetime": "Source effective end when the assertion is no longer current.",
+    "event_datetime_local": "Local-time rendering of the source family-history effective start, corresponding to event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time rendering of the source effective end when the family-history assertion is no longer current, corresponding to event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim source code system.",
     "source_code": "Source condition code",
     "source_display": "Verbatim source condition display.",
@@ -1457,6 +1532,8 @@ def gold_clinical_family_history():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1494,8 +1571,11 @@ CLINICAL_GENOMIC_RESULT_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1529,6 +1609,18 @@ CLINICAL_GENOMIC_RESULT_SELECT = [
     '`clinvar_concept_id` AS `clinvar_concept_id`',
     '`omop_genomic_concept_id` AS `omop_genomic_concept_id`',
     '`snomed_code` AS `snomed_code`',
+    '`cosmic_id` AS `cosmic_id`',  # GEN4_GOLD_V1
+    '`itd_length_bp` AS `itd_length_bp`',  # GEN4_GOLD_V1
+    '`reported_pathogenicity` AS `reported_pathogenicity`',  # GEN4_GOLD_V1
+    '`resolved_transcript` AS `resolved_transcript`',  # GEN4_GOLD_V1
+    '`transcript_source` AS `transcript_source`',  # GEN4_GOLD_V1
+    '`variant_key` AS `variant_key`',  # GEN4_GOLD_V1
+    '`ref_allele` AS `ref_allele`',  # GEN4_GOLD_V1
+    '`alt_allele` AS `alt_allele`',  # GEN4_GOLD_V1
+    '`coordinate_method` AS `coordinate_method`',  # GEN4_GOLD_V1
+    '`clinvar_variation_id` AS `clinvar_variation_id`',  # GEN4_GOLD_V1
+    '`omop_genomic_concept_level` AS `omop_genomic_concept_level`',  # GEN4_GOLD_V1
+    '`concept_method` AS `concept_method`',  # GEN4_GOLD_V1
     '`evidence_text` AS `evidence_text`',
     '`evidence_start` AS `evidence_start`',
     '`evidence_end` AS `evidence_end`',
@@ -1581,8 +1673,11 @@ CLINICAL_GENOMIC_RESULT_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. PATH_ENCOUNTER_V2 (genomic only): encounter_window_single / encounter_window_same_day link a Barts-site LIMS accession to the patient's encounter containing the sample date; encounter_window_multiple and none_external_referral leave it NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "Local-time event timestamp taken from the report issue or verification time, falling back to the accession sample or request time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Event end time expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Gene-symbol or alteration coding namespace.",
     "source_code": "SNV, indel, fusion, CNV, rearrangement, repeat, karyotype, or other.",
     "source_display": "SNV, indel, fusion, CNV, rearrangement, repeat, karyotype, or other.",
@@ -1615,7 +1710,19 @@ CLINICAL_GENOMIC_RESULT_COLUMN_COMMENTS = {
     "iscn_raw": "Raw ISCN notation.",
     "clinvar_concept_id": "ClinVar concept identifier.",
     "omop_genomic_concept_id": "OMOP Genomic concept identifier.",
-    "snomed_code": "SNOMED finding code.",
+    "snomed_code": "Not populated: SNOMED has no variant-finding concepts; see omop_genomic_concept_id.",
+    "cosmic_id": 'COSMIC identifier exactly as reported by the laboratory; not enriched from COSMIC.',
+    "itd_length_bp": 'Reported FLT3/NPM1 insertion length in base pairs.',
+    "reported_pathogenicity": 'Laboratory pathogenicity class: pathogenic, likely_pathogenic, uncertain_significance, likely_benign, benign.',
+    "resolved_transcript": "RefSeq transcript the c. HGVS refers to: as reported, else the report's panel list, else the gene's MANE Select (see transcript_source).",
+    "transcript_source": 'reported, report_panel_list or mane_select.',
+    "variant_key": 'GRCh38 VCF key chrN:pos:ref:alt (left-normalised), derived in-estate from resolved_transcript + hgvs_c_parsed.',
+    "ref_allele": 'GRCh38 reference allele (VCF).',
+    "alt_allele": 'GRCh38 alternate allele (VCF).',
+    "coordinate_method": 'How coordinates were derived: transcript_model, transcript_model_projected (stated older version with identical CDS), *_position_only (interval only), or why none were (ref_mismatch, stated_transcript_unavailable, version_projection_position_not_coding, no_transcript_model, unsupported_hgvs, no_parsed_hgvs_c). Positions always describe ref_allele.',
+    "clinvar_variation_id": 'ClinVar VariationID matched on variant_key (ClinVar GRCh38 release loaded in 3_lookup).',
+    "omop_genomic_concept_level": 'Level omop_genomic_concept_id was matched at: dna, rna, protein, fusion or gene.',
+    "concept_method": 'Exact match key used for omop_genomic_concept_id, prefixed by level.',
     "evidence_text": "Minimal narrative evidence span.",
     "evidence_start": "Evidence start offset.",
     "evidence_end": "Evidence end offset.",
@@ -1647,7 +1754,7 @@ CLINICAL_GENOMIC_RESULT_COLUMN_COMMENTS = {
 @dp.expect_all(CLINICAL_GENOMIC_RESULT_ADVISORY_RULES)
 def _gold_qc_clinical_genomic_result():
     """Quality-controlled twin of journey_clinical.genomic_result."""
-    df = _qc("clinical_genomic_result", CLINICAL_GENOMIC_RESULT_SELECT)
+    df = _qc("clinical_genomic_result", CLINICAL_GENOMIC_RESULT_SELECT, fk_columns=("encounter_id",))
     return _with_comments(df, CLINICAL_GENOMIC_RESULT_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -1672,8 +1779,11 @@ def gold_clinical_genomic_result():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1707,6 +1817,18 @@ def gold_clinical_genomic_result():
         '`clinvar_concept_id` AS `clinvar_concept_id`',
         '`omop_genomic_concept_id` AS `omop_genomic_concept_id`',
         '`snomed_code` AS `snomed_code`',
+        '`cosmic_id` AS `cosmic_id`',  # GEN4_GOLD_V1
+        '`itd_length_bp` AS `itd_length_bp`',  # GEN4_GOLD_V1
+        '`reported_pathogenicity` AS `reported_pathogenicity`',  # GEN4_GOLD_V1
+        '`resolved_transcript` AS `resolved_transcript`',  # GEN4_GOLD_V1
+        '`transcript_source` AS `transcript_source`',  # GEN4_GOLD_V1
+        '`variant_key` AS `variant_key`',  # GEN4_GOLD_V1
+        '`ref_allele` AS `ref_allele`',  # GEN4_GOLD_V1
+        '`alt_allele` AS `alt_allele`',  # GEN4_GOLD_V1
+        '`coordinate_method` AS `coordinate_method`',  # GEN4_GOLD_V1
+        '`clinvar_variation_id` AS `clinvar_variation_id`',  # GEN4_GOLD_V1
+        '`omop_genomic_concept_level` AS `omop_genomic_concept_level`',  # GEN4_GOLD_V1
+        '`concept_method` AS `concept_method`',  # GEN4_GOLD_V1
         '`evidence_text` AS `evidence_text`',
         '`evidence_start` AS `evidence_start`',
         '`evidence_end` AS `evidence_end`',
@@ -1742,8 +1864,11 @@ CLINICAL_GENOMIC_TEST_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1763,6 +1888,21 @@ CLINICAL_GENOMIC_TEST_SELECT = [
     '`test_snomed_code` AS `test_snomed_code`',
     '`test_loinc_code` AS `test_loinc_code`',
     '`test_omop_concept_id` AS `test_omop_concept_id`',
+    '`assay_component` AS `assay_component`',  # GEN4_GOLD_V1
+    '`is_primary_component` AS `is_primary_component`',  # GEN4_GOLD_V1
+    '`nhs_test_directory_code` AS `nhs_test_directory_code`',  # GEN4_GOLD_V1
+    '`test_code_method` AS `test_code_method`',  # GEN4_GOLD_V1
+    '`sample_type_site_raw` AS `sample_type_site_raw`',  # GEN4_GOLD_V1
+    '`sample_site_snomed_code` AS `sample_site_snomed_code`',  # GEN4_GOLD_V1
+    '`block_raw` AS `block_raw`',  # GEN4_GOLD_V1
+    '`tumour_content_raw` AS `tumour_content_raw`',  # GEN4_GOLD_V1
+    '`tumour_content_pct` AS `tumour_content_pct`',  # GEN4_GOLD_V1
+    '`clinical_details_raw` AS `clinical_details_raw`',  # GEN4_GOLD_V1
+    '`indication_snomed_code` AS `indication_snomed_code`',  # GEN4_GOLD_V1
+    '`interpretation_text` AS `interpretation_text`',  # GEN4_GOLD_V1
+    '`predicted_response` AS `predicted_response`',  # GEN4_GOLD_V1
+    '`predicted_response_drug_class` AS `predicted_response_drug_class`',  # GEN4_GOLD_V1
+    '`panel_genes_not_assessed` AS `panel_genes_not_assessed`',  # GEN4_GOLD_V1
     '`is_current` AS `is_current`',
     '`research_qi_only` AS `research_qi_only`',
     '`confidentiality_code` AS `confidentiality_code`',
@@ -1807,8 +1947,11 @@ CLINICAL_GENOMIC_TEST_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. PATH_ENCOUNTER_V2 (genomic only): encounter_window_single / encounter_window_same_day link a Barts-site LIMS accession to the patient's encounter containing the sample date; encounter_window_multiple and none_external_referral leave it NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "Local-time report issue time, falling back to the accession sample or request time when the report issue time is unavailable.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Event end time expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Assay coding namespace.",
     "source_code": "Source assay code.",
     "source_display": "Source assay display.",
@@ -1828,6 +1971,21 @@ CLINICAL_GENOMIC_TEST_COLUMN_COMMENTS = {
     "test_snomed_code": "Approved SNOMED assay code.",
     "test_loinc_code": "Approved LOINC assay code.",
     "test_omop_concept_id": "Standard OMOP assay concept.",
+    "assay_component": 'GEN4 assay within the report: mngs_dna, mngs_rna, tngs, flt3, npm1, bcr_abl1_qual. A myeloid NGS report has a DNA and (when run) an RNA panel row; an FLT3 report also an NPM1 row.',
+    "is_primary_component": "True for the report's primary assay, which keeps the pre-GEN4 genetic_test_id; secondary assays (mngs_rna, npm1) have their own ids.",
+    "nhs_test_directory_code": "NHS National Genomic Test Directory code(s) for the assay ('|'-separated), rule-mapped. © NHS England reference codes.",
+    "test_code_method": 'How test_loinc_code/test_snomed_code/test_omop_concept_id were set: assay_rule:<rule_id> (pathology_genetic_assay_concept).',
+    "sample_type_site_raw": 'Sample type/site exactly as written in the report.',
+    "sample_site_snomed_code": 'SNOMED body structure for the sample site, from deterministic term rules over sample_type_site_raw.',
+    "block_raw": 'Histology block identifier as reported (an identifier: governed by ig tags, published in full).',
+    "tumour_content_raw": "Tumour content as reported (e.g. '25%', '<10%').",
+    "tumour_content_pct": "Tumour content percent when reported without a qualifier; NULL for '<10%' style values.",
+    "clinical_details_raw": 'Clinical details/information section of the genetics report (free text).',
+    "indication_snomed_code": 'SNOMED disorder for the stated indication, from deterministic term rules over clinical_details_raw.',
+    "interpretation_text": "The laboratory's clinical interpretation narrative (free text, up to 4,000 characters).",
+    "predicted_response": 'likely_responsive or unlikely_responsive, only when the report itself states it.',
+    "predicted_response_drug_class": 'Drug class named in that statement (e.g. EGFR TKI).',
+    "panel_genes_not_assessed": 'True when the report states genes outside its result table were not assessed or reported.',
     "is_current": "Whether the source report version is current.",
     "research_qi_only": "Research/QI release flag.",
     "confidentiality_code": "Source confidentiality classification attached to the record for each genomic test record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
@@ -1852,7 +2010,7 @@ def _gold_qc_clinical_genomic_test():
     """Quality-controlled twin of journey_clinical.genomic_test."""
     df = _qc(
         "clinical_genomic_test",
-        CLINICAL_GENOMIC_TEST_SELECT,
+        CLINICAL_GENOMIC_TEST_SELECT, fk_columns=("encounter_id",),
         date_flags=["event_after_death_30d"],
     )
     return _with_comments(df, CLINICAL_GENOMIC_TEST_COLUMN_COMMENTS)
@@ -1879,8 +2037,11 @@ def gold_clinical_genomic_test():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1900,6 +2061,21 @@ def gold_clinical_genomic_test():
         '`test_snomed_code` AS `test_snomed_code`',
         '`test_loinc_code` AS `test_loinc_code`',
         '`test_omop_concept_id` AS `test_omop_concept_id`',
+        '`assay_component` AS `assay_component`',  # GEN4_GOLD_V1
+        '`is_primary_component` AS `is_primary_component`',  # GEN4_GOLD_V1
+        '`nhs_test_directory_code` AS `nhs_test_directory_code`',  # GEN4_GOLD_V1
+        '`test_code_method` AS `test_code_method`',  # GEN4_GOLD_V1
+        '`sample_type_site_raw` AS `sample_type_site_raw`',  # GEN4_GOLD_V1
+        '`sample_site_snomed_code` AS `sample_site_snomed_code`',  # GEN4_GOLD_V1
+        '`block_raw` AS `block_raw`',  # GEN4_GOLD_V1
+        '`tumour_content_raw` AS `tumour_content_raw`',  # GEN4_GOLD_V1
+        '`tumour_content_pct` AS `tumour_content_pct`',  # GEN4_GOLD_V1
+        '`clinical_details_raw` AS `clinical_details_raw`',  # GEN4_GOLD_V1
+        '`indication_snomed_code` AS `indication_snomed_code`',  # GEN4_GOLD_V1
+        '`interpretation_text` AS `interpretation_text`',  # GEN4_GOLD_V1
+        '`predicted_response` AS `predicted_response`',  # GEN4_GOLD_V1
+        '`predicted_response_drug_class` AS `predicted_response_drug_class`',  # GEN4_GOLD_V1
+        '`panel_genes_not_assessed` AS `panel_genes_not_assessed`',  # GEN4_GOLD_V1
         '`is_current` AS `is_current`',
         '`research_qi_only` AS `research_qi_only`',
         '`confidentiality_code` AS `confidentiality_code`',
@@ -1931,6 +2107,8 @@ CLINICAL_IMAGING_EXAM_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     'CASE WHEN YEAR(CAST(`event_end_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN YEAR(CAST(`event_end_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -2046,6 +2224,8 @@ CLINICAL_IMAGING_EXAM_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Imaging study start timestamp.",
     "event_end_datetime": "Imaging study end timestamp.",
+    "event_datetime_local": "Imaging study start timestamp expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Imaging study end timestamp expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source exam coding system.",
     "source_code": "Source exam code",
     "source_display": "Source exam display.",
@@ -2213,6 +2393,8 @@ def gold_clinical_imaging_exam():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2592,8 +2774,11 @@ CLINICAL_INDICATION_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS OR YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS OR YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -2678,8 +2863,11 @@ CLINICAL_INDICATION_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Accession report/sample/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "Local-time event timestamp, taken from the accession report, sample or request local time as a fallback. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time equivalent of the event end timestamp.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Indication text namespace.",
     "source_code": "Coded diagnosis display string.",
     "source_display": "Coded diagnosis display string.",
@@ -2730,7 +2918,7 @@ def _gold_qc_clinical_indication():
     df = _qc(
         "clinical_indication",
         CLINICAL_INDICATION_SELECT,
-        fk_columns=["person_id"],
+        fk_columns=["person_id", "encounter_id"],
         date_flags=["event_after_death_30d", "event_before_birth"],
     )
     return _with_comments(df, CLINICAL_INDICATION_COLUMN_COMMENTS)
@@ -2758,8 +2946,11 @@ def gold_clinical_indication():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2813,6 +3004,8 @@ CLINICAL_MEDICATION_ADMIN_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2906,6 +3099,8 @@ CLINICAL_MEDICATION_ADMIN_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Administration start or performed time.",
     "event_end_datetime": "Administration end time.",
+    "event_datetime_local": "Medication administration start or performed time expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Medication administration end time expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source medication coding system.",
     "source_code": "Source order-synonym identifier.",
     "source_display": "Source medication display.",
@@ -2992,6 +3187,8 @@ def gold_clinical_medication_admin():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -3056,6 +3253,8 @@ CLINICAL_MEDICATION_DISPENSE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1970-01-01' THEN NULL ELSE `event_datetime` END AS `event_datetime`",
     '`event_end_datetime` AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1970-01-01' THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -3125,6 +3324,8 @@ CLINICAL_MEDICATION_DISPENSE_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; JAC does not supply encounter context.",
     "event_datetime": "Source issue timestamp.",
     "event_end_datetime": "Dispense end timestamp when supplied.",
+    "event_datetime_local": "Source issue timestamp for the dispense event expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Dispense end timestamp expressed in local time when supplied.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim JAC drug coding system.",
     "source_code": "Verbatim JAC drug identifier.",
     "source_display": "Verbatim JAC drug description.",
@@ -3187,6 +3388,8 @@ def gold_clinical_medication_dispense():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -3230,6 +3433,8 @@ CLINICAL_MEDICATION_ORDER_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     "CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE CASE WHEN YEAR(CAST(`event_end_datetime` AS DATE)) >= 9999 OR CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END AS `event_end_datetime`",
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE CASE WHEN YEAR(CAST(`event_end_datetime` AS DATE)) >= 9999 OR CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`",  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -3343,6 +3548,8 @@ CLINICAL_MEDICATION_ORDER_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Order authored or start time.",
     "event_end_datetime": "Projected stop or discontinue time.",
+    "event_datetime_local": "Order authored or start time of the medication order expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Projected stop or discontinue time of the medication order expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source medication coding system.",
     "source_code": "Source medication synonym identifier.",
     "source_display": "Source medication display.",
@@ -3420,6 +3627,8 @@ def gold_clinical_medication_order():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -3476,6 +3685,8 @@ CLINICAL_MEDICATION_SUPPLY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -3568,6 +3779,8 @@ CLINICAL_MEDICATION_SUPPLY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Source request-created date.",
     "event_end_datetime": "Source request-completed date.",
+    "event_datetime_local": "Local-time equivalent of the event start datetime for the homecare supply-request item.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time equivalent of the event end datetime for the homecare supply-request item.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Matched dm+d VTM SNOMED CT identifier.",
     "source_code": "Matched dm+d VTM SNOMED CT identifier.",
     "source_display": "Matched dm+d VTM preferred name.",
@@ -3658,6 +3871,8 @@ def gold_clinical_medication_supply():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -3723,8 +3938,11 @@ CLINICAL_MICROBIOLOGY_ISOLATE_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -3789,8 +4007,11 @@ CLINICAL_MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "Local-time accession event timestamp taken from the sample time, falling back to report time and then request time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time equivalent of the event end timestamp.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Organism coding namespace.",
     "source_code": "Organism text or code.",
     "source_display": "Approved SNOMED organism code.",
@@ -3834,7 +4055,7 @@ CLINICAL_MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS = {
 @dp.expect_all(CLINICAL_MICROBIOLOGY_ISOLATE_ADVISORY_RULES)
 def _gold_qc_clinical_microbiology_isolate():
     """Quality-controlled twin of journey_clinical.microbiology_isolate."""
-    df = _qc("clinical_microbiology_isolate", CLINICAL_MICROBIOLOGY_ISOLATE_SELECT)
+    df = _qc("clinical_microbiology_isolate", CLINICAL_MICROBIOLOGY_ISOLATE_SELECT, fk_columns=("encounter_id",))
     return _with_comments(df, CLINICAL_MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -3857,8 +4078,11 @@ def gold_clinical_microbiology_isolate():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -3905,8 +4129,11 @@ CLINICAL_PATHOLOGY_ORDER_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -3980,8 +4207,11 @@ CLINICAL_PATHOLOGY_ORDER_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Requested or source-validity timestamp.",
     "event_end_datetime": "Order event end when supplied.",
+    "event_datetime_local": "Local-time equivalent of the order event datetime, derived from the source request or sample local timestamps. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time equivalent of the order event end datetime when supplied.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Native order catalogue coding system.",
     "source_code": "Native order catalogue code.",
     "source_display": "Native order description.",
@@ -4022,7 +4252,7 @@ def _gold_qc_clinical_pathology_order():
     df = _qc(
         "clinical_pathology_order",
         CLINICAL_PATHOLOGY_ORDER_SELECT,
-        fk_columns=["person_id"],
+        fk_columns=["person_id", "encounter_id"],
         date_flags=["event_after_death_30d", "event_before_birth"],
     )
     return _with_comments(df, CLINICAL_PATHOLOGY_ORDER_COLUMN_COMMENTS)
@@ -4047,8 +4277,11 @@ def gold_clinical_pathology_order():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -4086,8 +4319,11 @@ CLINICAL_PATHOLOGY_REPORT_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     'CASE WHEN NOT `person_id_resolved` THEN NULL ELSE `person_id` END AS `person_id`',
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -4171,8 +4407,11 @@ CLINICAL_PATHOLOGY_REPORT_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Report issue or result timestamp.",
     "event_end_datetime": "Report event end.",
+    "event_datetime_local": "Report issue or result timestamp expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Report event end timestamp expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source test coding system.",
     "source_code": "Source test code.",
     "source_display": "Source test display.",
@@ -4235,8 +4474,11 @@ def gold_clinical_pathology_report():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -4279,8 +4521,11 @@ CLINICAL_PATHOLOGY_RESULT_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     'CASE WHEN NOT `person_id_resolved` THEN NULL ELSE `person_id` END AS `person_id`',
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     'CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -4387,8 +4632,11 @@ CLINICAL_PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each pathology result record. It is derived from bronze field `measurement_datetime` in `4_prod.bronze.map_pathology`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Measurement end timestamp.",
+    "event_datetime_local": "Measurement timestamp expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Measurement end timestamp expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source test coding system.",
     "source_code": "Source test code.",
     "source_display": "Source test display.",
@@ -4464,8 +4712,11 @@ def gold_clinical_pathology_result():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -4513,6 +4764,7 @@ def gold_clinical_pathology_result():
 # COMMAND ----------
 
 # ==== journey_clinical.procedure ====
+# OPCS_QUALIFIER_BLOCK_V1_GOLD: anatomy columns pass through from silver.
 
 # contract v2: identifier names follow the native-id contract; lifecycle/QC and extracted child payloads are omitted.
 CLINICAL_PROCEDURE_SELECT = [
@@ -4531,6 +4783,8 @@ CLINICAL_PROCEDURE_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR YEAR(CAST(`event_end_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR YEAR(CAST(`event_end_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -4543,6 +4797,10 @@ CLINICAL_PROCEDURE_SELECT = [
     '`body_site_display` AS `body_site_display`',
     "CASE WHEN UPPER(TRIM(CAST(`laterality_code` AS STRING))) = '0' THEN NULL ELSE `laterality_code` END AS `laterality_code`",
     '`laterality_display` AS `laterality_display`',
+    '`body_site_method` AS `body_site_method`',
+    '`laterality_method` AS `laterality_method`',
+    '`opcs_code_role` AS `opcs_code_role`',
+    '`opcs_anchor_procedure_id` AS `opcs_anchor_procedure_id`',
     '`performer_practitioner_id` AS `performer_practitioner_id`',
     "CASE WHEN UPPER(TRIM(CAST(`procedure_location_code` AS STRING))) = '0' THEN NULL ELSE `procedure_location_code` END AS `procedure_location_code`",
     '`procedure_location_display` AS `procedure_location_display`',
@@ -4578,6 +4836,11 @@ CLINICAL_PROCEDURE_MANDATORY_RULES = {
 }
 
 CLINICAL_PROCEDURE_ADVISORY_RULES = {
+    # NDC_DISPLAY_SUFFIX_V1 regression guard: Millennium's retired-term suffix ("... 07-SEP-2022 18:17:27<$>")
+    # is stripped upstream in Nomenclature_Pipeline, so this should read zero forever.
+    "gold.clinical.procedure.source_display.no_retired_term_suffix":
+        "NOT COALESCE(`source_display` LIKE '%<$>', FALSE)",
+
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 39,185 of 16,307,178 at the profile.
@@ -4629,6 +4892,8 @@ CLINICAL_PROCEDURE_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Primary performed timestamp.",
     "event_end_datetime": "Procedure end timestamp.",
+    "event_datetime_local": "Primary performed timestamp for the procedure or implant event, expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Procedure end timestamp expressed in local time, null where no end time is recorded. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim source coding system.",
     "source_code": "Source procedure code or implant label",
     "source_display": "Verbatim source procedure display.",
@@ -4637,10 +4902,14 @@ CLINICAL_PROCEDURE_COLUMN_COMMENTS = {
     "status_display": "Source status display.",
     "performed_start": "Procedure performed start.",
     "performed_end": "Procedure performed end.",
-    "body_site_code": "Body-site code where supplied.",
-    "body_site_display": "Body-site display where supplied.",
-    "laterality_code": "Source laterality code.",
-    "laterality_display": "Source laterality display.",
+    "body_site_code": "SNOMED body-structure code. Millennium OPCS-4 rows: the first OPCS site code of the coded operation, mapped through OMOP 'Maps to'. Implant rows: the site agreed by the operations the implant links to. See body_site_method.",
+    "body_site_display": "SNOMED body-structure name for body_site_code.",
+    "laterality_code": "Millennium LATERALITY_CD where the source records one; otherwise the OPCS-4 Z94.x code of the coded operation (Z94.1 bilateral, Z94.2 right, Z94.3 left, Z94.4 unilateral side not stated). See laterality_method.",
+    "laterality_display": "Laterality display: the Millennium laterality description or the Z94.x meaning.",
+    "body_site_method": "How body_site_code was derived. opcs_qualifier_block_v1: first site code of the OPCS-4 coded operation (same encounter and coding episode, ordered by PROC_PRIORITY then PROCEDURE_ID; sites coded after a harvest (Y54-Y69) code describe the donor site and are not used); suffix _multiple when the operation has several site codes, _unmapped when the site code has no SNOMED map (code NULL). implant_opcs_link_v1_same_day / _adjacent_day: site agreed by every candidate operation; _conflict when they disagree (code NULL). NULL: no site evidence.",
+    "laterality_method": "How laterality was derived. source_laterality_cd: Millennium LATERALITY_CD. opcs_qualifier_block_v1: the Z94.x code of the OPCS-4 coded operation (a Z94 coded after a harvest (Y54-Y69) code describes the donor site and is not used); _conflict when it carries different Z94 codes (laterality NULL). implant_opcs_link_v1_same_day / _adjacent_day: side agreed by every candidate operation with a side; _conflict when they disagree. NULL: no side evidence.",
+    "opcs_code_role": "Role of this OPCS-4 code in its coded operation (OPCS_QUALIFIER_BLOCK_V1): operation, site (body-structure code), laterality (Z94.x) or method (Y chapter). NULL for non-OPCS rows. Count procedures with opcs_code_role = 'operation'; the other roles qualify the operation named in opcs_anchor_procedure_id.",
+    "opcs_anchor_procedure_id": "PROCEDURE_ID of the OPCS-4 operation this row belongs to: the row itself for an operation; the preceding operation in coding order for a qualifier; NULL for a qualifier coded before any operation. Implant rows: the linked operation when exactly one candidate operation exists (IMPLANT_OPCS_LINK_V1).",
     "performer_practitioner_id": "Millennium personnel PERSON_ID as BIGINT when available.",
     "procedure_location_code": "Source procedure-location code retained without asserting a location-dimension FK.",
     "procedure_location_display": "Source procedure-location display.",
@@ -4708,6 +4977,8 @@ def gold_clinical_procedure():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -4720,6 +4991,10 @@ def gold_clinical_procedure():
         '`body_site_display` AS `body_site_display`',
         '`laterality_code` AS `laterality_code`',
         '`laterality_display` AS `laterality_display`',
+        '`body_site_method` AS `body_site_method`',
+        '`laterality_method` AS `laterality_method`',
+        '`opcs_code_role` AS `opcs_code_role`',
+        '`opcs_anchor_procedure_id` AS `opcs_anchor_procedure_id`',
         '`performer_practitioner_id` AS `performer_practitioner_id`',
         '`procedure_location_code` AS `procedure_location_code`',
         '`procedure_location_display` AS `procedure_location_display`',
@@ -4760,6 +5035,8 @@ CLINICAL_RESEARCH_ENROLLMENT_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -4838,6 +5115,8 @@ CLINICAL_RESEARCH_ENROLLMENT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each research enrollment record. It is derived from bronze field `ON_STUDY_DT_TM_CLEAN` in `4_prod.bronze.map_research_subject`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each research enrollment record. It is derived from bronze field `OFF_STUDY_DT_TM_CLEAN` in `4_prod.bronze.map_research_subject`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time representation of the research-subject registration event start date and time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the research-subject registration event end date and time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each research enrollment record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Number to indicate the current status of the enrolled patient(1: On Study,2:OnTreatment, 3:Off Treatment,4-OnFollowup,5-OffStudy)",
     "source_display": "Human-readable label supplied by the source system for the source code for each research enrollment record. It is derived from bronze field `STATUS_DESC` in `4_prod.bronze.map_research_subject`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -4906,6 +5185,8 @@ def gold_clinical_research_enrollment():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -4948,8 +5229,11 @@ CLINICAL_SPECIMEN_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     'CASE WHEN NOT `person_id_resolved` THEN NULL ELSE `person_id` END AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -5033,8 +5317,11 @@ CLINICAL_SPECIMEN_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Collection or receipt timestamp.",
     "event_end_datetime": "Event end when supplied.",
+    "event_datetime_local": "Local-time representation of the specimen event (collection or receipt) timestamp. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the specimen event end timestamp, when supplied.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source specimen type system.",
     "source_code": "Source specimen type code.",
     "source_display": "Source specimen type display.",
@@ -5080,7 +5367,7 @@ CLINICAL_SPECIMEN_COLUMN_COMMENTS = {
 @dp.expect_all(CLINICAL_SPECIMEN_ADVISORY_RULES)
 def _gold_qc_clinical_specimen():
     """Quality-controlled twin of journey_clinical.specimen."""
-    df = _qc("clinical_specimen", CLINICAL_SPECIMEN_SELECT)
+    df = _qc("clinical_specimen", CLINICAL_SPECIMEN_SELECT, fk_columns=("encounter_id",))
     return _with_comments(df, CLINICAL_SPECIMEN_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -5102,8 +5389,11 @@ def gold_clinical_specimen():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -5153,8 +5443,11 @@ CLINICAL_SUSCEPTIBILITY_RESULT_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`encounter_id` AS `encounter_id`',
+    '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -5220,8 +5513,11 @@ CLINICAL_SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. Gold: encounter_id can still be NULL here when the encounter is not in the Gold encounter spine.",  # GOLD_COLUMN_PARITY_V1
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
+    "event_datetime_local": "Local-time accession event timestamp, taken from the sample, report or request time in fallback order.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time equivalent of the event end timestamp.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Antimicrobial coding namespace.",
     "source_code": "Antimicrobial code or text.",
     "source_display": "Source antimicrobial result/test code.",
@@ -5266,7 +5562,7 @@ CLINICAL_SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS = {
 @dp.expect_all(CLINICAL_SUSCEPTIBILITY_RESULT_ADVISORY_RULES)
 def _gold_qc_clinical_susceptibility_result():
     """Quality-controlled twin of journey_clinical.susceptibility_result."""
-    df = _qc("clinical_susceptibility_result", CLINICAL_SUSCEPTIBILITY_RESULT_SELECT)
+    df = _qc("clinical_susceptibility_result", CLINICAL_SUSCEPTIBILITY_RESULT_SELECT, fk_columns=("encounter_id",))
     return _with_comments(df, CLINICAL_SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -5289,8 +5585,11 @@ def gold_clinical_susceptibility_result():
         '`subject_id_system` AS `subject_id_system`',
         '`person_id` AS `person_id`',
         '`encounter_id` AS `encounter_id`',
+        '`encounter_link_method` AS `encounter_link_method`',  # GOLD_COLUMN_PARITY_V1
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -5341,6 +5640,8 @@ CLINICAL_TRANSFUSION_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -5415,6 +5716,8 @@ CLINICAL_TRANSFUSION_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; BloodTrack transfusion rows do not supply encounter context.",
     "event_datetime": "Transfusion begin timestamp falling back to end.",
     "event_end_datetime": "Transfusion end timestamp.",
+    "event_datetime_local": "Transfusion begin timestamp, falling back to end, expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Transfusion end timestamp expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "BloodTrack product coding system.",
     "source_code": "ISBT product code with product display fallback.",
     "source_display": "Blood product description.",
@@ -5488,6 +5791,8 @@ def gold_clinical_transfusion():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -5535,6 +5840,7 @@ CLINICAL_TRANSFUSION_EVENT_SELECT = [
     '`subject_key` AS `subject_key`',
     '`subject_id_system` AS `subject_id_system`',
     '`event_datetime` AS `event_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`workflow_step` AS `workflow_step`',
     '`transaction_success_ind` AS `transaction_success_ind`',
     '`unit_number` AS `unit_number`',
@@ -5594,6 +5900,7 @@ CLINICAL_TRANSFUSION_EVENT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "event_datetime": "Effective transaction timestamp.",
+    "event_datetime_local": "Effective BloodTrack transaction timestamp expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "workflow_step": "BloodTrack workflow step.",
     "transaction_success_ind": "Whether the transaction succeeded.",
     "unit_number": "Blood unit number.",
@@ -5652,6 +5959,7 @@ def gold_clinical_transfusion_event():
         '`subject_key` AS `subject_key`',
         '`subject_id_system` AS `subject_id_system`',
         '`event_datetime` AS `event_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`workflow_step` AS `workflow_step`',
         '`transaction_success_ind` AS `transaction_success_ind`',
         '`unit_number` AS `unit_number`',
@@ -5691,6 +5999,8 @@ CLINICAL_VITAL_SIGN_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END AS `event_datetime`",
     'CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    "CASE WHEN `event_datetime` IS NULL THEN `event_datetime_local` WHEN (CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL WHEN CAST((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) AS TIMESTAMP) = CAST(`event_datetime` AS TIMESTAMP) THEN `event_datetime_local` WHEN `event_datetime_local` = from_utc_timestamp(`event_datetime`, 'Europe/London') THEN from_utc_timestamp((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END), 'Europe/London') ELSE `event_datetime_local` + (CAST((CASE WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 AND timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) BETWEEN TIMESTAMP'1990-01-01 00:00:00' AND `loaded_at` THEN timestamp_seconds(CAST(unix_timestamp(`event_datetime`) AS BIGINT) * 1000) WHEN YEAR(CAST(`event_datetime` AS TIMESTAMP)) = 1970 THEN NULL ELSE `event_datetime` END) AS TIMESTAMP) - CAST(`event_datetime` AS TIMESTAMP)) END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -5796,6 +6106,8 @@ CLINICAL_VITAL_SIGN_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "Clinical start date and time of the event as recorded on the Millennium CLINICAL_EVENT row.",
     "event_end_datetime": "Measurement end timestamp.",
+    "event_datetime_local": "Local-time representation of the vital-sign measurement timestamp. Gold: NULL wherever Gold nulls event_datetime; where Gold repairs a millisecond-epoch event_datetime, the repaired time in Europe/London.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the vital-sign measurement end timestamp. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each vital sign record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Source vital code.",
     "source_display": "Source vital display.",
@@ -5891,6 +6203,8 @@ def gold_clinical_vital_sign():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -5956,6 +6270,8 @@ EVENTS_PATIENT_EVENT_SELECT = [
     '`encounter_id` AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 OR CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END AS `event_datetime`",
     "CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`",
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 OR CAST(`event_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`event_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`",  # GOLD_COLUMN_PARITY_V1
     '`event_type` AS `event_type`',
     '`fact_category` AS `fact_category`',
     '`fact_table` AS `fact_table`',
@@ -6053,6 +6369,8 @@ EVENTS_PATIENT_EVENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Clinical or administrative event time.",
     "event_end_datetime": "Event end when the source supplies one.",
+    "event_datetime_local": "Local-time rendering of the clinical or administrative event time (event_datetime). Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time rendering of the event end time (event_end_datetime), populated when the source supplies one. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "event_type": "Fact kind (condition",
     "fact_category": "Clinical versus administrative fact.",
     "fact_table": "Typed fact table holding the event's values.",
@@ -6126,6 +6444,8 @@ def gold_events_patient_event():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`event_type` AS `event_type`',
         '`fact_category` AS `fact_category`',
         '`fact_table` AS `fact_table`',
@@ -6878,12 +7198,86 @@ def gold_clinical_procedure_implant_attribute():
 
 # COMMAND ----------
 
+# ==== journey_clinical.procedure_indication (PROCEDURE_INDICATION_V1) ====
+
+# Child of both clinical_procedure and clinical_condition: a candidate is admitted only when Gold admitted both parents.
+CLINICAL_PROCEDURE_INDICATION_COLUMNS = [
+    "procedure_patient_event_key", "procedure_source_object", "procedure_id", "implant_event_id", "implant_sequence",
+    "condition_patient_event_key", "diagnosis_id", "problem_id", "person_id", "encounter_id",
+    "procedure_site_code", "procedure_site_display", "condition_site_code", "condition_site_display",
+    "match_type", "match_levels", "diagnosis_priority", "indication_rank", "rule_id", "rule_version", "loaded_at",
+]
+CLINICAL_PROCEDURE_INDICATION_SELECT = [f"`{c}` AS `{c}`" for c in CLINICAL_PROCEDURE_INDICATION_COLUMNS]
+CLINICAL_PROCEDURE_INDICATION_COLUMN_COMMENTS = {
+    "procedure_patient_event_key": "patient_event_key of the clinical_procedure row: an OPCS-4 operation, or an implant linked to exactly one operation.",
+    "procedure_source_object": "source_object of the procedure row: millennium_procedure or implant.",
+    "procedure_id": "Millennium PROCEDURE_ID of the operation row (NULL for implant rows).",
+    "implant_event_id": "Millennium implant EVENT_ID for implant rows.",
+    "implant_sequence": "Millennium IMPLANT_SEQUENCE for implant rows.",
+    "condition_patient_event_key": "patient_event_key of the clinical_condition row proposed as the indication.",
+    "diagnosis_id": "Millennium DIAGNOSIS_ID of the condition when it is a diagnosis.",
+    "problem_id": "Millennium PROBLEM_ID of the condition when it is a problem.",
+    "person_id": "Millennium PERSON_ID.",
+    "encounter_id": "Millennium ENCNTR_ID shared by the procedure and the condition.",
+    "procedure_site_code": "SNOMED body structure of the operation (an OPCS-4 site code of the coded operation via OMOP 'Maps to').",
+    "procedure_site_display": "SNOMED name of procedure_site_code.",
+    "condition_site_code": "SNOMED finding site of the condition's standard concept ('Has finding site').",
+    "condition_site_display": "SNOMED name of condition_site_code.",
+    "match_type": "exact (same structure), condition_site_narrower (the condition site is a descendant of the procedure site) or condition_site_broader (an ancestor).",
+    "match_levels": "is-a levels between the two sites (0 = exact; at most 2).",
+    "diagnosis_priority": "Millennium DIAG_PRIORITY of the diagnosis as recorded: 1 = coded primary, 2+ = secondary positions, 0 = not ranked (Discharge/Working diagnoses such as ED); NULL for problems.",
+    "indication_rank": "1 = best candidate for this procedure: fewest match_levels, then lowest positive diagnosis_priority (0 and NULL last), then condition_patient_event_key.",
+    "rule_id": "Matching rule: procedure_site_finding_site_v1.",
+    "rule_version": "Rule version.",
+    "loaded_at": "Greatest load timestamp of the procedure and condition rows.",
+}
+CLINICAL_PROCEDURE_INDICATION_MANDATORY_RULES = {
+    # The candidate belongs in Gold only when both its procedure and its condition were admitted to Gold.
+    # The left joins keep rejected rows long enough for Lakeflow to count them.
+    "gold.clinical_procedure_indication.procedure_admitted": "COALESCE(__gold_procedure_present, FALSE)",
+    "gold.clinical_procedure_indication.condition_admitted": "COALESCE(__gold_condition_present, FALSE)",
+}
+
+@dp.materialized_view(
+    name=_n("gold_qc._clinical_procedure_indication"),
+    comment="Internal QC of clinical_procedure_indication; counts candidates whose procedure or condition Gold rejected.",
+    refresh_policy="incremental",
+)
+@dp.expect_all_or_drop(CLINICAL_PROCEDURE_INDICATION_MANDATORY_RULES)
+def _gold_qc_clinical_procedure_indication():
+    """PROCEDURE_INDICATION_V1 Gold child of clinical_procedure and clinical_condition; parent-rejected rows are excluded."""
+    procedures = (spark.read.table(_n("gold_clinical.procedure"))
+                  .select(F.col("patient_event_key").alias("procedure_patient_event_key")).dropDuplicates()
+                  .withColumn("__gold_procedure_present", F.lit(True)))
+    conditions = (spark.read.table(_n("gold_clinical.condition"))
+                  .select(F.col("patient_event_key").alias("condition_patient_event_key")).dropDuplicates()
+                  .withColumn("__gold_condition_present", F.lit(True)))
+    child = spark.read.table(_src("clinical_procedure_indication"))
+    df = (child.join(procedures, "procedure_patient_event_key", "left")
+          .join(conditions, "condition_patient_event_key", "left")
+          .selectExpr(*CLINICAL_PROCEDURE_INDICATION_SELECT, "__gold_procedure_present", "__gold_condition_present"))
+    return _with_comments(df, CLINICAL_PROCEDURE_INDICATION_COLUMN_COMMENTS)
+
+@dp.materialized_view(
+    name=_n("gold_clinical.procedure_indication"),
+    comment="Candidate indications for coded operations and singly-linked implants: same-encounter conditions whose SNOMED finding site matches the operation's coded body site exactly or within two is-a levels; indication_rank 1 = closest anatomy then lowest diagnosis priority. Rule-based (procedure_site_finding_site_v1), no manual curation.",
+    table_properties={"quality": "gold"},
+    refresh_policy="incremental",
+)
+def gold_clinical_procedure_indication():
+    """Publish clinical_procedure_indication without the internal parent-admission markers."""
+    return (spark.read.table(_n("gold_qc._clinical_procedure_indication"))
+            .drop("__gold_procedure_present", "__gold_condition_present"))
+
+# COMMAND ----------
+
 # ==== journey_clinical.presenting_complaint (S3b) ====
 
 PRESENTING_COMPLAINT_COLUMNS = [
     "patient_event_key", "source_patient_event_key", "encounter_key", "encounter_id",
     "subject_key", "subject_id_system", "person_id", "source_object", "source_event_id",
     "statement_sequence", "event_datetime", "encounter_class", "source_coding_system",
+    "event_datetime_local",  # GOLD_COLUMN_PARITY_V1
     "source_code", "source_display", "complaint_text_normalised", "complaint_group_display",
     *_s3_axis_columns("complaint"),
     "record_status", "record_status_effective_from", "record_status_effective_to",

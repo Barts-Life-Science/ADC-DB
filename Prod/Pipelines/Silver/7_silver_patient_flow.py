@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Patient flow
 # MAGIC Tracking episodes, attendance, location stays, milestones, pre-arrivals, pending movements and bed observations.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 7 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -15,6 +15,7 @@
 # COMMAND ----------
 
 from pyspark.sql import Column, functions as F
+from silver_active_rows import active_rows  # ACTIVE_ROWS_V1
 
 try:
     from pyspark import pipelines as dp
@@ -66,7 +67,8 @@ def _with_comments(frame, product):
 def canonical(source_name, target_name, keys, key_name, namespace):
     # Normalize a configured patient-flow bronze feed: standardize names, construct stable keys,
     # and carry identity, record status and source-derived load timestamps.
-    source = spark.read.table(f"{BRONZE}.{source_name}")
+    # ACTIVE_ROWS_V1: bronze rows that are not active never enter silver; the rule lives in silver_active_rows.py.
+    source = active_rows(spark.read.table(f"{BRONZE}.{source_name}"), f"{BRONZE}.{source_name}")
     df = source.select(*[F.col(column).alias(column.lower()) for column in source.columns])
     if target_name == "clinical_prearrival":
         df = df.withColumnRenamed("linked_person_id", "person_id").withColumnRenamed("linked_encntr_id", "encounter_id")
@@ -163,4 +165,3 @@ FLOW_SPECS = [
 ]
 for _spec in FLOW_SPECS:
     declare_product(*_spec)
-

@@ -24,6 +24,8 @@ dbutils.widgets.text("src_era_keys", "4_prod.omop_silver._om_era_keys")
 dbutils.widgets.text("src_person_address", "4_prod.silver.reference_person_address")
 dbutils.widgets.text("study_start", "2012-01-01")
 dbutils.widgets.text("pipeline_version", "0.6.0-r0")
+# OMOP_AREA_OBS_V1: yes = allocate only the area observation keys (imd/radon/census) in clinical_event.
+dbutils.widgets.dropdown("geo_keys_only", "no", ["no", "yes"])
 CATALOG = dbutils.widgets.get("catalog").strip()
 META_SCHEMA = dbutils.widgets.get("meta_schema").strip()
 ID_SPACE = dbutils.widgets.get("id_space").strip()
@@ -517,23 +519,55 @@ def _allergy_keys():
     )
 
 
+# OMOP_AREA_OBS_V1: one area observation per measure of a person's active HOME/PREVIOUS address (silver
+# reference_person_address). key stem -> registry key <stem>:<address_id>.
+AREA_OBSERVATIONS = [
+    {"stem": "imd", "column": "imd2025_quintile", "low": 1, "high": 5, "unit": 37524288, "source_concept": 35812882,
+     "source_value": "imd_quintile", "value_text": "imd2025_quintile", "rule": "heron_uk_imd_quintile:iod2025",
+     "coding_system": "HERON-UK"},
+    {"stem": "radon", "column": "radon_class_max", "low": 1, "high": 6, "unit": 0, "source_concept": 0,
+     "source_value": "radon_class_max:ukhsa_bgs_atlas_v3", "value_text": "radon_potential_band",
+     "rule": "radon_indicative_atlas_v3", "coding_system": "UKHSA-BGS"},
+    {"stem": "census:hh_deprived_any", "column": "census_pct_hh_deprived_any", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_deprived_any", "value_text": None,
+     "rule": "census2021_oa_ts011", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:hh_overcrowded", "column": "census_pct_hh_overcrowded", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_overcrowded", "value_text": None,
+     "rule": "census2021_oa_ts052", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:hh_no_car", "column": "census_pct_hh_no_car", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_no_car", "value_text": None,
+     "rule": "census2021_oa_ts045", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:bad_health", "column": "census_pct_bad_health", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_bad_health", "value_text": None,
+     "rule": "census2021_oa_ts037", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:limited_english", "column": "census_pct_limited_english", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_limited_english", "value_text": None,
+     "rule": "census2021_oa_ts029", "coding_system": "ONS-Census-2021"},
+]
+
+
 def _imd_keys():
-    # HERON-UK IMD observation rows share the clinical_event space. Same address filters as the
-    # pipeline's _imd_candidates(); the pipeline's person/period/date/duplicate gates only remove
-    # rows, so this is a superset.
-    return (
-        _source(SRC_PERSON_ADDRESS)
-        .where(
-            (F.col("parent_entity") == "PERSON")
-            & (F.col("active_ind") == 1)
-            & F.col("address_type_code").isin("756", "758")
-            & F.trim(F.col("imd_quintile")).isin("1", "2", "3", "4", "5")
-            & F.col("address_id").isNotNull()
-            & F.col("person_id").isNotNull()
+    # OMOP_AREA_OBS_V1: area observation keys <stem>:<address_id> in the clinical_event space (imd:<address_id> as
+    # before, now IoD 2025; radon; census measures). Same address filters as the pipeline's _imd_candidates();
+    # the pipeline's person/period/date/duplicate gates only remove rows, so this is a superset.
+    frames = []
+    for spec in AREA_OBSERVATIONS:
+        frames.append(
+            _source(SRC_PERSON_ADDRESS)
+            .where(
+                (F.col("parent_entity") == "PERSON")
+                & (F.col("active_ind") == 1)
+                & F.col("address_type_code").isin("756", "758")
+                & F.col(spec["column"]).cast("double").between(spec["low"], spec["high"])
+                & F.col("address_id").isNotNull()
+                & F.col("person_id").isNotNull()
+            )
+            .select(F.concat(F.lit(spec["stem"] + ":"), F.col("address_id").cast("bigint").cast("string")).alias("source_key"))
         )
-        .select(F.concat(F.lit("imd:"), F.col("address_id").cast("bigint").cast("string")).alias("source_key"))
-        .distinct()
-    )
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return out.distinct()
 
 
 def _specimen_keys():
@@ -622,6 +656,9 @@ candidate = {
     "condition_era": _condition_era_keys,
     "episode": _episode_keys,  # OGR_NO_DEV_V1
 }[ID_SPACE]()
+if dbutils.widgets.get("geo_keys_only") == "yes":  # OMOP_AREA_OBS_V1
+    assert ID_SPACE == "clinical_event", "geo_keys_only applies to the clinical_event space"
+    candidate = _imd_keys()
 
 existing = spark.table(TARGET).where(F.col("id_space") == ID_SPACE)
 new_keys = candidate.join(existing.select("source_key"), "source_key", "left_anti")

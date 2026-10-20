@@ -1765,6 +1765,46 @@ schema_rde_radiology = StructType([
         StructField("ADC_UPDT", TimestampType(), True, metadata={"comment": ""})
     ])
 
+def _radiology_report_order():
+    """Map each Barts radiology report (DOC) event to the ORDER_ID of the exam it reports on.
+
+    From 2013 onwards Millennium writes radiology report events with ORDER_ID = 0, so joining
+    them to mill_orders on their own ORDER_ID silently dropped ~11M reports from rde_radiology.
+    In 4_prod.bronze.map_radiology_event an exam, its sections and its report share
+    REF_EXAM_KEY (accession|exam code); we take the exam-side ORDER_ID for the same patient.
+    A report whose key resolves to more than one order is left unresolved rather than guessed.
+    """
+    radiology_events = spark.table("4_prod.bronze.map_radiology_event").filter(
+        F.col("CONTRIBUTOR_SYSTEM_CD") == 6141416
+    )
+
+    report_events = (
+        radiology_events
+        .filter(F.col("EVENT_CLASS_DESC") == "DOC")
+        .select(F.col("EVENT_ID").alias("REPORT_EVENT_ID"), "PERSON_ID", "REF_EXAM_KEY")
+    )
+
+    exam_orders = (
+        radiology_events
+        .filter(F.col("EVENT_CLASS_DESC") != "DOC")
+        .filter(F.coalesce(F.col("ORDER_ID"), F.lit(0)) != 0)
+        .filter(F.col("REF_EXAM_KEY").isNotNull())
+        .select("REF_EXAM_KEY", "PERSON_ID", "ORDER_ID")
+        .distinct()
+    )
+
+    return (
+        report_events
+        .join(exam_orders, ["REF_EXAM_KEY", "PERSON_ID"], "inner")
+        .groupBy("REPORT_EVENT_ID")
+        .agg(
+            F.min("ORDER_ID").alias("EXAM_ORDER_ID"),
+            F.countDistinct("ORDER_ID").alias("EXAM_ORDER_COUNT"),
+        )
+        .filter(F.col("EXAM_ORDER_COUNT") == 1)
+        .select("REPORT_EVENT_ID", "EXAM_ORDER_ID")
+    )
+
 @dlt.table(name="rde_radiology_incr", table_properties={
         "skipChangeCommits": "true"}, temporary=True)
 def radiology_incr():
@@ -1779,10 +1819,18 @@ def radiology_incr():
 
     clinical_event_final = clinical_event.filter(F.col("VALID_UNTIL_DT_TM") > F.current_timestamp()).filter(~col("RESULT_STATUS_CD").isin(29, 30, 31)).filter(col("ADC_UPDT") > max_adc_updt).alias("EVE")
 
+    # Report events have ORDER_ID = 0; borrow the order of the exam they report on.
+    report_order = _radiology_report_order().alias("RO")
+    resolved_order_id = (
+        F.when(F.coalesce(col("EVE.ORDER_ID"), F.lit(0)) != 0, col("EVE.ORDER_ID"))
+        .otherwise(col("RO.EXAM_ORDER_ID"))
+    )
+
     joined_data = (
         clinical_event_final
+        .join(report_order, col("EVE.EVENT_ID") == col("RO.REPORT_EVENT_ID"), "left")
         .join(encounter, col("EVE.ENCNTR_ID") == encounter.ENCNTR_ID)
-        .join(orders, (encounter.ENCNTR_ID == orders.ENCNTR_ID) & (orders.ORDER_ID == col("EVE.ORDER_ID")))
+        .join(orders, (encounter.ENCNTR_ID == orders.ENCNTR_ID) & (orders.ORDER_ID == resolved_order_id))
         .join(code_value_ref.alias("R"), col("EVE.RECORD_STATUS_CD") == col("R.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("EC"), col("EVE.ENTRY_MODE_CD") == col("EC.CODE_VALUE_CD"), "left")
         .join(code_value_ref.alias("ER"), col("EVE.RESULT_STATUS_CD") == col("ER.CODE_VALUE_CD"), "left")

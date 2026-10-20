@@ -3028,6 +3028,27 @@ def _refresh_map_cutoffs(cutoffs: dict[str, dict]) -> None:
         cutoffs[source_name] = {'source_name': source_name, 'table_name': table_name, 'end_version': end_version, 'end_adc_updt': _max_timestamp_at_version(table_name, ts_col, end_version), 'timestamp_column': ts_col}
 
 # TIER_RESCORE_BRONZE_REFRESH_PATCH_APPLIED v1
+# TIER_LLM_LANE_V1: Opus-certified test pairs get the llm_verified gold lane.
+def _tll_relabel(rescore, test_map, concept):
+    """TIER_LLM_LANE_V1: rescore pairs Opus certified carry the llm_verified lane in their rule id; others revert."""
+    lanes = "('bronze_pathology_test_auto_high', 'bronze_pathology_test_auto_low')"
+    certified = (f"""SELECT DISTINCT trim(regexp_replace(lower(t.description), '\\\\s+', ' ')) AS source_display,
+                           CASE WHEN c.vocabulary_id = 'SNOMED' THEN c.concept_code ELSE CAST(t.measurement_concept_id AS STRING) END AS target_code
+                    FROM {test_map} t JOIN {concept} c ON c.concept_id = t.measurement_concept_id
+                    WHERE t.llm_model LIKE 'claude-opus%' AND t.llm_verdict IN ('accept', 'choose')
+                      AND t.measurement_concept_id IS NOT NULL AND t.description IS NOT NULL""")
+    spark.sql(f"""MERGE INTO {rescore} r USING ({certified}) c
+                  ON r.lane IN {lanes} AND r.source_display = c.source_display AND r.target_code = c.target_code
+                  WHEN MATCHED AND r.mapping_rule_id NOT LIKE '%:bronze_pathology_test_llm_verified:%'
+                    THEN UPDATE SET r.mapping_rule_id = concat('rescore:bronze_pathology_test_llm_verified:', r.scoring_model)""")
+    spark.sql(f"""MERGE INTO {rescore} r USING (SELECT * FROM {rescore} x WHERE x.lane IN {lanes}
+                    AND x.mapping_rule_id LIKE '%:bronze_pathology_test_llm_verified:%'
+                    AND NOT EXISTS (SELECT 1 FROM ({certified}) c WHERE c.source_display = x.source_display
+                                                                  AND c.target_code = x.target_code)) s
+                  ON r.lane = s.lane AND r.source_display = s.source_display AND r.target_code = s.target_code
+                  WHEN MATCHED THEN UPDATE SET r.mapping_rule_id = concat('rescore:', r.lane, ':', r.scoring_model)""")
+
+
 def _refresh_tier_lane_rescore(max_embed_texts: int=20000) -> dict:
     """Score new pathology tier-lane pairs into tier_lane_rescore, so Silver/Gold admit them.
 
@@ -3239,6 +3260,8 @@ def create_map_pathology(force_full: bool=False, run_embed_loop: bool=True) -> d
                 incremental_manifest, 'MAPPING_COMPLETE'
             )
         _refresh_tier_lane_rescore()
+        _tll_relabel('3_lookup.omop.tier_lane_rescore' if ENVIRONMENT == 'prod' else '8_dev.lookup.tier_lane_rescore',
+                     TEST_MAP, CONCEPT)  # TIER_LLM_LANE_V1
         if not mapping_metrics.get('hold_map_cutoffs'):  # MAP_CORRECTION_SCOPED_V1
             _refresh_map_cutoffs(cutoffs)
         _advance_state(cutoffs)

@@ -112,9 +112,13 @@ def _n(name):
     return PUBLIC_SCHEMA + "." + plane + "_" + table
 
 
+from silver_active_rows import active_rows  # ACTIVE_ROWS_V1
+
+
 def read_source(name):
     # Read the named source table as a Spark DataFrame.
-    return spark.read.table(name)
+    # ACTIVE_ROWS_V1: bronze rows that are not active never enter silver; the rule lives in silver_active_rows.py.
+    return active_rows(spark.read.table(name), name)
 
 # COMMAND ----------
 

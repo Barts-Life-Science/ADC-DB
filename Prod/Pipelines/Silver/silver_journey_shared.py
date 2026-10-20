@@ -150,9 +150,13 @@ import json as _json
 
 SOURCE_OVERRIDES = _json.loads(spark.conf.get("journey.source_overrides", "{}"))
 
+from silver_active_rows import active_rows  # ACTIVE_ROWS_V1
+
+
 def read_source(name):
     # Read a source table, honoring the configured development source override when present.
-    return spark.read.table(SOURCE_OVERRIDES.get(name, name))
+    # ACTIVE_ROWS_V1: bronze rows that are not active never enter silver; the rule lives in silver_active_rows.py.
+    return active_rows(spark.read.table(SOURCE_OVERRIDES.get(name, name)), name)
 
 
 
@@ -1856,6 +1860,8 @@ def _condition_diagnosis_canonical_pregate():
         F.when(s.PERSON_ID.isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved"))
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        # ENCOUNTER_SLICE_V1: the consultant episode the diagnosis was coded against.
+        s.ENCNTR_SLICE_ID.cast("bigint").alias("encounter_slice_id"),
         F.coalesce(s.DIAG_DT_TM, s.ASSERTED_DT_TM, s.BEG_EFFECTIVE_DT_TM).alias("event_datetime"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
         F.coalesce(s.DIAG_DT_TM_LOCAL, s.ASSERTED_DT_TM_LOCAL, s.BEG_EFFECTIVE_DT_TM_LOCAL).alias("event_datetime_local"),
@@ -1877,6 +1883,12 @@ def _condition_diagnosis_canonical_pregate():
         ).alias("_condition_code_json"),
         s.DIAG_TYPE_CD.cast("string").alias("category_code"),
         s.diag_type_desc.alias("category_display"),
+        # DIAG_PRIORITY_V1: Millennium's ranking of the diagnosis, carried verbatim (0 = not ranked).
+        s.DIAG_PRIORITY.cast("bigint").alias("diag_priority"),
+        s.CLINICAL_DIAG_PRIORITY.cast("bigint").alias("clinical_diag_priority"),
+        s.RANKING_CD.cast("string").alias("ranking_code"),
+        # Bronze map_diagnosis carries no ranking description.
+        F.lit(None).cast("string").alias("ranking_display"),
         s.ACTIVE_STATUS_CD.cast("string").alias("clinical_status_code"),
         F.lit(None).cast("string").alias("clinical_status_display"),
         s.CONFIRMATION_STATUS_CD.cast("string").alias("verification_status_code"),
@@ -1942,6 +1954,7 @@ def _condition_problem_canonical_pregate():
         F.when(s.PERSON_ID.isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved"))
          .alias("identity_status"),
         encounter_key.cast("bigint").alias("encounter_id"),
+        F.lit(None).cast("bigint").alias("encounter_slice_id"),  # ENCOUNTER_SLICE_V1
         F.coalesce(s.ASSERTED_DT_TM, s.ONSET_DT_TM, s.BEG_EFFECTIVE_DT_TM,
                    s.earliest_problem_date).alias("event_datetime"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("event_end_datetime"),
@@ -1965,6 +1978,11 @@ def _condition_problem_canonical_pregate():
         ).alias("_condition_code_json"),
         s.CLASSIFICATION_CD.cast("string").alias("category_code"),
         s.classification_desc.alias("category_display"),
+        # DIAG_PRIORITY_V1: problems have no diagnosis priorities; their RANKING_CD uses the same
+        # Primary/Secondary/Tertiary code set as diagnoses.
+        F.lit(None).cast("bigint").alias("diag_priority"),
+        F.lit(None).cast("bigint").alias("clinical_diag_priority"),
+        s.RANKING_CD.cast("string").alias("ranking_code"), s.ranking_desc.alias("ranking_display"),
         s.LIFE_CYCLE_STATUS_CD.cast("string").alias("clinical_status_code"),
         s.life_cycle_status_desc.alias("clinical_status_display"),
         s.CONFIRMATION_STATUS_CD.cast("string").alias("verification_status_code"),
@@ -2228,6 +2246,7 @@ def _maternity_diagnosis_canonical_pregate():
         skey.alias("subject_key"), ssys.alias("subject_id_system"), person.cast("bigint").alias("person_id"),
         _maternity_identity_status(F.col("s.PERSON_ID"), F.col("_spine_person_id"))
          .alias("identity_status"), F.lit(None).cast("bigint").alias("encounter_id"),
+        F.lit(None).cast("bigint").alias("encounter_slice_id"),  # ENCOUNTER_SLICE_V1
         F.col("s.DIAGDATE_CLEAN").alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
         # DIAGDATE_CLEAN is already local wall-clock time.
@@ -2241,6 +2260,11 @@ def _maternity_diagnosis_canonical_pregate():
                        F.col("s.DIAG_SNOMED_DESC"), True)
         ).alias("_condition_code_json"),
         F.col("s.DIAGSCHEME").alias("category_code"), F.lit("maternity diagnosis").alias("category_display"),
+        # DIAG_PRIORITY_V1: the maternity feed carries no diagnosis ranking.
+        F.lit(None).cast("bigint").alias("diag_priority"),
+        F.lit(None).cast("bigint").alias("clinical_diag_priority"),
+        F.lit(None).cast("string").alias("ranking_code"),
+        F.lit(None).cast("string").alias("ranking_display"),
         F.lit("active").alias("clinical_status_code"), F.lit("active").alias("clinical_status_display"),
         F.lit("confirmed").alias("verification_status_code"),
         F.lit("confirmed").alias("verification_status_display"),
@@ -2880,6 +2904,7 @@ CONDITION_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_slice_id",  # ENCOUNTER_SLICE_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -2891,6 +2916,11 @@ CONDITION_SOURCE_COLUMNS = [
     "condition_code",
     "category_code",
     "category_display",
+    # DIAG_PRIORITY_V1: diagnosis ranking.
+    "diag_priority",
+    "clinical_diag_priority",
+    "ranking_code",
+    "ranking_display",
     "clinical_status_code",
     "clinical_status_display",
     "verification_status_code",
@@ -2962,6 +2992,11 @@ PROCEDURE_SOURCE_COLUMNS = [
     "body_site_display",
     "laterality_code",
     "laterality_display",
+    # OPCS_QUALIFIER_BLOCK_V1 / IMPLANT_OPCS_LINK_V1: provenance of body site and laterality, OPCS role and operation anchor.
+    "body_site_method",
+    "laterality_method",
+    "opcs_code_role",
+    "opcs_anchor_procedure_id",
     "performer_practitioner_id",
     "procedure_location_code",
     "procedure_location_display",
@@ -3306,6 +3341,69 @@ def _alias_resolved_accession(df, id_col="pathology_accession_id"):
 SRC_PATHOLOGY_ACCESSION_ALIAS = "4_prod.bronze.map_pathology_accession_alias"
 
 
+# PATH_ENCOUNTER_V1: which encounter a pathology row belongs to, and how that was decided. Only Millennium
+# (Cerner) sources carry an encounter; the TFC LIMS feed has none. In order:
+#   source_accession   - the row's own Millennium source names the encounter (results and reports);
+#   accession_single   - every current Millennium source of the row's alias-resolved accession names the
+#                        same encounter (_pathology_accession_identity.accession_encounter_id); this is how
+#                        LIMS rows inherit an encounter once their accession is merged with the Cerner order;
+#   accession_multiple - those sources name different encounters, so none is chosen;
+#   none               - the accession has no Millennium source.
+def _pathology_encounter(single, conflict, own=None):
+    """encounter_id and encounter_link_method under PATH_ENCOUNTER_V1.
+
+    single   - the accession's one encounter (NULL when it has none or several);
+    conflict - true when the accession's Millennium sources name more than one encounter;
+    own      - the row's own source encounter, for the products that carry one.
+    """
+    own = F.lit(None).cast("bigint") if own is None else own.cast("bigint")
+    method = (
+        F.when(own.isNotNull(), F.lit("source_accession"))
+        .when(single.isNotNull(), F.lit("accession_single"))
+        .when(F.coalesce(conflict, F.lit(False)), F.lit("accession_multiple"))
+        .otherwise(F.lit("none"))
+    )
+    return [F.coalesce(own, single.cast("bigint")).alias("encounter_id"), method.alias("encounter_link_method")]
+
+
+# PATH_ENCOUNTER_V2 (genomic test/result only): V1 first; when V1 finds no Millennium source, a Barts-site
+# LIMS accession takes the patient's encounter whose period contains the sample date (unique, or the unique
+# one starting that day). External referral sites (E*, XQA) are never linked. See _genomic_encounter_window.
+def _pathology_encounter_v2(single, conflict, window_id, window_method):
+    """encounter_id and encounter_link_method under PATH_ENCOUNTER_V2 (V1 rule, then the date window)."""
+    method = (
+        F.when(single.isNotNull(), F.lit("accession_single"))
+        .when(F.coalesce(conflict, F.lit(False)), F.lit("accession_multiple"))
+        .when(window_method.isNotNull(), window_method)
+        .otherwise(F.lit("none"))
+    )
+    encounter = F.coalesce(single.cast("bigint"), window_id.cast("bigint"))
+    return [encounter.alias("encounter_id"), method.alias("encounter_link_method")]
+
+
+def _genomic_encounter_window_stage():
+    """The window MV renamed for joining onto a resolved accession id."""
+    return spark.read.table(_n("journey_events._genomic_encounter_window")).select(
+        F.col("pathology_accession_id").alias("_win_accession_id"),
+        F.col("window_encounter_id").alias("_window_encounter_id"),
+        F.col("window_method").alias("_window_method"),
+    )
+
+
+def _pathology_result_with_accession_encounter(results):
+    """map_pathology rows with their parent accession's encounter evidence (PATH_ENCOUNTER_V1).
+
+    Reads the materialized parent-link MV (one row per source parent) so the caller's plan gains one
+    join to a stored table rather than the inline accession/alias/report-version chain.
+    """
+    link = spark.read.table(_n("journey_events._pathology_parent_link")).select(
+        F.col("source_parent_key").alias("_enc_parent_key"),
+        F.col("accession_encounter_id").alias("_link_accession_encounter_id"),
+        F.col("accession_encounter_conflict").alias("_link_accession_encounter_conflict"),
+    )
+    return results.join(link, results.source_parent_key == link._enc_parent_key, "left").drop("_enc_parent_key")
+
+
 SRC_PATHOLOGY_ACCESSION = "4_prod.bronze.map_pathology_accession"
 
 
@@ -3330,7 +3428,7 @@ def _pathology_specimen_canonical():
         F.when(F.col("person_resolution_status") == "eligible", F.lit("resolved"))
          .when(F.col("person_resolution_status") == "conflicting", F.lit("provisional"))
          .otherwise(F.lit("unresolved")).alias("identity_status"),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce("sample_dt", "request_dt", "report_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
         _clamped_ts(F.coalesce("sample_dt_local", "request_dt_local", "report_dt_local")).alias("event_datetime_local"),
@@ -3397,6 +3495,7 @@ def _pathology_report_series_canonical():
     i = spark.read.table(_n("journey_events._pathology_accession_identity")).select(
         F.col("pathology_accession_id").alias("_identity_accession_id"),
         "canonical_person_id", "person_resolution_status", "evidence_mrn", "evidence_nhs",
+        "accession_encounter_id", "accession_encounter_conflict",  # PATH_ENCOUNTER_V1
     ).alias("i")
     enriched = (
         r.join(link, r.source_record_key == F.col("l._link_parent_key"), "left")
@@ -3420,6 +3519,8 @@ def _pathology_report_series_canonical():
                 F.col("i.person_resolution_status").alias("person_resolution_status"),
                 F.col("i.evidence_mrn").alias("evidence_mrn"),
                 F.col("i.evidence_nhs").alias("evidence_nhs"),
+                F.col("i.accession_encounter_id").alias("accession_encounter_id"),  # PATH_ENCOUNTER_V1
+                F.col("i.accession_encounter_conflict").alias("accession_encounter_conflict"),
             )).alias("v"),
             F.count(F.lit(1)).cast("long").alias("version_count"),
             F.max(F.when(r.is_current & text_present, r.report_version_id))
@@ -3445,7 +3546,8 @@ def _pathology_report_series_canonical():
         F.when(F.col("v.person_resolution_status") == "eligible", F.lit("resolved"))
          .when(F.col("v.person_resolution_status") == "conflicting", F.lit("provisional"))
          .otherwise(F.lit("unresolved")).alias("identity_status"),
-        F.col("v.source_encounter_id").cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("v.accession_encounter_id"), F.col("v.accession_encounter_conflict"),
+                              own=F.col("v.source_encounter_id")),
         _clamped_ts(F.col("v.issued_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
         _clamped_ts(F.col("v.issued_dt_local")).alias("event_datetime_local"),
@@ -3502,6 +3604,7 @@ RESULT_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -3554,10 +3657,17 @@ RESULT_SOURCE_COLUMNS = [
     "_result_confidence_tier",
 ]
 
-def _pathology_result_canonical_pregate(source_df=None, include_parent_links=False):
+def _pathology_result_canonical_pregate(source_df=None, include_parent_links=False,
+                                        include_accession_encounter=False):
     # Normalize pathology result source rows before the downstream admission filter so excluded
-    # evidence remains countable.
+    # evidence remains countable. PATH_ENCOUNTER_V1: a caller-supplied source_df carries the parent
+    # accession's encounter evidence itself; include_accession_encounter adds it to the default source.
     s = read_source(SRC_PATHOLOGY) if source_df is None else source_df
+    if source_df is None and include_accession_encounter:
+        s = _pathology_result_with_accession_encounter(s)
+    if "_link_accession_encounter_id" not in s.columns:
+        s = (s.withColumn("_link_accession_encounter_id", F.lit(None).cast("bigint"))
+              .withColumn("_link_accession_encounter_conflict", F.lit(None).cast("boolean")))
     source_row_id = F.coalesce(
         s.source_record_key,
         F.concat_ws(":", s.source_table, s.source_event_id.cast("string"), s.source_sequence_start.cast("string")),
@@ -3579,7 +3689,8 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
         F.when(_present(s.PERSON_ID), F.lit("resolved"))
          .when(_present(s.MRN) | _present(s.NHS_Number), F.lit("provisional"))
          .otherwise(F.lit("unresolved")).alias("identity_status"),
-        s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("_link_accession_encounter_id"), F.col("_link_accession_encounter_conflict"),
+                              own=s.ENCNTR_ID),
         _clamped_ts(s.measurement_datetime).alias("event_datetime"),
         _clamped_ts(s.event_end_dt_tm).alias("event_end_datetime"),
         _clamped_ts(s.measurement_datetime_local).alias("event_datetime_local"),
@@ -3654,11 +3765,11 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
         s.result_confidence_tier.alias("_result_confidence_tier"),
     )
 
-def _pathology_result_canonical(source_df=None, include_parent_links=False):
+def _pathology_result_canonical(source_df=None, include_parent_links=False, include_accession_encounter=False):
     # Assemble normalized pathology result rows for downstream dataset builders, preserving the
     # existing source and identity rules.
     return _pathology_result_canonical_pregate(
-        source_df, include_parent_links
+        source_df, include_parent_links, include_accession_encounter
     ).where(_usable_code(F.col("source_code")))
 
 
@@ -3684,6 +3795,7 @@ def _pathology_requested_test_canonical_pregate():
         F.col("sample_dt").alias("_acc_sample_dt"),
         F.col("request_dt_local").alias("_acc_request_dt_local"),
         F.col("sample_dt_local").alias("_acc_sample_dt_local"),
+        "accession_encounter_id", "accession_encounter_conflict",  # PATH_ENCOUNTER_V1
     )
     j = t.join(i, "_resolved_accession_id", "left")
     event_id = stable_id(
@@ -3708,7 +3820,7 @@ def _pathology_requested_test_canonical_pregate():
         F.when(F.col("person_resolution_status") == "eligible", F.lit("resolved"))
          .when(F.col("person_resolution_status") == "conflicting", F.lit("provisional"))
          .otherwise(F.lit("unresolved")).alias("identity_status"),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce("_acc_request_dt", "_acc_sample_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
         _clamped_ts(F.coalesce("_acc_request_dt_local", "_acc_sample_dt_local")).alias("event_datetime_local"),
@@ -3753,6 +3865,7 @@ def _pathology_requested_test_canonical():
 
 
 SRC_PATHOLOGY_GENETIC_TEST = "4_prod.bronze.map_pathology_genetic_test"
+SRC_PATHOLOGY_GENETIC_REPORT = "4_prod.bronze.map_pathology_genetic_report"  # GEN4  # GEN4_SILVER_V1
 
 def _genomic_identity_stage():
     # Read accession-level patient-resolution evidence and rename its fields for joining genomic
@@ -3766,6 +3879,7 @@ def _genomic_identity_stage():
         F.col("request_dt_local").alias("_acc_request_dt_local"),
         F.col("sample_dt_local").alias("_acc_sample_dt_local"),
         F.col("report_dt_local").alias("_acc_report_dt_local"),
+        "accession_encounter_id", "accession_encounter_conflict",  # PATH_ENCOUNTER_V1
     )
 
 def _identity_mapped_columns():
@@ -3792,7 +3906,10 @@ def _genomic_test_canonical_pregate():
     ).alias("r")
     j = (
         t.join(i, F.col("t._resolved_accession_id") == F.col("i._identity_accession_id"), "left")
+        .join(_genomic_encounter_window_stage(), F.col("t._resolved_accession_id") == F.col("_win_accession_id"), "left")
         .join(r, F.col("t.report_version_id") == F.col("r._rv_id"), "left")
+        .join(read_source(SRC_PATHOLOGY_GENETIC_REPORT).select(F.col("report_version_id").alias("_rep_rv_id"),
+              *['sample_type_site_raw', 'sample_site_snomed_code', 'block_raw', 'tumour_content_raw', 'tumour_content_pct', 'clinical_details_raw', 'indication_snomed_code', 'interpretation_text', 'predicted_response', 'predicted_response_drug_class', 'panel_genes_not_assessed']).alias("rep"), F.col("t.report_version_id") == F.col("rep._rep_rv_id"), "left")
     )
     event_id = stable_id("genomic_test:assay", F.col("t.genetic_test_id"))
     skey, ssys = subject_key_with_system(
@@ -3808,7 +3925,7 @@ def _genomic_test_canonical_pregate():
         F.col("t.genetic_test_id").cast("string").alias("genetic_test_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         *_identity_mapped_columns(),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter_v2(F.col("accession_encounter_id"), F.col("accession_encounter_conflict"), F.col("_window_encounter_id"), F.col("_window_method")),
         _clamped_ts(F.coalesce(F.col("r._rv_issued_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
@@ -3831,6 +3948,20 @@ def _genomic_test_canonical_pregate():
         F.col("t.test_snomed_code").cast("string").alias("test_snomed_code"),
         F.col("t.test_loinc_code").cast("string").alias("test_loinc_code"),
         F.col("t.test_omop_concept_id").cast("string").alias("test_omop_concept_id"),
+        # GEN4: assay component, its codes, and report-level content from map_pathology_genetic_report
+        F.col("t.assay_component"), F.col("t.is_primary_component"), F.col("t.nhs_test_directory_code"),
+        F.col("t.test_code_method"),
+        F.col("rep.sample_type_site_raw"),
+        F.col("rep.sample_site_snomed_code"),
+        F.col("rep.block_raw"),
+        F.col("rep.tumour_content_raw"),
+        F.col("rep.tumour_content_pct"),
+        F.col("rep.clinical_details_raw"),
+        F.col("rep.indication_snomed_code"),
+        F.col("rep.interpretation_text"),
+        F.col("rep.predicted_response"),
+        F.col("rep.predicted_response_drug_class"),
+        F.col("rep.panel_genes_not_assessed"),
         F.col("t.is_current"), F.col("t.research_qi_only"),
         F.when(superseded, F.lit("superseded")).otherwise(F.lit("active")).alias("record_status"),
         F.lit(None).cast("timestamp").alias("record_status_effective_from"),
@@ -3879,6 +4010,7 @@ def _genomic_result_canonical_pregate():
     j = (
         g.join(parent, F.col("g.genetic_test_id") == F.col("p._gt_id"), "left")
         .join(i, F.col("p._resolved_accession_id") == F.col("i._identity_accession_id"), "left")
+        .join(_genomic_encounter_window_stage(), F.col("p._resolved_accession_id") == F.col("_win_accession_id"), "left")
         .join(r, F.col("g.report_version_id") == F.col("r._rv_id"), "left")
     )
     event_id = stable_id("genomic_result:finding", F.col("g.genetic_result_id"))
@@ -3896,7 +4028,7 @@ def _genomic_result_canonical_pregate():
         F.col("g.genetic_result_id").cast("string").alias("genetic_result_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         *_identity_mapped_columns(),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter_v2(F.col("accession_encounter_id"), F.col("accession_encounter_conflict"), F.col("_window_encounter_id"), F.col("_window_method")),
         _clamped_ts(F.coalesce(F.col("r._rv_issued_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
@@ -3931,6 +4063,19 @@ def _genomic_result_canonical_pregate():
         F.col("g.clinvar_concept_id").cast("string").alias("clinvar_concept_id"),
         F.col("g.omop_genomic_concept_id").cast("string").alias("omop_genomic_concept_id"),
         F.col("g.snomed_code").cast("string").alias("snomed_code"),
+        # GEN4: finding extras, GRCh38 coordinates and concept provenance
+        F.col("g.cosmic_id"),
+        F.col("g.itd_length_bp"),
+        F.col("g.reported_pathogenicity"),
+        F.col("g.resolved_transcript"),
+        F.col("g.transcript_source"),
+        F.col("g.variant_key"),
+        F.col("g.ref_allele"),
+        F.col("g.alt_allele"),
+        F.col("g.coordinate_method"),
+        F.col("g.clinvar_variation_id"),
+        F.col("g.omop_genomic_concept_level"),
+        F.col("g.concept_method"),
         F.col("g.evidence_text"), F.col("g.evidence_start"), F.col("g.evidence_end"),
         F.col("g.parser_profile_id"), F.col("g.parser_version"),
         F.col("g.review_status"), F.col("g.lifecycle_status"),
@@ -3992,7 +4137,7 @@ def _indication_canonical_pregate():
         F.col("x.indication_id").cast("string").alias("indication_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         *_identity_mapped_columns(),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce(F.col("_acc_report_dt"), F.col("_acc_sample_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
@@ -4064,7 +4209,7 @@ def _micro_isolate_canonical_pregate():
         F.col("m.microbiology_isolate_id").cast("string").alias("microbiology_isolate_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         *_identity_mapped_columns(),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce(F.col("_acc_sample_dt"), F.col("_acc_report_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
@@ -4150,7 +4295,7 @@ def _susceptibility_canonical_pregate():
         F.col("a.susceptibility_result_id").cast("string").alias("susceptibility_result_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         *_identity_mapped_columns(),
-        F.lit(None).cast("bigint").alias("encounter_id"),
+        *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce(F.col("_acc_sample_dt"), F.col("_acc_report_dt"),
                                F.col("_acc_request_dt"))).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),

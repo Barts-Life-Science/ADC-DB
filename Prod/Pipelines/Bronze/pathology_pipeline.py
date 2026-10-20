@@ -36,7 +36,6 @@ class PipelineConfig:
     order_detail_table: str = "4_prod.raw.mill_order_detail"
     orders_table: str = "4_prod.raw.mill_orders"
     code_value_table: str = "3_lookup.mill.mill_code_value"
-    enable_approved_accession_merges: bool = False
     enable_result_equivalence: bool = False
 
 
@@ -693,13 +692,119 @@ def _accession_pick(source_stage, name: str, fields, present, leading=()):
     )
 
 
-def build_source_stage(spark, config: PipelineConfig):
-    """Build one row per existing source parent plus accession-grain auxiliaries."""
+# PATH_ACCESSION_ID_DETERMINISTIC_V1 (2026-10-18): new accessions used to be minted with uuid(). uuid() is
+# non-deterministic, so Spark marks every shuffle downstream of it INDETERMINATE and, when a worker is lost
+# mid-shuffle, aborts the write ("cannot rollback the ResultStage") instead of recomputing the lost blocks.
+# Deriving the id from the source accession key makes recomputation give identical ids, so stage retries recover.
+# Existing ids are looked up first and kept; derived ids carry UUID version nibble 5, so they can never equal
+# one of the version-4 ids minted before this change.
+def deterministic_accession_id(source_accession_id):
+    """UUID-shaped pathology_accession_id built from sha256 of the (already namespaced) source accession key."""
+    _, _, F, _ = _imports()
+    digest = F.sha2(F.concat_ws("|", F.lit("pathology_accession_id_v1"), source_accession_id), 256)
+    return F.concat_ws(
+        "-",
+        F.substring(digest, 1, 8),
+        F.substring(digest, 9, 4),
+        F.concat(F.lit("5"), F.substring(digest, 14, 3)),
+        F.concat(F.lit("8"), F.substring(digest, 18, 3)),
+        F.substring(digest, 21, 12),
+    )
+
+
+def core_input_scope(spark, config: PipelineConfig, touched_parent_keys):
+    """Parent keys and normalized lab numbers covering every member of every group a touched parent is in.
+
+    The groups to rebuild are the touched parents' current groups (their lab numbers in map_pathology, or
+    the LabNo inside a LIMS parent key when the parent has left map_pathology) and the groups they were in
+    last run (map_pathology_accession_source). Returns (parents[source_parent_key], labs[normalized_lab_no]).
+    An empty-string lab number is kept: it is itself a shared group key.
+    """
+    _, _, F, _ = _imports()
+    touched = touched_parent_keys.select("source_system", "source_parent_key").dropDuplicates()
+    accession_source = spark.table(f"{config.bronze_schema}.map_pathology_accession_source")
+    previous_groups = (
+        accession_source.join(touched, ["source_system", "source_parent_key"], "inner")
+        .select("match_group_key")
+        .dropDuplicates()
+    )
+    previous_members = accession_source.join(previous_groups, "match_group_key", "inner").select(
+        "source_parent_key", "normalized_lab_no"
+    )
+    current_members = (
+        spark.table(config.map_pathology_table)
+        .select(
+            F.when(F.col("source_table") == "raw", F.lit("TFC_LIMS")).otherwise(F.lit("CERNER")).alias("source_system"),
+            "source_parent_key",
+            _normalize_lab_no(F.col("lab_no")).alias("normalized_lab_no"),
+        )
+        .join(touched, ["source_system", "source_parent_key"], "inner")
+        .select("source_parent_key", "normalized_lab_no")
+    )
+    key_lab = F.split(F.col("source_parent_key"), "[|]").getItem(2)
+    lims_key_labs = touched.where(F.col("source_parent_key").startswith("raw|")).select(
+        "source_parent_key",
+        F.when(key_lab == "\u2205", F.lit(None).cast("string")).otherwise(_normalize_lab_no(key_lab)).alias("normalized_lab_no"),
+    )
+    members = previous_members.unionByName(current_members).unionByName(lims_key_labs)
+    parents = members.select("source_parent_key").unionByName(touched.select("source_parent_key")).dropDuplicates()
+    labs = members.select("normalized_lab_no").where(F.col("normalized_lab_no").isNotNull()).dropDuplicates()
+    return parents, labs
+
+
+def _scope_lims_sample(sample, scope):
+    """Keep LIMS sample rows whose LabNo is a scoped lab number or whose raw parent key is a scoped parent."""
+    _, _, F, _ = _imports()
+    parents, labs = scope
+    keyed = sample.withColumn(
+        "_scope_parent_key",
+        F.concat_ws(
+            "|",
+            F.lit("raw"),
+            F.coalesce(F.col("LIMSNo").cast("string"), F.lit("\u2205")),
+            F.coalesce(F.col("LabNo"), F.lit("\u2205")),
+        ),
+    ).withColumn("_scope_lab", _normalize_lab_no(F.col("LabNo")))
+    lab_hit = labs.select(F.col("normalized_lab_no").alias("_scope_lab"), F.lit(True).alias("_lab_hit"))
+    parent_hit = parents.select(F.col("source_parent_key").alias("_scope_parent_key"), F.lit(True).alias("_parent_hit"))
+    return (
+        keyed.join(lab_hit, "_scope_lab", "left")
+        .join(parent_hit, "_scope_parent_key", "left")
+        .where(F.coalesce(F.col("_lab_hit"), F.lit(False)) | F.coalesce(F.col("_parent_hit"), F.lit(False)))
+        .drop("_scope_parent_key", "_scope_lab", "_lab_hit", "_parent_hit")
+    )
+
+
+def _scope_map_pathology(mapped, scope):
+    """Keep every map_pathology row of each parent that has a scoped lab number or is a scoped parent.
+
+    Whole parents are kept because raw_map and linked aggregate per parent.
+    """
+    _, _, F, _ = _imports()
+    parents, labs = scope
+    lab_parents = (
+        mapped.select("source_parent_key", _normalize_lab_no(F.col("lab_no")).alias("normalized_lab_no"))
+        .join(labs, "normalized_lab_no", "inner")
+        .select("source_parent_key")
+    )
+    keep = lab_parents.unionByName(parents.select("source_parent_key")).dropDuplicates()
+    return mapped.join(keep, "source_parent_key", "left_semi")
+
+
+def build_source_stage(spark, config: PipelineConfig, scope=None):
+    """Build one row per existing source parent plus accession-grain auxiliaries.
+
+    PATH_CORE_INPUT_SCOPE_V1 (2026-10-18): with `scope` = (parents, labs) from core_input_scope(), the LIMS
+    sample and map_pathology inputs are cut down before the expensive deduplication and aggregations.
+    run_core still applies its exact match-group filter afterwards, so the scope only has to be a superset.
+    """
 
     _, Window, F, _ = _imports()
     sample = spark.table(config.sample_table).filter(
         F.expr(_active_filter(spark, config.sample_table))
     )
+    if scope is not None:
+        sample = _scope_lims_sample(sample, scope)
     sample_window = Window.partitionBy("LIMSNo", "LabNo").orderBy(
         F.col("ADC_UPDT").desc_nulls_last(),
         F.col("SampleDT").desc_nulls_last(),
@@ -713,6 +818,8 @@ def build_source_stage(spark, config: PipelineConfig):
     )
 
     mapped = spark.table(config.map_pathology_table)
+    if scope is not None:
+        mapped = _scope_map_pathology(mapped, scope)
     raw_map = (
         mapped.filter(F.col("source_table") == "raw")
         .groupBy("source_parent_key")
@@ -896,13 +1003,20 @@ def build_source_stage(spark, config: PipelineConfig):
         source_ids = source_ids.withColumn("_existing_accession_id", F.lit(None).cast("string"))
     source_ids = source_ids.withColumn(
         "pathology_accession_id",
-        F.coalesce(F.col("_existing_accession_id"), F.expr("uuid()")),
+        F.coalesce(F.col("_existing_accession_id"), deterministic_accession_id(F.col("source_accession_id"))),
     ).select("source_accession_id", "pathology_accession_id")
     return source.join(source_ids, "source_accession_id", "inner")
 
 
+# PATH_AUTO_MERGE_V1: the code-defined LIMS <-> Cerner accession merge rule (no approval table, no flag).
+AUTO_MERGE_RULE_ID = "lab_no_date_star_v1"
+AUTO_MERGE_RULE_VERSION = "1"
+# 99.98% of identifier-agreeing star candidates are 0 or 1 day apart (prod, 2026-10-17); wider gaps stay proposed.
+AUTO_MERGE_MAX_DAY_DIFFERENCE = 1
+
+
 def build_link_candidates(spark, source_stage, config: PipelineConfig):
-    """Generate bounded raw↔Cerner candidates and approved unique merges."""
+    """Generate bounded raw↔Cerner candidates and the rule-decided merges (PATH_AUTO_MERGE_V1)."""
 
     _, Window, F, _ = _imports()
     grouped = source_stage.groupBy("source_accession_id", "source_system", "pathology_accession_id").agg(
@@ -915,6 +1029,8 @@ def build_link_candidates(spark, source_stage, config: PipelineConfig):
         F.min("sample_dt").alias("sample_dt"),
         F.max("report_dt").alias("report_dt"),
         F.first("match_group_key", ignorenulls=True).alias("match_group_key"),
+        F.countDistinct("normalized_lab_no").alias("lab_number_count"),  # PATH_AUTO_MERGE_V1
+        F.countDistinct("person_id").alias("person_count"),
     ).withColumn("match_dt", _source_date())
 
     raw = grouped.filter(F.col("source_system") == "TFC_LIMS").alias("r")
@@ -946,50 +1062,35 @@ def build_link_candidates(spark, source_stage, config: PipelineConfig):
         F.col("l.source_site_code").alias("linked_site"),
         F.col("r.wkg_code").alias("raw_wkg_code"),
         F.col("r.normalized_lab_no").alias("normalized_lab_no"),
+        # PATH_AUTO_MERGE_V1: only single-lab, single-patient source accessions may merge.
+        ((F.col("r.lab_number_count") == 1) & (F.col("l.lab_number_count") == 1)
+         & (F.col("r.person_count") <= 1) & (F.col("l.person_count") <= 1)).alias("_single_sample_pair"),
     )
     left_counts = candidates.groupBy("left_source_accession_id").count().withColumnRenamed("count", "left_candidate_count")
     right_counts = candidates.groupBy("right_source_accession_id").count().withColumnRenamed("count", "right_candidate_count")
     candidates = candidates.join(left_counts, "left_source_accession_id").join(right_counts, "right_source_accession_id")
 
-    approved_rule = None
-    rules_table = f"{config.lookup_schema}.pathology_accession_link_rule"
-    if table_exists(spark, rules_table):
-        rules = (
-            spark.table(rules_table)
-            .filter(
-                (F.upper(F.col("status")) == "APPROVED")
-                & (F.col("auto_merge_ind") == True)
-                & (F.current_timestamp() >= F.coalesce(F.col("valid_from"), F.lit("1900-01-01").cast("timestamp")))
-                & (F.current_timestamp() < F.coalesce(F.col("valid_to"), F.lit("9999-12-31").cast("timestamp")))
-            )
-            .orderBy(F.col("reviewed_at").desc_nulls_last())
-            .limit(1)
-            .collect()
-        )
-        approved_rule = rules[0].asDict() if rules else None
-
+    # PATH_AUTO_MERGE_V1: a candidate merges when its Cerner order (right side) matches only this LIMS
+    # accession, both sides are a single sample (one lab number, at most one patient), the two sides name the
+    # same person, nothing conflicts and the dates are close. The LIMS side may carry many candidates: those are
+    # the other orders of the same sample, and they all merge into it.
     can_merge = (
-        F.lit(bool(config.enable_approved_accession_merges and approved_rule))
-        & (F.col("left_candidate_count") == 1)
-        & (F.col("right_candidate_count") == 1)
+        (F.col("right_candidate_count") == 1)
+        & F.col("_single_sample_pair")
+        & F.col("identifier_agreement")
         & ~F.col("identifier_conflict")
+        & (F.col("day_difference") <= F.lit(AUTO_MERGE_MAX_DAY_DIFFERENCE))
     )
-    if approved_rule:
-        can_merge = can_merge & (
-            F.col("day_difference") <= F.lit(int(approved_rule["max_day_difference"]))
-        )
-        if approved_rule.get("require_identifier_agreement"):
-            can_merge = can_merge & F.col("identifier_agreement")
-        if approved_rule.get("require_site_agreement"):
-            can_merge = can_merge & F.col("raw_site").eqNullSafe(F.col("linked_site"))
 
-    rule_id = approved_rule["rule_id"] if approved_rule else "lab_no_date_candidate_v1"
-    rule_version = approved_rule["rule_version"] if approved_rule else "1"
+    # The candidate-generation rule is unchanged; its id and version are hashed into link_candidate_id, so they
+    # stay as they were and the merge rule is recorded in the evidence instead.
+    rule_id = "lab_no_date_candidate_v1"
+    rule_version = "1"
     candidates = (
         candidates.withColumn(
             "candidate_status",
             F.when(F.col("identifier_conflict"), F.lit("conflicted"))
-            .when(can_merge, F.lit("approved"))
+            .when(can_merge, F.lit("merged"))
             .otherwise(F.lit("proposed")),
         )
         .withColumn("candidate_rule_id", F.lit(rule_id))
@@ -1027,28 +1128,41 @@ def build_link_candidates(spark, source_stage, config: PipelineConfig):
                     "raw_wkg_code",
                     "left_candidate_count",
                     "right_candidate_count",
+                    F.when(F.col("candidate_status") == "merged", F.lit(AUTO_MERGE_RULE_ID)).alias("merge_rule_id"),
+                    F.when(F.col("candidate_status") == "merged", F.lit(AUTO_MERGE_RULE_VERSION)).alias("merge_rule_version"),
                 )
             ),
         )
     )
 
-    approved = candidates.filter(F.col("candidate_status") == "approved")
-    merge_map = (
-        approved.select(
+    # The merge map: every member of a merged star points at the LIMS (left) accession. Each Cerner order has
+    # exactly one merged candidate (right_candidate_count = 1), so a member never gets two survivors; the LIMS
+    # accession maps to itself, which marks its own source rows as confirmed.
+    merged = candidates.filter(F.col("candidate_status") == "merged")
+    members = (
+        merged.select(
             F.col("left_pathology_accession_id").alias("member_id"),
-            F.least("left_pathology_accession_id", "right_pathology_accession_id").alias("survivor_id"),
-            F.col("candidate_rule_id").alias("merge_rule_id"),
-            F.col("evidence_json").alias("merge_evidence_json"),
+            F.col("left_pathology_accession_id").alias("survivor_id"),
         )
         .unionByName(
-            approved.select(
+            merged.select(
                 F.col("right_pathology_accession_id").alias("member_id"),
-                F.least("left_pathology_accession_id", "right_pathology_accession_id").alias("survivor_id"),
-                F.col("candidate_rule_id").alias("merge_rule_id"),
-                F.col("evidence_json").alias("merge_evidence_json"),
+                F.col("left_pathology_accession_id").alias("survivor_id"),
             )
         )
         .dropDuplicates(["member_id"])
+    )
+    # One evidence document per star - the smallest of its pairs' evidence - shared by every member. Once merged,
+    # all members carry the survivor's id, so per-member evidence would be picked arbitrarily on the next run;
+    # a per-star choice gives the same link evidence on every run. Each pair's own evidence stays on its candidate.
+    star_evidence = merged.groupBy(F.col("left_pathology_accession_id").alias("_star_id")).agg(
+        F.min("evidence_json").alias("merge_evidence_json")
+    )
+    merge_map = members.join(star_evidence, members.survivor_id == star_evidence._star_id, "inner").select(
+        "member_id",
+        "survivor_id",
+        F.lit(AUTO_MERGE_RULE_ID).alias("merge_rule_id"),
+        "merge_evidence_json",
     )
     return candidates, merge_map
 
@@ -1614,7 +1728,12 @@ def run_core(
 
     try:
         ensure_contracts(spark, config)
-        source_stage = build_source_stage(spark, config)
+        scope = None
+        if touched_parent_keys is not None:
+            # Stage the narrow input scope once; the builder then reads small inputs (see build_source_stage).
+            scope_parents, scope_labs = core_input_scope(spark, config, touched_parent_keys)
+            scope = (materialize(scope_parents, "scope_parents"), materialize(scope_labs, "scope_labs"))
+        source_stage = build_source_stage(spark, config, scope=scope)
         scoped_match_groups = None
         if touched_parent_keys is not None:
             _, _, F, _ = _imports()

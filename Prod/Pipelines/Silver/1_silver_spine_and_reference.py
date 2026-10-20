@@ -1911,7 +1911,7 @@ def _event_index():
                                 "journey_clinical.specimen", "clinical"),
         _event_index_projection(_pathology_report_series_canonical(), "pathology_report",
                                 "journey_clinical.pathology_report", "clinical"),
-        _event_index_projection(_pathology_result_canonical(), "pathology_result",
+        _event_index_projection(_pathology_result_canonical(include_accession_encounter=True), "pathology_result",  # PATH_ENCOUNTER_V1
                                 "journey_clinical.pathology_result", "clinical"),
         _event_index_projection(_genomic_test_canonical(), "genomic_test",
                                 "journey_clinical.genomic_test", "clinical"),
@@ -5977,4 +5977,3 @@ def person_gp_registration():
     # Build the declared dataset: registered GP practice history per person.
     return gp_registration_body(read_source(SRC_GP_REGISTRATION)).withColumn(
         "person_gp_registration_key", stable_id("person_gp_registration:mill", F.col("person_org_reltn_id")))
-

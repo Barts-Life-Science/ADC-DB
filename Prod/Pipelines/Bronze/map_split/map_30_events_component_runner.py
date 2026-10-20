@@ -72,6 +72,21 @@ if _map_split_computed_hash != _map_split_manifest_hash:
     })
 _PIPELINE_SOURCE_MANIFEST = _map_split_manifest
 _PIPELINE_SOURCE_MANIFEST_HASH = _map_split_manifest_hash
+
+
+def _mp30_pinned_version(table_name, latest_version):
+    """Delta version a component must read: the initializer manifest's when the source is in it, else latest.
+
+    MAP30_MANIFEST_VERSIONS_V1 (2026-10-18): components used to read each source's latest version, so one run's
+    components (and a retry) could read different snapshots under one manifest hash. A source missing from the
+    manifest (for example an output written earlier in this run) still reads its latest version, and says so.
+    """
+    pinned = _PIPELINE_SOURCE_MANIFEST.get(table_name)
+    if pinned is not None:
+        return int(pinned)
+    version = int(latest_version(table_name))
+    print(f'[MAP-SPLIT] {table_name} is not in the source manifest; reading latest version {version}')
+    return version
 _map_split_effective_full_refresh = str(
     dbutils.widgets.get('effective_full_refresh') or ''
 ).strip().lower()
@@ -165,8 +180,8 @@ def _mp30_persist_stage(frame):
     Serverless supports no .cache()/.persist()/.localCheckpoint(), so a frame referenced by
     more than one Spark action re-executes its entire upstream DAG on every action. Staging
     replaces that with one write plus cheap table reads. Stage names match the _map_common
-    orphan-staging sweep so an aborted run cannot leave the table behind, and a write failure
-    degrades to the unstaged frame rather than failing the component.
+    orphan-staging sweep so an aborted run cannot leave the table behind. A write failure is
+    retried once and then fails the component.
     """
     if frame is None:
         return frame
@@ -180,15 +195,37 @@ def _mp30_persist_stage(frame):
     try:
         frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
     except Exception as stage_error:
-        print(f'[WARN] persist stage write failed for {stage_table}; continuing unmaterialized: {str(stage_error)[:500]}')
+        # PERSIST_STAGE_FAIL_CLOSED_V1 (2026-10-18): retry once, then fail. Continuing unstaged re-ran the whole upstream
+        # lineage at every later action (map_text 2026-10-18: 20.7 of 23.8 MERGE minutes) and hid the failure.
+        print(f'[WARN] persist stage write failed for {stage_table}; retrying once: {str(stage_error)[:500]}')
         try:
             spark.sql(f'DROP TABLE IF EXISTS {_mp30_sql_identifier(stage_table)}')
-        except Exception:
-            pass
-        return frame
+            frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
+        except Exception as retry_error:
+            try:
+                spark.sql(f'DROP TABLE IF EXISTS {_mp30_sql_identifier(stage_table)}')
+            except Exception:
+                pass
+            raise RuntimeError(
+                f'persist stage {stage_table} failed twice; failing the component instead of recomputing unstaged'
+            ) from retry_error
     staged = spark.table(stage_table)
     _MP30_PERSIST_STAGES[id(staged)] = (staged, stage_table)
     return staged
+
+
+def _mp30_live_target_keys(target_table: str):
+    """EVENT_IDs that are live (not source-deleted) in a target now.
+
+    MAP30_DEPARTURE_SCOPE_V1 (2026-10-18): a changed key can only depart (be marked deleted or out of scope) if it
+    is live in the target. On 2026-10-18 text sent 3.81M departure keys to a MERGE that updated 10,164 rows, and
+    re-marking already-deleted rows re-hashed their ROW_HASH on every run.
+    """
+    return (
+        spark.table(target_table)
+        .where(~F.coalesce(F.col('SOURCE_DELETED_IND'), F.lit(False)))
+        .select('EVENT_ID')
+    )
 
 
 def _mp30_persist_stage_drop(frame) -> None:
@@ -259,7 +296,7 @@ def _mne_latest_delta_version(table_name: str) -> int:
     return int(row['version'])
 
 def _mne_capture_source_versions(config: MapNumericEventsConfig) -> Dict[str, int]:
-    return {source: _mne_latest_delta_version(source) for source in _mne_source_tables(config)}
+    return {source: _mp30_pinned_version(source, _mne_latest_delta_version) for source in _mne_source_tables(config)}
 
 def _m30_hardening_sql_identifier(table_name: str) -> str:
     return '.'.join('`' + part.replace('`', '``') + '`' for part in table_name.split('.'))
@@ -897,7 +934,9 @@ def _mne_incremental_update(config: MapNumericEventsConfig, previous_versions: D
         updates = _mp30_persist_stage(all_updates.where(F.col('IN_NUMERIC_SCOPE_IND')) if config.numeric_semantic_only else all_updates)
         try:
             retained_keys = updates.select('EVENT_ID').dropDuplicates()
-            deleted_or_out_of_scope = changed_keys.join(retained_keys, 'EVENT_ID', 'left_anti')
+            deleted_or_out_of_scope = changed_keys.join(retained_keys, 'EVENT_ID', 'left_anti').join(
+                _mp30_live_target_keys(config.target_table), 'EVENT_ID', 'left_semi'
+            )
             metrics: Dict[str, object] = {'mode': 'INCREMENTAL', 'changed_event_ids': int(changed_count), 'broadcast_event_ids': bool(broadcast_keys)}
             metrics.update(_mne_merge_active_updates(config, updates))
             metrics.update(_mne_mark_deleted_or_out_of_scope(config, deleted_or_out_of_scope, source_versions, run_id, run_timestamp))
@@ -1339,7 +1378,7 @@ def _mte_capture_source_versions(
     previous_versions: Optional[Dict[str, int]] = None,
 ) -> Dict[str, int]:
     versions = _mne_capture_source_versions(config)
-    versions[config.long_text_table] = _mne_latest_delta_version(config.long_text_table)
+    versions[config.long_text_table] = _mp30_pinned_version(config.long_text_table, _mne_latest_delta_version)
     return _mte_align_source_versions_to_numeric_base(
         config,
         versions,
@@ -2624,7 +2663,9 @@ def _mte_incremental_update(
         )
         try:
             retained_keys = updates.select("EVENT_ID").dropDuplicates()
-            removed = changed_keys.join(retained_keys, "EVENT_ID", "left_anti")
+            removed = changed_keys.join(retained_keys, "EVENT_ID", "left_anti").join(
+                _mp30_live_target_keys(config.target_table), "EVENT_ID", "left_semi"
+            )
             metrics: Dict[str, object] = {
                 "mode": "INCREMENTAL",
                 "changed_event_ids": int(changed_count),
@@ -3023,7 +3064,7 @@ def _latest_delta_version(table_name: str) -> int:
     return int(row['version'])
 
 def _capture_source_versions(config: MapDateEventsConfig) -> Dict[str, int]:
-    return {source: _latest_delta_version(source) for source in _source_tables(config)}
+    return {source: _mp30_pinned_version(source, _latest_delta_version) for source in _source_tables(config)}
 
 def _read_snapshot(table_name: str, version: int) -> DataFrame:
     return _m30_hardening_read_pinned_snapshot(table_name, int(version))
@@ -3534,7 +3575,15 @@ def _latest_table_version(table_name: str) -> Tuple[int, object]:
     return (int(row['version']), row['timestamp'])
 
 def capture_source_versions() -> Dict[str, int]:
-    return {table: _latest_table_version(table)[0] for table in MAP_NOMEN_SOURCES}
+    return {table: _mp30_pinned_version(table, lambda name: _latest_table_version(name)[0]) for table in MAP_NOMEN_SOURCES}
+
+
+def _mp30_version_timestamp(table_name: str, version: int):
+    """Commit timestamp of one Delta version: the pinned end of a nomenclature change batch."""
+    row = spark.sql(f'DESCRIBE HISTORY {qname(table_name)}').where(F.col('version') == int(version)).select('timestamp').first()
+    if row is None:
+        raise RuntimeError(f'No Delta history row for {table_name} version {version}')
+    return row['timestamp']
 
 def _has_cdf(table_name: str) -> bool:
     detail = spark.sql(f'DESCRIBE DETAIL {qname(table_name)}').first()
@@ -3587,7 +3636,7 @@ def read_change_batches(end_versions: Dict[str, int]) -> Dict[str, ChangeBatch]:
             raise FullRebuildRequired(f'CDF is not enabled for {table_name}')
         start_version = int(checkpoints[table_name]) + 1
         end_version = int(end_versions[table_name])
-        end_timestamp = _latest_table_version(table_name)[1]
+        end_timestamp = _mp30_version_timestamp(table_name, end_version)
         if start_version > end_version:
             batches[table_name] = ChangeBatch(table_name, start_version, end_version, end_timestamp, None)
             continue
@@ -4070,7 +4119,9 @@ class MapCodedEventsConfig:
     concept_source: str = '3_lookup.omop.concept'
     trust_scope: Optional[str] = 'Barts'
     cdf_retention: str = 'interval 30 days'
-    broadcast_event_id_limit: int = 1000000
+    # MAP30_CODED_BROADCAST_V1 (2026-10-18): same limit as numeric/text. 3.93M affected events exceeded 1M, so
+    # every clinical_event join became a shuffle; up to 10M LONG keys broadcast comfortably on the events lane.
+    broadcast_event_id_limit: int = 10000000
 
     @property
     def source_tables(self) -> Tuple[str, ...]:
@@ -4379,7 +4430,7 @@ def rebuild_map_coded_events_v2(config: MapCodedEventsConfig=DEFAULT_CODED_EVENT
     if configure_source_retention:
         configure_map_source_cdf_retention(config)
     try:
-        versions = {table: get_latest_delta_version(table) for table in config.source_tables}
+        versions = {table: _mp30_pinned_version(table, get_latest_delta_version) for table in config.source_tables}
         base, caches = build_coded_events_base(None, config, source_versions=versions)
         bridge, summary = build_omop_mapping_outputs(base, config, source_versions=versions)
         final = attach_omop_mapping_summary(base, summary)
@@ -4464,7 +4515,7 @@ def process_coded_events_incremental_v2(config: MapCodedEventsConfig=DEFAULT_COD
     missing = [table for table in config.source_tables if table not in checkpoints]
     if missing:
         raise RuntimeError('Missing source-version checkpoints for: ' + ', '.join(missing) + '. Run rebuild_map_coded_events_v2() once before enabling the incremental entry point.')
-    current_versions = {table: get_latest_delta_version(table) for table in config.source_tables}
+    current_versions = {table: _mp30_pinned_version(table, get_latest_delta_version) for table in config.source_tables}
     changed_ranges = {table: (checkpoints[table] + 1, current_versions[table]) for table in config.source_tables if current_versions[table] > checkpoints[table]}
     if not changed_ranges:
         return {'status': 'NO_CHANGES', 'checkpoint_versions': current_versions}

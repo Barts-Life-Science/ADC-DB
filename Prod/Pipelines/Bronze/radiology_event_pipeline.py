@@ -412,6 +412,48 @@ if _target_state_current(TARGET,CURRENT_SOURCE_VERSIONS):
         "source_versions":CURRENT_SOURCE_VERSIONS,
     },sort_keys=True))
 
+def nhsi_lookup_affected_events(previous_version,current_version):
+    """EVENT_IDs whose exam-code parse can change because the NHSI lookup changed between two Delta versions.
+
+    RAD_NHSI_VERSION_DIFF_V1 (2026-10-18): the old trigger re-read every lookup row inside a 24 h overlap below a
+    watermark equal to the static lookup's own max SOURCE_LOADED_AT, so it was never empty and every run recomputed
+    all ~34.4M events. Now: same version -> no events; unknown baseline or unreadable old version -> all events (the
+    old behaviour); otherwise class-234 events whose REFERENCE_NBR ends, optionally followed by one role digit, in a
+    code whose mapping was added, removed or changed.
+    """
+    target_ids=spark.table(TARGET).select("EVENT_ID")
+    if previous_version is not None and int(previous_version)==int(current_version):
+        return target_ids.limit(0)
+    if previous_version is None:
+        return target_ids
+    try:
+        before=spark.read.option("versionAsOf",int(previous_version)).table(NHSI_LOOKUP)
+        before.limit(1).count()
+    except Exception as error:
+        print({"nhsi_lookup_baseline_unreadable":str(error)[:200]})
+        return target_ids
+    after=spark.read.option("versionAsOf",int(current_version)).table(NHSI_LOOKUP)
+    def pairs(frame):
+        return frame.select(F.upper("EXAM_TYPE_CODE").alias("_CODE"),F.col("NHSI_MAPPING").alias("_NHSI"))
+    changed=pairs(before).subtract(pairs(after)).unionByName(pairs(after).subtract(pairs(before)))
+    codes=[r["_CODE"] for r in changed.select("_CODE").where("_CODE IS NOT NULL").distinct().collect()]
+    print({"nhsi_lookup_changed_codes":len(codes)})
+    if not codes:
+        return target_ids.limit(0)
+    return spark.table(TARGET).where((F.col("EVENT_CLASS_CD")==234)&reference_ends_with_code(codes)).select("EVENT_ID")
+
+
+def reference_ends_with_code(codes):
+    """True when upper(REFERENCE_NBR) ends in one of `codes`, optionally followed by one trailing role digit."""
+    ref=F.upper(F.col("REFERENCE_NBR"))
+    hit=F.lit(False)
+    for length in sorted({len(code) for code in codes}):
+        for trail in (0,1):
+            tail=F.substring(ref,F.length(ref)-F.lit(trail+length)+F.lit(1),length)
+            hit=hit|tail.isin(codes)
+    return hit
+
+
 marks={}
 snap,event_inc,event_boundary,event_version=pinned_event_slice()
 marks[EVENT_SOURCE]=wm_get(PIPE,EVENT_SOURCE)
@@ -432,8 +474,8 @@ if spark.catalog.tableExists(TARGET):
                  .where(F.col("EVENT_CLASS_CD").isin([224,231]))
                  .select(F.col("PARENT_EVENT_ID_NORM").alias("EVENT_ID")).where("EVENT_ID IS NOT NULL"))
     affected=affected.union(old_parents).distinct()
-    if lookup_inc.limit(1).count()>0:
-        affected=affected.union(spark.table(TARGET).select("EVENT_ID")).distinct()
+    affected=affected.union(nhsi_lookup_affected_events(
+        PREVIOUS_SOURCE_VERSIONS.get(NHSI_LOOKUP),CURRENT_SOURCE_VERSIONS[NHSI_LOOKUP])).distinct()
     changed_cv=cv_inc.select(F.col("CODE_VALUE").cast("bigint").alias("_CD")).distinct()
     cv_events=(spark.table(TARGET).join(changed_cv,
       (F.col("CONTRIBUTOR_SYSTEM_CD")==F.col("_CD"))|(F.col("EVENT_CLASS_CD")==F.col("_CD"))|
@@ -757,4 +799,3 @@ print("A9 build complete")
 # and record the warm-median weekly cost. NICIP concept columns remain a follow-up after S4 Task 5b.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-

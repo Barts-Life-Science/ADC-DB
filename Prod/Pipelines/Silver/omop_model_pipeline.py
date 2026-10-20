@@ -45,8 +45,14 @@ IMD_UNIT_CONCEPT_ID = 37524288
 # Cerner address types HOME (756) and PREVIOUS (758); business, mailing and temporary addresses
 # do not describe where the person lives.
 IMD_ADDRESS_TYPES = ("756", "758")
-# Pinned on 2026-09-24 to max(to_date(4_prod.silver.spine_person.loaded_at)).
-SOURCE_RELEASE_DATE = "2026-09-21"
+# OMOP_RUN_DATE_V1: weekly incremental model with no pinned release; the data cut is the UTC date this
+# update runs (observation_period end, future-death clamp, cdm_source, IMD/area date gate).
+from datetime import datetime as _omop_run_datetime, timezone as _omop_run_timezone
+SOURCE_RELEASE_DATE = _omop_run_datetime.now(_omop_run_timezone.utc).date().isoformat()
+# INCR_FIX_20261018: SOURCE_RELEASE_DATE is now a literal only in the one-row _om_run_day MV and in the tiny
+# cdm_source/metadata tables. Every other model reaches the run date through _om_run_day or _om_future_day,
+# so its query text stays the same from run to run and it can refresh incrementally.
+CALENDAR_LAST_DATE = "2300-12-31"  # last row of 3_lookup.omop.calendar_day; later dates are always "after"
 CARRY_CAUSE_TEXT = True
 CARRY_STAFF_IDENTIFIERS = True
 
@@ -110,6 +116,7 @@ SOURCE_TABLES = {
     "lkp_maternity_map": "3_lookup.omop.omop_maternity_concept_map",
     "lkp_vte_item_map": "3_lookup.omop.omop_maternity_vte_item_map",
     "lkp_stage_map": "3_lookup.omop.omop_stage_group_map",
+    "lkp_calendar": "3_lookup.omop.calendar_day",  # INCR_FIX_20261018
 }
 
 # Unqualified reads bind to datasets in this pipeline and therefore follow the
@@ -119,6 +126,8 @@ PIPELINE_DATASETS = {
     "src_om_visit_detail": "visit_detail",
     "src_om_specimen": "specimen",
     "src_om_observation_period": "observation_period",
+    "src_om_person": "person",  # OMOP_PREG_INFANT_V1
+    "src_om_condition_occurrence": "condition_occurrence",  # OMOP_PREG_INFANT_V1
 }
 
 # Dev sources promoted 2026-09-26: lookups to 3_lookup.omop, the ID registry to 4_prod.omop_meta.
@@ -225,7 +234,7 @@ def _finish(table, frame, transforms=True, **kw):
 
 
 def _evidence_extensions():
-    empty = spark.createDataFrame([], "person_id bigint, _evidence_start timestamp")
+    empty = _om_empty_frame([("person_id", "bigint"), ("_evidence_start", "timestamp")])  # INCR_FIX_20261018
     for builder in EVIDENCE_BUILDERS:
         empty = empty.unionByName(builder().select(
             F.col("person_id").cast("bigint").alias("person_id"),
@@ -236,7 +245,8 @@ def _evidence_extensions():
 
 def _extension_condition_occurrences():
     """Extension CONDITION_OCCURRENCE rows in the condition-era input shape."""
-    empty = spark.createDataFrame([], "person_id bigint, condition_concept_id int, _start date, _end date")
+    empty = _om_empty_frame([("person_id", "bigint"), ("condition_concept_id", "int"),  # INCR_FIX_20261018
+                             ("_start", "date"), ("_end", "date")])
     for builder in TABLE_EXTENSIONS.get("condition_occurrence", []):
         empty = empty.unionByName(builder().select(
             "person_id", "condition_concept_id",
@@ -465,6 +475,82 @@ def _death_cause_map():
     return unique.where(F.col("_dc_n") == 1).select("_dc_text", "_dc_concept_id", "_dc_method")
 
 
+# ==== INCR_FIX_20261018: the run date as data, not as query text ====
+
+@dp.materialized_view(
+    name="_om_run_day",
+    comment="Internal: one row holding this update's run (extraction) date, read from the calendar table. The only model whose definition carries the run-date literal, so a new run date re-plans this row and nothing else.",
+)
+def _om_run_day():
+    return (
+        read_source("lkp_calendar")
+        .where(F.col("calendar_date") == F.to_date(F.lit(SOURCE_RELEASE_DATE)))
+        .select(F.col("calendar_date").alias("_om_run_date"), F.lit(True).alias("_om_run_key"))
+    )
+
+
+@dp.materialized_view(
+    name="_om_future_day",
+    comment="Internal: every calendar date after the run date. Models left-join it on their own date, so a new run date only touches rows dated between the old and the new run date.",
+)
+def _om_future_day():
+    run = spark.read.table("_om_run_day")
+    return (
+        read_source("lkp_calendar")
+        .withColumn("_om_run_key", F.lit(True))
+        .join(run, "_om_run_key")
+        .where(F.col("calendar_date") > F.col("_om_run_date"))
+        .select(F.col("calendar_date").alias("_om_future_date"))
+    )
+
+
+def _after_run_date(frame, date_column, flag):
+    """Add boolean `flag`: the DATE column `date_column` is after the run date.
+
+    Same result as `date_column > run date` (NULL when the date is NULL), computed by an equi-join on
+    _om_future_day instead of a comparison with a literal.
+    """
+    future = spark.read.table("_om_future_day").withColumn("_om_future_hit", F.lit(True))
+    after = F.col("_om_future_hit").isNotNull() | (F.col(date_column) > F.lit(CALENDAR_LAST_DATE).cast("date"))
+    return (
+        frame.join(future, F.col(date_column) == F.col("_om_future_date"), "left")
+        .withColumn(flag, F.when(F.col(date_column).isNotNull(), after))
+        .drop("_om_future_date", "_om_future_hit")
+    )
+
+
+def _run_date_where(frame, flag):
+    """Add `_om_run_date` on rows whose boolean `flag` is true (NULL elsewhere).
+
+    An equi-join on the flag, so a new run date re-touches only the flagged rows.
+    """
+    run = spark.read.table("_om_run_day").withColumnRenamed("_om_run_key", "_om_run_flag")
+    return frame.join(run, F.col(flag) == F.col("_om_run_flag"), "left").drop("_om_run_flag")
+
+
+def _om_empty_frame(columns):
+    """A typed empty frame read from a Delta table; a literal empty DataFrame would stop incremental refresh.
+
+    `columns` is a list of (name, Spark SQL type) pairs.
+    """
+    return read_source("lkp_calendar").where(F.lit(False)).select(
+        *[F.lit(None).cast(dtype).alias(name) for name, dtype in columns]
+    )
+
+
+def _om_constant_rows(rows, schema):
+    """Constant rows (tuples matching `schema`) anchored on one calendar row instead of spark.createDataFrame."""
+    anchor = read_source("lkp_calendar").where(F.col("calendar_date") == F.lit("2000-01-01").cast("date"))
+    frames = [
+        anchor.select(*[F.lit(value).cast(field.dataType).alias(field.name) for value, field in zip(row, schema.fields)])
+        for row in rows
+    ]
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.unionByName(frame)
+    return result
+
+
 def _death_base():
     people = read_source("src_person").select(
         F.col("person_id").alias("_person_source_id"),
@@ -509,14 +595,24 @@ def _death_base():
         F.col("_evidence_deceased_datetime"),
         F.col("_person_deceased_datetime"),
     )
-    release_date = F.to_date(F.lit(SOURCE_RELEASE_DATE))
-    future_date = F.to_date(raw_date_value) > release_date
+    # INCR_FIX_20261018: future deaths clamp to the run date through _om_future_day/_om_run_day, not a literal.
+    joined = _after_run_date(joined.withColumn("_om_death_day", F.to_date(raw_date_value)),
+                             "_om_death_day", "_om_death_future")
+    joined = _after_run_date(joined.withColumn("_om_death_dt_day", F.to_date(raw_datetime_value)),
+                             "_om_death_dt_day", "_om_death_dt_future")
+    joined = _run_date_where(
+        joined.withColumn("_om_death_any_future",
+                          F.coalesce(F.col("_om_death_future"), F.lit(False))
+                          | F.coalesce(F.col("_om_death_dt_future"), F.lit(False))),
+        "_om_death_any_future",
+    )
+    future_date = F.col("_om_death_future")
     return joined.select(
         "person_id",
-        F.when(future_date, release_date).otherwise(F.to_date(raw_date_value)).alias("death_date"),
+        F.when(future_date, F.col("_om_run_date")).otherwise(F.to_date(raw_date_value)).alias("death_date"),
         F.when(
-            F.to_date(raw_datetime_value) > release_date,
-            F.to_timestamp(F.lit(SOURCE_RELEASE_DATE)),
+            F.col("_om_death_dt_future"),
+            F.col("_om_run_date").cast("timestamp"),
         ).otherwise(raw_datetime_value.cast("timestamp")).alias("death_datetime"),
         F.lit(32817).cast("int").alias("death_type_concept_id"),
         F.coalesce(F.col("_dc_concept_id"), F.lit(0)).cast("int").alias("cause_concept_id"),  # OGR_DEATH_CAUSE_V1
@@ -1170,7 +1266,13 @@ def visit_detail():
     )
 
 
-def _observation_period_base():
+@dp.materialized_view(
+    name="_om_observation_start",
+    comment="Internal: per person, the observation-period start, the death and censoring-age bounds and the gate reason. Carries no run-date literal, so new evidence refreshes it incrementally; observation_period adds the run-date end.",
+)
+def _om_observation_start():
+    # INCR_FIX_20261018: the evidence aggregation (billions of routed events) moved out of
+    # _observation_period_base into this model, whose result does not move with the run date.
     # HERON-UK convention for sources without enrolment dates: one period per person from the
     # first published record to the earliest of death, the censoring age and the extraction
     # (source release) date. Evidence dated before birth - 1 day (maternal records, epoch
@@ -1228,26 +1330,49 @@ def _observation_period_base():
         .where(F.col("_exclusion_reason").isNull())
         .select("person_id", F.col("death_date").alias("_death_date"))
     )
-    release_date = F.to_date(F.lit(SOURCE_RELEASE_DATE))
     joined = (
         per_person
         .join(people, per_person.person_id == F.col("_published_person_id"), "left")
         .join(deaths, "person_id", "left")
+        .withColumn("_om_start", F.to_date("_min_start"))
     )
+    joined = _after_run_date(joined, "_om_start", "_om_start_after_run")
     censor_date = F.add_months(F.col("_birth_date"), CENSOR_AGE_YEARS * 12)
-    start = F.to_date("_min_start")
-    end = F.least(release_date, F.col("_death_date"), censor_date)
+    start = F.col("_om_start")
     return joined.select(
-        F.col("person_id").alias("observation_period_id"),
         "person_id",
-        start.alias("observation_period_start_date"),
-        end.alias("observation_period_end_date"),
-        F.lit(32817).cast("int").alias("period_type_concept_id"),
+        "_om_start",
+        "_death_date",
+        censor_date.alias("_om_censor_date"),
         F.when(F.col("_published_person_id").isNull(), F.lit("person_not_published"))
         .when(F.col("_death_date") < start, F.lit("first_record_after_death"))
         .when(censor_date < start, F.lit("first_record_after_censor_age"))
-        .when(release_date < start, F.lit("first_record_after_extraction"))
+        .when(F.col("_om_start_after_run"), F.lit("first_record_after_extraction"))
         .alias("_exclusion_reason"),
+    )
+
+
+def _observation_period_base():
+    """Observation periods: _om_observation_start plus the end date (INCR_FIX_20261018).
+
+    The end is the earliest of death, the censoring age and the run (extraction) date. Every open period
+    ends on the run date, so this step recomputes each run by design, but it reads one row per person
+    (_om_observation_start), never the evidence behind it.
+    """
+    run = spark.read.table("_om_run_day")
+    return (
+        spark.read.table("_om_observation_start")
+        .withColumn("_om_run_key", F.lit(True))
+        .join(run, "_om_run_key")
+        .select(
+            F.col("person_id").alias("observation_period_id"),
+            "person_id",
+            F.col("_om_start").alias("observation_period_start_date"),
+            F.least(F.col("_om_run_date"), F.col("_death_date"), F.col("_om_censor_date"))
+            .alias("observation_period_end_date"),
+            F.lit(32817).cast("int").alias("period_type_concept_id"),
+            "_exclusion_reason",
+        )
     )
 
 
@@ -2351,41 +2476,87 @@ def _procedure_occurrence_core():
     )
 
 
+# OMOP_AREA_OBS_V1: one area observation per measure of a person's active HOME/PREVIOUS address (silver
+# reference_person_address). key stem -> registry key <stem>:<address_id>.
+AREA_OBSERVATIONS = [
+    {"stem": "imd", "column": "imd2025_quintile", "low": 1, "high": 5, "unit": 37524288, "source_concept": 35812882,
+     "source_value": "imd_quintile", "value_text": "imd2025_quintile", "rule": "heron_uk_imd_quintile:iod2025",
+     "coding_system": "HERON-UK"},
+    {"stem": "radon", "column": "radon_class_max", "low": 1, "high": 6, "unit": 0, "source_concept": 0,
+     "source_value": "radon_class_max:ukhsa_bgs_atlas_v3", "value_text": "radon_potential_band",
+     "rule": "radon_indicative_atlas_v3", "coding_system": "UKHSA-BGS"},
+    {"stem": "census:hh_deprived_any", "column": "census_pct_hh_deprived_any", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_deprived_any", "value_text": None,
+     "rule": "census2021_oa_ts011", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:hh_overcrowded", "column": "census_pct_hh_overcrowded", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_overcrowded", "value_text": None,
+     "rule": "census2021_oa_ts052", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:hh_no_car", "column": "census_pct_hh_no_car", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_hh_no_car", "value_text": None,
+     "rule": "census2021_oa_ts045", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:bad_health", "column": "census_pct_bad_health", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_bad_health", "value_text": None,
+     "rule": "census2021_oa_ts037", "coding_system": "ONS-Census-2021"},
+    {"stem": "census:limited_english", "column": "census_pct_limited_english", "low": 0, "high": 100, "unit": 8554,
+     "source_concept": 0, "source_value": "census2021_oa:pct_limited_english", "value_text": None,
+     "rule": "census2021_oa_ts029", "coding_system": "ONS-Census-2021"},
+]
+
+
 def _imd_candidates():
-    # Registry key recipe imd:<address_id>. _om_id_registry allocates the same filter set as a
-    # superset; the pipeline gates below only remove rows, so every published row is allocated.
-    return (
-        read_source("src_person_address")
-        .where(
-            (F.col("parent_entity") == "PERSON")
-            & (F.col("active_ind") == 1)
-            & F.col("address_type_code").isin(*IMD_ADDRESS_TYPES)
-            & F.trim(F.col("imd_quintile")).isin("1", "2", "3", "4", "5")
-            & F.col("address_id").isNotNull()
-            & F.col("person_id").isNotNull()
+    # OMOP_AREA_OBS_V1: every area measure of an active HOME/PREVIOUS person address, one row per measure. The registry
+    # key is <stem>:<address_id> (imd:<address_id> as before); _om_id_registry allocates the same filter set as a superset.
+    frames = []
+    for spec in AREA_OBSERVATIONS:
+        value = F.col(spec["column"]).cast("double")
+        text = F.col(spec["value_text"]).cast("string") if spec["value_text"] else F.lit(None).cast("string")
+        frames.append(
+            read_source("src_person_address")
+            .where(
+                (F.col("parent_entity") == "PERSON")
+                & (F.col("active_ind") == 1)
+                & F.col("address_type_code").isin(*IMD_ADDRESS_TYPES)
+                & value.between(spec["low"], spec["high"])
+                & F.col("address_id").isNotNull()
+                & F.col("person_id").isNotNull()
+            )
+            .select(
+                F.col("person_id").cast("bigint").alias("person_id"),
+                F.col("address_id").cast("bigint").alias("_address_id"),
+                F.lit(spec["stem"]).alias("_area_stem"),
+                value.alias("_area_value"),
+                text.alias("_area_value_text"),
+                F.lit(spec["unit"]).cast("int").alias("_area_unit"),
+                F.lit(spec["source_concept"]).cast("int").alias("_area_source_concept"),
+                F.lit(spec["source_value"]).alias("_area_source_value"),
+                F.lit(spec["rule"]).alias("_area_rule"),
+                F.lit(spec["coding_system"]).alias("_area_coding_system"),
+                F.to_date("beg_effective").alias("_beg_effective_date"),
+            )
         )
-        .select(
-            F.col("person_id").cast("bigint").alias("person_id"),
-            F.col("address_id").cast("bigint").alias("_address_id"),
-            F.trim(F.col("imd_quintile")).alias("_imd_quintile"),
-            F.to_date("beg_effective").alias("_beg_effective_date"),
-        )
-    )
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return out
 
 
 def _imd_base():
-    # HERON-UK IMD convention: observation_concept_id 0, observation_source_concept_id 35812882,
-    # value_as_number = quintile, unit 37524288. The date is the address effective-from date when
-    # usable, else observation_period_start_date — the latter only for a person's sole IMD record.
+    # OMOP_AREA_OBS_V1: area observations under the HERON-UK IMD rules: observation_concept_id 0; the date is the
+    # address effective-from date when usable, else observation_period_start_date for a person's sole record of that
+    # measure. IMD rows keep source concept 35812882 and unit 37524288 (now IoD 2025); radon and census rows carry
+    # source concept 0 and their own source value and unit. _area_rule / _area_coding_system feed the provenance sidecar.
     candidates = _imd_candidates()
     people = (
         _person_base()
         .where(F.col("_exclusion_reason").isNull())
         .select(F.col("person_id").alias("_published_person_id"), "_birth_date")
     )
-    periods = read_source("src_om_observation_period").select(
-        F.col("person_id").alias("_period_person_id"),
-        F.col("observation_period_start_date").alias("_period_start"),
+    # INCR_FIX_20261018: the published periods' starts, read from _om_observation_start (same rows as
+    # observation_period) so the weekly move of every period's end does not re-touch the area rows.
+    periods = (
+        spark.read.table("_om_observation_start")
+        .where(F.col("_exclusion_reason").isNull())
+        .select(F.col("person_id").alias("_period_person_id"), F.col("_om_start").alias("_period_start"))
     )
     registry = (
         read_source("src_id_registry")
@@ -2395,13 +2566,13 @@ def _imd_base():
             F.col("allocated_id").alias("_registry_id"),
         )
     )
-    release_date = F.to_date(F.lit(SOURCE_RELEASE_DATE))
+    candidates = _after_run_date(candidates, "_beg_effective_date", "_om_beg_after_run")  # INCR_FIX_20261018
     dated = (
         (F.col("_beg_effective_date") > F.to_date(F.lit("1900-01-01")))
-        & (F.col("_beg_effective_date") <= release_date)
+        & ~F.col("_om_beg_after_run")
         & (F.col("_birth_date").isNull() | (F.col("_beg_effective_date") >= F.col("_birth_date")))
     )
-    per_person = Window.partitionBy("person_id")
+    per_person = Window.partitionBy("person_id", "_area_stem")
     observation_date = F.when(dated, F.col("_beg_effective_date")).otherwise(F.col("_period_start"))
     joined = (
         candidates
@@ -2418,15 +2589,16 @@ def _imd_base():
         )
     )
     # Rows that pass the gates win the duplicate tiebreak; lowest address_id among them publishes.
-    duplicate_order = Window.partitionBy("person_id", "observation_date", "_imd_quintile").orderBy(
+    duplicate_order = Window.partitionBy("person_id", "observation_date", "_area_stem", "_area_value").orderBy(
         F.col("_gate_reason").isNull().desc(), F.col("_address_id").asc_nulls_last()
     )
     ranked = (
         joined
         .withColumn("_duplicate_rank", F.row_number().over(duplicate_order))
-        .withColumn("_registry_lookup", F.concat(F.lit("imd:"), F.col("_address_id").cast("string")))
+        .withColumn("_registry_lookup", F.concat(F.col("_area_stem"), F.lit(":"), F.col("_address_id").cast("string")))
         .join(registry, F.col("_registry_lookup") == F.col("_registry_key"), "left")
     )
+    is_imd = F.col("_area_stem") == "imd"
     return ranked.select(
         F.col("_registry_id").alias("observation_id"),
         "person_id",
@@ -2434,26 +2606,32 @@ def _imd_base():
         F.col("observation_date").cast("date").alias("observation_date"),
         F.col("observation_date").cast("timestamp").alias("observation_datetime"),
         F.lit(32817).cast("int").alias("observation_type_concept_id"),
-        F.col("_imd_quintile").cast("double").alias("value_as_number"),
+        F.col("_area_value").cast("double").alias("value_as_number"),
         F.lit(None).cast("string").alias("value_as_string"),
         F.lit(0).cast("int").alias("value_as_concept_id"),
         F.lit(0).cast("int").alias("qualifier_concept_id"),
-        F.lit(IMD_UNIT_CONCEPT_ID).cast("int").alias("unit_concept_id"),
+        F.col("_area_unit").cast("int").alias("unit_concept_id"),
         F.lit(None).cast("bigint").alias("provider_id"),
         F.lit(None).cast("bigint").alias("visit_occurrence_id"),
         F.lit(None).cast("bigint").alias("visit_detail_id"),
-        F.lit("imd_quintile").alias("observation_source_value"),
-        F.lit(IMD_SOURCE_CONCEPT_ID).cast("int").alias("observation_source_concept_id"),
+        F.col("_area_source_value").alias("observation_source_value"),
+        F.col("_area_source_concept").cast("int").alias("observation_source_concept_id"),
         F.lit(None).cast("string").alias("unit_source_value"),
         F.lit(None).cast("string").alias("qualifier_source_value"),
-        F.col("_imd_quintile").cast("string").alias("value_source_value"),
+        F.when(is_imd, F.col("_area_value").cast("int").cast("string"))
+        .otherwise(F.col("_area_value_text")).alias("value_source_value"),
         F.lit(None).cast("bigint").alias("observation_event_id"),
         F.lit(0).cast("int").alias("obs_event_field_concept_id"),
+        "_area_rule",
+        "_area_coding_system",
         F.when(F.col("_gate_reason").isNotNull(), F.col("_gate_reason"))
         .when(F.col("_duplicate_rank") > 1, F.lit("duplicate_imd_record"))
         .when(F.col("_registry_id").isNull(), F.lit("id_not_allocated"))
         .alias("_exclusion_reason"),
     )
+
+
+METADATA_ROWS.append((52, 0, 0, "area_observation_policy", "OMOP_AREA_OBS_V1: observation rows (concept 0) per active HOME/PREVIOUS address: IoD 2025 IMD quintile (HERON-UK imd_quintile convention, replaces IMD 2019), UKHSA/BGS indicative radon class 1-6 of the address 1 km square (source value radon_class_max:ukhsa_bgs_atlas_v3, band in value_source_value), and Census 2021 output-area percentages (unit 8554) for households deprived in any dimension, overcrowded households, households with no car, bad or very bad health and limited English; same date, person, period and duplicate gates as IMD; keys <measure>:<address_id>", None, None, None, None))
 
 
 # === GENERATED: explicit schema for observation (contract_codegen.py) — do not edit ===
@@ -2564,7 +2742,8 @@ def _observation_core():
         F.lit(None).cast("bigint").alias("observation_event_id"),
         F.lit(0).cast("int").alias("obs_event_field_concept_id"),
     )
-    imd = _imd_base().where(F.col("_exclusion_reason").isNull()).drop("_exclusion_reason")
+    imd = _imd_base().where(F.col("_exclusion_reason").isNull()).drop(
+        "_exclusion_reason", "_area_rule", "_area_coding_system")  # OMOP_AREA_OBS_V1
     return routed.unionByName(imd)
 
 
@@ -3672,7 +3851,7 @@ def _genomic_test_base():
         F.col("event_datetime_local").alias("event_datetime"),
         "assay_code", "assay_name", "method", "analysis_context",
         "overall_result_status", "panel_code", "panel_version",
-        "panel_version_inferred", "test_snomed_code", "test_loinc_code",
+        "panel_version_inferred", "test_snomed_code", "test_loinc_code", "assay_component",
         F.col("specimen_id").alias("_specimen_event"),
         "research_qi_only",
     )
@@ -3716,6 +3895,7 @@ def _genomic_test_base():
         F.col("panel_version_inferred").cast("boolean").alias("panel_version_inferred"),
         F.col("test_snomed_code").cast("string").alias("test_snomed_code"),
         F.col("test_loinc_code").cast("string").alias("test_loinc_code"),
+        F.col("assay_component"),
         F.col("_published_specimen_id").alias("specimen_id"),
         F.col("research_qi_only").cast("boolean").alias("research_qi_only"),
         F.col("_source_test_id").cast("string").alias("test_source_value"),
@@ -3750,6 +3930,7 @@ genomic_test_schema = T.StructType([
     T.StructField('panel_version_inferred', T.BooleanType(), True, metadata={'comment': 'True when the panel version was inferred rather than reported.'}),
     T.StructField('test_snomed_code', T.StringType(), True, metadata={'comment': 'Source SNOMED test code where carried.'}),
     T.StructField('test_loinc_code', T.StringType(), True, metadata={'comment': 'Source LOINC test code where carried.'}),
+    T.StructField('assay_component', T.StringType(), True, metadata={'comment': 'GEN4 assay within the report (mngs_dna, mngs_rna, tngs, flt3, npm1, bcr_abl1_qual).'}),
     T.StructField('specimen_id', T.LongType(), True, metadata={'comment': 'Published SPECIMEN foreign key where the source specimen resolves; NULL otherwise.'}),
     T.StructField('research_qi_only', T.BooleanType(), True, metadata={'comment': 'Source research/QI-only governance flag, retained verbatim.'}),
     T.StructField('test_source_value', T.StringType(), True, metadata={'comment': 'Journey patient_event_id surrogate for the test; the value child tables reference as genomic_test_id.'}),
@@ -3775,7 +3956,7 @@ def _gene_tested_base():
         F.col("genomic_test_id").alias("_source_test_id"),
         "hgnc_id", "reported_gene_symbol", "normalized_gene_symbol",
         "alias_match_type", "evidence_type", "test_scope",
-        "panel_version_inferred", "confidence",
+        "panel_version_inferred", "confidence", "assessment_status", "coverage_gap_regions_raw",
     )
     published_tests = (
         _genomic_test_base()
@@ -3806,6 +3987,8 @@ def _gene_tested_base():
         F.col("test_scope").cast("string").alias("test_scope"),
         F.col("panel_version_inferred").cast("boolean").alias("panel_version_inferred"),
         F.col("confidence").cast("double").alias("confidence"),
+        F.col("assessment_status").cast("string").alias("assessment_status"),
+        F.col("coverage_gap_regions_raw").cast("string").alias("coverage_gap_regions_raw"),
         F.when(F.col("_published_test_id").isNull(), F.lit("parent_test_not_published"))
         .when(F.col("_allocated_id").isNull(), F.lit("id_not_allocated"))
         .alias("_exclusion_reason"),
@@ -3824,6 +4007,8 @@ genomic_gene_tested_schema = T.StructType([
     T.StructField('test_scope', T.StringType(), True, metadata={'comment': 'Panel scope label.'}),
     T.StructField('panel_version_inferred', T.BooleanType(), True, metadata={'comment': 'True when the panel version was inferred.'}),
     T.StructField('confidence', T.DoubleType(), True, metadata={'comment': 'Upstream match confidence.'}),
+    T.StructField('assessment_status', T.StringType(), True, metadata={'comment': 'What the laboratory says about this gene for this assay: reported, dedicated_assay, panel_assessed, panel_not_assessed, insufficient_coverage, test_not_completed.'}),
+    T.StructField('coverage_gap_regions_raw', T.StringType(), True, metadata={'comment': 'Regions of the gene the laboratory could not assess, as reported.'}),
 ])
 # === END GENERATED: explicit schema for genomic_gene_tested ===
 
@@ -3851,7 +4036,9 @@ def _genomic_variant_base():
         "alteration_type", "detection_status",
         F.col("hgvs_c_parsed").alias("_hgvs_c"),
         F.col("hgvs_p_parsed").alias("_hgvs_p"),
-        "transcript", "hgvs_validation_status", "genome_build", "chromosome",
+        F.coalesce(F.col("resolved_transcript"), F.col("transcript")).alias("transcript"),  # GEN4_OMOP_V1
+        "hgvs_validation_status", "genome_build", "chromosome",
+        "ref_allele", "alt_allele", F.expr("try_cast(clinvar_variation_id AS bigint)").alias("_clinvar_variation_id"),
         "position_start", "position_end", "vaf", "zygosity",
         "reported_classification", "reported_tier", "copy_number",
         F.expr("try_cast(omop_genomic_concept_id AS int)").alias("_omop_genomic"),
@@ -3920,6 +4107,9 @@ def _genomic_variant_base():
         F.coalesce(F.col("_omop_genomic"), F.lit(0)).cast("int")
         .alias("omop_genomic_concept_id"),
         F.col("snomed_code").cast("string").alias("snomed_code"),
+        F.col("ref_allele").alias("reference_allele"),
+        F.col("alt_allele").alias("alternate_allele"),
+        F.col("_clinvar_variation_id").alias("clinvar_variation_id"),
         F.col("_published_specimen_id").alias("specimen_id"),
         F.col("is_current").cast("boolean").alias("is_current"),
         F.when(F.coalesce(F.col("record_status"), F.lit("")) != "active",
@@ -3965,6 +4155,9 @@ genomic_variant_schema = T.StructType([
     T.StructField('copy_number', T.DoubleType(), True, metadata={'comment': 'Copy number where applicable.'}),
     T.StructField('omop_genomic_concept_id', T.IntegerType(), True, metadata={'comment': 'Castable OMOP Genomic concept where the parser resolves one; 0 otherwise.'}),
     T.StructField('snomed_code', T.StringType(), True, metadata={'comment': 'Source SNOMED code where carried.'}),
+    T.StructField('reference_allele', T.StringType(), True, metadata={'comment': 'GRCh38 reference allele (VCF), derived in-estate (silver variant_key).'}),
+    T.StructField('alternate_allele', T.StringType(), True, metadata={'comment': 'GRCh38 alternate allele (VCF).'}),
+    T.StructField('clinvar_variation_id', T.LongType(), True, metadata={'comment': 'ClinVar VariationID matched on the GRCh38 VCF key.'}),
     T.StructField('specimen_id', T.LongType(), True, metadata={'comment': 'Published SPECIMEN foreign key where the source specimen resolves; NULL otherwise.'}),
     T.StructField('is_current', T.BooleanType(), True, metadata={'comment': 'Upstream currency flag; only current rows publish.'}),
 ])
@@ -4255,7 +4448,7 @@ def _metric(frame, model, lane_column=None):
         T.StructField("excluded_rows", T.LongType(), False),
         T.StructField("pipeline_version", T.StringType(), False),
     ])
-    zero = spark.createDataFrame([(model, model, "__none__", 0, PIPELINE_VERSION)], zero_schema)
+    zero = _om_constant_rows([(model, model, "__none__", 0, PIPELINE_VERSION)], zero_schema)  # INCR_FIX_20261018
     return counted.unionByName(zero)
 
 
@@ -4889,7 +5082,9 @@ def _episode_registry():
 
 
 def _episode_base():
-    people = _person_base().where(F.col("_exclusion_reason").isNull()).select(F.col("person_id").alias("_ep_person"))
+    # OMOP_PREG_INFANT_V1: the published PERSON table, so a targeted refresh never points at a person
+    # that PERSON does not hold
+    people = read_source("src_om_person").select(F.col("person_id").alias("_ep_person"))
     journeys = read_source("src_journey").where(
         (F.col("journey_type_code") == "pregnancy") & F.col("parent_journey_key").isNull()
         & (F.coalesce(F.col("status_code"), F.lit("")) != "superseded"))
@@ -4982,6 +5177,355 @@ def episode_event():
         F.col("_ad_id").cast("bigint").alias("event_id"),
         field[F.col("_table")].cast("int").alias("episode_event_field_concept_id"),
     )
+
+
+# OMOP_PREG_INFANT_V1: the OMOP pregnancy extension tables PREGNANCY and INFANT (the legacy 4_prod.omop columns, as
+# also published by PREBORN), built from the silver sources the maternity lane above already reads.
+#   pregnancy  one row per published pregnancy EPISODE; pregnancy_id = episode_id (registry key preg:<journey_key>)
+#   infant     one row per baby whose person is published; infant_id = the baby's person_id
+# Delivery method and outcomes come from 3_lookup.omop.omop_maternity_concept_map; the other concepts follow the
+# fixed rules below. A value with no mapping is concept 0, never a guess.
+
+PI_YES, PI_NO = 4188539, 4188540                 # SNOMED Yes / No
+PI_NULLIPAROUS, PI_MULTIPAROUS = 4012561, 4102166
+PI_LIVEBIRTH = 4092289
+PI_NEONATAL_DEATH = 4079843                      # born alive, died later: still a live birth
+PI_CONGENITAL_MALFORMATION = 4079975             # SNOMED 'Congenital malformation': published, and the ancestor searched
+PI_BMI_RANGE = (12, 80)                          # BMI outside this range is not published
+PI_PARITY_MAX = 20                               # same bound as the parity measurement
+PI_GRAVIDA_RANGE = (1, 30)                       # gravida 0 means "not recorded" in Millennium
+PI_MARITAL_STATUS = {                            # silver spine_person.marital_status_code (Cerner) -> concept
+    "309239": 4053842,   # Single
+    "309237": 4338692,   # Married / civil partner
+    "309241": 4143188,   # Widowed / surviving civil partner
+    "309236": 4069297,   # Divorced / civil partnership dissolved
+    "309238": 4027529,   # Separated
+}
+# A baby's birth outcome is the first of these maternity map fields that maps (field, silver column stem).
+PI_BIRTH_OUTCOME_FIELDS = [("BirthOutcome", "neonatal_outcome"), ("DeliveryOutcome", "delivery_outcome"),
+                           ("PregOutcome", "pregnancy_outcome")]
+
+
+def _pi_published_person_ids(alias):
+    """person_id of every row in the published PERSON table (not the live silver person base), so a targeted
+    refresh never references a person that PERSON does not hold."""
+    return read_source("src_om_person").select(F.col("person_id").alias(alias))
+
+
+def _pi_map_field(frame, field, code_column, stem):
+    """Left-join one maternity map field onto frame by Cerner code. Adds _<stem>_concept and _<stem>_rule
+    ("method|rule|version", for provenance). The map is unique per (field, code), so rows never fan out."""
+    mapped = _maternity_map().where(F.col("_mm_field") == field).select(
+        F.col("_mm_code").alias(f"_{stem}_code"),
+        F.col("_mm_concept").alias(f"_{stem}_concept"),
+        F.concat_ws("|", "_mm_method", "_mm_rule", "_mm_version").alias(f"_{stem}_rule"),
+    )
+    return frame.join(mapped, F.col(code_column) == F.col(f"_{stem}_code"), "left").drop(f"_{stem}_code")
+
+
+def _pi_first_mapped(suffix):
+    """Of the birth outcome fields, the value (concept, rule or display) of the first one that mapped."""
+    picks = []
+    for _, stem in PI_BIRTH_OUTCOME_FIELDS:
+        value = F.col(f"{stem}_display") if suffix == "display" else F.col(f"_{stem}_{suffix}")
+        picks.append(F.when(F.col(f"_{stem}_concept").isNotNull(), value))
+    return F.coalesce(*picks)
+
+
+def _pi_birth_rows():
+    """Active silver clinical_birth rows with their mapped concepts, the baby's birth outcome, the gestation in days
+    and the rank of the baby in its pregnancy (first-born first: birth_order ascending, missing order last, then
+    birth_key)."""
+    births = read_source("src_birth").where(F.col("record_status") == "active")
+    births = _pi_map_field(births, "DeliveryMethod", "delivery_method_code", "method")
+    for field, stem in PI_BIRTH_OUTCOME_FIELDS:
+        births = _pi_map_field(births, field, f"{stem}_code", stem)
+
+    # gestation needs both parts and no implausible flag (the maternity lane never defaults days to 0 either)
+    gestation_ok = (F.col("gestation_weeks").isNotNull() & F.col("gestation_days").isNotNull()
+                    & ~F.coalesce(F.col("gestation_implausible_ind"), F.lit(False)))
+    first_born = Window.partitionBy("journey_pregnancy_key").orderBy(
+        F.col("birth_order").asc_nulls_last(), F.col("birth_key").asc())
+    # Born alive is judged independently of later survival: a neonatal death or a "live birth subsequently died"
+    # delivery outcome is a live birth even though the birth outcome concept above reports the death.
+    # NULL when no outcome field maps at all (unknown, not "not alive").
+    any_outcome_mapped = (F.col("_neonatal_outcome_concept").isNotNull()
+                          | F.col("_delivery_outcome_concept").isNotNull()
+                          | F.col("_pregnancy_outcome_concept").isNotNull())
+    born_alive = (F.col("_neonatal_outcome_concept").isin(PI_LIVEBIRTH, PI_NEONATAL_DEATH)
+                  | (F.col("_delivery_outcome_concept") == PI_LIVEBIRTH))
+    return (
+        births
+        .withColumn("_born_alive", F.when(F.coalesce(born_alive, F.lit(False)), F.lit(True))
+                    .when(any_outcome_mapped, F.lit(False)))
+        .withColumn("_birth_outcome_concept", _pi_first_mapped("concept"))
+        .withColumn("_birth_outcome_rule", _pi_first_mapped("rule"))
+        .withColumn("_birth_outcome_source", _pi_first_mapped("display"))
+        .withColumn("_gestation_in_days",
+                    F.when(gestation_ok, F.col("gestation_weeks") * 7 + F.col("gestation_days")))
+        .withColumn("_birth_rank", F.row_number().over(first_born))
+    )
+
+
+def _pi_pregnancy_births():
+    """One row per pregnancy journey summarising its births. The first-born decides gestation, delivery method and
+    outcome; a PregOutcome map hit (miscarriage, ectopic, termination) outranks the baby's outcome."""
+    births = _pi_birth_rows()
+    is_first = F.col("_birth_rank") == 1
+    preg_outcome_hit = F.col("_pregnancy_outcome_concept").isNotNull()
+
+    def first_born(column):
+        return F.max(F.when(is_first, column))
+
+    return births.groupBy(F.col("journey_pregnancy_key").alias("_pb_journey")).agg(
+        F.max("birth_datetime").alias("_pb_end"),
+        first_born(F.col("_gestation_in_days")).alias("_pb_gestation"),
+        first_born(F.col("_method_concept")).alias("_pb_mode"),
+        first_born(F.col("delivery_method_display")).alias("_pb_mode_source"),
+        first_born(F.col("_method_rule")).alias("_pb_mode_rule"),
+        first_born(F.when(preg_outcome_hit, F.col("_pregnancy_outcome_concept"))
+                   .otherwise(F.col("_birth_outcome_concept"))).alias("_pb_outcome"),
+        first_born(F.when(preg_outcome_hit, F.col("pregnancy_outcome_display"))
+                   .otherwise(F.col("_birth_outcome_source"))).alias("_pb_outcome_source"),
+        first_born(F.when(preg_outcome_hit, F.col("_pregnancy_outcome_rule"))
+                   .otherwise(F.col("_birth_outcome_rule"))).alias("_pb_outcome_rule"),
+        F.max("fetus_number").alias("_pb_fetus_number"),
+        F.count(F.lit(1)).alias("_pb_births"),
+        F.count(F.when(F.col("_born_alive"), 1)).alias("_pb_liveborn"),
+        F.count("_born_alive").alias("_pb_outcomes_known"),
+    )
+
+
+def _pi_booking_bmi():
+    """The earliest plausible BMI on each pregnancy's maternity VTE risk assessment form. Silver records no
+    pre-pregnancy BMI; this form is usually completed at booking."""
+    history = read_source("src_pregnancy_history").where(F.col("record_status") == "active").select(
+        F.col("pregnancy_id").alias("_bmi_pregnancy"), F.col("journey_pregnancy_key").alias("_bmi_journey"))
+    forms = (read_source("src_vte_form")
+             .where((F.col("record_status") == "active") & F.col("pregnancy_id").isNotNull())
+             .withColumn("_bmi", F.col("bmi").cast("double"))
+             .where(F.col("_bmi").between(*PI_BMI_RANGE)))
+    earliest = Window.partitionBy("pregnancy_id").orderBy(
+        F.col("authored_datetime").asc_nulls_last(), F.col("patient_event_key").asc())
+    first_form = forms.withColumn("_bmi_rank", F.row_number().over(earliest)).where(F.col("_bmi_rank") == 1)
+    return first_form.join(history, F.col("pregnancy_id") == F.col("_bmi_pregnancy")).select("_bmi_journey", "_bmi")
+
+
+def _pi_pregnancy_base():
+    """Every pregnancy episode candidate, with the same rows and exclusion reasons as EPISODE, carrying its
+    PREGNANCY columns."""
+    history = read_source("src_pregnancy_history").where(F.col("record_status") == "active").select(
+        F.col("journey_pregnancy_key").alias("_ph_journey"), "gravida", "gravida_implausible_ind", "parity",
+        "previous_live_births", "previous_stillbirths", "previous_miscarriages")
+    marital = read_source("src_person").select(
+        F.col("person_id").cast("bigint").alias("_ms_person"), F.col("marital_status_code").alias("_ms_code"))
+    marital_concept = F.create_map(*[F.lit(x) for kv in PI_MARITAL_STATUS.items() for x in kv])[F.col("_ms_code")]
+
+    joined = (_episode_base()
+              .join(_pi_pregnancy_births(), F.col("_journey_key") == F.col("_pb_journey"), "left")
+              .join(history, F.col("_journey_key") == F.col("_ph_journey"), "left")
+              .join(_pi_booking_bmi(), F.col("_journey_key") == F.col("_bmi_journey"), "left")
+              .join(marital, F.col("person_id") == F.col("_ms_person"), "left"))
+
+    fetuses = F.coalesce(F.col("_pb_fetus_number"), F.col("_pb_births"))
+    end_date = F.to_date("_pb_end")
+    gravida_ok = (F.col("gravida").between(*PI_GRAVIDA_RANGE)
+                  & ~F.coalesce(F.col("gravida_implausible_ind"), F.lit(False)))
+    still_or_miscarried = F.when(
+        F.col("previous_stillbirths").isNotNull() | F.col("previous_miscarriages").isNotNull(),
+        F.coalesce(F.col("previous_stillbirths"), F.lit(0)) + F.coalesce(F.col("previous_miscarriages"), F.lit(0)))
+
+    return joined.select(
+        F.col("person_id"),
+        F.col("episode_id").alias("pregnancy_id"),
+        F.col("episode_start_date").alias("pregnancy_start_date"),
+        # last birth date; NULL when no birth is recorded or it falls before the start (end-before-start is a
+        # silver finding, see the PI handoff)
+        F.when(end_date >= F.col("episode_start_date"), end_date).alias("pregnancy_end_date"),
+        F.col("_pb_gestation").cast("int").alias("gestational_length_in_day"),
+        F.coalesce(F.col("_pb_outcome"), F.lit(0)).cast("int").alias("pregnancy_outcome_concept_id"),
+        F.coalesce(F.col("_pb_mode"), F.lit(0)).cast("int").alias("pregnancy_mode_delivery_concept_id"),
+        F.when(fetuses == 1, F.lit(PI_YES)).when(fetuses > 1, F.lit(PI_NO)).otherwise(F.lit(0))
+        .cast("int").alias("pregnancy_single_concept_id"),
+        F.coalesce(marital_concept, F.lit(0)).cast("int").alias("pregnancy_marital_status_concept_id"),
+        fetuses.cast("int").alias("pregnancy_number_fetuses"),
+        F.when(F.col("_pb_outcomes_known") > 0, F.col("_pb_liveborn")).cast("int").alias("pregnancy_number_liveborn"),
+        F.when(F.col("parity") == 0, F.lit(PI_NULLIPAROUS))
+        .when(F.col("parity").between(1, PI_PARITY_MAX), F.lit(PI_MULTIPAROUS))
+        .otherwise(F.lit(0)).cast("int").alias("prev_pregnancy_parity_concept_id"),
+        F.when(gravida_ok, F.col("gravida") - 1).cast("int").alias("prev_pregnancy_gravidity"),
+        F.col("previous_live_births").cast("int").alias("prev_livebirth_number"),
+        still_or_miscarried.cast("int").alias("prev_still_misc_number"),
+        F.col("_bmi").alias("pre_pregnancy_bmi"),
+        F.lit(0).cast("int").alias("pregnancy_folic_concept_id"),   # silver carries no folic-acid field yet
+        F.col("_pb_outcome_source").alias("pregnancy_outcome_source_value"),
+        F.col("_pb_mode_source").alias("pregnancy_mode_delivery_source_value"),
+        F.when(F.col("_bmi").isNotNull(), F.lit("silver:clinical_form_maternity_vte_risk_assessment"))
+        .alias("pre_pregnancy_bmi_source"),
+        F.when(marital_concept.isNotNull(), F.concat(F.lit("spine_person:"), F.col("_ms_code")))
+        .alias("pregnancy_marital_status_source_value"),
+        F.col("_pb_outcome_rule"),
+        F.col("_pb_mode_rule"),
+        F.col("_exclusion_reason"),
+    )
+
+
+# === explicit schema for pregnancy (OMOP_PREG_INFANT_V1) ===
+pregnancy_schema = T.StructType([
+    T.StructField('person_id', T.LongType(), False, metadata={'comment': 'Published mother person_id.'}),
+    T.StructField('pregnancy_id', T.LongType(), False, metadata={'comment': '= episode.episode_id of the pregnancy episode (registry preg:<journey_key>); never re-minted.'}),
+    T.StructField('pregnancy_start_date', T.DateType(), False, metadata={'comment': 'Estimated start: last menstrual period, else expected delivery date - 280 days, else first contact or first antenatal appointment (silver spine_journey period_start).'}),
+    T.StructField('pregnancy_end_date', T.DateType(), True, metadata={'comment': 'Date of the last recorded birth; NULL when no birth is recorded or it precedes the start.'}),
+    T.StructField('gestational_length_in_day', T.IntegerType(), True, metadata={'comment': 'First-born gestation (weeks*7 + days); NULL when either part is missing or flagged implausible.'}),
+    T.StructField('pregnancy_outcome_concept_id', T.IntegerType(), False, metadata={'comment': 'Miscarriage/ectopic/termination from the pregnancy outcome, else the first-born birth outcome (Livebirth 4092289, Stillbirth 443213, ...); 0 = not mapped.'}),
+    T.StructField('pregnancy_mode_delivery_concept_id', T.IntegerType(), False, metadata={'comment': 'First-born delivery method (maternity concept map DeliveryMethod); 0 = not recorded or not mapped.'}),
+    T.StructField('pregnancy_single_concept_id', T.IntegerType(), False, metadata={'comment': 'Yes 4188539 for one fetus, No 4188540 for more; 0 = unknown.'}),
+    T.StructField('pregnancy_marital_status_concept_id', T.IntegerType(), False, metadata={'comment': "Mother's current marital status (spine_person; not as at the pregnancy); 0 = not recorded or not disclosed."}),
+    T.StructField('pregnancy_number_fetuses', T.IntegerType(), True, metadata={'comment': 'Recorded fetus number, else count of birth records.'}),
+    T.StructField('pregnancy_number_liveborn', T.IntegerType(), True, metadata={'comment': 'Babies born alive (live birth, including those who later died as neonates); NULL when no birth outcome maps.'}),
+    T.StructField('prev_pregnancy_parity_concept_id', T.IntegerType(), False, metadata={'comment': 'Nulliparous 4012561 (parity 0) or Multiparous 4102166 (1-20); 0 = unknown.'}),
+    T.StructField('prev_pregnancy_gravidity', T.IntegerType(), True, metadata={'comment': 'Previous pregnancies = gravida - 1 (gravida 1-30, not flagged implausible); NULL otherwise.'}),
+    T.StructField('prev_livebirth_number', T.IntegerType(), True, metadata={'comment': 'Previous live births as recorded at booking.'}),
+    T.StructField('prev_still_misc_number', T.IntegerType(), True, metadata={'comment': 'Previous stillbirths + previous miscarriages as recorded at booking.'}),
+    T.StructField('pre_pregnancy_bmi', T.DoubleType(), True, metadata={'comment': 'Earliest BMI (12-80) on the maternity VTE risk assessment form; a booking BMI proxy.'}),
+    T.StructField('pregnancy_folic_concept_id', T.IntegerType(), False, metadata={'comment': '0: silver carries no folic-acid supplement field yet.'}),
+    T.StructField('pregnancy_outcome_source_value', T.StringType(), True, metadata={'comment': 'Millennium display of the outcome that decided pregnancy_outcome_concept_id.'}),
+    T.StructField('pregnancy_mode_delivery_source_value', T.StringType(), True, metadata={'comment': 'Millennium display of the first-born delivery method.'}),
+    T.StructField('pre_pregnancy_bmi_source', T.StringType(), True, metadata={'comment': 'Silver table the BMI came from.'}),
+    T.StructField('pregnancy_marital_status_source_value', T.StringType(), True, metadata={'comment': 'spine_person:<Cerner marital status code>.'}),
+])
+
+
+@dp.materialized_view(
+    name="pregnancy",
+    schema=pregnancy_schema,
+    comment="OMOP pregnancy extension: one row per published pregnancy episode (pregnancy_id = episode_id).",
+)
+def pregnancy():
+    return _pi_pregnancy_base().where(F.col("_exclusion_reason").isNull()).select(
+        *[f.name for f in pregnancy_schema.fields])
+
+
+def _pi_congenital_persons():
+    """person_id of everyone with a published condition under SNOMED 'Congenital malformation' (4079975). The wider
+    'Congenital disease' (440508) also holds congenital infections, so it is not used."""
+    congenital = read_source("src_vocab_concept_ancestor").where(
+        F.col("ancestor_concept_id") == PI_CONGENITAL_MALFORMATION).select(
+        F.col("descendant_concept_id").cast("int").alias("_cg_concept"))
+    conditions = read_source("src_om_condition_occurrence").select(
+        F.col("person_id").alias("_cg_person"), F.col("condition_concept_id").cast("int").alias("_cg_found"))
+    return (conditions.join(F.broadcast(congenital), F.col("_cg_found") == F.col("_cg_concept"))
+            .select("_cg_person").distinct())
+
+
+def _pi_infant_base():
+    """Every active birth row with its INFANT columns and an exclusion reason; at most one row per baby passes."""
+    pregnancies = _episode_base().where(F.col("_exclusion_reason").isNull()).select(
+        F.col("episode_id").alias("_in_pregnancy_id"), F.col("_journey_key").alias("_in_journey"))
+    births = (_pi_birth_rows()
+              .join(pregnancies, F.col("journey_pregnancy_key") == F.col("_in_journey"), "left")
+              .join(_pi_published_person_ids("_in_person"), F.col("baby_person_id") == F.col("_in_person"), "left")
+              .join(_pi_congenital_persons(), F.col("baby_person_id") == F.col("_cg_person"), "left"))
+
+    # One row per baby (silver holds 1,354 babies on two pregnancy records): a published pregnancy first, then a
+    # row with a birth time, then with a weight, then the latest update; birth_key settles exact ties.
+    best_row = Window.partitionBy("baby_person_id").orderBy(
+        F.col("_in_pregnancy_id").isNull().asc(), F.col("birth_datetime").isNull().asc(),
+        F.col("birth_weight_grams").isNull().asc(), F.col("source_update_timestamp").desc_nulls_last(),
+        F.col("birth_key").asc())
+    weight_ok = F.col("birth_weight_grams").isNotNull() & ~F.coalesce(F.col("birth_weight_implausible_ind"), F.lit(False))
+    apgar_ok = F.col("apgar_5_minute").between(0, 10)
+
+    return births.withColumn("_in_rank", F.row_number().over(best_row)).select(
+        F.col("_in_pregnancy_id").cast("bigint").alias("pregnancy_id"),
+        F.col("baby_person_id").cast("bigint").alias("infant_id"),
+        F.coalesce(F.col("_birth_outcome_concept"), F.lit(0)).cast("int").alias("birth_outcome_concept_id"),
+        F.when(weight_ok, F.col("birth_weight_grams")).cast("double").alias("birth_weight"),
+        F.when(F.col("_cg_person").isNotNull(), F.lit(PI_CONGENITAL_MALFORMATION)).otherwise(F.lit(0))
+        .cast("int").alias("birth_con_malformation_concept_id"),
+        F.when(apgar_ok, F.col("apgar_5_minute")).cast("int").alias("birth_apgar"),
+        F.when(weight_ok, F.lit("silver:clinical_birth.birth_weight_grams")).alias("birth_weight_source"),
+        F.when(apgar_ok, F.lit("silver:clinical_birth.apgar_5_minute")).alias("birth_apgar_source"),
+        F.col("_birth_outcome_rule"),
+        F.when(F.col("baby_person_id").isNull(), F.lit("baby_person_unresolved"))
+        .when(F.col("_in_person").isNull(), F.lit("baby_person_not_published"))
+        .when(F.col("_in_pregnancy_id").isNull(), F.lit("pregnancy_not_published"))
+        .when(F.col("_in_rank") > 1, F.lit("infant_duplicate_birth"))
+        .alias("_exclusion_reason"),
+    )
+
+
+# === explicit schema for infant (OMOP_PREG_INFANT_V1) ===
+infant_schema = T.StructType([
+    T.StructField('pregnancy_id', T.LongType(), False, metadata={'comment': 'pregnancy.pregnancy_id of the birth.'}),
+    T.StructField('infant_id', T.LongType(), False, metadata={'comment': "The baby's published person_id."}),
+    T.StructField('birth_outcome_concept_id', T.IntegerType(), False, metadata={'comment': 'First mapped of neonatal outcome, delivery outcome, pregnancy outcome (Livebirth 4092289, Stillbirth 443213, Neonatal death 4079843, ...); 0 = not mapped.'}),
+    T.StructField('birth_weight', T.DoubleType(), True, metadata={'comment': 'Birth weight in grams; NULL when not recorded or flagged implausible upstream.'}),
+    T.StructField('birth_con_malformation_concept_id', T.IntegerType(), False, metadata={'comment': 'Congenital malformation 4079975 when the baby has a published condition under SNOMED 4079975 Congenital malformation (recorded at any age); 0 otherwise (absence of a record, not a recorded No).'}),
+    T.StructField('birth_apgar', T.IntegerType(), True, metadata={'comment': '5-minute Apgar score 0-10.'}),
+    T.StructField('birth_weight_source', T.StringType(), True, metadata={'comment': 'Silver column the weight came from.'}),
+    T.StructField('birth_apgar_source', T.StringType(), True, metadata={'comment': 'Silver column the Apgar came from.'}),
+])
+
+
+@dp.materialized_view(
+    name="infant",
+    schema=infant_schema,
+    comment="OMOP infant extension: one row per baby with a published person (infant_id = person_id) and pregnancy.",
+)
+def infant():
+    return _pi_infant_base().where(F.col("_exclusion_reason").isNull()).select(
+        *[f.name for f in infant_schema.fields])
+
+
+def _pi_infant_metrics():
+    """Exclusion counts for INFANT. PREGNANCY rows are exactly the EPISODE rows, so episode metrics cover them."""
+    return _metric(_pi_infant_base(), "infant")
+
+
+def _pi_map_provenance(frame, table, row_id, field, rule_column):
+    """Provenance rows for a concept column decided by the maternity map ("method|rule|version" in rule_column)."""
+    parts = F.split(F.col(rule_column), r"\|")
+    return _provenance_rows(
+        frame.where(F.col(field) != 0), table, F.col(row_id), field, F.col(field), F.lit(0),
+        F.lit("Millennium maternity"), parts[0], F.lit(None), parts[1], F.lit(None), parts[2])
+
+
+def _pi_rule_provenance(frame, table, row_id, field, rule_id, coding_system="Millennium maternity"):
+    """Provenance rows for a concept column decided by a fixed rule in this block."""
+    return _provenance_rows(
+        frame.where(F.col(field) != 0), table, F.col(row_id), field, F.col(field), F.lit(0),
+        F.lit(coding_system), F.lit("fixed_rule"), F.lit(None), F.lit(rule_id), F.lit(None),
+        F.lit(PIPELINE_VERSION))
+
+
+def _pi_provenance():
+    """omop_concept_provenance rows for every non-zero concept in PREGNANCY and INFANT."""
+    pregnancies = _pi_pregnancy_base().where(F.col("_exclusion_reason").isNull())
+    infants = _pi_infant_base().where(F.col("_exclusion_reason").isNull())
+    return (
+        _pi_map_provenance(pregnancies, "pregnancy", "pregnancy_id", "pregnancy_outcome_concept_id", "_pb_outcome_rule")
+        .unionByName(_pi_map_provenance(pregnancies, "pregnancy", "pregnancy_id",
+                                        "pregnancy_mode_delivery_concept_id", "_pb_mode_rule"))
+        .unionByName(_pi_rule_provenance(pregnancies, "pregnancy", "pregnancy_id",
+                                         "pregnancy_single_concept_id", "fetus_count_single:v1"))
+        .unionByName(_pi_rule_provenance(pregnancies, "pregnancy", "pregnancy_id",
+                                         "pregnancy_marital_status_concept_id", "cerner_marital_status:v1"))
+        .unionByName(_pi_rule_provenance(pregnancies, "pregnancy", "pregnancy_id",
+                                         "prev_pregnancy_parity_concept_id", "parity_class:v1"))
+        .unionByName(_pi_map_provenance(infants, "infant", "infant_id", "birth_outcome_concept_id",
+                                        "_birth_outcome_rule"))
+        .unionByName(_pi_rule_provenance(infants, "infant", "infant_id", "birth_con_malformation_concept_id",
+                                         "congenital_malformation_descendant:v1", "SNOMED"))
+    )
+
+
+METRIC_BUILDERS.append(_pi_infant_metrics)
+PROVENANCE_BUILDERS.append(_pi_provenance)
+METADATA_ROWS.extend([
+    (53, 0, 0, "pregnancy_extension_policy", "OMOP_PREG_INFANT_V1: PREGNANCY = one row per published pregnancy episode (pregnancy_id = episode_id); start = episode start; end = last birth date (NULL if none or before start); outcome = pregnancy-outcome map hit (miscarriage/ectopic/termination) else first-born birth outcome; delivery mode = first-born DeliveryMethod map; liveborn = babies born alive (live birth or neonatal death, independent of later survival); gravidity = gravida - 1 (1-30, not flagged); parity class 0 / 1-20; BMI = earliest VTE-form BMI 12-80; marital = current spine_person status; folic = 0 (not in silver); unmapped = 0", None, None, None, None),
+    (54, 0, 0, "infant_extension_policy", "OMOP_PREG_INFANT_V1: INFANT = one row per baby with a published person and published pregnancy (infant_id = person_id); a baby on several birth rows keeps the published-pregnancy, dated, weighed, latest row; birth outcome = first mapped of neonatal (BirthOutcome), delivery, pregnancy outcome; weight NULL when flagged implausible; Apgar 5 min 0-10; congenital malformation 4079975 from published conditions under 4079975 (any age); exclusions in omop_exclusion_metrics captured_model infant", None, None, None, None),
+])
 
 
 _register_extension("procedure_occurrence", _maternity_rows_procedure_occurrence)
@@ -5315,6 +5859,7 @@ def _routed_provenance():
                    F.get_json_object(F.col("_p.axis"), "$.rule")).alias("map_rule_id"),
         F.get_json_object(F.col("_p.axis"), "$.scoring_model").alias("scoring_model"),
         F.col("_p.version").cast("string").alias("map_version"),
+        F.col("_p.axis").alias("map_axis_json"),  # OMOP_PROVENANCE_AXIS_V1
         F.lit(PIPELINE_VERSION).alias("pipeline_version"),
     )
 
@@ -5330,10 +5875,10 @@ def _death_provenance():
 def _imd_provenance():
     # HERON-UK IMD rows: concept 0 by convention, identified by the fixed source concept.
     rows = _imd_base().where(F.col("_exclusion_reason").isNull())
-    return _provenance_rows(
+    return _provenance_rows(  # OMOP_AREA_OBS_V1: per-measure coding system and rule
         rows, "observation", F.col("observation_id"), "observation_concept_id", F.col("observation_concept_id"),
-        F.col("observation_source_concept_id"), F.lit("HERON-UK"), F.lit("fixed_source_concept"), F.lit(1.0),
-        F.lit("heron_uk_imd_quintile"), F.lit(None), F.lit(PIPELINE_VERSION))
+        F.col("observation_source_concept_id"), F.col("_area_coding_system"), F.lit("fixed_source_concept"), F.lit(1.0),
+        F.col("_area_rule"), F.lit(None), F.lit(PIPELINE_VERSION))
 
 
 # === GENERATED: explicit schema for omop_concept_provenance (OGR) — do not edit ===
@@ -5350,6 +5895,7 @@ omop_concept_provenance_schema = T.StructType([
     T.StructField('scoring_model', T.StringType(), True, metadata={'comment': 'Embedding/scoring model for similarity-scored mappings; NULL for rule and exact mappings.'}),
     T.StructField('map_version', T.StringType(), True, metadata={'comment': 'Mapping release/version string from silver.'}),
     T.StructField('pipeline_version', T.StringType(), False, metadata={'comment': 'OMOP pipeline version that published the row.'}),
+    T.StructField('map_axis_json', T.StringType(), True, metadata={'comment': 'S3 mapping axis JSON from silver patient_event map_source (method, cosine, scoring_model, status, rule, rollup_levels); NULL when the mapping has no S3 axis. Read by the gold OMOP mapping gate.'}),
 ])
 # === END GENERATED: explicit schema for omop_concept_provenance ===
 
@@ -5359,9 +5905,14 @@ omop_concept_provenance_schema = T.StructType([
     comment="Mapping provenance sidecar: one row per published concept field (routed, adapter and death cause) with method, confidence, rule, scoring model and version.",
 )
 def omop_concept_provenance():
-    frame = _routed_provenance().unionByName(_death_provenance()).unionByName(_imd_provenance())
+    # OMOP_PROVENANCE_AXIS_V1: map_axis_json carries the S3 axis for the gold OMOP mapping gate.
+    frame = (
+        _routed_provenance()
+        .unionByName(_death_provenance(), allowMissingColumns=True)
+        .unionByName(_imd_provenance(), allowMissingColumns=True)
+    )
     for builder in PROVENANCE_BUILDERS:
-        frame = frame.unionByName(builder())
+        frame = frame.unionByName(builder(), allowMissingColumns=True)
     return frame
 
 
@@ -5427,7 +5978,7 @@ def omop_exclusion_metrics():
         T.StructField("excluded_rows", T.LongType(), False),
         T.StructField("pipeline_version", T.StringType(), False),
     ])
-    frames.append(spark.createDataFrame([
+    frames.append(_om_constant_rows([  # INCR_FIX_20261018
         ("cdm_source", "cdm_source", "__none__", 0, PIPELINE_VERSION),
         ("metadata", "metadata", "__none__", 0, PIPELINE_VERSION),
         ("omop_person_research_flags", "omop_person_research_flags", "__none__", 0, PIPELINE_VERSION),

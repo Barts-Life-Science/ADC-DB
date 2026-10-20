@@ -336,6 +336,16 @@ def run_mapping_section():
         .filter(F.col("NOMENCLATURE_ID").isNotNull())
         .filter(F.col("SOURCE_CHANGE_TS") <= F.current_timestamp() + F.expr("INTERVAL 1 DAY"))
     )
+    # NDC_DISPLAY_SUFFIX_V1: Millennium pads a retired term's SOURCE_STRING to 255 characters and appends its
+    # retirement time and '<$>' ("Yellow fever   ...   07-SEP-2022 18:17:27<$>"). Strip it here so map_nomenclature,
+    # the embeddings and the similarity scores see the clinical term; the raw value stays in mill_nomenclature.
+    # _NDC_SUFFIXED marks the cleaned rows so the ndc_display_suffix_v1 rescope can find them again.
+    NDC_RULE_ID = "ndc_display_suffix_v1"
+    NDC_SUFFIX_PATTERN = r"\s+[0-9]{2}-[A-Z]{3}-[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}<\$>$"
+    source = (
+        source.withColumn("_NDC_SUFFIXED", F.coalesce(F.col("SOURCE_STRING").rlike(NDC_SUFFIX_PATTERN), F.lit(False)))
+        .withColumn("SOURCE_STRING", F.regexp_replace(F.col("SOURCE_STRING"), NDC_SUFFIX_PATTERN, ""))
+    )
     source_window = Window.partitionBy("NOMENCLATURE_ID").orderBy(
         F.col("SOURCE_CHANGE_TS").desc(), F.col("ADC_UPDT").desc_nulls_last()
     )
@@ -650,6 +660,14 @@ def run_mapping_section():
             governed.join(candidates.select("NOMENCLATURE_ID"), "NOMENCLATURE_ID", "left_anti")
         )
         print(f"Rescope {B4_RULE_ID}: added {governed.count()} governed rows to the candidate set")
+
+    if NDC_RULE_ID in RESCOPE_RULE_IDS and not FORCE_FULL:
+        # NDC_DISPLAY_SUFFIX_V1: one-off re-map of every retired term that carried the suffix (older than the lookback).
+        suffixed = source.filter(F.col("_NDC_SUFFIXED"))
+        candidates = candidates.unionByName(
+            suffixed.join(candidates.select("NOMENCLATURE_ID"), "NOMENCLATURE_ID", "left_anti")
+        )
+        print(f"Rescope {NDC_RULE_ID}: added {suffixed.count()} retired-suffix rows to the candidate set")
 
     base_columns = [
         "NOMENCLATURE_ID",

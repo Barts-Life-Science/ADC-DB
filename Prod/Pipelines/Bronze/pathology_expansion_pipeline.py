@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from pathology_amr import run_amr
 from pathology_genetics import run_genetics
+from pathology_validation import run_genetics_validation  # GEN4_LANE_V1
 from pathology_incremental import run_incremental_core
 from pathology_indications import changed_scope, run_indications
 from pathology_pipeline import PipelineConfig, create_views
@@ -166,18 +167,21 @@ if force_full_refresh:
 core = run_incremental_core(spark, config, validate_stage_keys=False)
 periodic = periodic_lane_state(force_full_refresh)
 
-if periodic["enabled"]:
-    if spark.table(f"{lookup_schema}.pathology_hgnc_alias").limit(1).count() > 0:
-        genetics = run_genetics(
-            spark,
-            config,
-            include_proposed_profiles=True,
-            full_reconcile=True,
-            validate_stage_keys=False,
-        )
-    else:
-        genetics = "SKIPPED_NO_HGNC"
+# GEN4_LANE_V1: genetics runs on every run. Incremental by report text hash and parser/enrich versions;
+# a forced full refresh re-parses everything. Its validation gates fail the task on any ERROR.
+if spark.table(f"{lookup_schema}.pathology_hgnc_alias").limit(1).count() > 0:
+    genetics = run_genetics(
+        spark,
+        config,
+        include_proposed_profiles=False,
+        mode="full" if force_full_refresh else "incremental",
+        validate_stage_keys=False,
+    )
+    genetics = {**genetics, "validation_run_id": run_genetics_validation(spark, config)}
+else:
+    genetics = "SKIPPED_NO_HGNC"
 
+if periodic["enabled"]:
     amr = run_amr(
         spark,
         config,
@@ -191,7 +195,6 @@ else:
         "cadence": periodic["cadence"],
         "iso_week": periodic["iso_week"],
     }
-    genetics = skipped
     amr = skipped
 amr_lane = amr_lane_state(periodic, target_schema)
 if amr_lane["enabled"] and not periodic["enabled"]:
@@ -259,5 +262,4 @@ result = {
     "doctrine_reference": "no-curation doctrine 2026-08-13, master plan v2.4",
 }
 dbutils.notebook.exit(json.dumps(result, sort_keys=True, default=str))
-
 

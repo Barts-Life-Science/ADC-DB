@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Clinical events
 # MAGIC Conditions, procedures, pathology, genomics, microbiology, medication, forms, vital signs, scores, imaging and other clinical facts.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 2 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -463,6 +463,7 @@ CONDITION_PUBLIC_COLUMNS = [  # VDB_SILVER_COND_LOCAL_V1: + Europe/London compan
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_slice_id',  # ENCOUNTER_SLICE_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -474,6 +475,11 @@ CONDITION_PUBLIC_COLUMNS = [  # VDB_SILVER_COND_LOCAL_V1: + Europe/London compan
     'condition_code',
     'category_code',
     'category_display',
+    # DIAG_PRIORITY_V1: diagnosis ranking.
+    'diag_priority',
+    'clinical_diag_priority',
+    'ranking_code',
+    'ranking_display',
     'clinical_status_code',
     'clinical_status_display',
     'verification_status_code',
@@ -530,6 +536,8 @@ CONDITION_COLUMN_COMMENTS = {
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
     "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    # ENCOUNTER_SLICE_V1
+    "encounter_slice_id": "Millennium ENCNTR_SLICE_ID as BIGINT: the encounter slice (consultant episode) the diagnosis was coded against. Clinical coders record one ranked diagnosis list per slice, so diag_priority is ranked within it. Diagnosis arm only; null on the problem and maternity arms.",
     "event_datetime": "Primary assertion timestamp.",
     "event_end_datetime": "Source effective end where supplied.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time, over the bronze *_LOCAL companions of the same fallback chain (diagnosis: DIAG_DT_TM, ASSERTED_DT_TM, BEG_EFFECTIVE_DT_TM; problem: ASSERTED_DT_TM, ONSET_DT_TM, BEG_EFFECTIVE_DT_TM, earliest_problem_date). The maternity arm's DIAGDATE_CLEAN is already local wall-clock and is carried unchanged. Silver timestamps are UTC instants; take local calendar dates and clock times from this column.",
@@ -541,6 +549,11 @@ CONDITION_COLUMN_COMMENTS = {
     "condition_code": "Source and mapped condition codings.",
     "category_code": "Source condition category code.",
     "category_display": "Source condition category display.",
+    # DIAG_PRIORITY_V1
+    "diag_priority": "Millennium DIAGNOSIS.DIAG_PRIORITY, verbatim: the clinical coder's sequence number for the diagnosis within its encounter, 1 = primary diagnosis; 0 = not ranked. Set on coded Final and Principal ICD-10 diagnoses. About 13% of coded encounters have more than one diagnosis at 1 (the same code repeated, or one primary per consultant episode). Null on the problem and maternity arms.",
+    "clinical_diag_priority": "Millennium DIAGNOSIS.CLINICAL_DIAG_PRIORITY, verbatim: the clinician's ordering of diagnoses recorded at the point of care, 1 = first listed; 0 = not ranked. Set mainly on clinician-entered Discharge, Working and Admitting diagnoses; null on coded Final and Principal diagnoses and on the problem and maternity arms.",
+    "ranking_code": "Millennium RANKING_CD, verbatim (code set 12034: 3310 Primary, 3311 Secondary, 684907 Tertiary); '0' = not ranked. Rarely set on diagnoses (about 68,000 of 46.6 million rows); set on about 119,000 problems. Null on the maternity arm.",
+    "ranking_display": "Display for ranking_code from bronze map_problem.ranking_desc. Null on the diagnosis arm, because bronze map_diagnosis carries no ranking description, and on the maternity arm.",
     "clinical_status_code": "Source clinical-status code.",
     "clinical_status_display": "Source clinical-status display.",
     "verification_status_code": "Source verification-status code.",
@@ -561,9 +574,9 @@ CONDITION_COLUMN_COMMENTS = {
     "vip_ind": "Source VIP indicator.",
     "withheld_identity_ind": "Identity-withholding status is not populated by the current source projections; null does not mean identity was not withheld.",
     "source_feed": "Registered source feed owning the assertion.",
-    "record_status": "Diagnosis and problem arms are superseded when their END_EFFECTIVE_DT_TM is before 2100-01-01, otherwise active; a null end defaults to not-ended. The maternity-diagnosis arm is always active. No arm emits retracted here, and clinical status, source-presence flags and problem-history revision flags do not determine this label.",
+    "record_status": "Always active. Inactive, deleted and end-dated (superseded) diagnosis and problem rows are not brought into silver (ACTIVE_ROWS_V1, silver_active_rows.py); the maternity-diagnosis arm is always active.",
     "record_status_effective_from": "ACTIVE_STATUS_DT_TM from map_diagnosis or map_problem on the corresponding Millennium arm; DIAGDATE_CLEAN from map_maternity_diagnosis on the maternity arm. Values are carried unchanged without a fallback. The maternity value is a diagnosis-date proxy rather than an independently observed row-status change.",
-    "record_status_effective_to": "END_EFFECTIVE_DT_TM from the diagnosis or problem row only when it is before 2100-01-01; otherwise null. Always null on the maternity-diagnosis arm. No problem-history end, pregnancy end or ingestion timestamp is substituted.",
+    "record_status_effective_to": "Always null: end-dated diagnosis and problem rows are not brought into silver (ACTIVE_ROWS_V1).",
     "source_update_timestamp": "Source application update datetime.",
     "loaded_at": "Diagnosis and maternity arms carry their own ADC_UPDT. The problem arm takes greatest(map_problem.ADC_UPDT, maximum map_problem_history.ADC_UPDT for that PROBLEM_ID), across all retained revisions rather than only the latest. Problem-history UPDT_DT_TM is not added to the parent's source_update_timestamp, which remains its own UPDT_DT_TM; diagnosis uses its own UPDT_DT_TM and maternity uses RECORD_UPDATED_DT. The maternity identity join adds no pregnancy-spine clock, and the union adds no cross-arm timestamp maximum.",
 }
@@ -663,6 +676,207 @@ def _implant_attribute_grouped():
 
 # COMMAND ----------
 
+# ==== OPCS_QUALIFIER_BLOCK_V1: OPCS-4 qualifier codes attached to their operation ====
+from pyspark.sql.window import Window
+from silver_journey_shared import SRC_DIAGNOSIS, SRC_PROCEDURE
+
+# Clinical coders record one operation as an ordered run of OPCS-4 codes in a coding episode (same encounter, same
+# PROC_DT_TM): the operation, then its site code(s) (OMOP domain 'Spec Anatomic Site'), method codes (Y chapter)
+# and its side (Z94.x). Example: W19.2 nail fixation, Z77.2 shaft of tibia, Z94.3 left. map_procedure holds one row
+# per code, so the side and site never reached the operation row. Rows are ordered by PROC_PRIORITY then
+# PROCEDURE_ID (pre-2018 rows tie on priority and the ids keep entry order); each non-operation code joins the
+# latest operation before it. Qualifiers that come before every operation in their episode stay unattached, and
+# a site or side coded after a harvest (Y54-Y69) code describes the donor site, not the operation.
+OPCS_BLOCK_RULE = "opcs_qualifier_block_v1"
+OPCS_LATERALITY_DISPLAY = {
+    "Z94.1": "Bilateral", "Z94.2": "Right", "Z94.3": "Left", "Z94.4": "Unilateral (side not stated)",
+    "Z94.8": "Other specified laterality", "Z94.9": "Unspecified laterality",
+}
+
+
+def _opcs_laterality_display(code):
+    """Display text for a Z94.x laterality code."""
+    return F.create_map(*[F.lit(x) for pair in OPCS_LATERALITY_DISPLAY.items() for x in pair])[code]
+
+
+def _opcs_vocabulary():
+    """One row per OPCS-4 code: its OMOP domain, whether it is a harvest (donor-site) method code, and for site codes
+    the SNOMED body structure it 'Maps to'.
+    A valid concept beats a retired one and a mapped concept beats an unmapped one; then the lowest site id."""
+    concept = read_source("3_lookup.omop.concept")
+    opcs = concept.where(F.col("vocabulary_id") == "OPCS4").select(
+        F.col("concept_code").alias("opcs_code"),
+        F.col("concept_id").cast("bigint").alias("_opcs_concept_id"),
+        F.col("domain_id").alias("opcs_domain"),
+        F.lower(F.col("concept_name")).startswith("harvest of").alias("opcs_is_harvest"),
+        F.col("invalid_reason").isNotNull().alias("_retired"))
+    maps_to = read_source("3_lookup.omop.concept_relationship").where(
+        (F.col("relationship_id") == "Maps to") & F.col("invalid_reason").isNull()).select(
+        F.col("concept_id_1").cast("bigint").alias("_opcs_concept_id"),
+        F.col("concept_id_2").cast("bigint").alias("site_concept_id"))
+    snomed = concept.where(F.col("vocabulary_id") == "SNOMED").select(
+        F.col("concept_id").cast("bigint").alias("site_concept_id"),
+        F.col("concept_code").alias("site_snomed_code"),
+        F.col("concept_name").alias("site_snomed_display"))
+    mapped = opcs.join(maps_to, "_opcs_concept_id", "left").join(snomed, "site_concept_id", "left")
+    best = mapped.groupBy("opcs_code").agg(F.min(F.struct(
+        "_retired", F.col("site_snomed_code").isNull().alias("_unmapped"), "site_concept_id",
+        "opcs_domain", "opcs_is_harvest", "site_snomed_code", "site_snomed_display")).alias("_best"))
+    return best.select("opcs_code", "_best.opcs_domain", "_best.opcs_is_harvest", "_best.site_concept_id",
+                       "_best.site_snomed_code", "_best.site_snomed_display")
+
+
+def _opcs_procedure_block_query():
+    """One row per OPCS-4 map_procedure row: its role, the operation it belongs to, and that operation's site and side."""
+    code = F.upper(F.trim(F.col("SOURCE_IDENTIFIER")))
+    rows = (read_source(SRC_PROCEDURE)
+            .where(F.col("source_vocabulary_desc") == "OPCS4")
+            .select(F.col("PROCEDURE_ID").cast("bigint").alias("procedure_id"),
+                    F.col("ENCNTR_ID").cast("bigint").alias("encounter_id"),
+                    "PROC_DT_TM", F.to_date("PROC_DT_TM_LOCAL").alias("block_local_date"),
+                    "PROC_PRIORITY", code.alias("opcs_code"))
+            .join(F.broadcast(_opcs_vocabulary()), "opcs_code", "left")
+            .withColumn("opcs_code_role",
+                        F.when(F.col("opcs_code").startswith("Z94"), F.lit("laterality"))
+                        .when(F.col("opcs_domain") == "Spec Anatomic Site", F.lit("site"))
+                        .when(F.col("opcs_code").startswith("Y"), F.lit("method"))
+                        .otherwise(F.lit("operation"))))
+    # Running count of operations in coding order = the block a row belongs to (0 = before any operation).
+    coding_order = (Window.partitionBy("encounter_id", "PROC_DT_TM")
+                    .orderBy(F.col("PROC_PRIORITY").asc_nulls_last(), F.col("procedure_id").asc())
+                    .rowsBetween(Window.unboundedPreceding, Window.currentRow))
+    is_operation = F.col("opcs_code_role") == "operation"
+    rows = rows.withColumn("_block_no", F.sum(F.when(is_operation, 1).otherwise(0)).over(coding_order))
+    block_key = ["encounter_id", "PROC_DT_TM", "_block_no"]
+    # A harvest method code (Y54-Y69 "Harvest of ...") carries the donor site's own site and side (Y56.2 harvest of a
+    # flap from the back, then Z94.2): qualifiers after the block's first harvest code describe the donor site, so only
+    # earlier ones describe the operation. Other Y codes (approach, image guidance) do not split the block.
+    block_order = (Window.partitionBy(*block_key)
+                   .orderBy(F.col("PROC_PRIORITY").asc_nulls_last(), F.col("procedure_id").asc())
+                   .rowsBetween(Window.unboundedPreceding, Window.currentRow))
+    is_harvest = (F.col("opcs_code_role") == "method") & F.coalesce(F.col("opcs_is_harvest"), F.lit(False))
+    rows = rows.withColumn("_after_method", F.sum(F.when(is_harvest, 1).otherwise(0)).over(block_order) > 0)
+    is_site = (F.col("opcs_code_role") == "site") & ~F.col("_after_method")
+    is_side = (F.col("opcs_code_role") == "laterality") & ~F.col("_after_method")
+    coding_position = F.coalesce(F.col("PROC_PRIORITY").cast("bigint"), F.lit(9223372036854775807))
+    blocks = rows.where(F.col("_block_no") > 0).groupBy(*block_key).agg(
+        F.max(F.when(is_operation, F.col("procedure_id"))).alias("anchor_procedure_id"),
+        F.max(F.when(is_operation, F.col("opcs_code"))).alias("anchor_opcs_code"),
+        # The first site in coding order names the body site; all mapped sites feed the indication match.
+        F.min(F.when(is_site, F.struct(coding_position.alias("_position"), "procedure_id", "site_concept_id",
+                                       "site_snomed_code", "site_snomed_display"))).alias("_first_site"),
+        F.countDistinct(F.when(is_site, F.col("opcs_code"))).alias("_site_count"),
+        F.array_sort(F.collect_set(F.when(is_site, F.col("site_concept_id")))).alias("site_concept_ids"),
+        F.array_sort(F.collect_set(F.when(is_side, F.col("opcs_code")))).alias("_sides"))
+    one_side = F.size("_sides") == 1
+    blocks = blocks.select(
+        *block_key, "anchor_procedure_id", "anchor_opcs_code", "site_concept_ids",
+        F.col("_first_site.site_concept_id").alias("site_concept_id"),
+        F.col("_first_site.site_snomed_code").alias("body_site_code"),
+        F.col("_first_site.site_snomed_display").alias("body_site_display"),
+        F.when(F.col("_site_count") == 0, F.lit(None).cast("string"))
+         .when(F.col("_first_site.site_snomed_code").isNull(), F.lit(OPCS_BLOCK_RULE + "_unmapped"))
+         .when(F.col("_site_count") > 1, F.lit(OPCS_BLOCK_RULE + "_multiple"))
+         .otherwise(F.lit(OPCS_BLOCK_RULE)).alias("body_site_method"),
+        F.when(one_side, F.col("_sides")[0]).alias("laterality_code"),
+        F.when(one_side, _opcs_laterality_display(F.col("_sides")[0])).alias("laterality_display"),
+        F.when(one_side, F.lit(OPCS_BLOCK_RULE))
+         .when(F.size("_sides") > 1, F.lit(OPCS_BLOCK_RULE + "_conflict")).alias("laterality_method"))
+    # The per-row vocabulary columns gave way to the block's values (the first site of the operation).
+    rows = rows.drop("opcs_domain", "opcs_is_harvest", "site_concept_id", "site_snomed_code", "site_snomed_display",
+                     "_after_method")
+    return rows.join(blocks, block_key, "left").select(
+        "procedure_id", "encounter_id", "block_local_date", "opcs_code", "opcs_code_role",
+        "anchor_procedure_id", "anchor_opcs_code", "site_concept_id", "site_concept_ids",
+        "body_site_code", "body_site_display", "body_site_method",
+        "laterality_code", "laterality_display", "laterality_method")
+
+
+@materialized_view(
+    name=_n("journey_clinical._opcs_procedure_block"),
+    private=True,
+    comment="Internal OPCS-4 coded-operation runs (OPCS_QUALIFIER_BLOCK_V1): every OPCS map_procedure row with its role and its operation's site and side.",
+    refresh_policy="incremental",
+)
+def _opcs_procedure_block():
+    # Build the declared dataset: every OPCS-4 row with the operation it qualifies.
+    return _opcs_procedure_block_query()
+
+
+# ==== IMPLANT_OPCS_LINK_V1: implant rows take the side and site of the operation that placed them ====
+IMPLANT_LINK_RULE = "implant_opcs_link_v1"
+# Imaging (U) and miscellaneous (X: drugs, oxygen ...) operations never place an implant; their site and side codes
+# describe a scan or an infusion, so they are never candidates.
+IMPLANT_LINK_EXCLUDED_CHAPTERS = ["U", "X"]
+
+
+def _implant_opcs_link_query():
+    """One row per implant with candidate OPCS operations in its encounter on the implant's London date (else the day
+    before or after). The link names the operation when there is exactly one candidate. Side and site are published
+    when every candidate that has one agrees and none is itself in conflict; otherwise NULL with a _conflict method."""
+    operations = (spark.read.table(_n("journey_clinical._opcs_procedure_block"))
+                  .where((F.col("opcs_code_role") == "operation")
+                         & ~F.substring("opcs_code", 1, 1).isin(*IMPLANT_LINK_EXCLUDED_CHAPTERS))
+                  .select("encounter_id", "block_local_date", F.col("procedure_id").alias("candidate_procedure_id"),
+                          "site_concept_id", "body_site_code", "body_site_display", "body_site_method",
+                          "laterality_code", "laterality_method"))
+    implants = _implant_procedure_canonical().select(
+        "patient_event_key", "encounter_id", F.to_date("event_datetime_local").alias("_implant_date"))
+    # Equi-join on encounter, keep candidates within a day, and keep only the nearest day per implant.
+    pairs = (implants.join(operations, "encounter_id")
+             .withColumn("_day_offset", F.abs(F.datediff("block_local_date", "_implant_date")))
+             .where(F.col("_day_offset") <= 1))
+    pairs = (pairs.withColumn("_nearest", F.min("_day_offset").over(Window.partitionBy("patient_event_key")))
+             .where(F.col("_day_offset") == F.col("_nearest")).drop("_nearest"))
+    has_site = F.col("body_site_code").isNotNull()
+    grouped = pairs.groupBy("patient_event_key").agg(
+        F.min("_day_offset").alias("_day_offset"),
+        F.countDistinct("candidate_procedure_id").alias("_candidates"),
+        F.max("candidate_procedure_id").alias("_any_candidate"),
+        F.array_sort(F.collect_set("laterality_code")).alias("_sides"),
+        F.max(F.coalesce(F.col("laterality_method").endswith("_conflict"), F.lit(False))).alias("_side_conflict"),
+        F.array_sort(F.collect_set(F.when(has_site, F.struct("body_site_code", "body_site_display",
+                                                             "site_concept_id")))).alias("_sites"))
+    method = F.concat(F.lit(IMPLANT_LINK_RULE),
+                      F.when(F.col("_day_offset") == 0, F.lit("_same_day")).otherwise(F.lit("_adjacent_day")))
+    one_side = (F.size("_sides") == 1) & ~F.col("_side_conflict")
+    one_site = F.size("_sites") == 1
+    return grouped.select(
+        F.col("patient_event_key").alias("_link_event_key"),
+        F.col("_candidates").alias("_link_candidate_count"),
+        F.when(F.col("_candidates") == 1, F.col("_any_candidate")).alias("_link_procedure_id"),
+        F.when(one_site, F.col("_sites")[0]["body_site_code"]).alias("_link_body_site_code"),
+        F.when(one_site, F.col("_sites")[0]["body_site_display"]).alias("_link_body_site_display"),
+        F.when(one_site, method).when(F.size("_sites") > 1, F.concat(method, F.lit("_conflict")))
+         .alias("_link_body_site_method"),
+        F.when(one_side, F.col("_sides")[0]).alias("_link_laterality_code"),
+        F.when(one_side, _opcs_laterality_display(F.col("_sides")[0])).alias("_link_laterality_display"),
+        F.when(one_side, method)
+         .when((F.size("_sides") > 1) | F.col("_side_conflict"), F.concat(method, F.lit("_conflict")))
+         .alias("_link_laterality_method"))
+
+
+@materialized_view(
+    name=_n("journey_clinical._implant_opcs_link"),
+    private=True,
+    comment="Internal implant to OPCS-4 operation link (IMPLANT_OPCS_LINK_V1): same-encounter operations on the implant's London date, else the adjacent day.",
+    refresh_policy="incremental",
+)
+def _implant_opcs_link():
+    # Build the declared dataset: each implant's candidate operations, side and site.
+    return _implant_opcs_link_query()
+
+
+def _with_no_opcs_anatomy(df):
+    """Arms without OPCS evidence carry the four anatomy provenance columns as NULL."""
+    return (df.withColumn("body_site_method", F.lit(None).cast("string"))
+              .withColumn("laterality_method", F.lit(None).cast("string"))
+              .withColumn("opcs_code_role", F.lit(None).cast("string"))
+              .withColumn("opcs_anchor_procedure_id", F.lit(None).cast("bigint")))
+
+
+# COMMAND ----------
+
 # contract v2: the researcher-facing parent excludes lifecycle, QC and retired fields.
 PROCEDURE_PUBLIC_COLUMNS = [
     'patient_event_key',
@@ -693,6 +907,10 @@ PROCEDURE_PUBLIC_COLUMNS = [
     'body_site_display',
     'laterality_code',
     'laterality_display',
+    'body_site_method',
+    'laterality_method',
+    'opcs_code_role',
+    'opcs_anchor_procedure_id',
     'performer_practitioner_id',
     'procedure_location_code',
     'procedure_location_display',
@@ -744,9 +962,35 @@ PROCEDURE_LIFECYCLE_COLUMNS = [
 def _procedure_primitive_query():
     # Combine procedure sources with grouped implant attributes, retaining JSON across the join-
     # shaped internal stage.
+    # OPCS_QUALIFIER_BLOCK_V1 / IMPLANT_OPCS_LINK_V1: Millennium OPCS rows take the site and side of their coded
+    # operation and implant rows those of the operation they link to. A source LATERALITY_CD still wins.
     attributes = spark.read.table(_n("journey_clinical._implant_attribute_grouped")).alias("a")
+    blocks = spark.read.table(_n("journey_clinical._opcs_procedure_block")).select(
+        F.col("procedure_id").alias("_block_procedure_id"),
+        F.col("opcs_code_role").alias("_block_role"),
+        F.col("anchor_procedure_id").alias("_block_anchor_id"),
+        F.col("body_site_code").alias("_block_site_code"),
+        F.col("body_site_display").alias("_block_site_display"),
+        F.col("body_site_method").alias("_block_site_method"),
+        F.col("laterality_code").alias("_block_side_code"),
+        F.col("laterality_display").alias("_block_side_display"),
+        F.col("laterality_method").alias("_block_side_method"),
+    )
+    links = spark.read.table(_n("journey_clinical._implant_opcs_link"))
+    source_side = F.col("laterality_display").isNotNull()
     procedure_rows = (
         _procedure_canonical()
+        .join(blocks, F.col("procedure_id") == F.col("_block_procedure_id"), "left")
+        .withColumn("laterality_method",
+                    F.when(source_side, F.lit("source_laterality_cd")).otherwise(F.col("_block_side_method")))
+        .withColumn("laterality_code", F.when(source_side, F.col("laterality_code")).otherwise(F.col("_block_side_code")))
+        .withColumn("laterality_display",
+                    F.when(source_side, F.col("laterality_display")).otherwise(F.col("_block_side_display")))
+        .withColumn("body_site_code", F.col("_block_site_code"))
+        .withColumn("body_site_display", F.col("_block_site_display"))
+        .withColumn("body_site_method", F.col("_block_site_method"))
+        .withColumn("opcs_code_role", F.col("_block_role"))
+        .withColumn("opcs_anchor_procedure_id", F.col("_block_anchor_id"))
         .withColumn("_implant_attribute_json", F.lit(None).cast("string"))
         .withColumn("_implant_attribute_count", F.lit(0).cast("long"))
     )
@@ -758,6 +1002,7 @@ def _procedure_primitive_query():
             F.col("patient_event_key") == F.col("a._implant_attribute_event_key"),
             "left",
         )
+        .join(links, F.col("patient_event_key") == F.col("_link_event_key"), "left")
         .withColumn("_implant_attribute_json", F.col("a._implant_attribute_json"))
         .withColumn(
             "_implant_attribute_count",
@@ -766,18 +1011,26 @@ def _procedure_primitive_query():
         .withColumn(
             "loaded_at", F.greatest(F.col("loaded_at"), F.col("a._evidence_loaded_at"))
         )
+        .withColumn("body_site_code", F.col("_link_body_site_code"))
+        .withColumn("body_site_display", F.col("_link_body_site_display"))
+        .withColumn("body_site_method", F.col("_link_body_site_method"))
+        .withColumn("laterality_code", F.col("_link_laterality_code"))
+        .withColumn("laterality_display", F.col("_link_laterality_display"))
+        .withColumn("laterality_method", F.col("_link_laterality_method"))
+        .withColumn("opcs_code_role", F.lit(None).cast("string"))
+        .withColumn("opcs_anchor_procedure_id", F.col("_link_procedure_id"))
     )
-    theatre_rows = (
+    theatre_rows = _with_no_opcs_anatomy(
         _theatre_procedure_canonical()
         .withColumn("_implant_attribute_json", F.lit(None).cast("string"))
         .withColumn("_implant_attribute_count", F.lit(0).cast("long"))
     )
-    cc_rows = (
+    cc_rows = _with_no_opcs_anatomy(
         _cc_procedure_canonical()
         .withColumn("_implant_attribute_json", F.lit(None).cast("string"))
         .withColumn("_implant_attribute_count", F.lit(0).cast("long"))
     )
-    endobase_rows = (
+    endobase_rows = _with_no_opcs_anatomy(
         _endobase_procedure_canonical()
         .withColumn("_implant_attribute_json", F.lit(None).cast("string"))
         .withColumn("_implant_attribute_count", F.lit(0).cast("long"))
@@ -857,10 +1110,14 @@ PROCEDURE_COLUMN_COMMENTS = {
     "status_display": "Source status display.",
     "performed_start": "Procedure performed start.",
     "performed_end": "Procedure performed end.",
-    "body_site_code": "Body-site code where supplied.",
-    "body_site_display": "Body-site display where supplied.",
-    "laterality_code": "Source laterality code.",
-    "laterality_display": "Source laterality display.",
+    "body_site_code": "SNOMED body-structure code. Millennium OPCS-4 rows: the first OPCS site code of the coded operation, mapped through OMOP 'Maps to'. Implant rows: the site agreed by the operations the implant links to. See body_site_method.",
+    "body_site_display": "SNOMED body-structure name for body_site_code.",
+    "laterality_code": "Millennium LATERALITY_CD where the source records one; otherwise the OPCS-4 Z94.x code of the coded operation (Z94.1 bilateral, Z94.2 right, Z94.3 left, Z94.4 unilateral side not stated). See laterality_method.",
+    "laterality_display": "Laterality display: the Millennium laterality description or the Z94.x meaning.",
+    "body_site_method": "How body_site_code was derived. opcs_qualifier_block_v1: first site code of the OPCS-4 coded operation (same encounter and coding episode, ordered by PROC_PRIORITY then PROCEDURE_ID; sites coded after a harvest (Y54-Y69) code describe the donor site and are not used); suffix _multiple when the operation has several site codes, _unmapped when the site code has no SNOMED map (code NULL). implant_opcs_link_v1_same_day / _adjacent_day: site agreed by every candidate operation; _conflict when they disagree (code NULL). NULL: no site evidence.",
+    "laterality_method": "How laterality was derived. source_laterality_cd: Millennium LATERALITY_CD. opcs_qualifier_block_v1: the Z94.x code of the OPCS-4 coded operation (a Z94 coded after a harvest (Y54-Y69) code describes the donor site and is not used); _conflict when it carries different Z94 codes (laterality NULL). implant_opcs_link_v1_same_day / _adjacent_day: side agreed by every candidate operation with a side; _conflict when they disagree. NULL: no side evidence.",
+    "opcs_code_role": "Role of this OPCS-4 code in its coded operation (OPCS_QUALIFIER_BLOCK_V1): operation, site (body-structure code), laterality (Z94.x) or method (Y chapter). NULL for non-OPCS rows. Count procedures with opcs_code_role = 'operation'; the other roles qualify the operation named in opcs_anchor_procedure_id.",
+    "opcs_anchor_procedure_id": "PROCEDURE_ID of the OPCS-4 operation this row belongs to: the row itself for an operation; the preceding operation in coding order for a qualifier; NULL for a qualifier coded before any operation. Implant rows: the linked operation when exactly one candidate operation exists (IMPLANT_OPCS_LINK_V1).",
     "performer_practitioner_id": "Millennium personnel PERSON_ID as BIGINT when available.",
     "procedure_location_code": "Source procedure-location code retained without asserting a location-dimension FK.",
     "procedure_location_display": "Source procedure-location display.",
@@ -1120,6 +1377,164 @@ def procedure_implant_attribute():
 
 # COMMAND ----------
 
+# ==== journey_clinical.procedure_indication (PROCEDURE_INDICATION_V1) ====
+#
+# Millennium never records which diagnosis an operation or implant treated. This table proposes the link by anatomy:
+# a same-encounter condition whose SNOMED finding site ('Has finding site' of the condition's standard concept) is
+# the operation's coded body site, or within two is-a levels of it in either direction. Example: W19.2 + Z77.2
+# (shaft of tibia) matches S82.2 fracture of shaft of tibia exactly and never S82.0 fracture of patella.
+# Every candidate is published with its rule and anatomical distance; indication_rank 1 is the closest anatomy, then
+# the lowest diagnosis priority. Nothing is curated by hand.
+PROCEDURE_INDICATION_RULE = "procedure_site_finding_site_v1"
+PROCEDURE_INDICATION_MAX_LEVELS = 2
+
+PROCEDURE_INDICATION_PUBLIC_COLUMNS = [
+    "procedure_patient_event_key", "procedure_source_object", "procedure_id", "implant_event_id", "implant_sequence",
+    "condition_patient_event_key", "diagnosis_id", "problem_id", "person_id", "encounter_id",
+    "procedure_site_code", "procedure_site_display", "condition_site_code", "condition_site_display",
+    "match_type", "match_levels", "diagnosis_priority", "indication_rank", "rule_id", "rule_version", "loaded_at",
+]
+
+PROCEDURE_INDICATION_COLUMN_COMMENTS = {
+    "procedure_patient_event_key": "patient_event_key of the clinical_procedure row: an OPCS-4 operation, or an implant linked to exactly one operation.",
+    "procedure_source_object": "source_object of the procedure row: millennium_procedure or implant.",
+    "procedure_id": "Millennium PROCEDURE_ID of the operation row (NULL for implant rows).",
+    "implant_event_id": "Millennium implant EVENT_ID for implant rows.",
+    "implant_sequence": "Millennium IMPLANT_SEQUENCE for implant rows.",
+    "condition_patient_event_key": "patient_event_key of the clinical_condition row proposed as the indication.",
+    "diagnosis_id": "Millennium DIAGNOSIS_ID of the condition when it is a diagnosis.",
+    "problem_id": "Millennium PROBLEM_ID of the condition when it is a problem.",
+    "person_id": "Millennium PERSON_ID.",
+    "encounter_id": "Millennium ENCNTR_ID shared by the procedure and the condition.",
+    "procedure_site_code": "SNOMED body structure of the operation (an OPCS-4 site code of the coded operation via OMOP 'Maps to').",
+    "procedure_site_display": "SNOMED name of procedure_site_code.",
+    "condition_site_code": "SNOMED finding site of the condition's standard concept ('Has finding site').",
+    "condition_site_display": "SNOMED name of condition_site_code.",
+    "match_type": "exact (same structure), condition_site_narrower (the condition site is a descendant of the procedure site) or condition_site_broader (an ancestor).",
+    "match_levels": "is-a levels between the two sites (0 = exact; at most 2).",
+    "diagnosis_priority": "Millennium DIAG_PRIORITY of the diagnosis as recorded: 1 = coded primary, 2+ = secondary positions, 0 = not ranked (Discharge/Working diagnoses such as ED); NULL for problems.",
+    "indication_rank": "1 = best candidate for this procedure: fewest match_levels, then lowest positive diagnosis_priority (0 and NULL last), then condition_patient_event_key.",
+    "rule_id": "Matching rule: procedure_site_finding_site_v1.",
+    "rule_version": "Rule version.",
+    "loaded_at": "Greatest load timestamp of the procedure and condition rows.",
+}
+
+
+def _snomed_names(alias):
+    """SNOMED concept id -> code and name, with columns prefixed for one side of the match."""
+    return read_source("3_lookup.omop.concept").select(
+        F.col("concept_id").cast("bigint").alias(f"{alias}_id"),
+        F.col("concept_code").alias(f"{alias}_code"),
+        F.col("concept_name").alias(f"{alias}_display"))
+
+
+def _procedure_site_rows():
+    """Operations and singly-linked implants, one row per mapped site of their coded operation."""
+    procedures = (spark.read.table(_n("journey_clinical._procedure_primitive"))
+                  .where((F.col("opcs_code_role") == "operation")
+                         | ((F.col("source_object") == "implant") & F.col("opcs_anchor_procedure_id").isNotNull()))
+                  .select("patient_event_key", "source_object", "procedure_id", "implant_event_id", "implant_sequence",
+                          "person_id", "encounter_id", "opcs_anchor_procedure_id", "loaded_at"))
+    sites = (spark.read.table(_n("journey_clinical._opcs_procedure_block"))
+             .where(F.col("opcs_code_role") == "operation")
+             .select(F.col("procedure_id").alias("_site_anchor_id"),
+                     F.explode("site_concept_ids").alias("procedure_site_id")))
+    return (procedures.join(sites, F.col("opcs_anchor_procedure_id") == F.col("_site_anchor_id"))
+            .drop("_site_anchor_id", "opcs_anchor_procedure_id"))
+
+
+def _condition_site_rows():
+    """Encounter conditions, one row per SNOMED finding site of their standard concept (a non-standard concept is
+    first followed through 'Maps to')."""
+    relationship = read_source("3_lookup.omop.concept_relationship").where(F.col("invalid_reason").isNull())
+    maps_to = relationship.where(F.col("relationship_id") == "Maps to").select(
+        F.col("concept_id_1").cast("bigint").alias("_cond_concept_id"),
+        F.col("concept_id_2").cast("bigint").alias("_std_id"))
+    finding_site = relationship.where(F.col("relationship_id") == "Has finding site").select(
+        F.col("concept_id_1").cast("bigint").alias("_std_id"),
+        F.col("concept_id_2").cast("bigint").alias("condition_site_id"))
+    conditions = (spark.read.table(_n("journey_clinical.condition"))
+                  .where(F.col("encounter_id").isNotNull() & F.col("condition_omop_concept_id").isNotNull())
+                  .select(F.col("patient_event_key").alias("condition_patient_event_key"), "diagnosis_id", "problem_id",
+                          F.col("encounter_id").alias("_cond_encounter_id"),
+                          F.col("condition_omop_concept_id").cast("bigint").alias("_cond_concept_id"),
+                          F.col("loaded_at").alias("_cond_loaded_at")))
+    standard = (conditions.join(maps_to, "_cond_concept_id", "left")
+                .withColumn("_std_id", F.coalesce(F.col("_std_id"), F.col("_cond_concept_id"))))
+    return (standard.join(finding_site, "_std_id")
+            .drop("_std_id", "_cond_concept_id")
+            .dropDuplicates(["condition_patient_event_key", "condition_site_id"]))
+
+
+def _procedure_indication_query():
+    """Anatomy-matched (procedure, condition) candidates in the same encounter, ranked per procedure."""
+    procedures = _procedure_site_rows()
+    pairs = (procedures.join(_condition_site_rows(), F.col("encounter_id") == F.col("_cond_encounter_id"))
+             .drop("_cond_encounter_id"))
+    # concept_ancestor narrowed to the procedure sites in play: three equi-joins, never an OR-join.
+    proc_sites = F.broadcast(procedures.select(F.col("procedure_site_id").alias("_site")).distinct())
+    ancestors = (read_source("3_lookup.omop.concept_ancestor")
+                 .where(F.col("min_levels_of_separation").between(1, PROCEDURE_INDICATION_MAX_LEVELS))
+                 .select(F.col("ancestor_concept_id").cast("bigint").alias("_anc"),
+                         F.col("descendant_concept_id").cast("bigint").alias("_des"),
+                         F.col("min_levels_of_separation").cast("int").alias("_levels")))
+    under_procedure = ancestors.join(proc_sites, F.col("_anc") == F.col("_site"), "left_semi")
+    over_procedure = ancestors.join(proc_sites, F.col("_des") == F.col("_site"), "left_semi")
+    exact = (pairs.where(F.col("procedure_site_id") == F.col("condition_site_id"))
+             .withColumn("match_type", F.lit("exact")).withColumn("match_levels", F.lit(0)))
+    narrower = (pairs.join(under_procedure, (F.col("_anc") == F.col("procedure_site_id"))
+                           & (F.col("_des") == F.col("condition_site_id")))
+                .withColumn("match_type", F.lit("condition_site_narrower"))
+                .withColumn("match_levels", F.col("_levels")).drop("_anc", "_des", "_levels"))
+    broader = (pairs.join(over_procedure, (F.col("_anc") == F.col("condition_site_id"))
+                          & (F.col("_des") == F.col("procedure_site_id")))
+               .withColumn("match_type", F.lit("condition_site_broader"))
+               .withColumn("match_levels", F.col("_levels")).drop("_anc", "_des", "_levels"))
+    matches = exact.unionByName(narrower).unionByName(broader)
+    # Keep the closest site pair per (procedure, condition); deterministic tie-break on the site ids.
+    pair_order = Window.partitionBy("patient_event_key", "condition_patient_event_key").orderBy(
+        F.col("match_levels").asc(), F.col("match_type").asc(),
+        F.col("procedure_site_id").asc(), F.col("condition_site_id").asc())
+    matches = (matches.withColumn("_pair_rn", F.row_number().over(pair_order))
+               .where(F.col("_pair_rn") == 1).drop("_pair_rn"))
+    priority = read_source(SRC_DIAGNOSIS).select(
+        F.col("DIAGNOSIS_ID").cast("bigint").alias("diagnosis_id"),
+        F.col("DIAG_PRIORITY").cast("int").alias("diagnosis_priority"))
+    matches = matches.join(priority, "diagnosis_id", "left")
+    # DIAG_PRIORITY 1 is the coded primary; 0 is the unranked bucket (Discharge/Working, e.g. ED) and sorts last.
+    ranked_priority = F.when(F.col("diagnosis_priority") > 0, F.col("diagnosis_priority"))
+    rank_order = Window.partitionBy("patient_event_key").orderBy(
+        F.col("match_levels").asc(), ranked_priority.asc_nulls_last(),
+        F.col("condition_patient_event_key").asc())
+    return (matches.withColumn("indication_rank", F.row_number().over(rank_order))
+            .join(_snomed_names("procedure_site"), "procedure_site_id", "left")
+            .join(_snomed_names("condition_site"), "condition_site_id", "left")
+            .select(
+                F.col("patient_event_key").alias("procedure_patient_event_key"),
+                F.col("source_object").alias("procedure_source_object"),
+                "procedure_id", "implant_event_id", "implant_sequence",
+                "condition_patient_event_key", "diagnosis_id", "problem_id", "person_id", "encounter_id",
+                "procedure_site_code", "procedure_site_display", "condition_site_code", "condition_site_display",
+                "match_type", "match_levels", "diagnosis_priority", "indication_rank",
+                F.lit(PROCEDURE_INDICATION_RULE).alias("rule_id"), F.lit("1").alias("rule_version"),
+                F.greatest(F.col("loaded_at"), F.col("_cond_loaded_at")).alias("loaded_at")))
+
+
+@materialized_view(
+    name=_n("journey_clinical.procedure_indication"),
+    comment="Candidate indications for coded operations and singly-linked implants (PROCEDURE_INDICATION_V1): same-encounter conditions whose SNOMED finding site matches the operation's coded body site exactly or within two is-a levels. One row per (procedure, condition); indication_rank 1 = closest anatomy, then lowest diagnosis priority. Rule-based, no manual curation.",
+    column_comments=PROCEDURE_INDICATION_COLUMN_COMMENTS,
+    cluster_by=["person_id"],
+    # auto, not incremental: a row-based refresh of this join over the OMOP hierarchy took 6-8 min even for a few
+    # changed rows in dev, against ~13 s for a full recompute; auto lets the cost model choose (dev proof 2026-10-16).
+    refresh_policy="auto",
+)
+def procedure_indication():
+    # Build the declared dataset: anatomy-matched procedure to condition candidates.
+    return _procedure_indication_query().select(*PROCEDURE_INDICATION_PUBLIC_COLUMNS)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Pathology, reports and specimens
 
@@ -1137,6 +1552,10 @@ def _pathology_parent_link_canonical():
         F.col("source_record_key").alias("source_parent_key"),
         F.col("report_series_id"),
     )
+    # PATH_ENCOUNTER_V1: the resolved accession's encounter evidence rides on the link.
+    acc = spark.read.table(_n("journey_events._pathology_accession_identity")).select(
+        "pathology_accession_id", "accession_encounter_id", "accession_encounter_conflict",
+    )
     return (
         src.select(
             "source_parent_key", "source_system",
@@ -1145,6 +1564,7 @@ def _pathology_parent_link_canonical():
             F.col("ADC_UPDT").alias("loaded_at"),
         )
         .join(ver, "source_parent_key", "left")
+        .join(acc, "pathology_accession_id", "left")
     )
 
 # COMMAND ----------
@@ -1196,7 +1616,15 @@ def _pathology_accession_identity():
             F.max("nhs_number").alias("evidence_nhs"),
             F.count(F.lit(1)).cast("long").alias("source_row_count"),
             F.max("ADC_UPDT").alias("evidence_loaded_at"),
+            # PATH_ENCOUNTER_V1: the encounters named by the accession's current (Millennium) sources.
+            F.min(F.when(F.col("is_current"), F.col("encounter_id"))).cast("bigint").alias("_encounter_lo"),
+            F.max(F.when(F.col("is_current"), F.col("encounter_id"))).cast("bigint").alias("_encounter_hi"),
         )
+        .withColumn("accession_encounter_id",
+                    F.when(F.col("_encounter_lo") == F.col("_encounter_hi"), F.col("_encounter_lo")))
+        .withColumn("accession_encounter_conflict",
+                    F.coalesce(F.col("_encounter_lo") != F.col("_encounter_hi"), F.lit(False)))
+        .drop("_encounter_lo", "_encounter_hi")
     )
     return survivors.select(
         "pathology_accession_id", "primary_source_accession_id", "canonical_accession_status",
@@ -1245,6 +1673,7 @@ SPECIMEN_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -1299,7 +1728,8 @@ SPECIMEN_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Collection or receipt timestamp.",
     "event_end_datetime": "Event end when supplied.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -1404,6 +1834,7 @@ REPORT_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -1453,7 +1884,8 @@ PATHOLOGY_REPORT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Report issue or result timestamp.",
     "event_end_datetime": "Report event end.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -1527,6 +1959,7 @@ RESULT_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -1607,10 +2040,13 @@ def _pathology_result_primitive():
     # planning (GROUP_EXPRESSION_TYPE_IS_NOT_ORDERABLE) and forces complete recompute every
     # update.
     raw = read_source(SRC_PATHOLOGY).alias("s")
-    link = _pathology_parent_link_canonical().select(
+    # PATH_ENCOUNTER_V1: read the materialized parent link, which also carries the accession's encounter.
+    link = spark.read.table(_n("journey_events._pathology_parent_link")).select(
         F.col("source_parent_key").alias("_source_parent_key"),
         F.col("pathology_accession_id").alias("_link_accession_id"),
         F.col("report_series_id").alias("_link_series_id"),
+        F.col("accession_encounter_id").alias("_link_accession_encounter_id"),
+        F.col("accession_encounter_conflict").alias("_link_accession_encounter_conflict"),
     ).alias("l")
     eq = read_source(SRC_PATHOLOGY_RESULT_EQUIVALENCE).select(
         F.col("source_record_key").alias("_eq_key"),
@@ -1623,6 +2059,7 @@ def _pathology_result_primitive():
         raw.join(link, raw.source_parent_key == F.col("l._source_parent_key"), "left")
         .join(eq, raw.source_record_key == F.col("e._eq_key"), "left")
         .select("s.*", "l._link_accession_id", "l._link_series_id",
+                "l._link_accession_encounter_id", "l._link_accession_encounter_conflict",
                 "e._eq_group", "e._eq_role", "e._eq_preferred", "e._eq_person_projection")
     )
     return _pathology_result_canonical(
@@ -1662,7 +2099,8 @@ PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each pathology result record. It is derived from bronze field `measurement_datetime` in `4_prod.bronze.map_pathology`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Measurement end timestamp.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -1752,7 +2190,8 @@ PATHOLOGY_ORDER_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier system used for subject_key.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Requested or source-validity timestamp.",
     "event_end_datetime": "Order event end when supplied.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -1805,7 +2244,8 @@ def _lifecycle_source_pathology_order():
     # contract v2: publish the direct pathology-order projection with source_object and key names
     return s.select(
         "patient_event_key", "subject_key", "subject_id_system", "person_id",
-        "identity_status", "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
+        "identity_status", "encounter_id", "encounter_link_method",  # PATH_ENCOUNTER_V1
+        "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         "source_coding_system", "source_code", "source_display",
         "source_object", "wkg_code", "tlc_code", "order_id", "order_mnemonic",
         "raw_request_text", "test_description", "test_snomed_code", "test_omop_concept_id",
@@ -1849,6 +2289,73 @@ def pathology_order_lifecycle():
 # ==== Genomics, indication and microbiology/AMR ====
 
 # contract v2: retain the full canonical shape for internal reuse.
+# PATH_ENCOUNTER_V2: encounter evidence for genomic accessions that V1 cannot link (no Millennium source).
+from silver_journey_shared import SRC_PATHOLOGY_GENETIC_TEST
+
+EXTERNAL_SITE_RULE = "source_site_code LIKE 'E%' OR source_site_code = 'XQA'"
+
+
+@materialized_view(
+    name=_n("journey_events._genomic_encounter_window"),
+    private=True,
+    comment="INTERNAL PATH_ENCOUNTER_V2 evidence: for genomic accessions without a Millennium encounter, the "
+            "patient's encounter whose period contains the sample date (Barts sites only; external referral "
+            "sites E*/XQA are marked none_external_referral).",
+    refresh_policy="incremental",
+)
+def _genomic_encounter_window():
+    # One row per alias-resolved genomic accession that V1 leaves unlinked, with window_method set and
+    # window_encounter_id when exactly one encounter qualifies.
+    accessions = _alias_resolved_accession(read_source(SRC_PATHOLOGY_GENETIC_TEST)).select(
+        F.col("_resolved_accession_id").alias("pathology_accession_id")
+    ).distinct()
+    identity = spark.read.table(_n("journey_events._pathology_accession_identity")).select(
+        "pathology_accession_id", "canonical_person_id", "sample_dt_local", "request_dt_local", "source_site_code",
+        "accession_encounter_id", "accession_encounter_conflict",
+    )
+    unlinked = (
+        accessions.join(identity, "pathology_accession_id", "inner")
+        .where(F.col("accession_encounter_id").isNull() & ~F.coalesce(F.col("accession_encounter_conflict"), F.lit(False)))
+        .withColumn("_external", F.coalesce(F.expr(EXTERNAL_SITE_RULE), F.lit(False)))
+        .withColumn("_sample_date", F.to_date(F.coalesce(F.col("sample_dt_local"), F.col("request_dt_local"))))
+        .withColumn("_person_id", F.col("canonical_person_id").cast("bigint"))
+    )
+    encounters = spark.read.table(_n("journey_spine.encounter")).where(
+        F.col("period_start_local").isNotNull() & (F.coalesce(F.col("record_status"), F.lit("active")) == "active")
+    ).select(
+        F.col("person_id").alias("_enc_person_id"),
+        F.col("encounter_id").alias("_enc_id"),
+        F.to_date("period_start_local").alias("_enc_start"),
+        F.coalesce(F.to_date("period_end_local"), F.date_add(F.to_date("period_start_local"), 1)).alias("_enc_end"),
+    )
+    containing = (
+        unlinked.where(~F.col("_external") & F.col("_person_id").isNotNull() & F.col("_sample_date").isNotNull())
+        .join(encounters, F.col("_person_id") == F.col("_enc_person_id"), "inner")
+        .where(F.col("_sample_date").between(F.col("_enc_start"), F.col("_enc_end")))
+        .groupBy("pathology_accession_id")
+        .agg(
+            F.min("_enc_id").alias("_lo"), F.max("_enc_id").alias("_hi"),
+            F.min(F.when(F.col("_enc_start") == F.col("_sample_date"), F.col("_enc_id"))).alias("_day_lo"),
+            F.max(F.when(F.col("_enc_start") == F.col("_sample_date"), F.col("_enc_id"))).alias("_day_hi"),
+        )
+    )
+    return (
+        unlinked.select("pathology_accession_id", "_external").join(containing, "pathology_accession_id", "left")
+        .select(
+            "pathology_accession_id",
+            F.when(F.col("_external"), F.lit(None).cast("bigint"))
+             .when(F.col("_lo") == F.col("_hi"), F.col("_lo"))
+             .when(F.col("_day_lo") == F.col("_day_hi"), F.col("_day_lo"))
+             .cast("bigint").alias("window_encounter_id"),
+            F.when(F.col("_external"), F.lit("none_external_referral"))
+             .when(F.col("_lo") == F.col("_hi"), F.lit("encounter_window_single"))
+             .when(F.col("_day_lo") == F.col("_day_hi"), F.lit("encounter_window_same_day"))
+             .when(F.col("_lo").isNotNull(), F.lit("encounter_window_multiple"))
+             .alias("window_method"),
+        )
+    )
+
+
 GENOMIC_TEST_SOURCE_COLUMNS = [
     "patient_event_key",
     "genetic_test_id",
@@ -1857,6 +2364,7 @@ GENOMIC_TEST_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -1880,6 +2388,21 @@ GENOMIC_TEST_SOURCE_COLUMNS = [
     "test_snomed_code",
     "test_loinc_code",
     "test_omop_concept_id",
+    "assay_component",  # GEN4
+    "is_primary_component",  # GEN4
+    "nhs_test_directory_code",  # GEN4
+    "test_code_method",  # GEN4
+    "sample_type_site_raw",  # GEN4
+    "sample_site_snomed_code",  # GEN4
+    "block_raw",  # GEN4
+    "tumour_content_raw",  # GEN4
+    "tumour_content_pct",  # GEN4
+    "clinical_details_raw",  # GEN4
+    "indication_snomed_code",  # GEN4
+    "interpretation_text",  # GEN4
+    "predicted_response",  # GEN4
+    "predicted_response_drug_class",  # GEN4
+    "panel_genes_not_assessed",  # GEN4  # GEN4_SILVER_V1
     "is_current",
     "research_qi_only",
     "record_status",
@@ -1902,6 +2425,7 @@ GENOMIC_TEST_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -1925,6 +2449,21 @@ GENOMIC_TEST_PUBLIC_COLUMNS = [
     'test_snomed_code',
     'test_loinc_code',
     'test_omop_concept_id',
+    'assay_component',  # GEN4
+    'is_primary_component',  # GEN4
+    'nhs_test_directory_code',  # GEN4
+    'test_code_method',  # GEN4
+    'sample_type_site_raw',  # GEN4
+    'sample_site_snomed_code',  # GEN4
+    'block_raw',  # GEN4
+    'tumour_content_raw',  # GEN4
+    'tumour_content_pct',  # GEN4
+    'clinical_details_raw',  # GEN4
+    'indication_snomed_code',  # GEN4
+    'interpretation_text',  # GEN4
+    'predicted_response',  # GEN4
+    'predicted_response_drug_class',  # GEN4
+    'panel_genes_not_assessed',  # GEN4
     'is_current',
     'research_qi_only',
     'confidentiality_code',
@@ -1951,7 +2490,8 @@ GENOMIC_TEST_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. PATH_ENCOUNTER_V2 (genomic only): encounter_window_single / encounter_window_same_day link a Barts-site LIMS accession to the patient's encounter containing the sample date; encounter_window_multiple and none_external_referral leave it NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -1975,6 +2515,21 @@ GENOMIC_TEST_COLUMN_COMMENTS = {
     "test_snomed_code": "Approved SNOMED assay code.",
     "test_loinc_code": "Approved LOINC assay code.",
     "test_omop_concept_id": "Standard OMOP assay concept.",
+    "assay_component": 'GEN4 assay within the report: mngs_dna, mngs_rna, tngs, flt3, npm1, bcr_abl1_qual. A myeloid NGS report has a DNA and (when run) an RNA panel row; an FLT3 report also an NPM1 row.',
+    "is_primary_component": "True for the report's primary assay, which keeps the pre-GEN4 genetic_test_id; secondary assays (mngs_rna, npm1) have their own ids.",
+    "nhs_test_directory_code": "NHS National Genomic Test Directory code(s) for the assay ('|'-separated), rule-mapped. © NHS England reference codes.",
+    "test_code_method": 'How test_loinc_code/test_snomed_code/test_omop_concept_id were set: assay_rule:<rule_id> (pathology_genetic_assay_concept).',
+    "sample_type_site_raw": 'Sample type/site exactly as written in the report.',
+    "sample_site_snomed_code": 'SNOMED body structure for the sample site, from deterministic term rules over sample_type_site_raw.',
+    "block_raw": 'Histology block identifier as reported (an identifier: governed by ig tags, published in full).',
+    "tumour_content_raw": "Tumour content as reported (e.g. '25%', '<10%').",
+    "tumour_content_pct": "Tumour content percent when reported without a qualifier; NULL for '<10%' style values.",
+    "clinical_details_raw": 'Clinical details/information section of the genetics report (free text).',
+    "indication_snomed_code": 'SNOMED disorder for the stated indication, from deterministic term rules over clinical_details_raw.',
+    "interpretation_text": "The laboratory's clinical interpretation narrative (free text, up to 4,000 characters).",
+    "predicted_response": 'likely_responsive or unlikely_responsive, only when the report itself states it.',
+    "predicted_response_drug_class": 'Drug class named in that statement (e.g. EGFR TKI).',
+    "panel_genes_not_assessed": 'True when the report states genes outside its result table were not assessed or reported.',
     "is_current": "Whether the source report version is current.",
     "research_qi_only": "Research/QI release flag.",
     "confidentiality_code": "Source confidentiality classification attached to the record for each genomic test record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
@@ -2036,6 +2591,7 @@ GENOMIC_RESULT_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -2073,6 +2629,18 @@ GENOMIC_RESULT_SOURCE_COLUMNS = [
     "clinvar_concept_id",
     "omop_genomic_concept_id",
     "snomed_code",
+    "cosmic_id",  # GEN4
+    "itd_length_bp",  # GEN4
+    "reported_pathogenicity",  # GEN4
+    "resolved_transcript",  # GEN4
+    "transcript_source",  # GEN4
+    "variant_key",  # GEN4
+    "ref_allele",  # GEN4
+    "alt_allele",  # GEN4
+    "coordinate_method",  # GEN4
+    "clinvar_variation_id",  # GEN4
+    "omop_genomic_concept_level",  # GEN4
+    "concept_method",  # GEN4
     "evidence_text",
     "evidence_start",
     "evidence_end",
@@ -2104,6 +2672,7 @@ GENOMIC_RESULT_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -2141,6 +2710,18 @@ GENOMIC_RESULT_PUBLIC_COLUMNS = [
     'clinvar_concept_id',
     'omop_genomic_concept_id',
     'snomed_code',
+    'cosmic_id',  # GEN4
+    'itd_length_bp',  # GEN4
+    'reported_pathogenicity',  # GEN4
+    'resolved_transcript',  # GEN4
+    'transcript_source',  # GEN4
+    'variant_key',  # GEN4
+    'ref_allele',  # GEN4
+    'alt_allele',  # GEN4
+    'coordinate_method',  # GEN4
+    'clinvar_variation_id',  # GEN4
+    'omop_genomic_concept_level',  # GEN4
+    'concept_method',  # GEN4
     'evidence_text',
     'evidence_start',
     'evidence_end',
@@ -2176,7 +2757,8 @@ GENOMIC_RESULT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL. PATH_ENCOUNTER_V2 (genomic only): encounter_window_single / encounter_window_same_day link a Barts-site LIMS accession to the patient's encounter containing the sample date; encounter_window_multiple and none_external_referral leave it NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Report issue time with accession fallback.",
     "event_end_datetime": "Event end time.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -2213,7 +2795,19 @@ GENOMIC_RESULT_COLUMN_COMMENTS = {
     "iscn_raw": "Raw ISCN notation.",
     "clinvar_concept_id": "ClinVar concept identifier.",
     "omop_genomic_concept_id": "OMOP Genomic concept identifier.",
-    "snomed_code": "SNOMED finding code.",
+    "snomed_code": "Not populated: SNOMED has no variant-finding concepts; see omop_genomic_concept_id.",
+    "cosmic_id": 'COSMIC identifier exactly as reported by the laboratory; not enriched from COSMIC.',
+    "itd_length_bp": 'Reported FLT3/NPM1 insertion length in base pairs.',
+    "reported_pathogenicity": 'Laboratory pathogenicity class: pathogenic, likely_pathogenic, uncertain_significance, likely_benign, benign.',
+    "resolved_transcript": "RefSeq transcript the c. HGVS refers to: as reported, else the report's panel list, else the gene's MANE Select (see transcript_source).",
+    "transcript_source": 'reported, report_panel_list or mane_select.',
+    "variant_key": 'GRCh38 VCF key chrN:pos:ref:alt (left-normalised), derived in-estate from resolved_transcript + hgvs_c_parsed.',
+    "ref_allele": 'GRCh38 reference allele (VCF).',
+    "alt_allele": 'GRCh38 alternate allele (VCF).',
+    "coordinate_method": 'How coordinates were derived: transcript_model, transcript_model_projected (stated older version with identical CDS), *_position_only (interval only), or why none were (ref_mismatch, stated_transcript_unavailable, version_projection_position_not_coding, no_transcript_model, unsupported_hgvs, no_parsed_hgvs_c). Positions always describe ref_allele.',
+    "clinvar_variation_id": 'ClinVar VariationID matched on variant_key (ClinVar GRCh38 release loaded in 3_lookup).',
+    "omop_genomic_concept_level": 'Level omop_genomic_concept_id was matched at: dna, rna, protein, fusion or gene.',
+    "concept_method": 'Exact match key used for omop_genomic_concept_id, prefixed by level.',
     "evidence_text": "Minimal narrative evidence span.",
     "evidence_start": "Evidence start offset.",
     "evidence_end": "Evidence end offset.",
@@ -2290,6 +2884,8 @@ GENE_TESTED_COLUMN_COMMENTS = {
     "test_scope": "Reported exon/region/coverage scope when available.",
     "panel_version_inferred": "Whether membership used an inferred panel version.",
     "confidence": "Deterministic normalization confidence.",
+    "assessment_status": 'What the lab says about this gene for this assay: reported, dedicated_assay, panel_assessed, panel_not_assessed, insufficient_coverage, test_not_completed.',
+    "coverage_gap_regions_raw": 'Regions of this gene the lab could not assess, as reported (chr:start-end;...; coordinates as printed by the lab).',
     "loaded_at": "map_pathology_gene_tested.ADC_UPDT carried unchanged for the assay-gene membership row. The parent assay key is derived without joining or adding its timestamp; this is bronze load provenance, not a genomic-test event time or Silver refresh time.",
 }
 
@@ -2314,6 +2910,7 @@ def _lifecycle_source_gene_tested():
         g.hgnc_id, g.reported_gene_symbol, g.normalized_gene_symbol,
         g.alias_match_type, g.evidence_type, g.test_scope,
         g.panel_version_inferred, g.confidence,
+        g.assessment_status, g.coverage_gap_regions_raw,  # GEN4
         g.ADC_UPDT.alias("loaded_at"),
     )
 
@@ -2347,6 +2944,7 @@ INDICATION_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -2395,6 +2993,7 @@ INDICATION_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -2447,7 +3046,8 @@ INDICATION_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Accession report/sample/request fallback time.",
     "event_end_datetime": "Event end time.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -2535,6 +3135,7 @@ MICRO_ISOLATE_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -2582,6 +3183,7 @@ MICRO_ISOLATE_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -2633,7 +3235,8 @@ MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -2719,6 +3322,7 @@ SUSCEPTIBILITY_SOURCE_COLUMNS = [
     "person_id",
     "identity_status",
     "encounter_id",
+    "encounter_link_method",  # PATH_ENCOUNTER_V1
     "event_datetime",
     "event_end_datetime",
     "event_datetime_local",
@@ -2767,6 +3371,7 @@ SUSCEPTIBILITY_PUBLIC_COLUMNS = [
     'subject_id_system',
     'person_id',
     'encounter_id',
+    'encounter_link_method',  # PATH_ENCOUNTER_V1
     'event_datetime',
     'event_end_datetime',
     'event_datetime_local',
@@ -2819,7 +3424,8 @@ SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS = {
     "subject_key": "Deterministic SHA-256 over the strongest source identifier. Not salted, not secret; a stable join key across feeds where person_id is unresolved.",
     "subject_id_system": "Identifier namespace selected for `subject_key`: Millennium person identifier first, then MRN, then NHS number; nosubject denotes the per-source-record fallback when none is present.",
     "person_id": "Resolved Millennium PERSON_ID as BIGINT through the shared pathology identity projection.",
-    "encounter_id": "Millennium ENCNTR_ID as BIGINT when available.",
+    "encounter_id": "Millennium ENCNTR_ID as BIGINT: the row's own Millennium source encounter, else the single encounter shared by every Millennium source of its accession; see encounter_link_method.",
+    "encounter_link_method": "How encounter_id was set (PATH_ENCOUNTER_V1). source_accession: the row's own Millennium source names the encounter. accession_single: every current Millennium source of the alias-resolved accession names this one encounter (how TFC LIMS rows inherit one once their accession is merged with the Millennium order). accession_multiple: those sources name different encounters, so encounter_id is NULL. none: the accession has no Millennium source, so encounter_id is NULL.",  # PATH_ENCOUNTER_V1
     "event_datetime": "Accession sample/report/request fallback time.",
     "event_end_datetime": "Event end time.",
     "event_datetime_local": "event_datetime in Europe/London wall-clock time (GMT/BST). Millennium rows take the bronze *_LOCAL companions of the same source columns and fallback order; rows from local-clock sources (LUNA, PACS/DICOM, TFC LIMS, CCMDS, MSDS, BadgerNet, EndoBase, SLAM, iWeb, Datix and similar) carry event_datetime unchanged. event_datetime is a UTC instant for Millennium rows, so take local calendar dates and clock times from this column.",
@@ -7512,4 +8118,3 @@ ORDER_ATTRIBUTE_COLUMN_COMMENTS = {
 def medication_order_attribute():
     # Build the declared dataset: one row per medication order with its latest detail attributes.
     return order_attribute_body(spark.read.table(_n("journey_clinical.medication_order_detail")))
-

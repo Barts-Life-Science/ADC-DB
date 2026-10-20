@@ -37,6 +37,8 @@ CLINICAL_FORM_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -114,6 +116,8 @@ CLINICAL_FORM_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID; joins to spine_encounter.encounter_id.",
     "event_datetime": "First documented timestamp.",
     "event_end_datetime": "Last documented or performed timestamp.",
+    "event_datetime_local": "Local-time representation of the first documented timestamp for the form instance. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the last documented or performed timestamp for the form instance. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source form coding system.",
     "source_code": "Source form reference identifier.",
     "source_display": "Source form description.",
@@ -176,6 +180,8 @@ def gold_clinical_form():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -281,4 +287,3 @@ def gold_clinical_form_smoking_status():
     df = spark.read.table(_n("gold_qc._clinical_form_smoking_status")).drop("__gold_parent_present")
     return (_s3_gate_direct_public(df, "clinical_form_smoking_status")
             .drop(*[f"_{axis}_{suffix}" for axis in axes for suffix in ("gate_pass", "policy_id")]))
-

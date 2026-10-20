@@ -54,8 +54,8 @@ FORCE_FULL_REFRESH = bronze_bool("force_full_refresh", False)
 FULL_RECONCILIATION = bronze_bool("full_reconciliation", False)
 BOOTSTRAP_MODE = bronze_bool("bootstrap_mode", False)
 RUN_ID = bronze_run_id()
-PIPELINE_LOGIC_VERSION = "2026.09.pms1"  # PMS_THEATRE_IMPLANT_V1: bump forces one FULL run to backfill implant flags
-LOGIC_VERSION_INT = 2026092901
+PIPELINE_LOGIC_VERSION = "2026.10.emptycol1"  # EMPTYCOL_W6: bump forces one FULL run to backfill case anaesthesia type
+LOGIC_VERSION_INT = 2026101601
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 RUN_FUTURE_HORIZON = None
 
@@ -99,7 +99,8 @@ LOOKUP_SOURCES = {CODE_VALUE, IMPLANT_DETAILS_SOURCE}
 EXPECTED_COLUMNS = {
     SRC_CASE: {"SURG_CASE_ID", "PERSON_ID", "ENCNTR_ID", "SCH_EVENT_ID", "SCHED_START_DT_TM", "CANCEL_DT_TM", "UPDT_CNT", "ADC_UPDT"},
     SRC_STATE: {"SN_SURG_CASE_ST_ID", "SURG_CASE_ID", "SCH_APPT_ID", "SCH_SLOT_TYPE_ID", "ADC_UPDT"},
-    SRC_PROCEDURE: {"SURG_CASE_PROC_ID", "SURG_CASE_ID", "SURG_PROC_CD", "PROC_TEXT", "ORDER_ID", "UPDT_CNT", "ADC_UPDT"},
+    SRC_PROCEDURE: {"SURG_CASE_PROC_ID", "SURG_CASE_ID", "SURG_PROC_CD", "PROC_TEXT", "ORDER_ID", "UPDT_CNT", "ADC_UPDT",
+                    "ANESTH_TYPE_CD", "PRIMARY_PROC_IND"},
     SRC_MODIFIER: {"SURG_CASE_PROC_MOD_ID", "SURG_CASE_PROC_ID", "MODIFIER_CD", "MODIFIER_SEQ", "ADC_UPDT"},
     SRC_TIMES: {"CASE_TIMES_ID", "SURG_CASE_ID", "TASK_ASSAY_CD", "CASE_TIME_DT_TM", "UPDT_CNT", "ADC_UPDT"},
     SRC_ATTENDANCE: {"CASE_ATTENDANCE_ID", "SURG_CASE_ID", "CASE_ATTENDEE_ID", "ROLE_PERF_CD", "IN_DT_TM", "OUT_DT_TM", "UPDT_CNT", "ADC_UPDT"},
@@ -759,6 +760,42 @@ def build_case(case_ids: DataFrame | None, decode_lookup: DataFrame) -> DataFram
         ("FIRST_PERFORMED_MILESTONE_DT_TM_RAW", "FIRST_PERFORMED_MILESTONE_DT_TM"),
     ]:
         result = add_performed_timestamp(result, raw, clean)
+    # EMPTYCOL_W6_ANAESTHESIA v1
+    # Cerner leaves the case-level anaesthesia type empty; derive it from the case's procedures. One distinct
+    # type -> that type; several -> the primary procedure's when unambiguous; otherwise none. The source
+    # column records which rule applied (case | procedure_single | procedure_primary | procedure_conflict).
+    proc_types = (
+        scope_by_ids(source_snapshot(SRC_PROCEDURE), case_ids, "SURG_CASE_ID")
+        .select(
+            F.col("SURG_CASE_ID").cast("long").alias("SURG_CASE_ID"),
+            F.when(F.col("ANESTH_TYPE_CD").cast("long") != 0, F.col("ANESTH_TYPE_CD").cast("long")).alias("_TYPE"),
+            (F.col("PRIMARY_PROC_IND").cast("long") == 1).alias("_PRIMARY"),
+        )
+        .where(F.col("_TYPE").isNotNull())
+        .groupBy("SURG_CASE_ID")
+        .agg(
+            F.countDistinct("_TYPE").alias("_TYPES"),
+            F.min("_TYPE").alias("_ONLY_TYPE"),
+            F.countDistinct(F.when(F.col("_PRIMARY"), F.col("_TYPE"))).alias("_PRIMARY_TYPES"),
+            F.min(F.when(F.col("_PRIMARY"), F.col("_TYPE"))).alias("_PRIMARY_TYPE"),
+        )
+    )
+    case_type = F.when(F.col("ANESTH_TYPE_CD") != 0, F.col("ANESTH_TYPE_CD"))
+    result = result.join(proc_types, "SURG_CASE_ID", "left")
+    result = result.withColumn(
+        "ANESTH_TYPE_SOURCE",
+        F.when(case_type.isNotNull(), F.lit("case"))
+        .when(F.col("_TYPES") == 1, F.lit("procedure_single"))
+        .when((F.col("_TYPES") > 1) & (F.col("_PRIMARY_TYPES") == 1), F.lit("procedure_primary"))
+        .when(F.col("_TYPES") > 1, F.lit("procedure_conflict")),
+    ).withColumn(
+        "ANESTH_TYPE_CD",
+        F.coalesce(
+            case_type,
+            F.when(F.col("_TYPES") == 1, F.col("_ONLY_TYPE")),
+            F.when((F.col("_TYPES") > 1) & (F.col("_PRIMARY_TYPES") == 1), F.col("_PRIMARY_TYPE")),
+        ),
+    ).drop("_TYPES", "_ONLY_TYPE", "_PRIMARY_TYPES", "_PRIMARY_TYPE")
     for code, description in [
         ("INST_CD", "INST_DESCRIPTION"), ("DEPT_CD", "DEPT_DESCRIPTION"),
         ("SURG_AREA_CD", "SURG_AREA_DESCRIPTION"), ("SURG_OP_LOC_CD", "SURG_OP_LOCATION_DESCRIPTION"),
@@ -1014,7 +1051,7 @@ def build_implant(
 # COMMAND ----------
 
 TARGET_SOURCES = {
-    CASE: [SRC_CASE, SRC_STATE, SRC_TIMES, CODE_VALUE, LOGIC_SOURCE],
+    CASE: [SRC_CASE, SRC_STATE, SRC_TIMES, SRC_PROCEDURE, CODE_VALUE, LOGIC_SOURCE],  # EMPTYCOL_W6_ANAESTHESIA v1
     PROCEDURE: [SRC_PROCEDURE, SRC_MODIFIER, SRC_CASE, CODE_VALUE, LOGIC_SOURCE],
     TIMES: [SRC_TIMES, SRC_CASE, CODE_VALUE, LOGIC_SOURCE],
     ATTENDANCE: [SRC_ATTENDANCE, SRC_CASE, CODE_VALUE, LOGIC_SOURCE],
@@ -1208,6 +1245,8 @@ def apply_output_comments() -> None:
             "SCH_EVENT_ID": "S14 appointment/request-thread link to the real scheduling request.",
             "SCH_APPT_ID": "S14 appointment slot link from the 1:1 SurgiNet state row.",
             "SCHED_SURG_AREA_CD": "S14 theatre booking intent; retained because it materially differs from actual area.",
+            "ANESTH_TYPE_CD": "Anaesthesia type (code set 10050). Cerner leaves it empty at case level, so it is derived from the case's procedures when they agree, else from the primary procedure; see ANESTH_TYPE_SOURCE.",
+            "ANESTH_TYPE_SOURCE": "How ANESTH_TYPE_CD was obtained: case (case row), procedure_single (all the case's procedures agree), procedure_primary (they differ; the primary procedure's), procedure_conflict (they differ and no single primary type; left null). Null when no procedure records a type.",
             "SOURCE_ADC_UPDT": "Journey standard block input: greatest case/state/milestone source timestamp.",
         },
         "S14 theatre feeder and Journey standard block",
@@ -1301,7 +1340,8 @@ def run_pipeline() -> dict:
         ids = None
         if modes[CASE] == "INCREMENTAL":
             ids = union_key_frames(
-                [changed_rows(SRC_CASE, CASE), changed_rows(SRC_STATE, CASE), changed_rows(SRC_TIMES, CASE)],
+                [changed_rows(SRC_CASE, CASE), changed_rows(SRC_STATE, CASE), changed_rows(SRC_TIMES, CASE),
+                 changed_rows(SRC_PROCEDURE, CASE)],
                 "SURG_CASE_ID",
             )
         staged = materialize_stage(build_case(ids, decode_lookup), CASE, TARGET_KEYS[CASE])
@@ -1401,4 +1441,3 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-

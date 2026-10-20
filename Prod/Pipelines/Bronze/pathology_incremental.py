@@ -382,6 +382,23 @@ def log_run(
     )
 
 
+def _stage_touched(spark, config: PipelineConfig, touched, run_id: str):
+    """Write the touched-parent set once to a run-scoped Delta table and read it back.
+
+    PATH_TOUCHED_STAGE_V1 (2026-10-18): the set is derived lazily from five change feeds. Unstaged, the
+    count, the core and the equivalence lane each re-read those feeds.
+    """
+    table = f"{config.bronze_schema}._pathology_expansion_touched_{run_id.replace('-', '')}"
+    (
+        touched.select("source_system", "source_parent_key")
+        .dropDuplicates()
+        .write.format("delta")
+        .mode("overwrite")
+        .saveAsTable(table)
+    )
+    return spark.table(table), table
+
+
 def run_incremental_core(
     spark,
     config: PipelineConfig | None = None,
@@ -410,6 +427,7 @@ def run_incremental_core(
             validate_stage_keys=validate_stage_keys,
         )
     else:
+        touched, touched_table = _stage_touched(spark, config, touched, run_id)
         count = touched.count()
         mode = "INCREMENTAL"
         if count == 0:
@@ -425,6 +443,7 @@ def run_incremental_core(
                 message="No touched source parents",
                 source_parent_count=0,
             )
+            spark.sql(f"DROP TABLE IF EXISTS {touched_table}")
             return {"run_id": run_id, "mode": mode, "metrics": {}}
         log_run(
             spark,
@@ -436,13 +455,28 @@ def run_incremental_core(
             message="Recomputing complete match groups for touched parents",
             source_parent_count=count,
         )
-        metrics = run_core(
-            spark,
-            config,
-            full_reconcile=False,
-            touched_parent_keys=touched,
-            validate_stage_keys=validate_stage_keys,
-        )
+        try:
+            metrics = run_core(
+                spark,
+                config,
+                full_reconcile=False,
+                touched_parent_keys=touched,
+                validate_stage_keys=validate_stage_keys,
+            )
+        except Exception as error:
+            # A failed core used to leave only a STARTED row; record the failure and where it happened.
+            log_run(
+                spark,
+                config,
+                run_id=run_id,
+                mode=mode,
+                status="FAILED",
+                stage="core",
+                message=repr(error)[:8000],
+                source_parent_count=count,
+            )
+            spark.sql(f"DROP TABLE IF EXISTS {touched_table}")
+            raise
     if touched is not None:
         _run_equivalence_only_lane(spark, config, touched, run_id)  # PATH_EXPANSION_LANES_V1
     commit_state(spark, config, versions, run_id)
@@ -455,4 +489,6 @@ def run_incremental_core(
         stage="core",
         message=str(metrics)[:8000],
     )
+    if touched is not None:
+        spark.sql(f"DROP TABLE IF EXISTS {touched_table}")
     return {"run_id": run_id, "mode": mode, "metrics": metrics}

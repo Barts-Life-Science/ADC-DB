@@ -238,6 +238,58 @@ def _sync_replace_state(feed):
     return int(spark.table(target).count())
 
 
+INVOCATIONS = f"{CONTROL_SCHEMA}.feed_invocations"
+INVOCATION_SCHEMA = (
+    "pipeline_run_id string, feed string, status string, eligible_total long, work_rows long, processed long, "
+    "touched long, drift_settled long, remaining_estimate long, stop_reason string, recorded_at timestamp"
+)
+
+
+def record_invocation(feed, result):
+    """Append one row for this task invocation (every attempt, including failures) from the engine's own result.
+
+    ANON_OUTCOME_V1 (2026-10-18): the finalizer used to combine the latest plan with processed counts summed over
+    all attempts (an unfinished retry could look complete), and document-context feeds, which write no plan row,
+    looked not run. Outcomes now come from the latest invocation only.
+    """
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {INVOCATIONS} ({INVOCATION_SCHEMA}) USING DELTA")
+
+    def number(key):
+        value = result.get(key)
+        return int(value) if value is not None else None
+
+    spark.createDataFrame(
+        [(RUN_ID, feed, str(result.get("status")), number("eligible_total"), number("work_rows"), number("processed"),
+          number("touched"), number("drift_settled"), number("remaining_estimate"),
+          (str(result.get("stop_reason"))[:500] if result.get("stop_reason") is not None else None),
+          datetime.now(timezone.utc))],
+        INVOCATION_SCHEMA,
+    ).write.mode("append").saveAsTable(INVOCATIONS)
+
+
+def summarize_feed(feed):
+    """run_summary row for one feed from its latest invocation in this pipeline run (never summed across attempts)."""
+    latest = None
+    if spark.catalog.tableExists(INVOCATIONS):
+        latest = (
+            spark.table(INVOCATIONS)
+            .where((F.col("pipeline_run_id") == RUN_ID) & (F.col("feed") == feed))
+            .orderBy(F.col("recorded_at").desc())
+            .first()
+        )
+    now = datetime.now(timezone.utc)
+    if latest is None:
+        return (RUN_ID, feed, None, None, None, None, now, "not_run")
+    remaining = latest["remaining_estimate"]
+    if latest["status"] == "failed":
+        outcome = "failed"
+    elif latest["status"] == "partial" or remaining is None or remaining > 0:
+        outcome = "partial"
+    else:
+        outcome = "complete"
+    return (RUN_ID, feed, latest["eligible_total"], latest["work_rows"], latest["processed"], remaining, now, outcome)
+
+
 if ACTION == "init":
     init_result = _run_engine("init_controls", None, "init", False, 1800)
     fingerprint_result = _run_engine(
@@ -254,40 +306,31 @@ if ACTION == "init":
     }
 
 elif ACTION == "run":
-    result = _run_engine("run", FEED, FEED, True, MAX_RUNTIME_SECONDS)
+    try:
+        result = _run_engine("run", FEED, FEED, True, MAX_RUNTIME_SECONDS)
+    except Exception as error:
+        record_invocation(FEED, {"status": "failed", "stop_reason": repr(error)})
+        raise
+    record_invocation(FEED, result)
     if result.get("status") not in {"success", "partial"}:
         raise RuntimeError(f"anon engine failed for {FEED}: {result}")
     if FEED in REPLACE_BUILT_FEEDS:
         result["state_rows"] = _sync_replace_state(FEED)
 
 elif ACTION == "finalize":
-    rows = []
-    for feed in REPORT_FEEDS:
-        latest = spark.sql(f"""
-            SELECT cursor FROM {CONTROL_SCHEMA}.engine_progress
-            WHERE feed = '{feed}' AND lane = 'plan' AND run_id LIKE '{RUN_ID}_%'
-            ORDER BY finished_at DESC LIMIT 1""").first()
-        plan = json.loads(latest.cursor) if latest else {}
-        processed = spark.sql(f"""
-            SELECT coalesce(sum(batch_rows), 0) AS rows
-            FROM {CONTROL_SCHEMA}.engine_progress
-            WHERE feed = '{feed}' AND lane IN ('resolved', 'unresolved')
-              AND run_id LIKE '{RUN_ID}_%'""").first().rows
-        touched = int(plan.get("touched") or 0)
-        rows.append((
-            RUN_ID,
-            feed,
-            plan.get("eligible_total"),
-            plan.get("work_rows"),
-            int(processed),
-            max((plan.get("eligible_total") or 0) - int(processed) - touched, 0),
-            datetime.now(timezone.utc),
-        ))
+    rows = [summarize_feed(feed) for feed in REPORT_FEEDS]
+    if spark.catalog.tableExists(f"{CONTROL_SCHEMA}.run_summary") and \
+            "outcome" not in spark.table(f"{CONTROL_SCHEMA}.run_summary").columns:
+        spark.sql(f"ALTER TABLE {CONTROL_SCHEMA}.run_summary ADD COLUMNS (outcome STRING)")
     spark.createDataFrame(
         rows,
         "pipeline_run_id string, feed string, eligible_total long, work_rows long, "
-        "processed long, remaining_estimate long, recorded_at timestamp",
+        "processed long, remaining_estimate long, recorded_at timestamp, outcome string",
     ).write.mode("append").saveAsTable(f"{CONTROL_SCHEMA}.run_summary")
+    if spark.catalog.tableExists(INVOCATIONS):
+        for column in ("pipeline_run_id", "feed", "status", "eligible_total", "work_rows", "processed", "touched",
+                       "drift_settled", "remaining_estimate", "stop_reason", "recorded_at"):
+            spark.sql(f"ALTER TABLE {INVOCATIONS} ALTER COLUMN {column} SET TAGS ('ig_risk'='1','ig_severity'='1')")
     for column in (
         "pipeline_run_id",
         "feed",
@@ -296,6 +339,7 @@ elif ACTION == "finalize":
         "processed",
         "remaining_estimate",
         "recorded_at",
+        "outcome",
     ):
         spark.sql(
             f"ALTER TABLE {CONTROL_SCHEMA}.run_summary ALTER COLUMN {column} "
@@ -314,6 +358,7 @@ elif ACTION == "finalize":
                     "processed",
                     "remaining_estimate",
                     "recorded_at",
+                    "outcome",
                 ],
                 row,
             ))
@@ -331,4 +376,3 @@ payload = {
 }
 print(bronze_json(payload))
 dbutils.notebook.exit(bronze_json(payload))
-

@@ -376,6 +376,31 @@ def _change_feed(spark, table, first_version, last_version):
             .option("startingVersion", int(first_version)).option("endingVersion", int(last_version)).table(table))
 
 
+# INDICATIONS_CONTEXT_COLUMNS_V1: the map_diagnosis columns build_diagnosis_context reads. An update that leaves all of them unchanged
+# (for example a nomenclature display clean-up rewriting SOURCE_STRING and similarity scores) cannot change a context
+# row, so it must not put its patient in scope or push the run past INCREMENTAL_MAX_PATIENT_FRACTION.
+DIAGNOSIS_CONTEXT_COLUMNS = ['DIAGNOSIS_ID', 'PERSON_ID', 'ENCNTR_ID', 'DIAG_DT_TM', 'ASSERTED_DT_TM', 'BEG_EFFECTIVE_DT_TM', 'DIAGNOSIS_TEXT', 'SNOMED_CODE', 'SNOMED_TERM', 'OMOP_CONCEPT_ID', 'confirmation_status_desc']
+
+
+def _context_relevant_diagnosis_changes(changes):
+    """Change-feed rows that can alter the context: inserts, deletes, and both images of an update whose
+    context columns differ between its pre- and post-image (a moved patient keeps both persons in scope)."""
+    _, F, _ = _imports()
+    fingerprint = F.sha2(F.to_json(F.struct(*[F.col(c) for c in DIAGNOSIS_CONTEXT_COLUMNS])), 256)
+    marked = changes.withColumn("_context_fp", fingerprint)
+    pre = marked.where(F.col("_change_type") == "update_preimage").select(
+        "DIAGNOSIS_ID", "_commit_version", F.col("_context_fp").alias("_pre_fp"))
+    post = marked.where(F.col("_change_type") == "update_postimage").select(
+        "DIAGNOSIS_ID", "_commit_version", F.col("_context_fp").alias("_post_fp"))
+    changed_updates = (pre.join(post, ["DIAGNOSIS_ID", "_commit_version"], "full_outer")
+                       .where(~F.col("_pre_fp").eqNullSafe(F.col("_post_fp")))
+                       .select("DIAGNOSIS_ID", "_commit_version"))
+    updates = (marked.where(F.col("_change_type").isin("update_preimage", "update_postimage"))
+               .join(changed_updates, ["DIAGNOSIS_ID", "_commit_version"], "left_semi"))
+    inserts_deletes = marked.where(F.col("_change_type").isin("insert", "delete"))
+    return inserts_deletes.unionByName(updates).drop("_context_fp")
+
+
 def changed_scope(spark, config: PipelineConfig, diagnosis_versions, accession_versions):
     """The accessions whose diagnosis context may have changed, for an incremental run.
 
@@ -393,7 +418,9 @@ def changed_scope(spark, config: PipelineConfig, diagnosis_versions, accession_v
         accession_changes = _change_feed(spark, source, *accession_versions)
         frames = []
         if diagnosis_changes is not None:
-            frames.append(diagnosis_changes.select(F.col("PERSON_ID").cast("long").alias("person_id")))
+            # INDICATIONS_CONTEXT_COLUMNS_V1: only changes to the columns the context reads put a patient in scope.
+            frames.append(_context_relevant_diagnosis_changes(diagnosis_changes).select(
+                F.col("PERSON_ID").cast("long").alias("person_id")))
         if accession_changes is not None:
             frames.append(accession_changes.select(F.col("person_id").cast("long").alias("person_id")))
         if not frames:

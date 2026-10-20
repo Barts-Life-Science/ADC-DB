@@ -414,6 +414,59 @@ def validate_amr_conservation(spark, config: PipelineConfig, run_id: str):
     ]
 
 
+# GEN4_VALIDATION_V1: structural checks for the assay-component genetics model.
+GEN4_STATUSES = ("detected", "not_detected", "indeterminate", "failed", "unknown",
+                 "not_performed", "duplicate_request", "sent_away")
+
+
+def validate_genetics_gen4(spark, config: PipelineConfig, run_id: str):
+    """One aggregate pass per genetics table; every check is ERROR severity."""
+    F = _imports()
+    schema = config.bronze_schema
+    tests = spark.table(f"{schema}.map_pathology_genetic_test")
+    findings = spark.table(f"{schema}.map_pathology_genetic_result")
+    reports = spark.table(f"{schema}.map_pathology_genetic_report").select("report_version_id").withColumn("_has_report", F.lit(1))
+    per_test = (
+        tests.join(findings.groupBy("genetic_test_id").agg(F.count(F.lit(1)).alias("_n_findings")), "genetic_test_id", "left")
+        .join(reports, "report_version_id", "left")
+        .withColumn("_legacy_id", F.sha2(F.concat_ws("|", F.lit("pathology_genetic_test"), "report_version_id",
+                                                     F.split("parser_profile_id", "@")[0], F.split("parser_profile_id", "@")[1]), 256))
+    )
+    t = per_test.agg(
+        F.sum(F.when(F.col("is_primary_component") & (F.col("genetic_test_id") != F.col("_legacy_id")), 1).otherwise(0)).alias("primary_id_changed"),
+        F.sum(F.when((F.col("overall_result_status") == "detected") & F.col("_n_findings").isNull(), 1).otherwise(0)).alias("detected_without_findings"),
+        F.sum(F.when(F.col("_has_report").isNull(), 1).otherwise(0)).alias("tests_without_report"),
+        F.sum(F.when(~F.col("overall_result_status").isin(*GEN4_STATUSES), 1).otherwise(0)).alias("unknown_status_values"),
+    ).first()
+    multi_primary = (
+        tests.groupBy("report_version_id").agg(F.sum(F.col("is_primary_component").cast("int")).alias("_p"))
+        .agg(F.sum(F.when(F.col("_p") != 1, 1).otherwise(0)).alias("bad")).first()["bad"] or 0
+    )
+    orphans = findings.join(tests.select("genetic_test_id"), "genetic_test_id", "left_anti").agg(F.count(F.lit(1)).alias("n")).first()["n"]
+    return [
+        _result(spark, run_id, "gen4_one_primary_per_report", "ERROR", multi_primary == 0, multi_primary, 0),
+        _result(spark, run_id, "gen4_primary_keeps_legacy_id", "ERROR", (t["primary_id_changed"] or 0) == 0, t["primary_id_changed"], 0),
+        _result(spark, run_id, "gen4_finding_parent_exists", "ERROR", orphans == 0, orphans, 0),
+        _result(spark, run_id, "gen4_detected_component_has_findings", "ERROR", (t["detected_without_findings"] or 0) == 0, t["detected_without_findings"], 0),
+        _result(spark, run_id, "gen4_test_has_report_row", "ERROR", (t["tests_without_report"] or 0) == 0, t["tests_without_report"], 0),
+        _result(spark, run_id, "gen4_known_status_values", "ERROR", (t["unknown_status_values"] or 0) == 0, t["unknown_status_values"], 0),
+    ]
+
+
+def run_genetics_validation(spark, config: PipelineConfig, *, fail_on_error: bool = True) -> str:
+    """Run the genetics checks (v3 lifecycle/genetics + GEN4 structure), record them, raise on ERROR."""
+    run_id = spark.sql("SELECT uuid() AS id").first()["id"]
+    frames = validate_lifecycle_and_genetics(spark, config, run_id) + validate_genetics_gen4(spark, config, run_id)
+    output = frames[0]
+    for frame in frames[1:]:
+        output = output.unionByName(frame)
+    output.write.mode("append").saveAsTable(f"{config.bronze_schema}.pathology_validation_result")
+    failed = [row["check_name"] for row in output.filter("severity = 'ERROR' AND NOT passed").select("check_name").collect()]
+    if fail_on_error and failed:
+        raise RuntimeError(f"Genetics validation failed {failed}; run_id={run_id}")
+    return run_id
+
+
 def run_validation(spark, config: PipelineConfig | None = None, *, fail_on_error: bool = True):
     config = config or PipelineConfig()
     ensure_contracts(spark, config)

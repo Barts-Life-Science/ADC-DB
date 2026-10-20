@@ -15,6 +15,7 @@
 # COMMAND ----------
 
 from pyspark.sql import Column, functions as F
+from silver_active_rows import active_rows  # ACTIVE_ROWS_V1
 
 try:
     from pyspark import pipelines as dp
@@ -66,7 +67,8 @@ def _with_comments(frame, product):
 def canonical(source_name, target_name, keys, key_name, namespace):
     # Normalize a configured patient-safety bronze feed: standardize names, construct stable
     # keys, and carry identity, record status and source-derived load timestamps.
-    source = spark.read.table(f"{BRONZE}.{source_name}")
+    # ACTIVE_ROWS_V1: bronze rows that are not active never enter silver; the rule lives in silver_active_rows.py.
+    source = active_rows(spark.read.table(f"{BRONZE}.{source_name}"), f"{BRONZE}.{source_name}")
     df = source.select(*[F.col(column).alias(column.lower()) for column in source.columns])
     native_renames = {
         "clinical_safety_incident": ("recordid", "incident_id"),

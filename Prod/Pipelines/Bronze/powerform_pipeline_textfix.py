@@ -4229,13 +4229,46 @@ def create_current_views() -> None:
     )
 
 
-def process_candidate_batch(
+def stage_batch_frame(frame: DataFrame, label: str, stages: list) -> DataFrame:
+    """Write one batch intermediate to a run-scoped Delta table and read it back.
+
+    PF_BATCH_STAGE_V1 (2026-10-18): process_candidate_batch reused lazy frames across several actions, so
+    classification and enrichment re-ran each time (item MERGE: 17.2 of 18.8 min preparing its source; a
+    14,221-row mapping source: 9.2 min). A retry of the same run overwrites the same tables.
+    """
+    table = f"{TARGET_SCHEMA}._powerform_batch_{safe_token(POWERFORM_RUN_ID)}_{label}"
+    frame.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(table)
+    stages.append(table)
+    return spark.table(table)
+
+
+def drop_batch_stages(stages: list) -> None:
+    """Drop a batch's run-scoped stage tables."""
+    for table in stages:
+        spark.sql(f"DROP TABLE IF EXISTS {qname(table)}")
+
+
+_PF_BATCH_STAGES: list = []
+
+
+def process_candidate_batch(scope: DataFrame, versions: Dict[str, int]) -> dict:
+    """Run one candidate batch; its run-scoped stage tables are always dropped, also when the batch fails."""
+    _PF_BATCH_STAGES.clear()
+    try:
+        return _process_candidate_batch_staged(scope, versions)
+    finally:
+        drop_batch_stages(_PF_BATCH_STAGES)
+        _PF_BATCH_STAGES.clear()
+
+
+def _process_candidate_batch_staged(
     scope: DataFrame, versions: Dict[str, int]
 ) -> dict:
     keys = scope.select("DOC_RESPONSE_KEY").distinct()
     source_snapshot = read_snapshot(SRC_POWERFORM, versions[SRC_POWERFORM])
     source_rows = source_snapshot.join(keys, "DOC_RESPONSE_KEY", "left_semi")
-    classified = classify_responses(source_rows)
+    batch_stages = _PF_BATCH_STAGES
+    classified = stage_batch_frame(classify_responses(source_rows), "classified", batch_stages)
     classification = classification_metrics(classified)
     enriched = enrich_with_canonical_lanes(classified, versions)
     mapped, mapping = apply_contextual_mappings(enriched, versions)
@@ -4246,7 +4279,7 @@ def process_candidate_batch(
             "approved PowerForm mapping ambiguity blocks production commit: "
             f"{mapping}"
         )
-    prepared = prepare_item_rows(mapped, scope)
+    prepared = stage_batch_frame(prepare_item_rows(mapped, scope), "prepared", batch_stages)
     item_merge = merge_item_rows(prepared)
     item_tombstones = tombstone_item_scope(
         keys, source_rows, "PHYSICAL_SOURCE_DISAPPEARANCE"
@@ -4267,7 +4300,7 @@ def process_candidate_batch(
 
     map_candidate_metrics = {"operation": "skipped_empty"}
     if not is_empty(prepared):
-        generated = generated_mapping_candidates(prepared)
+        generated = stage_batch_frame(generated_mapping_candidates(prepared), "generated", batch_stages)
         if not is_empty(generated):
             map_candidate_metrics = merge_mapping_candidates(
                 generated, exact_full=False
@@ -5027,7 +5060,6 @@ except Exception as exc:
 
 print(bronze_json(FINAL_RESULT))
 dbutils.notebook.exit(bronze_json(FINAL_RESULT))
-
 
 
 

@@ -1270,12 +1270,20 @@ def _mmvte_persist_stage(frame: Optional[DataFrame]) -> Optional[DataFrame]:
     try:
         frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
     except Exception as stage_exc:
-        print(f'[WARN] persist stage write failed for {stage_table}; continuing unmaterialized: {str(stage_exc)[:500]}')
+        # PERSIST_STAGE_FAIL_CLOSED_V1 (2026-10-18): retry once, then fail. Continuing unstaged re-ran the whole upstream
+        # lineage at every later action (map_text 2026-10-18: 20.7 of 23.8 MERGE minutes) and hid the failure.
+        print(f'[WARN] persist stage write failed for {stage_table}; retrying once: {str(stage_exc)[:500]}')
         try:
             spark.sql(f'DROP TABLE IF EXISTS {_mmvte_sql_identifier(stage_table)}')
-        except Exception:
-            pass
-        return frame
+            frame.write.format('delta').mode('overwrite').option('overwriteSchema', 'true').saveAsTable(stage_table)
+        except Exception as retry_error:
+            try:
+                spark.sql(f'DROP TABLE IF EXISTS {_mmvte_sql_identifier(stage_table)}')
+            except Exception:
+                pass
+            raise RuntimeError(
+                f'persist stage {stage_table} failed twice; failing the component instead of recomputing unstaged'
+            ) from retry_error
     staged = spark.table(stage_table)
     _MMVTE_PERSIST_STAGES[id(staged)] = (staged, stage_table)
     return staged
@@ -3655,9 +3663,10 @@ def process_implant_details_incremental(force_full_refresh: bool=False, sync_eve
         set_checkpoint_version(IMPLANT_SOURCE_TABLE, context['ending_version'], run_id)
         mapping_metrics = refresh_implant_mapping_enrichment() if refresh_mapping else {}
         return {'run_id': run_id, 'status': 'NO_CLINICAL_EVENT_CHANGES', 'context': context, **mapping_metrics}
-    implant_events = build_implant_detail_events(context['affected_encounters'])
-    implant_events.count()
-    implant_details = build_implant_details_base(implant_events, context['affected_encounters'])
+    # IMPLANT_STAGE_V1 (2026-10-18): stage once; the unused count and lazy reuse re-ran the event build for
+    # the foundation sync, the detail MERGE and the mapping refresh (9.1 of 9.2 MERGE minutes on 2026-10-18).
+    implant_events = _mmvte_persist_stage(build_implant_detail_events(context['affected_encounters']))
+    implant_details = _mmvte_persist_stage(build_implant_details_base(implant_events, context['affected_encounters']))
     metrics = {'run_id': run_id, 'status': 'SUCCESS', 'context': context}
     try:
         if sync_event_foundation:
@@ -3671,7 +3680,8 @@ def process_implant_details_incremental(force_full_refresh: bool=False, sync_eve
         set_checkpoint_version(IMPLANT_SOURCE_TABLE, context['ending_version'], run_id)
         return metrics
     finally:
-        None
+        _mmvte_persist_stage_drop(implant_details)
+        _mmvte_persist_stage_drop(implant_events)
 
 def run_implant_details_full_backfill(refresh_mapping: bool=True, run_validation: bool=True) -> Dict:
     return process_implant_details_incremental(force_full_refresh=True, sync_event_foundation=True, refresh_mapping=refresh_mapping, run_validation=run_validation)

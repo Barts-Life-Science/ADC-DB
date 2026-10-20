@@ -133,14 +133,18 @@ SOURCE_SLA = {
     SRC_INGREDIENT: (2, "LIVE"),
     SRC_DETAIL: (2, "LIVE"),
     CODE_VALUE: (365, "REFERENCE"),
+    # MED_S4_LOOKUP_REGISTERED_V1 (2026-10-18): the S4 concept lookup is an enrichment input of order and
+    # ingredient; unregistered, its changes never reached bronze. Its first run reconciles (reconciled_s4_keys).
+    S4_MED_LOOKUP_TABLE: (365, "REFERENCE"),
 }
-LOOKUP_SOURCES = {CODE_VALUE}
+LOOKUP_SOURCES = {CODE_VALUE, S4_MED_LOOKUP_TABLE}
 EXPECTED_COLUMNS = {
     SRC_ORDER: {"ORDER_ID", "PERSON_ID", "ENCNTR_ID", "ACTIVITY_TYPE_CD", "LAST_ACTION_SEQUENCE", "ORDER_STATUS_CD", "ADC_UPDT"},
     SRC_ACTION: {"ORDER_ID", "ACTION_SEQUENCE", "ACTION_TYPE_CD", "ACTION_DT_TM", "ORDER_STATUS_CD", "ADC_UPDT"},
     SRC_INGREDIENT: {"ORDER_ID", "ACTION_SEQUENCE", "COMP_SEQUENCE", "STRENGTH", "VOLUME", "DOSE_QUANTITY", "ADC_UPDT"},
     SRC_DETAIL: {"ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE", "OE_FIELD_ID", "OE_FIELD_MEANING", "ADC_UPDT"},
     CODE_VALUE: {"CODE_VALUE", "DESCRIPTION", "DISPLAY", "ADC_UPDT"},
+    S4_MED_LOOKUP_TABLE: {"SYNONYM_ID", "SOURCE_ROW_HASH", "ADC_UPDT"},
 }
 HASH_EXCLUDE = {
     "ROW_HASH", "ADC_UPDT", "SOURCE_PRESENT_IND", "PIPELINE_RUN_ID",
@@ -255,17 +259,153 @@ def choose_mode(target: str, sources: list[str]) -> str:
     if FORCE_FULL_REFRESH or FULL_RECONCILIATION or not bronze_table_exists(target):
         return "FULL"
     changed = False
+    changed_lookups = {}
     for source in sources:
         previous = last_checkpoint(target, source)
         if previous is None:
+            if source == S4_MED_LOOKUP_TABLE:
+                # First run with the S4 lookup registered: reconcile stored enrichment instead of a full rebuild.
+                changed_lookups[source] = None
+                changed = True
+                continue
             return "FULL"
         if int(previous["source_version"]) != int(SOURCE_VERSIONS[source]):
             if source == LOGIC_SOURCE:
                 return "FULL"
             if source in LOOKUP_SOURCES:
-                return "FULL_LOOKUP_CHANGE"
+                changed_lookups[source] = int(previous["source_version"])
             changed = True
+    if changed_lookups:
+        frames = lookup_delta_order_frames(target, changed_lookups)
+        if frames is None:
+            return "FULL_LOOKUP_CHANGE"
+        LOOKUP_DELTA_ORDERS[target] = frames
     return "INCREMENTAL" if changed else "UNCHANGED_SKIP"
+
+
+# MED_LOOKUP_DELTA_V1 (2026-10-18): a lookup version change used to rebuild order/action/ingredient in full
+# (2026-10-18: 1.03B rows staged for 134 changed codes). Now the consumed lookup columns are diffed between the
+# checkpointed and current versions, and only orders that use a changed key join the incremental scope. Anything
+# that cannot be decided cheaply (old version unreadable, schema change, too many keys) keeps the full path.
+LOOKUP_DELTA_ORDERS: dict[str, list[DataFrame]] = {}
+LOOKUP_DELTA_MAX_KEYS = 100000
+_CHANGED_LOOKUP_KEYS: dict[tuple[str, int], list | None] = {}
+
+# Per lookup: its key column, the lookup columns the builders read, and per target the raw table and the
+# columns whose values are looked up in it.
+LOOKUP_DELTA_RULES = {
+    CODE_VALUE: {
+        "key": "CODE_VALUE",
+        "consumed": ["DESCRIPTION", "DISPLAY"],
+        "targets": {
+            ORDER: (SRC_ORDER, ["ACTIVITY_TYPE_CD", "ORDER_STATUS_CD", "DEPT_STATUS_CD", "ACTIVE_STATUS_CD",
+                                "STOP_TYPE_CD", "DISCONTINUE_TYPE_CD", "MED_ORDER_TYPE_CD"]),
+            ACTION: (SRC_ACTION, ["ACTION_TYPE_CD", "ACTION_QUALIFIER_CD", "ORDER_STATUS_CD", "DEPT_STATUS_CD",
+                                  "STOP_TYPE_CD"]),
+            INGREDIENT: (SRC_INGREDIENT, ["CATALOG_TYPE_CD", "STRENGTH_UNIT", "VOLUME_UNIT", "DOSE_QUANTITY_UNIT",
+                                          "ORDERED_DOSE_UNIT_CD", "NORMALIZED_RATE_UNIT_CD", "CONCENTRATION_UNIT_CD"]),
+        },
+    },
+    S4_MED_LOOKUP_TABLE: {
+        "key": "SYNONYM_ID",
+        "consumed": ["SNOMED_CODE", "MULTUM_CODE", "RXNORM_CODE", "MAPPED_OMOP_CONCEPT_ID", "MAPPED_OMOP_CONCEPT_TERM",
+                     "STANDARDIZED_SIMILARITY_OMOP_CONCEPT_ID", "STANDARDIZED_SIMILARITY_OMOP_CONCEPT_TERM",
+                     "SIMILARITY_OMOP_CONCEPT_ID", "SIMILARITY_OMOP_CONCEPT_TERM", "RAW_SIMILARITY_SCORE",
+                     "SIMILARITY_SCORE", "SOURCE_ROW_HASH"],
+        "targets": {ORDER: (SRC_ORDER, ["SYNONYM_ID"]), INGREDIENT: (SRC_INGREDIENT, ["SYNONYM_ID"])},
+    },
+}
+
+
+def changed_lookup_keys(lookup: str, previous_version: int) -> list | None:
+    """Keys whose consumed lookup values differ between `previous_version` and the run's pinned version.
+
+    Returns None when that cannot be decided cheaply; the caller then keeps the full rebuild.
+    """
+    cache_key = (lookup, int(previous_version))
+    if cache_key in _CHANGED_LOOKUP_KEYS:
+        return _CHANGED_LOOKUP_KEYS[cache_key]
+    rule = LOOKUP_DELTA_RULES[lookup]
+    result = None
+    try:
+        before = spark.read.option("versionAsOf", int(previous_version)).table(lookup)
+        before.limit(1).count()
+    except Exception as error:
+        print(f"[MEDICATION_ORDER][LOOKUP_DELTA] {lookup}@{previous_version} unreadable: {str(error)[:200]}")
+        before = None
+    if before is not None:
+        after = spark.read.option("versionAsOf", int(SOURCE_VERSIONS[lookup])).table(lookup)
+        columns = rule["consumed"]
+        if all(column in before.columns and column in after.columns for column in [rule["key"], *columns]):
+
+            def shaped(frame):
+                """(key, hash of consumed values) per lookup row."""
+                return frame.select(
+                    F.col(rule["key"]).cast("long").alias("_KEY"),
+                    F.xxhash64(*[F.col(column).cast("string") for column in columns]).alias("_VALUE"),
+                )
+
+            diff = shaped(before).subtract(shaped(after)).unionByName(shaped(after).subtract(shaped(before)))
+            result = _bounded_keys(diff.select("_KEY"), "_KEY", lookup)
+        else:
+            print(f"[MEDICATION_ORDER][LOOKUP_DELTA] {lookup}: consumed columns changed between versions")
+    _CHANGED_LOOKUP_KEYS[cache_key] = result
+    return result
+
+
+def reconciled_s4_keys(target: str) -> list | None:
+    """SYNONYM_IDs whose stored S4 enrichment in `target` differs from what the run's pinned lookup produces.
+
+    Used once per target, when the S4 lookup has no checkpoint yet: its past changes never reached bronze, so the
+    stored output itself is the only sound baseline. The run then checkpoints the version it actually read.
+    """
+    stored = (
+        spark.table(target)
+        .select(F.col("SYNONYM_ID").cast("long").alias("SYNONYM_ID"), *S4_MED_CONCEPT_COLUMNS)
+        .where(F.col("SYNONYM_ID").isNotNull())
+        .dropDuplicates()
+    )
+    expected = add_s4_medication_concepts(stored.select("SYNONYM_ID").dropDuplicates(), ["SYNONYM_ID"]).select(
+        "SYNONYM_ID", *S4_MED_CONCEPT_COLUMNS
+    )
+    diff = stored.subtract(expected).select("SYNONYM_ID").unionByName(expected.subtract(stored).select("SYNONYM_ID"))
+    return _bounded_keys(diff, "SYNONYM_ID", f"{S4_MED_LOOKUP_TABLE} reconcile for {target}")
+
+
+def _bounded_keys(frame: DataFrame, column: str, label: str) -> list | None:
+    """Distinct non-null keys of `frame`, or None when there are more than LOOKUP_DELTA_MAX_KEYS."""
+    keys = [row[column] for row in frame.where(F.col(column).isNotNull()).distinct()
+            .limit(LOOKUP_DELTA_MAX_KEYS + 1).collect()]
+    if len(keys) > LOOKUP_DELTA_MAX_KEYS:
+        print(f"[MEDICATION_ORDER][LOOKUP_DELTA] {label}: over {LOOKUP_DELTA_MAX_KEYS} changed keys")
+        return None
+    return sorted(int(key) for key in keys)
+
+
+def lookup_delta_order_frames(target: str, changed_lookups: dict) -> list | None:
+    """ORDER_ID frames for `target` rows that use a changed lookup key; None means fall back to a full rebuild.
+
+    One row per (order, looked-up code) is projected first, so the changed-key match is an equality join the
+    planner can hash against the broadcast key set, not a nested loop over an OR of columns.
+    """
+    frames = []
+    for lookup, previous_version in changed_lookups.items():
+        rule = LOOKUP_DELTA_RULES[lookup]
+        if target not in rule["targets"]:
+            continue
+        keys = changed_lookup_keys(lookup, previous_version) if previous_version is not None else reconciled_s4_keys(target)
+        if keys is None:
+            return None
+        print(f"[MEDICATION_ORDER][LOOKUP_DELTA] {target}: {lookup} changed keys={len(keys)}")
+        if not keys:
+            continue
+        source, columns = rule["targets"][target]
+        changed = F.broadcast(spark.createDataFrame([(key,) for key in keys], "_LOOKUP_KEY long"))
+        projected = spark.table(source).select(
+            "ORDER_ID", F.explode(F.array(*[F.col(column).cast("long") for column in columns])).alias("_LOOKUP_KEY")
+        )
+        frames.append(projected.join(changed, "_LOOKUP_KEY", "left_semi").select("ORDER_ID"))
+    return frames
 
 
 def changed_rows(table: str, target: str) -> DataFrame:
@@ -507,7 +647,7 @@ def add_s4_medication_concepts(df: DataFrame, target_keys: list[str]) -> DataFra
     missing = [column for column in [*target_keys, "SYNONYM_ID"] if column not in df.columns]
     assert not missing, f"S4 medication enrichment: missing target columns {missing}"
 
-    lookup = spark.table(S4_MED_LOOKUP_TABLE).select(
+    lookup = spark.read.option("versionAsOf", int(SOURCE_VERSIONS[S4_MED_LOOKUP_TABLE])).table(S4_MED_LOOKUP_TABLE).select(
         F.col("SYNONYM_ID").cast("long").alias("__S4_LOOKUP_SYNONYM_ID"),
         F.col("SNOMED_CODE").cast("string").alias("SNOMED_CODE"),
         F.col("MULTUM_CODE").cast("string").alias("MULTUM_CODE"),
@@ -1097,9 +1237,9 @@ def build_detail(affected_orders: DataFrame | None = None) -> DataFrame:
 # COMMAND ----------
 
 TARGET_SOURCES = {
-    ORDER: [SRC_ORDER, CODE_VALUE, LOGIC_SOURCE],
+    ORDER: [SRC_ORDER, CODE_VALUE, S4_MED_LOOKUP_TABLE, LOGIC_SOURCE],
     ACTION: [SRC_ACTION, SRC_ORDER, CODE_VALUE, LOGIC_SOURCE],
-    INGREDIENT: [SRC_INGREDIENT, SRC_ORDER, CODE_VALUE, LOGIC_SOURCE],
+    INGREDIENT: [SRC_INGREDIENT, SRC_ORDER, CODE_VALUE, S4_MED_LOOKUP_TABLE, LOGIC_SOURCE],
     DETAIL: [SRC_DETAIL, SRC_ORDER, LOGIC_SOURCE],
 }
 TARGET_KEYS = {
@@ -1527,7 +1667,8 @@ def run_pipeline() -> dict:
     )
     decode_lookup = None
     if needs_decode_lookup:
-        decode_lookup = spark.table(CODE_VALUE).select(
+        # Read the version this run checkpoints, so a lookup update mid-run cannot be marked consumed unread.
+        decode_lookup = spark.read.option("versionAsOf", int(SOURCE_VERSIONS[CODE_VALUE])).table(CODE_VALUE).select(
             F.col("CODE_VALUE").cast("long").alias("__CODE_VALUE"),
             F.coalesce(F.col("DESCRIPTION"), F.col("DISPLAY")).alias("__CODE_DESCRIPTION"),
         )
@@ -1550,21 +1691,21 @@ def run_pipeline() -> dict:
     checkpoints: dict[str, list[str]] = {}
 
     if modes[ORDER] != "UNCHANGED_SKIP":
-        affected = union_order_ids([changed_rows(SRC_ORDER, ORDER)]) if modes[ORDER] == "INCREMENTAL" else None
+        affected = union_order_ids([changed_rows(SRC_ORDER, ORDER), *LOOKUP_DELTA_ORDERS.get(ORDER, [])]) if modes[ORDER] == "INCREMENTAL" else None
         staged = materialize_stage(build_order(affected, decode_lookup), ORDER, TARGET_KEYS[ORDER])
         tombstones = affected.select("ORDER_ID").join(staged.select("ORDER_ID"), "ORDER_ID", "left_anti") if affected is not None else None
         metrics[ORDER] = merge_target(staged, ORDER, TARGET_KEYS[ORDER], modes[ORDER] in FULL_MODES, tombstones)
         checkpoints[ORDER] = TARGET_SOURCES[ORDER]
 
     if modes[ACTION] != "UNCHANGED_SKIP":
-        affected = union_order_ids([changed_rows(SRC_ACTION, ACTION), changed_rows(SRC_ORDER, ACTION)]) if modes[ACTION] == "INCREMENTAL" else None
+        affected = union_order_ids([changed_rows(SRC_ACTION, ACTION), changed_rows(SRC_ORDER, ACTION), *LOOKUP_DELTA_ORDERS.get(ACTION, [])]) if modes[ACTION] == "INCREMENTAL" else None
         staged = materialize_stage(build_action(affected, decode_lookup), ACTION, TARGET_KEYS[ACTION])
         tombstones = existing_tombstones(ACTION, affected, staged, TARGET_KEYS[ACTION])
         metrics[ACTION] = merge_target(staged, ACTION, TARGET_KEYS[ACTION], modes[ACTION] in FULL_MODES, tombstones)
         checkpoints[ACTION] = TARGET_SOURCES[ACTION]
 
     if modes[INGREDIENT] != "UNCHANGED_SKIP":
-        affected = union_order_ids([changed_rows(SRC_INGREDIENT, INGREDIENT), changed_rows(SRC_ORDER, INGREDIENT)]) if modes[INGREDIENT] == "INCREMENTAL" else None
+        affected = union_order_ids([changed_rows(SRC_INGREDIENT, INGREDIENT), changed_rows(SRC_ORDER, INGREDIENT), *LOOKUP_DELTA_ORDERS.get(INGREDIENT, [])]) if modes[INGREDIENT] == "INCREMENTAL" else None
         staged = materialize_stage(build_ingredient(affected, decode_lookup), INGREDIENT, TARGET_KEYS[INGREDIENT])
         tombstones = existing_tombstones(INGREDIENT, affected, staged, TARGET_KEYS[INGREDIENT])
         metrics[INGREDIENT] = merge_target(staged, INGREDIENT, TARGET_KEYS[INGREDIENT], modes[INGREDIENT] in FULL_MODES, tombstones)

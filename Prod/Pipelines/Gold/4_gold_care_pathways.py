@@ -34,6 +34,8 @@ CLINICAL_APPOINTMENT_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -113,6 +115,8 @@ CLINICAL_APPOINTMENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Booked slot start where available",
     "event_end_datetime": "Booked slot end where available.",
+    "event_datetime_local": "Booked appointment slot start expressed in local time where available.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Booked appointment slot end expressed in local time where available.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim appointment-type coding system.",
     "source_code": "Verbatim appointment-type code.",
     "source_display": "Verbatim appointment-type display.",
@@ -184,6 +188,8 @@ def gold_clinical_appointment():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -235,6 +241,8 @@ CLINICAL_COMMUNITY_CARE_ACTIVITY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -341,6 +349,8 @@ CLINICAL_COMMUNITY_CARE_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date on which the care activity was recorded as taking place.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each community care activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Start date and time of the community care activity event expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "End date and time of the community care activity event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "CSDS care activity type code recorded for the activity in the source extract.",
     "source_code": "CSDS care activity type code recorded for the activity in the source extract.",
     "source_display": "Description corresponding to the CSDS care activity type code.",
@@ -429,6 +439,8 @@ def gold_clinical_community_care_activity():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -494,6 +506,8 @@ CLINICAL_COMMUNITY_CARE_CONTACT_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -583,6 +597,8 @@ CLINICAL_COMMUNITY_CARE_CONTACT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date of the care contact as submitted in the CSDS CYP201 record.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each community care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time timestamp at which the community care contact event started.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time timestamp at which the community care contact event ended.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coded consultation type submitted with the CSDS CYP201 care contact record.",
     "source_code": "Coded consultation type submitted with the CSDS CYP201 care contact record.",
     "source_display": "Description corresponding to the coded consultation type submitted with the care contact record.",
@@ -661,6 +677,8 @@ def gold_clinical_community_care_contact():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -715,6 +733,8 @@ CLINICAL_COSTED_ACTIVITY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -834,6 +854,8 @@ CLINICAL_COSTED_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Start date and time of the costed activity as supplied by the source PLICS extract (ActivityStartDate).",
     "event_end_datetime": "End date and time of the costed activity as supplied by the source PLICS extract (ActivityEndDate).",
+    "event_datetime_local": "Start date and time of the costed activity event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "End date and time of the costed activity event expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Source point-of-delivery classification; preserved without an invented mapping.",
     "source_code": "Source point-of-delivery classification; preserved without an invented mapping.",
     "source_display": "Human-readable label supplied by the source system for the source code for each costed activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -946,6 +968,8 @@ def gold_clinical_costed_activity():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1032,6 +1056,8 @@ CLINICAL_DRUG_EXPENDITURE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1166,6 +1192,8 @@ CLINICAL_DRUG_EXPENDITURE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Effective date/time as supplied; two known rows dated 2122 are retained losslessly.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each drug expenditure record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time representation of the drug-expenditure event start date and time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the drug-expenditure event end date and time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Strict trimmed all-numeric dm+d code; null for blank or non-numeric source values.",
     "source_code": "Name of the chargeable high-cost drug or device as recorded in the source.",
     "source_display": "Name of the chargeable high-cost drug or device as recorded in the source.",
@@ -1289,6 +1317,8 @@ def gold_clinical_drug_expenditure():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1388,6 +1418,8 @@ CLINICAL_ELECTIVE_ACCESS_ENTRY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1502,6 +1534,8 @@ CLINICAL_ELECTIVE_ACCESS_ENTRY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "B3 bronze field CREATED_DT_TM; source value retained unless documented as derived.",
     "event_end_datetime": "B3 bronze field ADMIT_DT_TM_CLEAN; source value retained unless documented as derived.",
+    "event_datetime_local": "Event start date and time for the elective-access entry, expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Event end date and time for the elective-access entry, expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "B3 bronze field PROCEDURE_CODE; source value retained unless documented as derived.",
     "source_code": "B3 bronze field PROCEDURE_CODE; source value retained unless documented as derived.",
     "source_display": "B3 bronze field PROCEDURE_DESC; source value retained unless documented as derived.",
@@ -1609,6 +1643,8 @@ def gold_clinical_elective_access_entry():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1691,6 +1727,8 @@ CLINICAL_HRG_GROUPING_SELECT = [
     '`encounter_id` AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1825,6 +1863,8 @@ CLINICAL_HRG_GROUPING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time the finished consultant episode started.",
     "event_end_datetime": "Date and time the finished consultant episode ended.",
+    "event_datetime_local": "Local-time representation of the start date and time of the HRG-grouped activity event. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the end date and time of the HRG-grouped activity event, where available. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "HRG4+ code assigned to this finished consultant episode.",
     "source_code": "HRG4+ code assigned to this finished consultant episode.",
     "source_display": "Description of the episode-level HRG4+ code, mapped from the HRG v4 reference lookup.",
@@ -1938,6 +1978,8 @@ def gold_clinical_hrg_grouping():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2022,6 +2064,8 @@ CLINICAL_PATHWAY_TRACKING_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2122,6 +2166,8 @@ CLINICAL_PATHWAY_TRACKING_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "B3 bronze field LATEST_ACTIVITY_DATE_CLEAN; source value retained unless documented as derived.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time timestamp of the PTL pathway activity event, corresponding to event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time end timestamp of the PTL pathway activity event, corresponding to event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each pathway tracking record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -2215,6 +2261,8 @@ def gold_clinical_pathway_tracking():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2281,6 +2329,8 @@ CLINICAL_REFERRAL_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2375,6 +2425,8 @@ CLINICAL_REFERRAL_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA referral feed supplies no encounter.",
     "event_datetime": "Referral received timestamp.",
     "event_end_datetime": "Event end timestamp; not supplied by LUNA referrals.",
+    "event_datetime_local": "Referral received timestamp expressed in local time, the local-time counterpart of event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time counterpart of event_end_datetime; not supplied by LUNA referrals, so expected to be null.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim LUNA treatment-function coding system.",
     "source_code": "Verbatim treatment-function code.",
     "source_display": "Verbatim treatment-function display.",
@@ -2470,6 +2522,8 @@ def gold_clinical_referral():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2537,6 +2591,8 @@ CLINICAL_RTT_ACTIVITY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2613,6 +2669,8 @@ CLINICAL_RTT_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA activity feed supplies no encounter.",
     "event_datetime": "RTT activity timestamp.",
     "event_end_datetime": "Event end timestamp; not supplied by LUNA RTT activities.",
+    "event_datetime_local": "RTT activity timestamp expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Event end timestamp expressed in local time; not supplied by LUNA RTT activities.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim LUNA RTT-status coding system.",
     "source_code": "Verbatim RTT-status code.",
     "source_display": "Verbatim RTT-status display.",
@@ -2689,6 +2747,8 @@ def gold_clinical_rtt_activity():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2739,6 +2799,8 @@ CLINICAL_RTT_PATHWAY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     'CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2829,6 +2891,8 @@ CLINICAL_RTT_PATHWAY_COLUMN_COMMENTS = {
     "encounter_id": "Nullable Millennium ENCNTR_ID; the LUNA pathway feed supplies no encounter.",
     "event_datetime": "RTT clock-period start timestamp.",
     "event_end_datetime": "RTT clock-period stop timestamp.",
+    "event_datetime_local": "RTT clock-period start timestamp expressed in local time. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "RTT clock-period stop timestamp expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim LUNA RTT-status coding system.",
     "source_code": "Verbatim current RTT-status code.",
     "source_display": "Verbatim current RTT-status display.",
@@ -2905,6 +2969,8 @@ def gold_clinical_rtt_pathway():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2961,6 +3027,8 @@ CLINICAL_WAITING_LIST_ENTRY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     "CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 OR CAST(`event_end_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_end_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_end_datetime` END END AS `event_end_datetime`",
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 OR CAST(`event_end_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`event_end_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `event_end_datetime` END END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`",  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -3065,6 +3133,8 @@ CLINICAL_WAITING_LIST_ENTRY_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Recorded waiting-period start timestamp carried from `WAITING_START_DT_TM`.",
     "event_end_datetime": "Recorded waiting-period end timestamp carried from `WAITING_END_DT_TM`.",
+    "event_datetime_local": "Waiting-start timestamp expressed in local time, when available. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Waiting-end timestamp expressed in local time, when available. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim Millennium planned-procedure coding system.",
     "source_code": "Verbatim planned-procedure code.",
     "source_display": "Verbatim planned-procedure display.",
@@ -3169,6 +3239,8 @@ def gold_clinical_waiting_list_entry():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',

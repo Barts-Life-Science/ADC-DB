@@ -840,15 +840,32 @@ def procedure_gates(source_rows):
     return {"rows": source_rows, "fingerprint": table_fingerprint(TARGET_PROCEDURE)}
 
 
-def build_procedure(source_versions, parent_version):
-    versions = {**source_versions, TARGET_PARENT: parent_version}
-    raw = read_pinned(SRC_PROCEDURE, versions)
-    core_raw = read_pinned(SRC_CORE, versions)
-    source_rows = procedure_source_gates(raw, core_raw)
-    due = _target_due_check(TARGET_PROCEDURE, versions)
-    if not due:
-        gate = procedure_gates(source_rows)
-        return {"mode": "NO_OP", "write": None, "gate": gate}
+# EAL_PROCEDURE_CORE_LAG_V1 (2026-10-18): LUNA's EAL Core extract lags its Procedures extract at source (in the
+# 2026-10-17 landing Core's newest entry was created 2026-10-12), so a weekly Procedures snapshot can carry
+# waiting-list entries Core has not caught up with yet. Those rows are held back, not published, and land on a
+# later run once Core contains their parent (the Core version change makes the target due again). An orphan
+# older than Core's trailing edge cannot be explained by that lag and still fails the run.
+CORE_LAG_EDGE_HOURS = 24
+
+
+def core_lag_edge_oid(core_raw):
+    """Lowest WaitingListOID among Core rows created in the last CORE_LAG_EDGE_HOURS of the pinned snapshot.
+
+    WaitingListOIDs are issued in creation order, so a procedure parent at or above this OID can be newer than
+    the Core extract; a parent below it should already be in Core.
+    """
+    newest = core_raw.agg(F.max("CreatedDateTime").alias("newest")).first()["newest"]
+    assert newest is not None, f"{SRC_CORE} has no CreatedDateTime values"
+    edge_window = F.lit(newest) - F.expr(f"INTERVAL {CORE_LAG_EDGE_HOURS} HOURS")
+    edge = core_raw.where(F.col("CreatedDateTime") >= edge_window).agg(F.min("WaitingListOID").alias("edge")).first()["edge"]
+    return int(edge)
+
+
+def publishable_procedures(raw, core_raw, versions):
+    """Join procedure rows to their EAL parent and hold back those whose parent is newer than the Core snapshot.
+
+    Returns (rows with a parent, core_lag summary). Raises when any orphan predates Core's trailing edge.
+    """
     selected = source_select(raw, {"SourceSystemOID": "SOURCE_SYSTEM_OID_SOURCE"})
     parent = read_pinned(TARGET_PARENT, versions).select(
         "WAITING_LIST_OID", "SOURCE_SYSTEM_OID",
@@ -856,8 +873,35 @@ def build_procedure(source_versions, parent_version):
         F.lit(True).alias("_PARENT_MATCH"),
     )
     joined = selected.join(parent, ["WAITING_LIST_OID"], "left")
-    missing = joined.where(F.col("_PARENT_MATCH").isNull()).count()
-    assert missing == 0, f"{missing} EAL procedure rows have no parent"
+    edge_oid = core_lag_edge_oid(core_raw)
+    orphan = F.col("_PARENT_MATCH").isNull()
+    counts = joined.agg(
+        F.sum(F.when(orphan, 1).otherwise(0)).alias("held_back"),
+        F.sum(F.when(orphan & (F.col("WAITING_LIST_OID") < F.lit(edge_oid)), 1).otherwise(0)).alias("unexplained"),
+    ).first()
+    held_back = int(counts["held_back"] or 0)
+    unexplained = int(counts["unexplained"] or 0)
+    assert unexplained == 0, (
+        f"{unexplained} EAL procedure rows have no parent and predate the Core snapshot edge "
+        f"(WaitingListOID {edge_oid}); this is not Core extract lag"
+    )
+    core_lag = {"held_back_rows": held_back, "core_edge_waiting_list_oid": edge_oid,
+                "edge_hours": CORE_LAG_EDGE_HOURS}
+    print("[B3_LUNA_EAL] procedure core lag: " + json.dumps(core_lag, sort_keys=True))
+    return joined.where(~orphan), core_lag
+
+
+def build_procedure(source_versions, parent_version):
+    versions = {**source_versions, TARGET_PARENT: parent_version}
+    raw = read_pinned(SRC_PROCEDURE, versions)
+    core_raw = read_pinned(SRC_CORE, versions)
+    source_rows = procedure_source_gates(raw, core_raw)
+    due = _target_due_check(TARGET_PROCEDURE, versions)
+    if not due:
+        _, core_lag = publishable_procedures(raw, core_raw, versions)
+        gate = procedure_gates(source_rows - core_lag["held_back_rows"])
+        return {"mode": "NO_OP", "write": None, "gate": gate, "core_lag": core_lag}
+    joined, core_lag = publishable_procedures(raw, core_raw, versions)
     joined = (
         joined.drop("_PARENT_MATCH")
         .withColumn("SOURCE_SYSTEM_OID_INHERITED_IND", F.lit(True))
@@ -880,9 +924,9 @@ def build_procedure(source_versions, parent_version):
     )
     explicit = {c: ("4", "2") for c in ["WAITING_LIST_OID", "PROCEDURE_OID"]}
     ig_tag_table(TARGET_PROCEDURE, explicit)
-    gate = procedure_gates(source_rows)
+    gate = procedure_gates(source_rows - core_lag["held_back_rows"])
     _record_target_versions(TARGET_PROCEDURE, versions)
-    return {"mode": "BUILD", "write": write, "gate": gate}
+    return {"mode": "BUILD", "write": write, "gate": gate, "core_lag": core_lag}
 
 
 # COMMAND ----------

@@ -689,6 +689,7 @@ GOVERNED_TRANSLATION_RULES = (
     "ecds:chief_complaint:pool_seed_exact", "ecds:chief_complaint:rfv_exact", "ecds:chief_complaint:closest",
     "nicip:preferred_term:exact:", "nicip:synonym:exact:", "nicip:preferred_term:closest",
     "dmd:id:native", "dmd:name:exact",
+    "stm-rules-",  # EMPTYCOL_W4_STM v1: deterministic specimen-type rules (stm-rules-<version>:rNNN)
     "bronze.map_implant_details:LAYER1_UDI_GUDID", "bronze.map_implant_details:LAYER1B_CATALOGUE_GUDID",
     "bronze.map_implant_details:LAYER2_EXACT_ANCHOR", "bronze.map_implant_details:LAYER3_BRAND_RULE",
     "bronze.map_implant_details:LAYER4_CLEANED_ANCHOR", "bronze.map_implant_details:LAYER6_OPCS_STANDARD",
@@ -1116,7 +1117,9 @@ def _tdx_product(target_name):
         released = _released(df) & F.col("text_is_anonymised")
         df = df.withColumn("source_text_sha256", F.col("text_sha256"))
         df = df.withColumn("document_text", F.when(released, F.col("document_text_anonymised")))
-        df = df.drop("text", "document_text_anonymised")
+        # GOLD_COLUMN_PARITY_V1: the source narrative and silver's anonymised field are published too (Ben,
+        # 2026-10-17: nothing is withheld from gold except QC failures); document_text stays the released
+        # anonymised text, and text_sha256/text_length/text_is_anonymised describe document_text.
         df = df.withColumn("text_sha256", F.sha2("document_text", 256))
         df = df.withColumn("text_length", F.length("document_text"))
         df = df.withColumn("text_is_anonymised", released)
@@ -1133,7 +1136,8 @@ def _tdx_product(target_name):
         released = _released(df)
         for original, anonymised in substitutions[target_name]:
             if original in df.columns and anonymised in df.columns:
-                df = df.withColumn(original, F.when(released, F.col(anonymised))).drop(anonymised)
+                # GOLD_COLUMN_PARITY_V1: the anon_* column itself is published as well.
+                df = df.withColumn(original, F.when(released, F.col(anonymised)))
     return _tdx_comments(df, target_name)
 
 def _tdx_qc(target_name, key_name):

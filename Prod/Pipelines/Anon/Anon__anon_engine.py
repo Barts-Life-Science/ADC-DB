@@ -610,6 +610,12 @@ def ensure_control_tables(spark):
           feed STRING, run_id STRING, row_key STRING, error_detail STRING, recorded_at TIMESTAMP
         ) USING DELTA"""
     )
+    spark.sql(
+        f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.anon_fingerprint_ack (
+          feed STRING NOT NULL, row_key STRING NOT NULL, identity_fingerprint STRING,
+          state_hash STRING NOT NULL, acked_at TIMESTAMP, run_id STRING
+        ) USING DELTA"""
+    )
 
 
 def tag_control_tables(spark):
@@ -637,6 +643,10 @@ def tag_control_tables(spark):
         "engine_errors": {
             "feed": ("1", "1"), "run_id": ("1", "1"), "row_key": ("1", "1"),
             "error_detail": ("2", "1"), "recorded_at": ("1", "1"),
+        },
+        "anon_fingerprint_ack": {
+            "feed": ("1", "1"), "row_key": ("1", "1"), "identity_fingerprint": ("2", "1"),
+            "state_hash": ("1", "1"), "acked_at": ("1", "1"), "run_id": ("1", "1"),
         },
     }
     for table, columns in tag_levels.items():
@@ -1217,6 +1227,87 @@ def _prepare_unresolved(feed, rows):
     )
 
 
+def _state_hash_columns(cfg):
+    """Columns whose values make up a row's published anonymisation state (order matters for the hash)."""
+    return [*cfg["text_cols"].values(), "anon_status", "anon_redactor_version", "anon_source_text_sha",
+            "anon_context_fingerprint", "anon_redaction_count", "anon_identity_fingerprint"]
+
+
+def _published_state_hash(cfg, prefix=""):
+    """sha256 of a row's published state; `prefix` reads the same columns under another name (e.g. '_t_')."""
+    return F.sha2(F.to_json(F.struct(*[F.col(f"{prefix}{c}").alias(c) for c in _state_hash_columns(cfg)])), 256)
+
+
+def _acked_fingerprints(feed):
+    """Per row key: the fingerprint a run checked without a rewrite, and the row state it was checked on."""
+    return (
+        spark.table(f"{CONTROL_SCHEMA}.anon_fingerprint_ack")
+        .where(F.col("feed") == feed)
+        .select(
+            F.col("row_key").alias("_row_key"),
+            F.col("identity_fingerprint").alias("_acked_identity_fingerprint"),
+            F.col("state_hash").alias("_acked_state_hash"),
+        )
+    )
+
+
+def _ack_unchanged_outputs(feed, cfg, stage, update_columns):
+    """Acknowledge, instead of rewriting, staged rows whose published output is unchanged.
+
+    ANON_FINGERPRINT_ACK_V1 (2026-10-18): identity-bundle changes re-redact every text row of the person, which is
+    correct, but 88% of those rows (2026-10-18: 182,569 of 207,990) came out byte-identical with only
+    anon_identity_fingerprint moved, and each wide row was rewritten. Such rows now get an acknowledgement bound to
+    the row's exact published state (state_hash). Any later rewrite of the row changes that state and voids the
+    acknowledgement. Everything else is merged as before. Returns (stage table to MERGE, its row count).
+    """
+    staged = spark.table(stage)
+    keys = list(cfg["key_cols"])
+    compared = [c for c in update_columns if c not in ("anon_identity_fingerprint", "anon_processed_at")]
+    current = spark.table(cfg["table"]).select(
+        *keys, *[F.col(c).alias(f"_t_{c}") for c in [*compared, "anon_identity_fingerprint"]]
+    )
+    same_output = F.lit(True)
+    for column in compared:
+        same_output = same_output & F.col(column).eqNullSafe(F.col(f"_t_{column}"))
+    unchanged = (
+        staged.join(current, keys, "inner")
+        .where(
+            F.col("_error_detail").isNull()
+            & (F.col("anon_status") == "anonymized")
+            & same_output
+            & ~F.col("anon_identity_fingerprint").eqNullSafe(F.col("_t_anon_identity_fingerprint"))
+        )
+        .select(*keys, "anon_identity_fingerprint", _published_state_hash(cfg, "_t_").alias("state_hash"))
+    )
+    ack_stage = f"{stage}_ack"
+    unchanged.write.mode("overwrite").saveAsTable(ack_stage)
+    acked = spark.table(ack_stage)
+    if acked.limit(1).count() == 0:
+        spark.sql(f"DROP TABLE IF EXISTS {ack_stage}")
+        return stage, int(staged.count())
+    ack_rows = f"{stage}_ack_rows"
+    acked.select(
+        F.lit(feed).alias("feed"),
+        _row_key_json(cfg).alias("row_key"),
+        F.col("anon_identity_fingerprint").alias("identity_fingerprint"),
+        F.col("state_hash"),
+        F.current_timestamp().alias("acked_at"),
+        F.lit(RUN_ID).alias("run_id"),
+    ).write.mode("overwrite").saveAsTable(ack_rows)
+    _merge_with_retry(
+        f"MERGE INTO {CONTROL_SCHEMA}.anon_fingerprint_ack t USING {ack_rows} s "
+        "ON t.feed = s.feed AND t.row_key = s.row_key "
+        "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+        f"{feed}:ack",
+    )
+    write_stage = f"{stage}_write"
+    staged.join(acked.select(*keys), keys, "left_anti").write.mode("overwrite").saveAsTable(write_stage)
+    write_rows = int(spark.table(write_stage).count())
+    for table in (ack_stage, ack_rows):
+        spark.sql(f"DROP TABLE IF EXISTS {table}")
+    return write_stage, write_rows
+
+
 def merge_batch(feed, output, lane, cursor, started_at):
     cfg = FEED_REGISTRY[feed]
     stage = f"{CONTROL_SCHEMA}._stage_{_safe_name(feed)}_{_safe_name(RUN_ID)}_{lane}"
@@ -1240,20 +1331,24 @@ def merge_batch(feed, output, lane, cursor, started_at):
     join_clause = " AND ".join(f"t.`{column}` <=> s.`{column}`" for column in cfg["key_cols"])
     update_columns = list(cfg["text_cols"].values()) + STATE_COLS
     update_clause = ", ".join(f"t.`{column}` = s.`{column}`" for column in update_columns)
-    result = _merge_with_retry(
-        f"MERGE INTO {cfg['table']} t USING {stage} s ON {join_clause} "
-        f"WHEN MATCHED THEN UPDATE SET {update_clause}",
-        f"{feed}:{lane}",
-    )
-    merge_result = result.asDict(recursive=True)
-    updated = int(merge_result["num_updated_rows"])
-    if updated != batch_rows:
-        verification = _verify_merged_batch(
-            cfg, stage, update_columns, batch_rows
+    write_stage, write_rows = _ack_unchanged_outputs(feed, cfg, stage, update_columns)
+    if write_rows:
+        result = _merge_with_retry(
+            f"MERGE INTO {cfg['table']} t USING {write_stage} s ON {join_clause} "
+            f"WHEN MATCHED THEN UPDATE SET {update_clause}",
+            f"{feed}:{lane}",
         )
-        _accept_verified_merge_metric_mismatch(
-            f"{feed}:{lane}", merge_result, verification
-        )
+        merge_result = result.asDict(recursive=True)
+        updated = int(merge_result["num_updated_rows"])
+        if updated != write_rows:
+            verification = _verify_merged_batch(
+                cfg, write_stage, update_columns, write_rows
+            )
+            _accept_verified_merge_metric_mismatch(
+                f"{feed}:{lane}", merge_result, verification
+            )
+    if write_stage != stage:
+        spark.sql(f"DROP TABLE IF EXISTS {write_stage}")
     errors = staged.where(F.col("_error_detail").isNotNull()).select(
         F.lit(feed).alias("feed"),
         F.lit(RUN_ID).alias("run_id"),
@@ -2075,22 +2170,23 @@ def run_feed(feed):
         source.where(_cheap_candidate_predicate(cfg))
         .select(*key_priority)
         .withColumn("_drift", F.lit(False))
+        .withColumn("_cheap", F.lit(True))
     )
     drift = (
         _drift_rows(feed, cfg, source)
         .select(*key_priority)
         .withColumn("_drift", F.lit(True))
+        .withColumn("_cheap", F.lit(False))
     )
+    # A key can arrive by both routes; keep one row that remembers both (touch_rows only touches _cheap rows).
     candidates = (
         drift.unionByName(cheap)
-        .withColumn(
-            "_rank",
-            F.row_number().over(
-                Window.partitionBy(*cfg["key_cols"]).orderBy(F.col("_drift").desc())
-            ),
+        .groupBy(*cfg["key_cols"])
+        .agg(
+            F.max("_priority").alias("_priority"),
+            F.max("_drift").alias("_drift"),
+            F.max("_cheap").alias("_cheap"),
         )
-        .where(F.col("_rank") == 1)
-        .drop("_rank")
     )
     try:
         candidate_metrics = candidates.agg(
@@ -2138,7 +2234,7 @@ def run_feed(feed):
             }
 
         slice_rows = (
-            slice_df.select(*cfg["key_cols"], "_drift")
+            slice_df.select(*cfg["key_cols"], "_drift", "_cheap")
             .join(source, cfg["key_cols"], "inner")
         )
         resolved = resolve_persons(slice_rows, cfg["person_routes"])
@@ -2159,6 +2255,8 @@ def run_feed(feed):
                 "left",
             )
             .withColumn("_current_source_text_sha", _text_hash(cfg))
+            .withColumn("_row_key", _row_key_json(cfg))
+            .join(_acked_fingerprints(feed), "_row_key", "left")
         )
         accepted = list(cfg["accepted_versions"])
         retry_cutoff = F.current_timestamp() - F.expr(
@@ -2176,6 +2274,11 @@ def run_feed(feed):
                 (F.col("anon_status") == "anonymized")
                 & ~F.col("anon_identity_fingerprint").eqNullSafe(
                     F.col("_current_identity_fingerprint")
+                )
+                & ~(
+                    # Acknowledged only for this exact row state and this exact fingerprint.
+                    F.coalesce(F.col("_acked_state_hash") == _published_state_hash(cfg), F.lit(False))
+                    & F.col("_acked_identity_fingerprint").eqNullSafe(F.col("_current_identity_fingerprint"))
                 )
             )
             | ((F.col("anon_status") == "anonymized") & anon_output_null)
@@ -2228,6 +2331,7 @@ def run_feed(feed):
                 "_anon_work_bucket",
                 "_anon_lane",
                 "_needs_work",
+                "_cheap",
             )
         )
         (
@@ -2256,13 +2360,16 @@ def run_feed(feed):
         work_rows = sum(
             group["rows"] for group in resolved_groups + unresolved_groups
         )
-        touched = touch_rows(feed, inspected_rows.where(~F.col("_needs_work")))
+        touched = touch_rows(feed, inspected_rows.where(~F.col("_needs_work") & F.col("_cheap")))
+        # Drift-only rows that needed no work keep their state: the drift watermark, not processed_at, selects them.
+        drift_settled = int(inspected_rows.where(~F.col("_needs_work") & ~F.col("_cheap")).count())
         spark.createDataFrame(
             [(feed, "plan", json.dumps({
                 "eligible_total": eligible_total,
                 "drift_total": drift_total,
                 "work_rows": work_rows,
                 "touched": touched,
+                "drift_settled": drift_settled,
                 "work_cap_rows": WORK_CAP_ROWS,
                 "work_bucket_count": work_bucket_count,
                 "batch_resolved_rows": int(cfg.get("batch_resolved_rows", 100000)),
@@ -2325,7 +2432,8 @@ def run_feed(feed):
             "eligible_total": eligible_total,
             "drift_total": drift_total,
             "work_rows": work_rows,
-            "remaining_estimate": max(eligible_total - processed - touched, 0),
+            "drift_settled": drift_settled,
+            "remaining_estimate": max(eligible_total - processed - touched - drift_settled, 0),
             "elapsed_seconds": _elapsed_seconds(),
         }
     finally:
@@ -2368,5 +2476,4 @@ except Exception as exc:
 payload = {"action": ACTION, "feed": FEED, "run_id": RUN_ID, **result}
 print(json.dumps(payload, default=str, sort_keys=True))
 dbutils.notebook.exit(json.dumps(payload, default=str, sort_keys=True))
-
 

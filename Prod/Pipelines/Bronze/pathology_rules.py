@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Iterable, Mapping, Sequence
 
 
-PARSER_VERSION = "3.0.0"  # content-anchored result zones, row-level VAF/tier, 2026-09-24
+PARSER_VERSION = "3.1.0"  # GEN4_RULES_V1: v3 findings + enrich worker (assay split, report fields), 2026-10-18
 
 
 def stable_id(namespace: str, *parts: object) -> str:
@@ -138,6 +138,75 @@ def lifecycle_status(
 
 
 
+def rtf_to_plain(raw: str):
+    """Return (plain_text, offsets) for RTF input, or (raw, None) for plain text.
+
+    offsets[i] is the index in raw of plain_text[i]; one extra trailing entry equals len(raw),
+    so a span [a, b) in plain text maps back to raw as offsets[a] .. offsets[b - 1] + 1.
+    Used by both the v3 finding parser and the GEN4 enrich worker.
+    """
+    import re as _re
+
+    if not raw.lstrip().startswith("{\\rtf"):
+        return raw, None
+    out_chars = []
+    offsets = []
+    i = 0
+    depth = 0
+    skip_depth = None
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            if skip_depth is not None and depth <= skip_depth:
+                skip_depth = None
+            depth -= 1
+            i += 1
+            continue
+        if ch == "\\":
+            m = _re.match(r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\(.)", raw[i:i + 40])
+            if not m:
+                i += 1
+                continue
+            word, hexcode, symbol = m.group(1), m.group(3), m.group(4)
+            if skip_depth is None:
+                if word in ("fonttbl", "colortbl", "stylesheet", "info", "pict", "listtable",
+                            "listoverridetable", "rsidtbl", "generator", "xmlnstbl"):
+                    skip_depth = depth
+                elif symbol == "*":
+                    skip_depth = depth
+                elif word in ("par", "line", "row", "sect", "page"):
+                    out_chars.append("\n")
+                    offsets.append(i)
+                elif word in ("tab", "cell"):
+                    out_chars.append("  ")
+                    offsets.extend((i, i))
+                elif hexcode:
+                    out_chars.append(bytes([int(hexcode, 16)]).decode("cp1252", "replace"))
+                    offsets.append(i)
+                elif symbol in ("\\", "{", "}"):
+                    out_chars.append(symbol)
+                    offsets.append(i)
+                elif symbol == "~":
+                    out_chars.append(" ")
+                    offsets.append(i)
+            i += m.end()
+            continue
+        if skip_depth is None and ch not in "\r\n":
+            out_chars.append(ch)
+            offsets.append(i)
+        i += 1
+    offsets.append(n)
+    return "".join(out_chars), offsets
+
+
+# Spark's cloudpickle must carry this by value alongside the workers that call it.
+rtf_to_plain.__module__ = "__main__"
+
 def parse_genetic_report_json_worker(
     text: object,
     gene_symbols,
@@ -212,6 +281,12 @@ def parse_genetic_report_json_worker(
                     r"|\s-{2,}\s"
                     r")"
                 ),
+                # GEN4_RULES_V1: statement reading stops at technical/method text, not at block separators.
+                "statement_stop_re": _re.compile(
+                    r"(?i)\bregions?\s+with\s+insufficient\s+coverage|\btechnical\s+information"
+                    r"|\bgenes?\s*\(exons?\)\s+included|\bmethod(?:ology)?\s*:"
+                ),
+                "separator_re": _re.compile(r"(?m)^[ \t]*-{2,}|\s-{2,}\s"),
                 "body_stop_re": _re.compile(
                     r"(?im)(?:"
                     r"\bregions?\s+with\s+insufficient\s+coverage"
@@ -326,64 +401,8 @@ def parse_genetic_report_json_worker(
     raw = "" if text is None else str(text)
 
     # RTF: strip control words to plain text but keep a map back to raw offsets
-    # so evidence_start/evidence_end always address the stored report text.
-    if raw.lstrip().startswith("{\\rtf"):
-        out_chars: list[str] = []
-        offsets: list[int] = []
-        i = 0
-        depth = 0
-        skip_depth = None
-        n = len(raw)
-        while i < n:
-            ch = raw[i]
-            if ch == "{":
-                depth += 1
-                i += 1
-                continue
-            if ch == "}":
-                if skip_depth is not None and depth <= skip_depth:
-                    skip_depth = None
-                depth -= 1
-                i += 1
-                continue
-            if ch == "\\":
-                m = _re.match(r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\(.)", raw[i:i + 40])
-                if not m:
-                    i += 1
-                    continue
-                word, hexcode, symbol = m.group(1), m.group(3), m.group(4)
-                if skip_depth is None:
-                    if word in ("fonttbl", "colortbl", "stylesheet", "info", "pict", "listtable",
-                                "listoverridetable", "rsidtbl", "generator", "xmlnstbl"):
-                        skip_depth = depth
-                    elif symbol == "*":
-                        skip_depth = depth
-                    elif word in ("par", "line", "row", "sect", "page"):
-                        out_chars.append("\n")
-                        offsets.append(i)
-                    elif word in ("tab", "cell"):
-                        out_chars.append("  ")
-                        offsets.extend((i, i))
-                    elif hexcode:
-                        out_chars.append(bytes([int(hexcode, 16)]).decode("cp1252", "replace"))
-                        offsets.append(i)
-                    elif symbol in ("\\", "{", "}"):
-                        out_chars.append(symbol)
-                        offsets.append(i)
-                    elif symbol == "~":
-                        out_chars.append(" ")
-                        offsets.append(i)
-                i += m.end()
-                continue
-            if skip_depth is None and ch not in "\r\n":
-                out_chars.append(ch)
-                offsets.append(i)
-            i += 1
-        source = "".join(out_chars)
-        offsets.append(n)
-    else:
-        source = raw
-        offsets = None
+    # so evidence_start/evidence_end always address the stored report text (GEN4_RULES_V1: shared decoder).
+    source, offsets = rtf_to_plain(raw)
 
     def raw_span(start: int, end: int) -> tuple[int, int]:
         if offsets is None:
@@ -549,6 +568,7 @@ def parse_genetic_report_json_worker(
         # cells, then k variant cells, then k VAF cells. Pair them by position.
         fields_by_row: dict[int, dict] = {}
         column_major: set[int] = set()
+        column_transcripts: dict[int, str | None] = {}  # GEN4: a column-major row's own gene-cell transcript
         index = 0
         previous_end = zone_start
         while index < len(rows):
@@ -560,14 +580,18 @@ def parse_genetic_report_json_worker(
             last_tail = rows[group[-1]][5]
             if len(group) > 1:
                 block_genes = [g for g in genes if previous_end <= g[0] < rows[group[0]][0]]
+                # GEN4: a gene cell may carry its transcript ("SRSF2 NM_003016.4"): strip it with the labels.
+                cell_ends = block_genes[1:] + [(rows[group[0]][0],)]
                 stacked = all(
-                    not s["separator_label_re"].sub("", source[a[1]:b[0]]).strip(" \t\r\n\u00a0*")
-                    for a, b in zip(block_genes, block_genes[1:] + [(rows[group[0]][0],)])
+                    not s["transcript_re"].sub("", s["separator_label_re"].sub("", source[a[1]:b[0]])).strip(" \t\r\n\u00a0*")
+                    for a, b in zip(block_genes, cell_ends)
                 )
                 if stacked and len(block_genes) == len(group) and len({g[2] for g in block_genes}) > 1:
                     for position, row_index in enumerate(group):
                         rows[row_index][6] = block_genes[position]
                         column_major.add(row_index)
+                        cell_transcript = s["transcript_re"].search(source[block_genes[position][1]:cell_ends[position][0]])
+                        column_transcripts[row_index] = cell_transcript.group(0) if cell_transcript else None
                 vafs = list(s["vaf_re"].finditer(last_tail))
                 tiers = list(s["tier_re"].finditer(last_tail))
                 if len(vafs) == len(group) and len(tiers) in (0, len(group)):
@@ -591,7 +615,11 @@ def parse_genetic_report_json_worker(
             elif gene and not any(gene[1] <= a[0] < a_start for a in anchors):
                 evidence_start = gene[0]
             prefix = "" if index in column_major else source[gene[1] if gene else a_start:a_start]
-            transcript = s["transcript_re"].search(prefix) or s["transcript_re"].search(tail)
+            if index in column_major:
+                transcript_text = column_transcripts.get(index)
+            else:
+                transcript = s["transcript_re"].search(prefix) or s["transcript_re"].search(tail)
+                transcript_text = transcript.group(0) if transcript else None
             c_raw, c_parsed = hgvs_checked(c_text, s["hgvs_c_syntax_re"])
             p_raw, p_parsed = hgvs_checked(p[2] if p else None, s["hgvs_p_syntax_re"])
             if (c_raw and not c_parsed) or (p_raw and not p_parsed):
@@ -617,7 +645,7 @@ def parse_genetic_report_json_worker(
                 hgvs_p_raw=p_raw,
                 hgvs_p_parsed=p_parsed,
                 hgvs_validation_status=validation,
-                transcript=transcript.group(0) if transcript else None,
+                transcript=transcript_text,
                 **fields_by_row[index],
             )
 
@@ -678,11 +706,19 @@ def parse_genetic_report_json_worker(
                 partner_gene_symbol="ABL1",
                 alteration_type="fusion",
             )
-        heads = list(s["statement_re"].finditer(source[:body_end]))
+        # GEN4_RULES_V1: FLT3 reports put the NPM1 result after a '---' separator, which ends body_end.
+        # Statements are read up to the technical/method stop; each ends at the next statement or separator,
+        # so statements inside the old body keep their exact evidence spans (and genetic_result_id).
+        statement_stop = s["statement_stop_re"].search(source)
+        statement_end = statement_stop.start() if statement_stop else len(source)
+        separators = [sep.start() for sep in s["separator_re"].finditer(source)]
+        heads = list(s["statement_re"].finditer(source[:statement_end]))
         for index, m in enumerate(heads):
             gene = m.group(1).upper()
             status = _re.sub(r"\s+", " ", m.group(4).lower())
-            end = heads[index + 1].start() if index + 1 < len(heads) else body_end
+            bounds = [heads[index + 1].start() if index + 1 < len(heads) else statement_end]
+            bounds += [p for p in separators if p > m.end()][:1]
+            end = min(bounds)
             statements.append((gene, status, m, end))
         positives: dict[str, list] = {}
         for gene, status, m, end in statements:

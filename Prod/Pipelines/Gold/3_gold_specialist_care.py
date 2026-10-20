@@ -34,6 +34,8 @@ CLINICAL_BABY_DELIVERY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
@@ -107,6 +109,8 @@ CLINICAL_BABY_DELIVERY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each baby delivery record. It is derived from bronze field `PERSONBIRTHDATETIMEBABY_CLEAN` in `4_prod.bronze.map_maternity_baby_delivery`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each baby delivery record. It is derived from bronze field `DISCHARGEDATETIMEBABYHSP_CLEAN` in `4_prod.bronze.map_maternity_baby_delivery`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time baby birth date and time for the MSDS delivery event, derived from the cleaned MSDS401 baby birth datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time baby hospital discharge date and time closing the MSDS delivery event, derived from the cleaned MSDS401 baby discharge datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each baby delivery record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -183,6 +187,8 @@ def gold_clinical_baby_delivery():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -239,6 +245,8 @@ CLINICAL_CANCER_TREATMENT_SELECT = [
     '`encounter_id` AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -347,6 +355,8 @@ CLINICAL_CANCER_TREATMENT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Treatment start timestamp.",
     "event_end_datetime": "Treatment end or final-treatment timestamp.",
+    "event_datetime_local": "Treatment start timestamp expressed in local time, corresponding to event_datetime. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Treatment end or final-treatment timestamp expressed in local time, corresponding to event_end_datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "SACT drug-token coding system.",
     "source_code": "Normalized drug token with agent-name display fallback.",
     "source_display": "Source agent name.",
@@ -416,6 +426,8 @@ def gold_clinical_cancer_treatment():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -584,6 +596,8 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -645,6 +659,8 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each critical care activity record. It is derived from bronze field `Activity_Date_CLEAN` in `4_prod.bronze.map_critical_care_activity`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each critical care activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Start date/time of the critical-care activity event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "End date/time of the critical-care activity event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each critical care activity record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each critical care activity record. It is derived from bronze field `Activity_Code` in `4_prod.bronze.map_critical_care_activity`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Textual description of the meaning of the NHS Data Dictionary code value for the element.",
@@ -704,6 +720,8 @@ def gold_clinical_critical_care_activity():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -740,6 +758,8 @@ CLINICAL_CRITICAL_CARE_ADMISSION_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -817,6 +837,8 @@ CLINICAL_CRITICAL_CARE_ADMISSION_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each critical care admission record. It is derived from bronze field `date_unit_adm_CLEAN` in `4_prod.bronze.map_critical_care_admission`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each critical care admission record. It is derived from bronze field `date_unit_discharge_CLEAN` in `4_prod.bronze.map_critical_care_admission`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time representation of the event start datetime for the critical-care admission.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the event end datetime for the critical-care admission. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each critical care admission record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each critical care admission record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each critical care admission record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -884,6 +906,8 @@ def gold_clinical_critical_care_admission():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -931,6 +955,8 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -999,6 +1025,8 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each critical care daily score record. It is derived from bronze field `DATE_DAILY_CLEAN` in `4_prod.bronze.map_critical_care_daily_score`, selected as the provenance anchor from 2 recorded bronze source fields. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each critical care daily score record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time representation of the event start date and time for the critical-care daily score record.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the event end date and time for the critical-care daily score record.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each critical care daily score record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each critical care daily score record. It is derived from bronze field `SCORE_TYPE` in `4_prod.bronze.map_critical_care_daily_score`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each critical care daily score record. It is derived from bronze field `SCORE_TYPE` in `4_prod.bronze.map_critical_care_daily_score`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -1064,6 +1092,8 @@ def gold_clinical_critical_care_daily_score():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1103,6 +1133,8 @@ CLINICAL_CRITICAL_CARE_PERIOD_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1185,6 +1217,8 @@ CLINICAL_CRITICAL_CARE_PERIOD_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each critical care period record. It is derived from bronze field `CC_Period_Start_Dt_Tm_CLEAN` in `4_prod.bronze.map_critical_care_period`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each critical care period record. It is derived from bronze field `CC_Period_Disch_Dt_Tm_CLEAN` in `4_prod.bronze.map_critical_care_period`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time form of the critical-care period start date-time, corresponding to event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time form of the critical-care period end date-time, corresponding to event_end_datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each critical care period record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -1258,6 +1292,8 @@ def gold_clinical_critical_care_period():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1306,6 +1342,8 @@ CLINICAL_LABOUR_DELIVERY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1384,6 +1422,8 @@ CLINICAL_LABOUR_DELIVERY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each labour delivery record. It is derived from bronze field `CAESAREANDATETIME_CLEAN` in `4_prod.bronze.map_maternity_labour_delivery`, selected as the provenance anchor from 3 recorded bronze source fields. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each labour delivery record. It is derived from bronze field `DISCHARGEDATETIMEMOTHERHSP_CLEAN` in `4_prod.bronze.map_maternity_labour_delivery`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time start of the labour-delivery event, derived from the cleaned MSDS mother delivery start, labour onset or caesarean datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time end of the labour-delivery event, derived from the cleaned MSDS mother hospital discharge datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each labour delivery record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "The method by which the process of labour began, or delivery by caesarean section occurred.",
     "source_display": "The method by which the process of labour began, or delivery by caesarean section occurred.",
@@ -1464,6 +1504,8 @@ def gold_clinical_labour_delivery():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1517,6 +1559,8 @@ CLINICAL_MATERNITY_CARE_CONTACT_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1600,6 +1644,8 @@ CLINICAL_MATERNITY_CARE_CONTACT_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each maternity care contact record. It is derived from bronze field `CCONTACTDATETIME_CLEAN` in `4_prod.bronze.map_maternity_care_contact`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each maternity care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local date and time of the maternity care contact, derived from the cleaned MSDS care contact datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local date and time at which the maternity care contact ended, where available.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each maternity care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each maternity care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each maternity care contact record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -1672,6 +1718,8 @@ def gold_clinical_maternity_care_contact():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1721,6 +1769,8 @@ CLINICAL_NEONATAL_CARE_DAY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     'CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    'CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE `event_datetime` END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1798,6 +1848,8 @@ CLINICAL_NEONATAL_CARE_DAY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date of the critical care activity record.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each neonatal care day record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Local-time representation of the neonatal critical-care activity day event start datetime. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the neonatal critical-care activity day event end datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each neonatal care day record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Neonatal Critical Care Activity Code 1 - coded activity performed on this day.",
     "source_display": "Neonatal Critical Care Activity Code 1 - coded activity performed on this day.",
@@ -1858,6 +1910,8 @@ def gold_clinical_neonatal_care_day():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -1895,6 +1949,8 @@ CLINICAL_NEONATAL_EPISODE_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -1967,6 +2023,8 @@ CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each neonatal episode record. It is derived from bronze field `AdmitTime_CLEAN` in `4_prod.bronze.map_neonatal_episode`, selected as the provenance anchor from 2 recorded bronze source fields. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each neonatal episode record. It is derived from bronze field `DischTime_CLEAN` in `4_prod.bronze.map_neonatal_episode`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Neonatal episode start date and time expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Neonatal episode end date and time expressed in local time. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each neonatal episode record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each neonatal episode record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each neonatal episode record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -2037,6 +2095,8 @@ def gold_clinical_neonatal_episode():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2084,6 +2144,8 @@ CLINICAL_NEONATAL_EXAMINATION_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     '`event_end_datetime` AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -2163,6 +2225,8 @@ CLINICAL_NEONATAL_EXAMINATION_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Date and time when the represented clinical or administrative event occurred for each neonatal examination record. It is derived from bronze field `DateOfExamination_CLEAN` in `4_prod.bronze.map_neonatal_examination`. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
     "event_end_datetime": "Date and time when the represented clinical or administrative event ended for each neonatal examination record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source precision and timezone handling follow the pipeline expression; null means the time was unavailable.",
+    "event_datetime_local": "Date and time of the neonatal examination event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "End date and time of the neonatal examination event expressed in local time.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each neonatal examination record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each neonatal examination record. It is derived from bronze field `EXAM_POPULATED_IND` in `4_prod.bronze.map_neonatal_examination`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each neonatal examination record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -2232,6 +2296,8 @@ def gold_clinical_neonatal_examination():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -2279,6 +2345,8 @@ CLINICAL_REGISTRY_ENTRY_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`event_datetime` AS `event_datetime`',
     'CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END AS `event_end_datetime`',
+    '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+    'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`registry_family` AS `registry_family`',
     '`registry_type` AS `registry_type`',
     '`entry_id` AS `entry_id`',
@@ -2339,6 +2407,8 @@ CLINICAL_REGISTRY_ENTRY_COLUMN_COMMENTS = {
     "encounter_id": "Native Millennium ENCNTR_ID as BIGINT when available.",
     "event_datetime": "Family-specific clinical timestamp; child rows inherit the parent timestamp.",
     "event_end_datetime": "Family-specific clinical end timestamp.",
+    "event_datetime_local": "Local-time representation of the family-specific clinical event timestamp for the registry entry.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the family-specific clinical end timestamp for the registry entry. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "registry_family": "Parameterized registry family.",
     "registry_type": "Registry subtype for composite-key MDT rows.",
     "entry_id": "Native iWeb ENTRY_ID as BIGINT; primary key within source_object.",
@@ -2394,6 +2464,8 @@ def gold_clinical_registry_entry():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`registry_family` AS `registry_family`',
         '`registry_type` AS `registry_type`',
         '`entry_id` AS `entry_id`',

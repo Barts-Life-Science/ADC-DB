@@ -45,6 +45,8 @@ TEXT_DOCUMENT_SELECT = [
     'CASE WHEN NOT `encounter_id_resolved` THEN NULL ELSE `encounter_id` END AS `encounter_id`',
     "CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_datetime` END END AS `event_datetime`",
     "CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END AS `event_end_datetime`",
+    "CASE WHEN `event_datetime` IS NOT NULL AND (CASE WHEN CAST(`event_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_datetime` END END) IS NULL THEN NULL ELSE `event_datetime_local` END AS `event_datetime_local`",  # GOLD_COLUMN_PARITY_V1
+    "CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` OR CAST(`event_end_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`event_end_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`event_end_datetime` AS DATE)) < 9999 THEN NULL ELSE `event_end_datetime` END END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`",  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
@@ -58,6 +60,7 @@ TEXT_DOCUMENT_SELECT = [
     '`document_thread_key` AS `document_thread_key`',
     '`supersedes_document_key` AS `supersedes_document_key`',
     '`version_ordinal` AS `version_ordinal`',
+    '`is_latest_version` AS `is_latest_version`',  # GOLD_COLUMN_PARITY_V1
     "CASE WHEN TRIM(CAST(`document_text` AS STRING)) = '' THEN NULL ELSE `document_text` END AS `document_text`",
     '`parser_version` AS `parser_version`',
     '`decompressor_version` AS `decompressor_version`',
@@ -192,6 +195,8 @@ TEXT_DOCUMENT_COLUMN_COMMENTS = {
     "encounter_id": "Millennium ENCNTR_ID when supplied; native encounter foreign key.",
     "event_datetime": "Document clinical or version timestamp.",
     "event_end_datetime": "Source version-validity end.",
+    "event_datetime_local": "Local-time representation of the document clinical or version timestamp held in event_datetime. Gold: NULL wherever Gold nulls event_datetime.",  # GOLD_COLUMN_PARITY_V1
+    "event_end_datetime_local": "Local-time representation of the source version-validity end held in event_end_datetime. Gold: NULL wherever Gold nulls event_end_datetime.",  # GOLD_COLUMN_PARITY_V1
     "source_coding_system": "Verbatim source document-type system.",
     "source_code": "Verbatim source document-type code.",
     "source_display": "Verbatim source document-type display.",
@@ -205,6 +210,7 @@ TEXT_DOCUMENT_COLUMN_COMMENTS = {
     "document_thread_key": "Deterministic SHA-256 key for all versions of one logical document.",
     "supersedes_document_key": "Deterministic SHA-256 key of the directly superseded document version.",
     "version_ordinal": "Source-supplied version ordinal when available; one for single-version lanes.",
+    "is_latest_version": "Exactly one row per document_thread_id selected by non-empty text then effective-from and source version ordinal descending with version_id descending as deterministic tiebreak.",  # GOLD_COLUMN_PARITY_V1
     "document_text": "Identifiable source document text under default-deny access.",
     "parser_version": "Parser version that produced document_text or sections. PACS reports whose text comes from the report-text bridge (v4, re-sourced from mill_blob_text) carry the bridge BRIDGED_TEXT_PARSER_VERSION, formatted mill_blob_text:d<decompressor>/p<parser>/pp<post-processor>; pacs-bridge-v1 marks v3 bridge text.",
     "decompressor_version": "Decompressor version used by bronze.",
@@ -306,6 +312,8 @@ def gold_text_document():
         '`encounter_id` AS `encounter_id`',
         '`event_datetime` AS `event_datetime`',
         '`event_end_datetime` AS `event_end_datetime`',
+        '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
+        '`event_end_datetime_local` AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
@@ -319,6 +327,7 @@ def gold_text_document():
         '`document_thread_key` AS `document_thread_key`',
         '`supersedes_document_key` AS `supersedes_document_key`',
         '`version_ordinal` AS `version_ordinal`',
+        '`is_latest_version` AS `is_latest_version`',  # GOLD_COLUMN_PARITY_V1
         '`document_text` AS `document_text`',
         '`parser_version` AS `parser_version`',
         '`decompressor_version` AS `decompressor_version`',
