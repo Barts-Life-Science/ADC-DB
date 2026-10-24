@@ -155,7 +155,7 @@ CLINICAL_BABY_DELIVERY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_baby_delivery"),
     comment="Internal quality-controlled twin of clinical_baby_delivery: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_BABY_DELIVERY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_BABY_DELIVERY_ADVISORY_RULES)
@@ -174,7 +174,7 @@ def _gold_qc_clinical_baby_delivery():
         "on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_baby_delivery():
     """Contract-v2 public twin of clinical_baby_delivery; QC support columns remain internal."""
@@ -394,7 +394,7 @@ CLINICAL_CANCER_TREATMENT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_cancer_treatment"),
     comment="Internal quality-controlled twin of clinical_cancer_treatment: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CANCER_TREATMENT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CANCER_TREATMENT_ADVISORY_RULES)
@@ -413,7 +413,7 @@ def _gold_qc_clinical_cancer_treatment():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_cancer_treatment():
     """Contract-v2 public twin of clinical_cancer_treatment; QC support columns remain internal."""
@@ -535,7 +535,7 @@ CLINICAL_CANCER_TREATMENT_CYCLE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_cancer_treatment_cycle"),
     comment="Internal quality-controlled twin of clinical_cancer_treatment_cycle: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CANCER_TREATMENT_CYCLE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CANCER_TREATMENT_CYCLE_ADVISORY_RULES)
@@ -553,7 +553,7 @@ def _gold_qc_clinical_cancer_treatment_cycle():
         "and Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_cancer_treatment_cycle():
     """Contract-v2 public twin of clinical_cancer_treatment_cycle; QC support columns remain internal."""
@@ -685,7 +685,7 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_activity"),
     comment="Internal quality-controlled twin of clinical_critical_care_activity: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ACTIVITY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_ACTIVITY_ADVISORY_RULES)
@@ -707,7 +707,7 @@ def _gold_qc_clinical_critical_care_activity():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_critical_care_activity():
     """Contract-v2 public twin of clinical_critical_care_activity; QC support columns remain internal."""
@@ -871,7 +871,7 @@ CLINICAL_CRITICAL_CARE_ADMISSION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_admission"),
     comment="Internal quality-controlled twin of clinical_critical_care_admission: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ADMISSION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_ADMISSION_ADVISORY_RULES)
@@ -893,7 +893,7 @@ def _gold_qc_clinical_critical_care_admission():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_critical_care_admission():
     """Contract-v2 public twin of clinical_critical_care_admission; QC support columns remain internal."""
@@ -1054,7 +1054,7 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_daily_score"),
     comment="Internal quality-controlled twin of clinical_critical_care_daily_score: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_DAILY_SCORE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_DAILY_SCORE_ADVISORY_RULES)
@@ -1076,7 +1076,7 @@ def _gold_qc_clinical_critical_care_daily_score():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_critical_care_daily_score():
     """Contract-v2 public twin of clinical_critical_care_daily_score; QC support columns remain internal."""
@@ -1256,7 +1256,7 @@ CLINICAL_CRITICAL_CARE_PERIOD_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_period"),
     comment="Internal quality-controlled twin of clinical_critical_care_period: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_PERIOD_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_PERIOD_ADVISORY_RULES)
@@ -1279,7 +1279,7 @@ def _gold_qc_clinical_critical_care_period():
         "on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_critical_care_period():
     """Contract-v2 public twin of clinical_critical_care_period; QC support columns remain internal."""
@@ -1466,7 +1466,7 @@ CLINICAL_LABOUR_DELIVERY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_labour_delivery"),
     comment="Internal quality-controlled twin of clinical_labour_delivery: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_LABOUR_DELIVERY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_LABOUR_DELIVERY_ADVISORY_RULES)
@@ -1492,7 +1492,7 @@ def _gold_qc_clinical_labour_delivery():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_labour_delivery():
     """Contract-v2 public twin of clinical_labour_delivery; QC support columns remain internal."""
@@ -1684,7 +1684,7 @@ CLINICAL_MATERNITY_CARE_CONTACT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_maternity_care_contact"),
     comment="Internal quality-controlled twin of clinical_maternity_care_contact: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_MATERNITY_CARE_CONTACT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_MATERNITY_CARE_CONTACT_ADVISORY_RULES)
@@ -1706,7 +1706,7 @@ def _gold_qc_clinical_maternity_care_contact():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_maternity_care_contact():
     """Contract-v2 public twin of clinical_maternity_care_contact; QC support columns remain internal."""
@@ -1876,7 +1876,7 @@ CLINICAL_NEONATAL_CARE_DAY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_care_day"),
     comment="Internal quality-controlled twin of clinical_neonatal_care_day: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_CARE_DAY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_CARE_DAY_ADVISORY_RULES)
@@ -1898,7 +1898,7 @@ def _gold_qc_clinical_neonatal_care_day():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_neonatal_care_day():
     """Contract-v2 public twin of clinical_neonatal_care_day; QC support columns remain internal."""
@@ -2061,7 +2061,7 @@ CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_episode"),
     comment="Internal quality-controlled twin of clinical_neonatal_episode: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_EPISODE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_EPISODE_ADVISORY_RULES)
@@ -2083,7 +2083,7 @@ def _gold_qc_clinical_neonatal_episode():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_neonatal_episode():
     """Contract-v2 public twin of clinical_neonatal_episode; QC support columns remain internal."""
@@ -2262,7 +2262,7 @@ CLINICAL_NEONATAL_EXAMINATION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_examination"),
     comment="Internal quality-controlled twin of clinical_neonatal_examination: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_EXAMINATION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_EXAMINATION_ADVISORY_RULES)
@@ -2284,7 +2284,7 @@ def _gold_qc_clinical_neonatal_examination():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_neonatal_examination():
     """Contract-v2 public twin of clinical_neonatal_examination; QC support columns remain internal."""
@@ -2432,7 +2432,7 @@ CLINICAL_REGISTRY_ENTRY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_entry"),
     comment="Internal quality-controlled twin of clinical_registry_entry: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_ENTRY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_REGISTRY_ENTRY_ADVISORY_RULES)
@@ -2451,7 +2451,7 @@ def _gold_qc_clinical_registry_entry():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_entry():
     """Contract-v2 public twin of clinical_registry_entry; QC support columns remain internal."""
@@ -2554,7 +2554,7 @@ REFERENCE_PREGNANCY_RECONCILIATION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_pregnancy_reconciliation"),
     comment="Internal quality-controlled twin of reference_pregnancy_reconciliation: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PREGNANCY_RECONCILIATION_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PREGNANCY_RECONCILIATION_ADVISORY_RULES)
@@ -2572,7 +2572,7 @@ def _gold_qc_reference_pregnancy_reconciliation():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_pregnancy_reconciliation():
     """Contract-v2 public twin of reference_pregnancy_reconciliation; QC support columns remain internal."""
@@ -2631,7 +2631,7 @@ CLINICAL_NEONATAL_CARE_DAY_ACTIVITY_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_care_day_activity"),
     comment="Internal QC of clinical_neonatal_care_day_activity; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_CARE_DAY_ACTIVITY_MANDATORY_RULES)
 def _gold_qc_clinical_neonatal_care_day_activity():
@@ -2647,7 +2647,7 @@ def _gold_qc_clinical_neonatal_care_day_activity():
     name=_n("gold_clinical.neonatal_care_day_activity"),
     comment='One BadgerNet critical-care activity code per neonatal care day.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_neonatal_care_day_activity():
     """Publish clinical_neonatal_care_day_activity without exposing the internal parent-admission marker."""
@@ -2685,7 +2685,7 @@ CLINICAL_NEONATAL_CARE_DAY_HIGH_COST_DRUG_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_care_day_high_cost_drug"),
     comment="Internal QC of clinical_neonatal_care_day_high_cost_drug; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_CARE_DAY_HIGH_COST_DRUG_MANDATORY_RULES)
 def _gold_qc_clinical_neonatal_care_day_high_cost_drug():
@@ -2701,7 +2701,7 @@ def _gold_qc_clinical_neonatal_care_day_high_cost_drug():
     name=_n("gold_clinical.neonatal_care_day_high_cost_drug"),
     comment='One BadgerNet high-cost-drug code per neonatal care day.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_neonatal_care_day_high_cost_drug():
     """Publish clinical_neonatal_care_day_high_cost_drug without exposing the internal parent-admission marker."""
@@ -3113,7 +3113,7 @@ CLINICAL_REGISTRY_ACS_TRANSFER_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_acs_transfer"),
     comment="Internal QC of clinical_registry_acs_transfer; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_ACS_TRANSFER_MANDATORY_RULES)
 def _gold_qc_clinical_registry_acs_transfer():
@@ -3129,7 +3129,7 @@ def _gold_qc_clinical_registry_acs_transfer():
     name=_n("gold_clinical.registry_acs_transfer"),
     comment='Typed child of clinical_registry_entry for the acs_transfer family. MINAP-style ACS transfer pathway: symptom, transfer and reperfusion timestamps, GRACE/Killip, drugs, laboratory results and Takotsubo fields. Diagnoses remain source labels. ADMISSION_DATE_QUALITY identifies the known 2000-01-01 placeholder range. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_acs_transfer():
     """Publish clinical_registry_acs_transfer without exposing the internal parent-admission marker."""
@@ -3413,7 +3413,7 @@ CLINICAL_REGISTRY_CARDIAC_MDT_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_cardiac_mdt"),
     comment="Internal QC of clinical_registry_cardiac_mdt; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_CARDIAC_MDT_MANDATORY_RULES)
 def _gold_qc_clinical_registry_cardiac_mdt():
@@ -3429,7 +3429,7 @@ def _gold_qc_clinical_registry_cardiac_mdt():
     name=_n("gold_clinical.registry_cardiac_mdt"),
     comment='Typed child of clinical_registry_entry for the cardiac_mdt family. Harmonised iWeb cardiac MDT record. REGISTRY_TYPE=CORONARY_REVASC identifies the coronary revascularisation workflow; REGISTRY_TYPE=CT_AORTIC identifies CT/aortic surveillance. Workflow-specific columns are null for the other registry. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_cardiac_mdt():
     """Publish clinical_registry_cardiac_mdt without exposing the internal parent-admission marker."""
@@ -3611,7 +3611,7 @@ CLINICAL_REGISTRY_CORONARY_LESION_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_coronary_lesion"),
     comment="Internal QC of clinical_registry_coronary_lesion; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_CORONARY_LESION_MANDATORY_RULES)
 def _gold_qc_clinical_registry_coronary_lesion():
@@ -3627,7 +3627,7 @@ def _gold_qc_clinical_registry_coronary_lesion():
     name=_n("gold_clinical.registry_coronary_lesion"),
     comment='Typed child of clinical_registry_entry for the coronary_lesion family. Per-lesion/per-vessel PCI and angiography detail from the iWeb coronary registry. The parent coronary procedure registry is not landed, so PARENT_ENTRY_ID is retained for future linkage but currently has no bronze parent and there is no reliable procedure date. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_coronary_lesion():
     """Publish clinical_registry_coronary_lesion without exposing the internal parent-admission marker."""
@@ -4181,7 +4181,7 @@ CLINICAL_REGISTRY_CORONARY_PROCEDURE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_coronary_procedure"),
     comment="Internal QC of clinical_registry_coronary_procedure; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_CORONARY_PROCEDURE_MANDATORY_RULES)
 def _gold_qc_clinical_registry_coronary_procedure():
@@ -4197,7 +4197,7 @@ def _gold_qc_clinical_registry_coronary_procedure():
     name=_n("gold_clinical.registry_coronary_procedure"),
     comment='Typed child of clinical_registry_entry for the coronary_procedure family. One row per unioned Reg_CORONARY_Pre/Reg_CORONARY_PostProcedure EntryId, with PRE_ and POST_ source fields kept separate. NHS number and MRN are deliberately published and column-tagged ig_risk=4/ig_severity=2 under the 2026-08-13 identifier doctrine. Person linkage copies the live iWeb current-alias plus consensus-safe historical fallback. DateOfDischarge raw text is retained beside parsed future/sentinel/clean fields; known source maximum 2026-12-10 is a future typo, never silently accepted. DATE_LAST_CHANGED is an edit timestamp, not the procedure date. LESION_CHILD_COUNT counts current iweb_coronary_lesion children; parent procedures with zero lesions are legitimate and retained. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_coronary_procedure():
     """Publish clinical_registry_coronary_procedure without exposing the internal parent-admission marker."""
@@ -4537,7 +4537,7 @@ CLINICAL_REGISTRY_ERACS_EPISODE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_eracs_episode"),
     comment="Internal QC of clinical_registry_eracs_episode; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_ERACS_EPISODE_MANDATORY_RULES)
 def _gold_qc_clinical_registry_eracs_episode():
@@ -4553,7 +4553,7 @@ def _gold_qc_clinical_registry_eracs_episode():
     name=_n("gold_clinical.registry_eracs_episode"),
     comment='Typed child of clinical_registry_entry for the eracs_episode family. Enhanced Recovery After Cardiac Surgery pathway registry, live since 2025: pathway timestamps, pacing, TEG/platelet mapping, transfusion, mobilisation and discharge milestones. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_eracs_episode():
     """Publish clinical_registry_eracs_episode without exposing the internal parent-admission marker."""
@@ -4819,7 +4819,7 @@ CLINICAL_REGISTRY_MORTALITY_REVIEW_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_mortality_review"),
     comment="Internal QC of clinical_registry_mortality_review; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_MORTALITY_REVIEW_MANDATORY_RULES)
 def _gold_qc_clinical_registry_mortality_review():
@@ -4835,7 +4835,7 @@ def _gold_qc_clinical_registry_mortality_review():
     name=_n("gold_clinical.registry_mortality_review"),
     comment='Typed child of clinical_registry_entry for the mortality_review family. Cardiac mortality/M&M review registry: source-text cause-of-death chain (not asserted to be ICD-coded), NCEPOD classification, coronial/medical-examiner fields and structured care-problem flags. Patient names, contact details and next-of-kin content are retained and governed with IG tags. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_mortality_review():
     """Publish clinical_registry_mortality_review without exposing the internal parent-admission marker."""
@@ -5015,7 +5015,7 @@ CLINICAL_REGISTRY_NONCORONARY_PROCEDURE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_noncoronary_procedure"),
     comment="Internal QC of clinical_registry_noncoronary_procedure; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_NONCORONARY_PROCEDURE_MANDATORY_RULES)
 def _gold_qc_clinical_registry_noncoronary_procedure():
@@ -5031,7 +5031,7 @@ def _gold_qc_clinical_registry_noncoronary_procedure():
     name=_n("gold_clinical.registry_noncoronary_procedure"),
     comment='Typed child of clinical_registry_entry for the noncoronary_procedure family. iWeb non-coronary/structural cath-lab registry covering interventions such as TAVI, TMVI, ASD/VSD closure and septal ablation. Local N-Label values are retained here and exploded separately in iweb_multiselect_value. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_noncoronary_procedure():
     """Publish clinical_registry_noncoronary_procedure without exposing the internal parent-admission marker."""
@@ -5467,7 +5467,7 @@ CLINICAL_REGISTRY_SURGERY_EPISODE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_surgery_episode"),
     comment="Internal QC of clinical_registry_surgery_episode; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_SURGERY_EPISODE_MANDATORY_RULES)
 def _gold_qc_clinical_registry_surgery_episode():
@@ -5483,7 +5483,7 @@ def _gold_qc_clinical_registry_surgery_episode():
     name=_n("gold_clinical.registry_surgery_episode"),
     comment="Typed child of clinical_registry_entry for the surgery_episode family. iWeb CS2010G adult cardiac surgery registry. Complete PRE1 fields remain top-level; PRE2, POST1 and POST2 source fields are retained losslessly in typed module structs. This preserves identifiers and clinical content while remaining within Unity Catalog's 1,000-tag-per-table quota. Every governed bronze column is retained under its lower-case name.",
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_surgery_episode():
     """Publish clinical_registry_surgery_episode without exposing the internal parent-admission marker."""
@@ -5639,7 +5639,7 @@ CLINICAL_REGISTRY_SURGERY_FOLLOWUP_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_surgery_followup"),
     comment="Internal QC of clinical_registry_surgery_followup; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_SURGERY_FOLLOWUP_MANDATORY_RULES)
 def _gold_qc_clinical_registry_surgery_followup():
@@ -5655,7 +5655,7 @@ def _gold_qc_clinical_registry_surgery_followup():
     name=_n("gold_clinical.registry_surgery_followup"),
     comment='Typed child of clinical_registry_entry for the surgery_followup family. CS2010G follow-up module. The source is small and dormant but semantically distinct. Duplicate EntryId rows are reduced deterministically to the latest DateLastChanged/ADC_UPDT row. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_surgery_followup():
     """Publish clinical_registry_surgery_followup without exposing the internal parent-admission marker."""
@@ -5881,7 +5881,7 @@ CLINICAL_REGISTRY_SURGERY_PROCEDURE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_surgery_procedure"),
     comment="Internal QC of clinical_registry_surgery_procedure; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_SURGERY_PROCEDURE_MANDATORY_RULES)
 def _gold_qc_clinical_registry_surgery_procedure():
@@ -5897,7 +5897,7 @@ def _gold_qc_clinical_registry_surgery_procedure():
     name=_n("gold_clinical.registry_surgery_procedure"),
     comment='Typed child of clinical_registry_entry for the surgery_procedure family. One row per graft, valve or aortic-implant component of a CS2010G surgery. PARENT_ENTRY_ID joins iweb_cardiac_surgery_episode and is hard-gated to zero orphans. Known source defect: IMPLANT_PROSTHESIS_NAMETXT contains some drug-picklist bleed-through. Every governed bronze column is retained under its lower-case name.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_registry_surgery_procedure():
     """Publish clinical_registry_surgery_procedure without exposing the internal parent-admission marker."""

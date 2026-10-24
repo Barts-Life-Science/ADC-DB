@@ -47,7 +47,7 @@ from silver_journey_shared import (
     private=True,
     comment="Incremental boundary for joined registry/device scalars and deterministic VARIANT JSON.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _registry_device_stage():
     # Build the declared dataset: Incremental boundary for joined registry/device scalars and
@@ -66,7 +66,7 @@ def _registry_device_stage():
 @materialized_view(
     name=_n("journey_clinical._qc_registry_entry"),
     comment="Private JSON bridge and Gold cross-rule flags for registry_entry.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_registry_entry():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -164,7 +164,7 @@ REGISTRY_ENTRY_COLUMN_COMMENTS = {
     name=_n("journey_clinical.registry_entry"),
     comment="Parameterized iWeb cardiac-registry entries across ten source families.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=REGISTRY_ENTRY_COLUMN_COMMENTS,
 )
 def registry_entry():
@@ -182,7 +182,7 @@ def registry_entry():
     name=_n('journey_clinical._registry_entry_metadata'),
     comment='Internal quality and batch metadata for clinical_registry_entry; same row grain as the research table. Join keys: patient_event_key, source_object, entry_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_entry_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -796,7 +796,7 @@ if list(REGISTRY_ACS_TRANSFER_COLUMN_COMMENTS) != REGISTRY_ACS_TRANSFER_PUBLIC_C
     name=_n("journey_clinical.registry_acs_transfer"),
     comment="Typed child of clinical_registry_entry for the acs_transfer family. MINAP-style ACS transfer pathway: symptom, transfer and reperfusion timestamps, GRACE/Killip, drugs, laboratory results and Takotsubo fields. Diagnoses remain source labels. ADMISSION_DATE_QUALITY identifies the known 2000-01-01 placeholder range. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_ACS_TRANSFER_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_acs_transfer():
     # Build the declared dataset: Typed child of clinical_registry_entry for the acs_transfer
@@ -1418,7 +1418,7 @@ if list(REGISTRY_CARDIAC_MDT_COLUMN_COMMENTS) != REGISTRY_CARDIAC_MDT_PUBLIC_COL
     name=_n("journey_clinical.registry_cardiac_mdt"),
     comment="Typed child of clinical_registry_entry for the cardiac_mdt family. Harmonised iWeb cardiac MDT record. REGISTRY_TYPE=CORONARY_REVASC identifies the coronary revascularisation workflow; REGISTRY_TYPE=CT_AORTIC identifies CT/aortic surveillance. Workflow-specific columns are null for the other registry. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_CARDIAC_MDT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_cardiac_mdt():
     # Build the declared dataset: Typed child of clinical_registry_entry for the cardiac_mdt
@@ -1949,7 +1949,7 @@ if list(REGISTRY_MORTALITY_REVIEW_COLUMN_COMMENTS) != REGISTRY_MORTALITY_REVIEW_
     name=_n("journey_clinical.registry_mortality_review"),
     comment="Typed child of clinical_registry_entry for the mortality_review family. Cardiac mortality/M&M review registry: source-text cause-of-death chain (not asserted to be ICD-coded), NCEPOD classification, coronial/medical-examiner fields and structured care-problem flags. Patient names, contact details and next-of-kin content are retained and governed with IG tags. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_MORTALITY_REVIEW_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_mortality_review():
     # Build the declared dataset: Typed child of clinical_registry_entry for the
@@ -2727,7 +2727,7 @@ if list(REGISTRY_SURGERY_EPISODE_COLUMN_COMMENTS) != REGISTRY_SURGERY_EPISODE_PU
     name=_n("journey_clinical.registry_surgery_episode"),
     comment="Typed child of clinical_registry_entry for the surgery_episode family. iWeb CS2010G adult cardiac surgery registry. Complete PRE1 fields remain top-level; PRE2, POST1 and POST2 source fields are retained losslessly in typed module structs. This preserves identifiers and clinical content while remaining within Unity Catalog's 1,000-tag-per-table quota. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_SURGERY_EPISODE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_surgery_episode():
     # Build the declared dataset: Typed child of clinical_registry_entry for the surgery_episode
@@ -3170,7 +3170,7 @@ if list(REGISTRY_SURGERY_FOLLOWUP_COLUMN_COMMENTS) != REGISTRY_SURGERY_FOLLOWUP_
     name=_n("journey_clinical.registry_surgery_followup"),
     comment="Typed child of clinical_registry_entry for the surgery_followup family. CS2010G follow-up module. The source is small and dormant but semantically distinct. Duplicate EntryId rows are reduced deterministically to the latest DateLastChanged/ADC_UPDT row. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_SURGERY_FOLLOWUP_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_surgery_followup():
     # Build the declared dataset: Typed child of clinical_registry_entry for the
@@ -3577,7 +3577,7 @@ if list(REGISTRY_SURGERY_PROCEDURE_COLUMN_COMMENTS) != REGISTRY_SURGERY_PROCEDUR
     name=_n("journey_clinical.registry_surgery_procedure"),
     comment="Typed child of clinical_registry_entry for the surgery_procedure family. One row per graft, valve or aortic-implant component of a CS2010G surgery. PARENT_ENTRY_ID joins iweb_cardiac_surgery_episode and is hard-gated to zero orphans. Known source defect: IMPLANT_PROSTHESIS_NAMETXT contains some drug-picklist bleed-through. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_SURGERY_PROCEDURE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_surgery_procedure():
     # Build the declared dataset: Typed child of clinical_registry_entry for the
@@ -4511,7 +4511,7 @@ if list(REGISTRY_CORONARY_PROCEDURE_COLUMN_COMMENTS) != REGISTRY_CORONARY_PROCED
     name=_n("journey_clinical.registry_coronary_procedure"),
     comment="Typed child of clinical_registry_entry for the coronary_procedure family. One row per unioned Reg_CORONARY_Pre/Reg_CORONARY_PostProcedure EntryId, with PRE_ and POST_ source fields kept separate. NHS number and MRN are deliberately published and column-tagged ig_risk=4/ig_severity=2 under the 2026-08-13 identifier doctrine. Person linkage copies the live iWeb current-alias plus consensus-safe historical fallback. DateOfDischarge raw text is retained beside parsed future/sentinel/clean fields; known source maximum 2026-12-10 is a future typo, never silently accepted. DATE_LAST_CHANGED is an edit timestamp, not the procedure date. LESION_CHILD_COUNT counts current iweb_coronary_lesion children; parent procedures with zero lesions are legitimate and retained. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_CORONARY_PROCEDURE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_coronary_procedure():
     # Build the declared dataset: Typed child of clinical_registry_entry for the
@@ -5057,7 +5057,7 @@ if list(REGISTRY_CORONARY_LESION_COLUMN_COMMENTS) != REGISTRY_CORONARY_LESION_PU
     name=_n("journey_clinical.registry_coronary_lesion"),
     comment="Typed child of clinical_registry_entry for the coronary_lesion family. Per-lesion/per-vessel PCI and angiography detail from the iWeb coronary registry. The parent coronary procedure registry is not landed, so PARENT_ENTRY_ID is retained for future linkage but currently has no bronze parent and there is no reliable procedure date. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_CORONARY_LESION_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_coronary_lesion():
     # Build the declared dataset: Typed child of clinical_registry_entry for the coronary_lesion
@@ -5648,7 +5648,7 @@ if list(REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS) != REGISTRY_ERACS_EPISODE_PUBLIC
     name=_n("journey_clinical.registry_eracs_episode"),
     comment="Typed child of clinical_registry_entry for the eracs_episode family. Enhanced Recovery After Cardiac Surgery pathway registry, live since 2025: pathway timestamps, pacing, TEG/platelet mapping, transfusion, mobilisation and discharge milestones. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_eracs_episode():
     # Build the declared dataset: Typed child of clinical_registry_entry for the eracs_episode
@@ -6077,7 +6077,7 @@ if list(REGISTRY_NONCORONARY_PROCEDURE_COLUMN_COMMENTS) != REGISTRY_NONCORONARY_
     name=_n("journey_clinical.registry_noncoronary_procedure"),
     comment="Typed child of clinical_registry_entry for the noncoronary_procedure family. iWeb non-coronary/structural cath-lab registry covering interventions such as TAVI, TMVI, ASD/VSD closure and septal ablation. Local N-Label values are retained here and exploded separately in iweb_multiselect_value. Every governed bronze column is retained under its lower-case name.",
     column_comments=REGISTRY_NONCORONARY_PROCEDURE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def registry_noncoronary_procedure():
     # Build the declared dataset: Typed child of clinical_registry_entry for the
@@ -6179,7 +6179,7 @@ def registry_noncoronary_procedure():
 @materialized_view(
     name=_n("journey_clinical._qc_device"),
     comment="Private JSON bridge and Gold cross-rule flags for device.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_device():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for device.
@@ -6293,7 +6293,7 @@ DEVICE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.device"),
     comment="One implanted-device registry record from the frozen MediConnect source, retaining native identifiers and device details.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=DEVICE_COLUMN_COMMENTS,
 )
 def device():
@@ -6311,7 +6311,7 @@ def device():
     name=_n('journey_clinical._device_metadata'),
     comment='Internal quality and batch metadata for clinical_device; same row grain as the research table. Join keys: patient_event_key, mc_device_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def device_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_device; same
@@ -6441,7 +6441,7 @@ def _lifecycle_source_critical_care_activity():
     name=_n("journey_clinical.critical_care_activity"),
     comment="Admitted CCMDS critical-care activity rows with period-link evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CRITICAL_CARE_ACTIVITY_COLUMN_COMMENTS,
 )
 def critical_care_activity():
@@ -6453,7 +6453,7 @@ def critical_care_activity():
     name=_n('journey_clinical._critical_care_activity_metadata'),
     comment='Internal quality and batch metadata for clinical_critical_care_activity; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def critical_care_activity_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -6609,7 +6609,7 @@ def _lifecycle_source_critical_care_admission():
     name=_n("journey_clinical.critical_care_admission"),
     comment="One Medicus critical-care admission per source admission key.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CRITICAL_CARE_ADMISSION_COLUMN_COMMENTS,
 )
 def critical_care_admission():
@@ -6620,7 +6620,7 @@ def critical_care_admission():
     name=_n('journey_clinical._critical_care_admission_metadata'),
     comment='Internal quality and batch metadata for clinical_critical_care_admission; same row grain as the research table. Join keys: patient_event_key, admission_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def critical_care_admission_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -6773,7 +6773,7 @@ def _lifecycle_source_critical_care_daily_score():
     name=_n("journey_clinical.critical_care_daily_score"),
     comment="Long-format Medicus critical-care scores; DAY_LATEST_IND and ROW_CLASS are flags, not dedup rules.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CRITICAL_CARE_DAILY_SCORE_COLUMN_COMMENTS,
 )
 def critical_care_daily_score():
@@ -6785,7 +6785,7 @@ def critical_care_daily_score():
     name=_n('journey_clinical._critical_care_daily_score_metadata'),
     comment='Internal quality and batch metadata for clinical_critical_care_daily_score; same row grain as the research table. Join keys: patient_event_key, source_unit, source_site, source_daily_id, score_type.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def critical_care_daily_score_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -6950,7 +6950,7 @@ def _lifecycle_source_neonatal_episode():
     name=_n("journey_clinical.neonatal_episode"),
     comment="One BadgerNet neonatal episode with baby subject and mother reference.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=NEONATAL_EPISODE_COLUMN_COMMENTS,
 )
 def neonatal_episode():
@@ -6962,7 +6962,7 @@ def neonatal_episode():
     name=_n('journey_clinical._neonatal_episode_metadata'),
     comment='Internal quality and batch metadata for clinical_neonatal_episode; same row grain as the research table. Join keys: patient_event_key, entity_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def neonatal_episode_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7100,7 +7100,7 @@ NEONATAL_CARE_DAY_COLUMN_COMMENTS = {
     name=_n("journey_clinical._neonatal_care_day_stage"),
     private=True,
     comment="Internal neonatal care-day rows carrying JSON arrays for the public parent and code children.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _neonatal_care_day_stage():
     # Build the declared dataset: Internal neonatal care-day rows carrying JSON arrays for the
@@ -7124,7 +7124,7 @@ def _lifecycle_source_neonatal_care_day():
     name=_n("journey_clinical.neonatal_care_day"),
     comment="One neonatal critical-care activity day for an admitted BadgerNet episode, retaining activity and high-cost-drug evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=NEONATAL_CARE_DAY_COLUMN_COMMENTS,
 )
 def neonatal_care_day():
@@ -7136,7 +7136,7 @@ def neonatal_care_day():
     name=_n('journey_clinical._neonatal_care_day_metadata'),
     comment='Internal quality and batch metadata for clinical_neonatal_care_day; same row grain as the research table. Join keys: patient_event_key, entity_id, activity_date.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def neonatal_care_day_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7171,7 +7171,7 @@ NEONATAL_CARE_DAY_ACTIVITY_COLUMN_COMMENTS = {
     name=_n("journey_clinical.neonatal_care_day_activity"),
     comment="One BadgerNet critical-care activity code per neonatal care day.",
     column_comments=NEONATAL_CARE_DAY_ACTIVITY_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def neonatal_care_day_activity():
     # Build the declared dataset: One BadgerNet critical-care activity code per neonatal care
@@ -7226,7 +7226,7 @@ NEONATAL_CARE_DAY_HIGH_COST_DRUG_COLUMN_COMMENTS = {
     name=_n("journey_clinical.neonatal_care_day_high_cost_drug"),
     comment="One BadgerNet high-cost-drug code per neonatal care day.",
     column_comments=NEONATAL_CARE_DAY_HIGH_COST_DRUG_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def neonatal_care_day_high_cost_drug():
     # Build the declared dataset: One BadgerNet high-cost-drug code per neonatal care day.
@@ -7407,7 +7407,7 @@ def _lifecycle_source_neonatal_examination():
     name=_n("journey_clinical.neonatal_examination"),
     comment="Populated BadgerNet neonatal examinations; empty episode stubs are excluded-and-counted.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=NEONATAL_EXAMINATION_COLUMN_COMMENTS,
 )
 def neonatal_examination():
@@ -7419,7 +7419,7 @@ def neonatal_examination():
     name=_n('journey_clinical._neonatal_examination_metadata'),
     comment='Internal quality and batch metadata for clinical_neonatal_examination; same row grain as the research table. Join keys: patient_event_key, entity_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def neonatal_examination_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7610,7 +7610,7 @@ def _lifecycle_source_baby_delivery():
     name=_n("journey_clinical.baby_delivery"),
     comment="One MSDS baby-delivery row with mother identity re-derived through pregnancy.",
     table_properties={"delta.dataSkippingStatsColumns": "person_id,event_datetime"},
-    cluster_by=["person_id", "event_datetime"], refresh_policy="incremental",
+    cluster_by=["person_id", "event_datetime"], refresh_policy="auto",
     column_comments=BABY_DELIVERY_COLUMN_COMMENTS,
 )
 def baby_delivery():
@@ -7622,7 +7622,7 @@ def baby_delivery():
     name=_n('journey_clinical._baby_delivery_metadata'),
     comment='Internal quality and batch metadata for clinical_baby_delivery; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def baby_delivery_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7805,7 +7805,7 @@ def _lifecycle_source_labour_delivery():
     name=_n("journey_clinical.labour_delivery"),
     comment="One MSDS labour-delivery row; code zero remains a legitimate value.",
     table_properties={"delta.dataSkippingStatsColumns": "person_id,event_datetime"},
-    cluster_by=["person_id", "event_datetime"], refresh_policy="incremental",
+    cluster_by=["person_id", "event_datetime"], refresh_policy="auto",
     column_comments=LABOUR_DELIVERY_COLUMN_COMMENTS,
 )
 def labour_delivery():
@@ -7817,7 +7817,7 @@ def labour_delivery():
     name=_n('journey_clinical._labour_delivery_metadata'),
     comment='Internal quality and batch metadata for clinical_labour_delivery; same row grain as the research table. Join keys: patient_event_key, labour_delivery_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def labour_delivery_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7989,7 +7989,7 @@ def _lifecycle_source_maternity_care_contact():
     name=_n("journey_clinical.maternity_care_contact"),
     comment="One MSDS maternity care contact with pregnancy-spine identity recovery.",
     table_properties={"delta.dataSkippingStatsColumns": "person_id,event_datetime"},
-    cluster_by=["person_id", "event_datetime"], refresh_policy="incremental",
+    cluster_by=["person_id", "event_datetime"], refresh_policy="auto",
     column_comments=MATERNITY_CARE_CONTACT_COLUMN_COMMENTS,
 )
 def maternity_care_contact():
@@ -8001,7 +8001,7 @@ def maternity_care_contact():
     name=_n('journey_clinical._maternity_care_contact_metadata'),
     comment='Internal quality and batch metadata for clinical_maternity_care_contact; same row grain as the research table. Join keys: patient_event_key, care_contact_id, pregnancy_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def maternity_care_contact_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for

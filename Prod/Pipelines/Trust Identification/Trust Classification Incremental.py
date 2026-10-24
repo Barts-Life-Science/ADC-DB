@@ -578,6 +578,31 @@ def ensure_setup():
     )
 
 
+# ---- TRUSTKEY_20261023: key fallback for deactivated feeds ----
+def retired_registry_key(registry, destination_catalog, table_name):
+    """Key recorded on a table's INACTIVE registry rows, or None when it has none.
+
+    A deactivated feed (active_ind = 0) can still have rows in staging that landed before it was switched
+    off. Those rows were merged into staging on this key, so it stays authoritative for draining them.
+    Raises when the inactive rows disagree, since there is then no single key to trust.
+    """
+    rows = (
+        spark.table(registry)
+        .filter(
+            (F.lower(F.col("dst_catalog")) == destination_catalog.lower())
+            & (F.lower(F.col("dst_table")) == table_name.lower())
+            & (F.coalesce(F.col("active_ind"), F.lit(0)) != 1)  # NULL counts as inactive
+        )
+        .select("upsert_key_columns")
+        .collect()
+    )
+    key_sets = {tuple(row["upsert_key_columns"]) for row in rows if row["upsert_key_columns"]}
+    if len(key_sets) > 1:
+        raise ValueError(f"Inactive registry lanes disagree on the key for {table_name}: {sorted(key_sets)}")
+    return list(next(iter(key_sets))) if key_sets else None
+# ---- end TRUSTKEY_20261023 helper ----
+
+
 def discover_merge_keys(table_name, staging_fqn):
     cols = table_columns(staging_fqn)
     cu = upper_map(cols)
@@ -610,6 +635,16 @@ def discover_merge_keys(table_name, staging_fqn):
     override = KEY_OVERRIDES.get(table_name.lower())
     if override and all(key.upper() in cu for key in override):
         return [cu[key.upper()] for key in override]
+
+    # TRUSTKEY_20261023: a deactivated feed's staged rows still drain on the key they landed with.
+    # Empty staging keeps the old path (raise, then the caller skips it as an empty dormant table).
+    retired = retired_registry_key(registry, destination_catalog, table_name)
+    if retired and spark.table(staging_fqn).limit(1).count() > 0:
+        missing = [key for key in retired if key.upper() not in cu]
+        if missing:
+            raise ValueError(f"Invalid inactive registered key for {table_name}; missing columns: {missing}")
+        print(f"{table_name}: feed is inactive; using its last registered key {retired}")
+        return [cu[key.upper()] for key in retired]
 
     raise ValueError(
         f"No authoritative registered or reviewed override key found for {table_name}"
@@ -650,6 +685,153 @@ def ensure_raw_target(table_name, staging_fqn, raw_fqn):
         raise ValueError(f"Raw target {raw_fqn} is missing business columns: {missing_business}")
     return raw_cols
 
+# ---- COSTFIX_20261020: key-range pruning for large clustered raw tables ----
+# A day's changed keys are scattered across the whole id range, so the runtime join filter skips almost
+# no files and every merge/check re-read the full target (3.8 TB for raw.mill_ce_blob). Literal ranges
+# built from the keys let Delta data skipping keep only files that can contain them (measured 2026-10-20:
+# 661 of 19,413 files). The ranges contain every key being matched, so results are unchanged.
+# Pruning applies only to tables with liquid clustering; unclustered tables are read exactly as before.
+RANGE_PRUNE_MAX_RANGES = 512
+RANGE_PRUNE_MAX_KEYS = 5000000
+_CLUSTERING_COLUMNS = {}
+
+
+def clustering_columns(fqn):
+    """Upper-cased liquid-clustering columns of a table, cached for the run; empty when unclustered."""
+    cache_key = fqn.lower()
+    if cache_key not in _CLUSTERING_COLUMNS:
+        try:
+            detail = spark.sql(f"DESCRIBE DETAIL {fqn}").first()
+            columns = [str(column).upper() for column in (detail["clusteringColumns"] or [])]
+        except Exception:
+            columns = []
+        _CLUSTERING_COLUMNS[cache_key] = columns
+    return _CLUSTERING_COLUMNS[cache_key]
+
+
+import numbers  # used by usable_range_keys below
+
+
+def build_key_ranges(sorted_values, max_ranges):
+    """Collapse sorted distinct key values into at most max_ranges inclusive (low, high) ranges.
+
+    The widest gaps between neighbouring values become the breaks between ranges, so the ranges hug
+    the keys as tightly as the range budget allows. Every input value lies inside one range.
+    """
+    if not sorted_values:
+        return []
+    gap_positions = sorted(
+        range(1, len(sorted_values)),
+        key=lambda position: sorted_values[position] - sorted_values[position - 1],
+        reverse=True,
+    )[: max(0, max_ranges - 1)]
+    ranges = []
+    start = 0
+    for cut in sorted(gap_positions):
+        ranges.append((sorted_values[start], sorted_values[cut - 1]))
+        start = cut
+    ranges.append((sorted_values[start], sorted_values[-1]))
+    return ranges
+
+
+def usable_range_keys(values):
+    """True when every key is a real number, so numeric ranges can describe them exactly.
+
+    Strings, booleans and NaN return False: NaN is unordered, and Spark's null-safe equality treats
+    NaN as equal to NaN, so a range could never safely cover it. Callers then read without pruning.
+    """
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, numbers.Number):
+            return False
+        if value != value:  # NaN is the only value not equal to itself
+            return False
+    return True
+
+
+def distinct_key_values(frame, column):
+    """(sorted distinct non-NULL values, whether a NULL is present) of one column; None above the key cap."""
+    rows = (
+        frame.select(F.col(column).alias("_range_key"))
+        .distinct()
+        .limit(RANGE_PRUNE_MAX_KEYS + 1)
+        .collect()
+    )
+    if len(rows) > RANGE_PRUNE_MAX_KEYS:
+        return None
+    values = [row["_range_key"] for row in rows if row["_range_key"] is not None]
+    if not usable_range_keys(values):
+        return None
+    has_null = any(row["_range_key"] is None for row in rows)
+    return sorted(values), has_null
+
+
+def key_range_filter(column, ranges, include_null=False):
+    """Column condition: the value lies in one of the ranges (or is NULL when include_null)."""
+    conditions = [column.between(F.lit(low), F.lit(high)) for low, high in ranges]
+    if include_null:
+        conditions.append(column.isNull())
+    if not conditions:
+        return F.lit(False)
+    return reduce(lambda left, right: left | right, conditions)
+
+
+def merge_key_prune(target_fqn, keys, merge_source):
+    """Range-pruning plan for a merge whose target is clustered on one of the merge keys, else None.
+
+    Returns {"column", "ranges", "has_null"}: the target column, the key ranges of the merge source and
+    whether the source holds a NULL key (null-safe matching can pair NULL with NULL).
+    """
+    key_upper = {key.upper() for key in keys}
+    clustered_keys = [column for column in clustering_columns(target_fqn) if column in key_upper]
+    if not clustered_keys:
+        return None
+    column = clustered_keys[0]
+    source_column = upper_map(merge_source.columns).get(column)
+    target_column = upper_map(table_columns(target_fqn)).get(column)
+    if source_column is None or target_column is None:
+        return None
+    found = distinct_key_values(merge_source, source_column)
+    if found is None:
+        print(f"{target_fqn}: more than {RANGE_PRUNE_MAX_KEYS:,} keys; reading without range pruning")
+        return None
+    values, has_null = found
+    ranges = build_key_ranges(values, RANGE_PRUNE_MAX_RANGES)
+    return {"column": target_column, "ranges": ranges, "has_null": has_null}
+
+
+def pruned_target(target_fqn, prune):
+    """The target table restricted to the merge source's key ranges (the whole table when prune is None)."""
+    table = spark.table(target_fqn)
+    if prune is None:
+        return table
+    return table.filter(
+        key_range_filter(F.col(f"`{prune['column']}`"), prune["ranges"], prune["has_null"])
+    )
+
+
+def merge_match_condition(keys, prune):
+    """MERGE ON clause: the null-safe key match, plus the target key-range filter when pruning applies."""
+    condition = key_condition("t", "s", keys)
+    if prune is None:
+        return condition
+    target_column = F.col(f"t.`{prune['column']}`")
+    return condition & key_range_filter(target_column, prune["ranges"], prune["has_null"])
+
+
+def prune_parent_rows(rows, source_fqn, key_column, needed_df, needed_column):
+    """Parent rows restricted to the ranges of the keys being looked up, when the parent table is clustered.
+
+    The lookup is an inner equality join, so NULL keys never match and need no range.
+    """
+    if not clustering_columns(source_fqn):
+        return rows
+    found = distinct_key_values(needed_df, needed_column)
+    if found is None or not found[0]:
+        return rows
+    ranges = build_key_ranges(found[0], RANGE_PRUNE_MAX_RANGES)
+    return rows.filter(key_range_filter(F.col(key_column), ranges))
+# ---- end COSTFIX_20261020 helpers ----
+
 
 def merge_unique(
     target_fqn,
@@ -684,10 +866,12 @@ def merge_unique(
     )
     if source_duplicates:
         raise ValueError(f"Merge source for {target_fqn} is not unique on {keys}")
+    # COSTFIX_20261020: the target reads below skip files outside the source's key ranges.
+    prune = merge_key_prune(target_fqn, keys, merge_source)
     if VALIDATE_TARGET_UNIQUENESS and table_exists(target_fqn):
         source_keys = merge_source.select(*keys).dropDuplicates()
         target_duplicates = (
-            spark.table(target_fqn).alias("t")
+            pruned_target(target_fqn, prune).alias("t")
             .join(source_keys.alias("s"), key_condition("t", "s", keys), "inner")
             .select(*[F.col(f"t.{key}").alias(key) for key in keys])
             .groupBy(*keys).count().filter(F.col("count") > 1).limit(1).count()
@@ -766,7 +950,7 @@ def merge_unique(
             if unreviewed_payload_differences else F.lit(False)
         )
         ambiguous = (
-            spark.table(target_fqn).alias("t")
+            pruned_target(target_fqn, prune).alias("t")
             .join(merge_source.alias("s"), key_condition("t", "s", keys), "inner")
             .filter(source_equal & unreviewed_payload_diff).limit(1).count()
         )
@@ -788,7 +972,7 @@ def merge_unique(
     (
         DeltaTable.forName(spark, target_fqn)
         .alias("t")
-        .merge(merge_source.alias("s"), key_condition("t", "s", keys))
+        .merge(merge_source.alias("s"), merge_match_condition(keys, prune))
         .whenMatchedUpdate(condition=changed_condition, set=update_map)
         .whenNotMatchedInsert(values=insert_map)
         .execute()
@@ -934,7 +1118,9 @@ def raw_lookup_mapping(key_type, needed_keys):
 
     needed = needed_keys.select(F.col(key_type).alias("needed_key")).dropDuplicates()
     original_source_columns = table_columns(source_fqn)
-    src = parent_rows(source_table).alias("src").join(
+    # COSTFIX_20261020: read only the parent files that can hold the needed keys.
+    parent = prune_parent_rows(parent_rows(source_table), source_fqn, source_key, needed, "needed_key")
+    src = parent.alias("src").join(
         needed.alias("n"),
         F.col(f"src.{source_key}") == F.col("n.needed_key"),
         "inner",

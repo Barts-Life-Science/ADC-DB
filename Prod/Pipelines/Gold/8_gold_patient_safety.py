@@ -36,7 +36,7 @@ CLINICAL_SAFETY_INCIDENT_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_ADVISORY_RULES)
@@ -47,7 +47,7 @@ def gold_clinical_safety_incident():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident",
     comment="Compatibility evidence of admitted clinical_safety_incident rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -75,7 +75,7 @@ CLINICAL_SAFETY_INCIDENT_PARTICIPANT_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_participant",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_participant.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_PARTICIPANT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_PARTICIPANT_ADVISORY_RULES)
@@ -86,7 +86,7 @@ def gold_clinical_safety_incident_participant():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_participant",
     comment="Compatibility evidence of admitted clinical_safety_incident_participant rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_participant():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -111,7 +111,7 @@ CLINICAL_SAFETY_INCIDENT_INJURY_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_injury",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_injury.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_INJURY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_INJURY_ADVISORY_RULES)
@@ -122,7 +122,7 @@ def gold_clinical_safety_incident_injury():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_injury",
     comment="Compatibility evidence of admitted clinical_safety_incident_injury rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_injury():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -147,7 +147,7 @@ CLINICAL_SAFETY_INCIDENT_FACTOR_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_factor",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_factor.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_FACTOR_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_FACTOR_ADVISORY_RULES)
@@ -158,7 +158,7 @@ def gold_clinical_safety_incident_factor():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_factor",
     comment="Compatibility evidence of admitted clinical_safety_incident_factor rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_factor():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -183,7 +183,7 @@ CLINICAL_SAFETY_INCIDENT_LFPSE_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_lfpse",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_lfpse.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_LFPSE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_LFPSE_ADVISORY_RULES)
@@ -194,7 +194,7 @@ def gold_clinical_safety_incident_lfpse():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_lfpse",
     comment="Compatibility evidence of admitted clinical_safety_incident_lfpse rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_lfpse():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -219,7 +219,7 @@ CLINICAL_SAFETY_INCIDENT_ACTION_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_action",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_action.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_ACTION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_ACTION_ADVISORY_RULES)
@@ -230,7 +230,7 @@ def gold_clinical_safety_incident_action():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_action",
     comment="Compatibility evidence of admitted clinical_safety_incident_action rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_action():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -255,7 +255,7 @@ CLINICAL_SAFETY_INCIDENT_STATUS_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_safety_incident_status",
     comment="TDX v2.1 Gold QC twin for clinical_safety_incident_status.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_SAFETY_INCIDENT_STATUS_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_SAFETY_INCIDENT_STATUS_ADVISORY_RULES)
@@ -266,9 +266,8 @@ def gold_clinical_safety_incident_status():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_safety_incident_status",
     comment="Compatibility evidence of admitted clinical_safety_incident_status rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_safety_incident_status():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
     return _tdx_qc("clinical_safety_incident_status", "safety_incident_status_key")
-

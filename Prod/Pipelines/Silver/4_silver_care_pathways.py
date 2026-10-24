@@ -11,6 +11,7 @@
 
 # Shared projections also serve the patient event index.
 from silver_journey_shared import (
+    _event_feed_events,  # EIR_20261021_V1
     APPOINTMENT_PRIMITIVE_COLUMNS,
     F,
     LIFECYCLE_COLUMN_COMMENTS,
@@ -164,7 +165,7 @@ def _lifecycle_source_person_relationship():
 @materialized_view(
     name=_n("journey_spine.person_relationship"),
     comment="Source-backed relationships between people, including mother-to-baby links supplied by maternity records.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PERSON_RELATIONSHIP_COLUMN_COMMENTS,
 )
 def person_relationship():
@@ -176,7 +177,7 @@ def person_relationship():
     name=_n('journey_spine._person_relationship_metadata'),
     comment='Internal quality and batch metadata for spine_person_relationship; same row grain as the research table. Join keys: person_relationship_key, birth_row_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def person_relationship_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -425,7 +426,7 @@ def _lifecycle_source_journey():
     name=_n("journey_spine.journey"),
     comment="Deterministic longitudinal journeys; pregnancy-v1 supplies parent and trimester rows.",
     cluster_by=["person_id", "period_start"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=JOURNEY_COLUMN_COMMENTS,
 )
 def journey():
@@ -437,7 +438,7 @@ def journey():
     name=_n('journey_spine._journey_metadata'),
     comment='Internal quality and batch metadata for spine_journey; same row grain as the research table. Join keys: journey_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def journey_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_journey; same
@@ -585,7 +586,7 @@ def _lifecycle_source_journey_participant():
 @materialized_view(
     name=_n("journey_spine.journey_participant"),
     comment="Journey participant roles with subject-key support for unresolved babies.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=JOURNEY_PARTICIPANT_COLUMN_COMMENTS,
 )
 def journey_participant():
@@ -597,7 +598,7 @@ def journey_participant():
     name=_n('journey_spine._journey_participant_metadata'),
     comment='Internal quality and batch metadata for spine_journey_participant; same row grain as the research table. Join keys: journey_participant_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def journey_participant_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -691,7 +692,8 @@ def _journey_event_links():
     # Link a pregnancy journey to patient events for the same subject whose periods overlap the
     # journey.
     j = _pregnancy_journey_canonical().alias("j")
-    e = spark.read.table(_n("journey_events._event_index")).alias("e")
+    # EIR_20261021_V1: event grain from the per-fact-table event feeds (the event index is retired).
+    e = _event_feed_events().alias("e")
     member_end = F.coalesce(F.col("e.event_end_datetime"), F.col("e.event_datetime"))
     overlap = (
         (F.col("j.subject_key") == F.col("e.subject_key"))
@@ -830,7 +832,7 @@ def _lifecycle_source_journey_link():
 @materialized_view(
     name=_n("journey_spine.journey_link"),
     comment="N:M journey membership links derived from subject and source-supported time overlap.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=JOURNEY_LINK_COLUMN_COMMENTS,
 )
 def journey_link():
@@ -842,7 +844,7 @@ def journey_link():
     name=_n('journey_spine._journey_link_metadata'),
     comment='Internal quality and batch metadata for spine_journey_link; same row grain as the research table. Join keys: journey_link_key, patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def journey_link_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_journey_link;
@@ -896,7 +898,7 @@ def _appointment_schedule_grouped_query():
     name=_n("journey_clinical._appointment_schedule_grouped"),
     private=True,
     comment="Internal incremental appointment booking/location history grouped as deterministic JSON.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _appointment_schedule_grouped():
     # Build the declared dataset: Internal incremental appointment booking/location history
@@ -968,7 +970,7 @@ def _appointment_resource_grouped_query():
     name=_n("journey_clinical._appointment_resource_grouped"),
     private=True,
     comment="Internal incremental appointment resource/slot history grouped as deterministic JSON.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _appointment_resource_grouped():
     # Build the declared dataset: Internal incremental appointment resource/slot history grouped
@@ -1048,7 +1050,7 @@ APPOINTMENT_LIFECYCLE_COLUMNS = [
     name=_n("journey_clinical._appointment_primitive"),
     private=True,
     comment="Internal orderable appointment join; booking/resource VARIANT arrays cross as JSON.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _appointment_primitive():
     # Build the declared dataset: Internal orderable appointment join; booking/resource VARIANT
@@ -1065,7 +1067,7 @@ def _appointment_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_appointment"),
     comment="Private JSON bridge and Gold cross-rule flags for appointment.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_appointment():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for appointment.
@@ -1134,7 +1136,7 @@ APPOINTMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.appointment"),
     comment="Scheduling appointments with ordered booking and resource history; SCH_EVENT_ID is never treated as a clinical EVENT_ID.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=APPOINTMENT_COLUMN_COMMENTS,
 )
 def appointment():
@@ -1153,7 +1155,7 @@ def appointment():
     name=_n('journey_clinical._appointment_metadata'),
     comment='Internal quality and batch metadata for clinical_appointment; same row grain as the research table. Join keys: patient_event_key, sch_event_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def appointment_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_appointment;
@@ -1196,7 +1198,7 @@ APPOINTMENT_BOOKING_COLUMN_COMMENTS = {
     name=_n("journey_clinical.appointment_booking"),
     comment="One booking or location iteration per scheduling appointment.",
     column_comments=APPOINTMENT_BOOKING_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def appointment_booking():
     # Contract v2 parent/child conservation: publish only bookings whose
@@ -1266,7 +1268,7 @@ APPOINTMENT_RESOURCE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.appointment_resource"),
     comment="One scheduling resource or slot row per appointment.",
     column_comments=APPOINTMENT_RESOURCE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def appointment_resource():
     # Contract v2 parent/child conservation, as for appointment_booking above.
@@ -1399,7 +1401,7 @@ def _lifecycle_source_referral():
     name=_n("journey_clinical.referral"),
     comment="LUNA referrals (request side of threads). UBRN retained as linkage evidence only.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=REFERRAL_COLUMN_COMMENTS,
 )
 def referral():
@@ -1411,7 +1413,7 @@ def referral():
     name=_n('journey_clinical._referral_metadata'),
     comment='Internal quality and batch metadata for clinical_referral; same row grain as the research table. Join keys: patient_event_key, source_system_oid, referral_oid.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def referral_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_referral;
@@ -1430,7 +1432,7 @@ def referral_lifecycle():
     name=_n("journey_clinical._rtt_pathway_primitive"),
     private=True,
     comment="Internal RTT period rows; encounter-type tags cross as JSON.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _rtt_pathway_primitive():
     # Build the declared dataset: Internal RTT period rows; encounter-type tags cross as JSON.
@@ -1446,7 +1448,7 @@ def _rtt_pathway_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_rtt_pathway"),
     comment="Private JSON bridge and Gold cross-rule flags for rtt_pathway.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_rtt_pathway():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for rtt_pathway.
@@ -1586,7 +1588,7 @@ RTT_PATHWAY_COLUMN_COMMENTS = {
     name=_n("journey_clinical.rtt_pathway"),
     comment="LUNA RTT pathway/clock periods (hybrid grain: one row per period, plus clockless-pathway sentinel rows). Clock discrepancies are carried, never filtered.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=RTT_PATHWAY_COLUMN_COMMENTS,
 )
 def rtt_pathway():
@@ -1605,7 +1607,7 @@ def rtt_pathway():
     name=_n('journey_clinical._rtt_pathway_metadata'),
     comment='Internal quality and batch metadata for clinical_rtt_pathway; same row grain as the research table. Join keys: patient_event_key, source_system_oid, pathway_oid, period_oid.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def rtt_pathway_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_rtt_pathway;
@@ -1641,7 +1643,7 @@ RTT_PATHWAY_ENCOUNTER_TYPE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.rtt_pathway_encounter_type"),
     comment="One ordered encounter-type tag per LUNA RTT pathway period.",
     column_comments=RTT_PATHWAY_ENCOUNTER_TYPE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def rtt_pathway_encounter_type():
     # Build the declared dataset: One ordered encounter-type tag per LUNA RTT pathway period.
@@ -1751,7 +1753,7 @@ def _lifecycle_source_rtt_activity():
     name=_n("journey_clinical.rtt_activity"),
     comment="LUNA clock-affecting RTT activity/status events. IS_ILLOGICAL is carried as data, never filtered.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=RTT_ACTIVITY_COLUMN_COMMENTS,
 )
 def rtt_activity():
@@ -1763,7 +1765,7 @@ def rtt_activity():
     name=_n('journey_clinical._rtt_activity_metadata'),
     comment='Internal quality and batch metadata for clinical_rtt_activity; same row grain as the research table. Join keys: patient_event_key, source_system_oid, rtt_activity_oid.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def rtt_activity_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_rtt_activity;
@@ -1888,7 +1890,7 @@ def _lifecycle_source_waiting_list_entry():
     name=_n("journey_clinical.waiting_list_entry"),
     comment="Waiting-list entries at physical version grain (CURRENT + HIST). patient_event_id is entry-grain and shared across versions; VERSION_DT_TM is descriptive fallback only, never an effective interval.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=WAITING_LIST_ENTRY_COLUMN_COMMENTS,
 )
 def waiting_list_entry():
@@ -1901,7 +1903,7 @@ def waiting_list_entry():
     name=_n('journey_clinical._waiting_list_entry_metadata'),
     comment='Internal quality and batch metadata for clinical_waiting_list_entry; same row grain as the research table. Join keys: patient_event_key, row_source, source_version_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def waiting_list_entry_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2064,7 +2066,7 @@ def _lifecycle_source_waiting_list_snapshot():
 @materialized_view(
     name=_n("journey_clinical.waiting_list_snapshot"),
     comment="Immutable weekly waiting-list census (one row per SNAPSHOT_DATE x PM_WAIT_LIST_ID). Snapshots never enter patient_event.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=WAITING_LIST_SNAPSHOT_COLUMN_COMMENTS,
 )
 def waiting_list_snapshot():
@@ -2076,7 +2078,7 @@ def waiting_list_snapshot():
     name=_n('journey_clinical._waiting_list_snapshot_metadata'),
     comment='Internal quality and batch metadata for clinical_waiting_list_snapshot; same row grain as the research table. Join keys: waiting_list_snapshot_key, snapshot_date, pm_wait_list_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def waiting_list_snapshot_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2265,7 +2267,7 @@ def _lifecycle_source_community_care_contact():
     name=_n("journey_clinical.community_care_contact"),
     comment="One CSDS community-care contact with sentinel-safe event time.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=COMMUNITY_CARE_CONTACT_COLUMN_COMMENTS,
 )
 def community_care_contact():
@@ -2276,7 +2278,7 @@ def community_care_contact():
     name=_n('journey_clinical._community_care_contact_metadata'),
     comment='Internal quality and batch metadata for clinical_community_care_contact; same row grain as the research table. Join keys: patient_event_key, community_care_contact_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def community_care_contact_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2495,7 +2497,7 @@ def _lifecycle_source_community_care_activity():
     name=_n("journey_clinical.community_care_activity"),
     comment="One admitted CSDS community-care activity with candidate terminology provenance.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=COMMUNITY_CARE_ACTIVITY_COLUMN_COMMENTS,
 )
 def community_care_activity():
@@ -2507,7 +2509,7 @@ def community_care_activity():
     name=_n('journey_clinical._community_care_activity_metadata'),
     comment='Internal quality and batch metadata for clinical_community_care_activity; same row grain as the research table. Join keys: patient_event_key, community_care_activity_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def community_care_activity_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2792,7 +2794,7 @@ HRG_GROUPING_COLUMN_COMMENTS = {
     name=_n("journey_clinical._hrg_grouping_stage"),
     private=True,
     comment="Internal HRG rows carrying JSON code arrays for the public parent and code children.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _hrg_grouping_stage():
     # Build the declared dataset: Internal HRG rows carrying JSON code arrays for the public
@@ -2816,7 +2818,7 @@ def _lifecycle_source_hrg_grouping():
     name=_n("journey_clinical.hrg_grouping"),
     comment="SLAM APC and outpatient HRG grouping results with sentinel-safe event time.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=HRG_GROUPING_COLUMN_COMMENTS,
 )
 def hrg_grouping():
@@ -2828,7 +2830,7 @@ def hrg_grouping():
     name=_n('journey_clinical._hrg_grouping_metadata'),
     comment='Internal quality and batch metadata for clinical_hrg_grouping; same row grain as the research table. Join keys: patient_event_key, source_object, cds_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def hrg_grouping_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_hrg_grouping;
@@ -2863,7 +2865,7 @@ HRG_GROUPING_DIAGNOSIS_COLUMN_COMMENTS = {
     name=_n("journey_clinical.hrg_grouping_diagnosis"),
     comment="One ICD-10 diagnosis code per HRG grouping row in source order.",
     column_comments=HRG_GROUPING_DIAGNOSIS_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def hrg_grouping_diagnosis():
     # Build the declared dataset: One ICD-10 diagnosis code per HRG grouping row in source
@@ -2920,7 +2922,7 @@ HRG_GROUPING_PROCEDURE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.hrg_grouping_procedure"),
     comment="One OPCS-4 procedure code per HRG grouping row in source order.",
     column_comments=HRG_GROUPING_PROCEDURE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def hrg_grouping_procedure():
     # Build the declared dataset: One OPCS-4 procedure code per HRG grouping row in source
@@ -3221,7 +3223,7 @@ def _lifecycle_source_costed_activity():
     name=_n("journey_clinical.costed_activity"),
     comment="One frozen PLICS costed activity from FY19/20 through FY21/22 extracts.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=COSTED_ACTIVITY_COLUMN_COMMENTS,
 )
 def costed_activity():
@@ -3233,7 +3235,7 @@ def costed_activity():
     name=_n('journey_clinical._costed_activity_metadata'),
     comment='Internal quality and batch metadata for clinical_costed_activity; same row grain as the research table. Join keys: patient_event_key, extract_cd, activity_record_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def costed_activity_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -3305,7 +3307,7 @@ def _lifecycle_source_cost_line_item():
 @materialized_view(
     name=_n("journey_reference.cost_line_item"),
     comment="PLICS cost lines (frozen FY19/20-FY21/22 extracts); event plane excluded by design.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=COST_LINE_ITEM_COLUMN_COMMENTS,
 )
 def cost_line_item():
@@ -3628,7 +3630,7 @@ def _lifecycle_source_drug_expenditure():
     name=_n("journey_clinical.drug_expenditure"),
     comment="One HCD drug-expenditure row keyed by immutable ROW_HASH.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=DRUG_EXPENDITURE_COLUMN_COMMENTS,
 )
 def drug_expenditure():
@@ -3639,7 +3641,7 @@ def drug_expenditure():
     name=_n('journey_clinical._drug_expenditure_metadata'),
     comment='Internal quality and batch metadata for clinical_drug_expenditure; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def drug_expenditure_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -3864,7 +3866,7 @@ def _lifecycle_source_medication_supply():
     name=_n("journey_clinical.medication_supply"),
     comment="One JAC homecare supply-request item; supply, never administration.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=MEDICATION_SUPPLY_COLUMN_COMMENTS,
 )
 def medication_supply():
@@ -3876,7 +3878,7 @@ def medication_supply():
     name=_n('journey_clinical._medication_supply_metadata'),
     comment='Internal quality and batch metadata for clinical_medication_supply; same row grain as the research table. Join keys: patient_event_key, homecare_request_item_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_supply_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4141,7 +4143,7 @@ def _lifecycle_source_elective_access_entry():
     name=_n("journey_clinical.elective_access_entry"),
     comment="One LUNA elective-access entry with primary OPCS and clinical-priority folds.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ELECTIVE_ACCESS_ENTRY_COLUMN_COMMENTS,
 )
 def elective_access_entry():
@@ -4153,7 +4155,7 @@ def elective_access_entry():
     name=_n('journey_clinical._elective_access_entry_metadata'),
     comment='Internal quality and batch metadata for clinical_elective_access_entry; same row grain as the research table. Join keys: patient_event_key, source_system_oid, waiting_list_oid.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def elective_access_entry_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4223,7 +4225,7 @@ def _lifecycle_source_elective_access_procedure():
 @materialized_view(
     name=_n("journey_reference.elective_access_procedure"),
     comment="All LUNA elective-access planned-procedure slots, including bare and tombstoned rows.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ELECTIVE_ACCESS_PROCEDURE_COLUMN_COMMENTS,
 )
 def elective_access_procedure():
@@ -4445,7 +4447,7 @@ def _lifecycle_source_pathway_tracking():
     name=_n("journey_clinical.pathway_tracking"),
     comment="Whole-trust Pathfinder PTL activity rows; scope is PTL_GROUP_ID, not cancer.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PATHWAY_TRACKING_COLUMN_COMMENTS,
 )
 def pathway_tracking():
@@ -4457,7 +4459,7 @@ def pathway_tracking():
     name=_n('journey_clinical._pathway_tracking_metadata'),
     comment='Internal quality and batch metadata for clinical_pathway_tracking; same row grain as the research table. Join keys: patient_event_key, ptl_unique_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def pathway_tracking_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4511,7 +4513,7 @@ def _lifecycle_source_pregnancy_reconciliation():
 @materialized_view(
     name=_n("journey_reference.pregnancy_reconciliation"),
     comment="Unmatched MSDS pregnancy rows documenting the person-spine coverage gap.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PREGNANCY_RECONCILIATION_COLUMN_COMMENTS,
 )
 def pregnancy_reconciliation():
@@ -4592,7 +4594,7 @@ def _lifecycle_source_theatre_attendance():
 @materialized_view(
     name=_n("journey_reference.theatre_attendance"),
     comment="SurgiNet case attendance; parent-orphan rows remain visible and flagged.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=THEATRE_ATTENDANCE_COLUMN_COMMENTS,
 )
 def theatre_attendance():
@@ -4660,7 +4662,7 @@ def _lifecycle_source_theatre_case_milestone():
 @materialized_view(
     name=_n("journey_reference.theatre_case_milestone"),
     comment="SurgiNet case-time milestones; source-case-time meaning is dead upstream.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=THEATRE_CASE_MILESTONE_COLUMN_COMMENTS,
 )
 def theatre_case_milestone():
@@ -4744,7 +4746,7 @@ def _lifecycle_source_theatre_implant():
 @materialized_view(
     name=_n("journey_reference.theatre_implant"),
     comment="SurgiNet theatre implant log; serial/lot/batch identifiers are IG-sensitive.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=THEATRE_IMPLANT_COLUMN_COMMENTS,
 )
 def theatre_implant():
@@ -4835,7 +4837,7 @@ PREGNANCY_HISTORY_COLUMN_COMMENTS = {
 @materialized_view(
     name=_n("journey_clinical.pregnancy_history"),
     comment="Obstetric history per pregnancy (gravida, parity, previous births/losses/caesareans, booking and EDD) from Millennium maternity.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=PREGNANCY_HISTORY_COLUMN_COMMENTS,
 )
 def pregnancy_history():
@@ -4955,7 +4957,7 @@ BIRTH_COLUMN_COMMENTS = {
 @materialized_view(
     name=_n("journey_clinical.birth"),
     comment="One row per Millennium birth: delivery method/outcome, birth weight, Apgar, gestation and baby identity linkage.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=BIRTH_COLUMN_COMMENTS,
 )
 def birth():
@@ -5080,7 +5082,7 @@ def _lifecycle_source_theatre_case():
 @materialized_view(
     name=_n("journey_reference.theatre_case"),
     comment="One SurgiNet surgical case with case covariates (ASA, wound class, anaesthesia, urgency, times) and the implant-expected flag.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=THEATRE_CASE_COLUMN_COMMENTS,
 )
 def theatre_case():

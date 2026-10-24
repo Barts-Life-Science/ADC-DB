@@ -237,7 +237,7 @@ def _lifecycle_source_artifact_asset():
     name=_n("journey_artifact.asset"),
     comment="One governed clinical artifact or artifact-collection locator; payloads remain outside Silver.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ARTIFACT_ASSET_COLUMN_COMMENTS,
 )
 def artifact_asset():
@@ -253,7 +253,7 @@ def artifact_asset():
     name=_n('journey_artifact._asset_metadata'),
     comment='Internal quality and batch metadata for artifact_asset; same row grain as the research table. Join keys: patient_event_key, source_object, dicom_path, pacs_examination_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def artifact_asset_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for artifact_asset; same
@@ -289,7 +289,7 @@ ARTIFACT_ASSET_SENSITIVITY_LABEL_COLUMN_COMMENTS = {
     name=_n("journey_artifact.asset_sensitivity_label"),
     comment="One ordered sensitivity label per governed artifact asset.",
     column_comments=ARTIFACT_ASSET_SENSITIVITY_LABEL_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def artifact_asset_sensitivity_label():
     # Build the declared dataset: One ordered sensitivity label per governed artifact asset.
@@ -447,7 +447,7 @@ def _lifecycle_source_artifact_link():
 @materialized_view(
     name=_n("journey_artifact.link"),
     comment="Traceable relationships from clinical artifacts to typed facts and documents.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ARTIFACT_LINK_COLUMN_COMMENTS,
 )
 def artifact_link():
@@ -459,7 +459,7 @@ def artifact_link():
     name=_n('journey_artifact._link_metadata'),
     comment='Internal quality and batch metadata for artifact_link; same row grain as the research table. Join keys: artifact_link_key, patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def artifact_link_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for artifact_link; same
@@ -715,7 +715,7 @@ def _document_threaded():
 @materialized_view(
     name=_n("journey_text._qc_document"),
     comment="Private JSON bridge and Gold cross-rule flags for document.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_document():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for document.
@@ -829,7 +829,7 @@ DOCUMENT_COLUMN_COMMENTS = {
     name=_n("journey_text.document"),
     comment="Identifiable clinical document versions with source thread and parser provenance.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=DOCUMENT_COLUMN_COMMENTS,
 )
 def document():
@@ -850,7 +850,7 @@ def document():
     name=_n('journey_text._document_metadata'),
     comment='Internal quality and batch metadata for text_document; same row grain as the research table. Join keys: patient_event_key, source_object, endobase_exam_id, event_id, update_count, valid_from_datetime, pacs_report_id, report_version_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def document_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for text_document; same
@@ -883,7 +883,7 @@ TEXT_DOCUMENT_SENSITIVITY_LABEL_COLUMN_COMMENTS = {
     name=_n("journey_text.document_sensitivity_label"),
     comment="One ordered sensitivity label per clinical text document.",
     column_comments=TEXT_DOCUMENT_SENSITIVITY_LABEL_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def text_document_sensitivity_label():
     # Build the declared dataset: One ordered sensitivity label per clinical text document.

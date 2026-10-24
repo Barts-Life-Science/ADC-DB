@@ -156,7 +156,7 @@ CLINICAL_APPOINTMENT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_appointment"),
     comment="Internal quality-controlled twin of clinical_appointment: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_APPOINTMENT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_APPOINTMENT_ADVISORY_RULES)
@@ -174,7 +174,7 @@ def _gold_qc_clinical_appointment():
         "and Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_appointment():
     """Contract-v2 public twin of clinical_appointment; QC support columns remain internal."""
@@ -404,7 +404,7 @@ CLINICAL_COMMUNITY_CARE_ACTIVITY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_community_care_activity"),
     comment="Internal quality-controlled twin of clinical_community_care_activity: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_COMMUNITY_CARE_ACTIVITY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_COMMUNITY_CARE_ACTIVITY_ADVISORY_RULES)
@@ -426,7 +426,7 @@ def _gold_qc_clinical_community_care_activity():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_community_care_activity():
     """Contract-v2 public twin of clinical_community_care_activity; QC support columns remain internal."""
@@ -642,7 +642,7 @@ CLINICAL_COMMUNITY_CARE_CONTACT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_community_care_contact"),
     comment="Internal quality-controlled twin of clinical_community_care_contact: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_COMMUNITY_CARE_CONTACT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_COMMUNITY_CARE_CONTACT_ADVISORY_RULES)
@@ -664,7 +664,7 @@ def _gold_qc_clinical_community_care_contact():
         "every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_community_care_contact():
     """Contract-v2 public twin of clinical_community_care_contact; QC support columns remain internal."""
@@ -930,7 +930,7 @@ CLINICAL_COSTED_ACTIVITY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_costed_activity"),
     comment="Internal quality-controlled twin of clinical_costed_activity: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_COSTED_ACTIVITY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_COSTED_ACTIVITY_ADVISORY_RULES)
@@ -956,7 +956,7 @@ def _gold_qc_clinical_costed_activity():
         "every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_costed_activity():
     """Contract-v2 public twin of clinical_costed_activity; QC support columns remain internal."""
@@ -1282,7 +1282,7 @@ CLINICAL_DRUG_EXPENDITURE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_drug_expenditure"),
     comment="Internal quality-controlled twin of clinical_drug_expenditure: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_DRUG_EXPENDITURE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_DRUG_EXPENDITURE_ADVISORY_RULES)
@@ -1304,7 +1304,7 @@ def _gold_qc_clinical_drug_expenditure():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_drug_expenditure():
     """Contract-v2 public twin of clinical_drug_expenditure; QC support columns remain internal."""
@@ -1605,7 +1605,7 @@ CLINICAL_ELECTIVE_ACCESS_ENTRY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_elective_access_entry"),
     comment="Internal quality-controlled twin of clinical_elective_access_entry: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_ELECTIVE_ACCESS_ENTRY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_ELECTIVE_ACCESS_ENTRY_ADVISORY_RULES)
@@ -1631,7 +1631,7 @@ def _gold_qc_clinical_elective_access_entry():
         "every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_elective_access_entry():
     """Contract-v2 public twin of clinical_elective_access_entry; QC support columns remain internal."""
@@ -1938,7 +1938,7 @@ CLINICAL_HRG_GROUPING_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_hrg_grouping"),
     comment="Internal quality-controlled twin of clinical_hrg_grouping: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_HRG_GROUPING_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_HRG_GROUPING_ADVISORY_RULES)
@@ -1964,7 +1964,7 @@ def _gold_qc_clinical_hrg_grouping():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_hrg_grouping():
     """Contract-v2 public twin of clinical_hrg_grouping; QC support columns remain internal."""
@@ -2223,7 +2223,7 @@ CLINICAL_PATHWAY_TRACKING_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_pathway_tracking"),
     comment="Internal quality-controlled twin of clinical_pathway_tracking: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_PATHWAY_TRACKING_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_PATHWAY_TRACKING_ADVISORY_RULES)
@@ -2249,7 +2249,7 @@ def _gold_qc_clinical_pathway_tracking():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_pathway_tracking():
     """Contract-v2 public twin of clinical_pathway_tracking; QC support columns remain internal."""
@@ -2483,7 +2483,7 @@ CLINICAL_REFERRAL_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_referral"),
     comment="Internal quality-controlled twin of clinical_referral: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REFERRAL_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_REFERRAL_ADVISORY_RULES)
@@ -2510,7 +2510,7 @@ def _gold_qc_clinical_referral():
         "matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_referral():
     """Contract-v2 public twin of clinical_referral; QC support columns remain internal."""
@@ -2709,7 +2709,7 @@ CLINICAL_RTT_ACTIVITY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_rtt_activity"),
     comment="Internal quality-controlled twin of clinical_rtt_activity: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_RTT_ACTIVITY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_RTT_ACTIVITY_ADVISORY_RULES)
@@ -2735,7 +2735,7 @@ def _gold_qc_clinical_rtt_activity():
         "and Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_rtt_activity():
     """Contract-v2 public twin of clinical_rtt_activity; QC support columns remain internal."""
@@ -2938,7 +2938,7 @@ CLINICAL_RTT_PATHWAY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_rtt_pathway"),
     comment="Internal quality-controlled twin of clinical_rtt_pathway: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_RTT_PATHWAY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_RTT_PATHWAY_ADVISORY_RULES)
@@ -2956,7 +2956,7 @@ def _gold_qc_clinical_rtt_pathway():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_rtt_pathway():
     """Contract-v2 public twin of clinical_rtt_pathway; QC support columns remain internal."""
@@ -3200,7 +3200,7 @@ CLINICAL_WAITING_LIST_ENTRY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_waiting_list_entry"),
     comment="Internal quality-controlled twin of clinical_waiting_list_entry: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_WAITING_LIST_ENTRY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_WAITING_LIST_ENTRY_ADVISORY_RULES)
@@ -3227,7 +3227,7 @@ def _gold_qc_clinical_waiting_list_entry():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_waiting_list_entry():
     """Contract-v2 public twin of clinical_waiting_list_entry; QC support columns remain internal."""
@@ -3441,7 +3441,7 @@ CLINICAL_WAITING_LIST_SNAPSHOT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_waiting_list_snapshot"),
     comment="Internal quality-controlled twin of clinical_waiting_list_snapshot: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_WAITING_LIST_SNAPSHOT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_WAITING_LIST_SNAPSHOT_ADVISORY_RULES)
@@ -3467,7 +3467,7 @@ def _gold_qc_clinical_waiting_list_snapshot():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_waiting_list_snapshot():
     """Contract-v2 public twin of clinical_waiting_list_snapshot; QC support columns remain internal."""
@@ -3554,7 +3554,7 @@ REFERENCE_ADMISSION_METRICS_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_admission_metrics"),
     comment="Internal quality-controlled twin of reference_admission_metrics: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_admission_metrics():
     """Quality-controlled twin of journey_reference.admission_metrics."""
@@ -3574,7 +3574,7 @@ def _gold_qc_reference_admission_metrics():
         "every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_admission_metrics():
     """Contract-v2 public twin of reference_admission_metrics; QC support columns remain internal."""
@@ -3663,7 +3663,7 @@ REFERENCE_COST_LINE_ITEM_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_cost_line_item"),
     comment="Internal quality-controlled twin of reference_cost_line_item: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_COST_LINE_ITEM_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_COST_LINE_ITEM_ADVISORY_RULES)
@@ -3681,7 +3681,7 @@ def _gold_qc_reference_cost_line_item():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_cost_line_item():
     """Contract-v2 public twin of reference_cost_line_item; QC support columns remain internal."""
@@ -3765,7 +3765,7 @@ REFERENCE_ELECTIVE_ACCESS_PROCEDURE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_elective_access_procedure"),
     comment="Internal quality-controlled twin of reference_elective_access_procedure: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_ELECTIVE_ACCESS_PROCEDURE_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_ELECTIVE_ACCESS_PROCEDURE_ADVISORY_RULES)
@@ -3783,7 +3783,7 @@ def _gold_qc_reference_elective_access_procedure():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_elective_access_procedure():
     """Contract-v2 public twin of reference_elective_access_procedure; QC support columns remain internal."""
@@ -3852,7 +3852,7 @@ CLINICAL_APPOINTMENT_BOOKING_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_appointment_booking"),
     comment="Internal QC of clinical_appointment_booking; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_APPOINTMENT_BOOKING_MANDATORY_RULES)
 def _gold_qc_clinical_appointment_booking():
@@ -3868,7 +3868,7 @@ def _gold_qc_clinical_appointment_booking():
     name=_n("gold_clinical.appointment_booking"),
     comment='One booking or location iteration per scheduling appointment.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_appointment_booking():
     """Publish clinical_appointment_booking without exposing the internal parent-admission marker."""
@@ -3918,7 +3918,7 @@ CLINICAL_APPOINTMENT_RESOURCE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_appointment_resource"),
     comment="Internal QC of clinical_appointment_resource; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_APPOINTMENT_RESOURCE_MANDATORY_RULES)
 def _gold_qc_clinical_appointment_resource():
@@ -3934,7 +3934,7 @@ def _gold_qc_clinical_appointment_resource():
     name=_n("gold_clinical.appointment_resource"),
     comment='One scheduling resource or slot row per appointment.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_appointment_resource():
     """Publish clinical_appointment_resource without exposing the internal parent-admission marker."""
@@ -3974,7 +3974,7 @@ CLINICAL_HRG_GROUPING_DIAGNOSIS_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_hrg_grouping_diagnosis"),
     comment="Internal QC of clinical_hrg_grouping_diagnosis; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_HRG_GROUPING_DIAGNOSIS_MANDATORY_RULES)
 def _gold_qc_clinical_hrg_grouping_diagnosis():
@@ -3990,7 +3990,7 @@ def _gold_qc_clinical_hrg_grouping_diagnosis():
     name=_n("gold_clinical.hrg_grouping_diagnosis"),
     comment='One ICD-10 diagnosis code per HRG grouping row in source order.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_hrg_grouping_diagnosis():
     """Publish clinical_hrg_grouping_diagnosis without exposing the internal parent-admission marker."""
@@ -4030,7 +4030,7 @@ CLINICAL_HRG_GROUPING_PROCEDURE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_hrg_grouping_procedure"),
     comment="Internal QC of clinical_hrg_grouping_procedure; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_HRG_GROUPING_PROCEDURE_MANDATORY_RULES)
 def _gold_qc_clinical_hrg_grouping_procedure():
@@ -4046,7 +4046,7 @@ def _gold_qc_clinical_hrg_grouping_procedure():
     name=_n("gold_clinical.hrg_grouping_procedure"),
     comment='One OPCS-4 procedure code per HRG grouping row in source order.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_hrg_grouping_procedure():
     """Publish clinical_hrg_grouping_procedure without exposing the internal parent-admission marker."""
@@ -4086,7 +4086,7 @@ CLINICAL_RTT_PATHWAY_ENCOUNTER_TYPE_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_rtt_pathway_encounter_type"),
     comment="Internal QC of clinical_rtt_pathway_encounter_type; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_RTT_PATHWAY_ENCOUNTER_TYPE_MANDATORY_RULES)
 def _gold_qc_clinical_rtt_pathway_encounter_type():
@@ -4102,7 +4102,7 @@ def _gold_qc_clinical_rtt_pathway_encounter_type():
     name=_n("gold_clinical.rtt_pathway_encounter_type"),
     comment='One ordered encounter-type tag per LUNA RTT pathway period.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_rtt_pathway_encounter_type():
     """Publish clinical_rtt_pathway_encounter_type without exposing the internal parent-admission marker."""

@@ -503,11 +503,6 @@ GOLD_V2_LIFECYCLE = {'clinical_allergy_intolerance': {'join_keys': ['patient_eve
                                                      'loaded_at']},
  'clinical_waiting_list_snapshot': {'join_keys': ['waiting_list_snapshot_key'],
                                     'support_columns': ['identity_status', 'loaded_at']},
- 'events_patient_event': {'join_keys': ['patient_event_row_key'],
-                          'support_columns': ['identity_status',
-                                              'record_status',
-                                              'load_batch_id',
-                                              'loaded_at']},
  'reference_concept_map': {'join_keys': ['concept_map_key'], 'support_columns': ['loaded_at']},
  'reference_cost_line_item': {'join_keys': ['cost_line_item_key'],
                               'support_columns': ['record_status', 'loaded_at']},
@@ -657,7 +652,6 @@ GOLD_V2_DATE_FLAGS = {'clinical_allergy_intolerance': ['event_after_death_30d', 
  'clinical_transfusion_event': ['event_after_death_30d'],
  'clinical_vital_sign': ['event_after_death_30d', 'event_before_birth'],
  'clinical_waiting_list_entry': ['event_after_death_30d', 'event_before_birth'],
- 'events_patient_event': ['event_after_death_30d', 'event_before_birth'],
  'text_document': ['event_after_death_30d', 'event_before_birth']}
 GOLD_V2_SOURCE_SUPPORT = {'text_document': ['is_latest_version']}
 

@@ -67,7 +67,6 @@ SOURCE_TABLES = {
     "src_location_stay": "4_prod.silver.spine_location_stay",
     "src_critical_care_period": "4_prod.silver.clinical_critical_care_period",
     "src_person_relationship": "4_prod.silver.spine_person_relationship",
-    "src_patient_event": "4_prod.silver.events_patient_event",
     "src_condition": "4_prod.silver.clinical_condition",
     "src_procedure": "4_prod.silver.clinical_procedure",
     "src_clinical_finding": "4_prod.silver.clinical_clinical_finding",
@@ -195,7 +194,93 @@ def _apply_source_compat(key, frame):
     return frame
 
 
+# EIR_20261021_V1: silver events_patient_event is retired. Its rows now live in one internal feed
+# table per fact table; the union of the feeds equals the old table row for row.
+EVENT_FEED_TABLES = [
+    "4_prod.tmp._events_feed_family_history",
+    "4_prod.tmp._events_feed_presenting_complaint",
+    "4_prod.tmp._events_feed_allergy_intolerance",
+    "4_prod.tmp._events_feed_transfusion",
+    "4_prod.tmp._events_feed_cancer_treatment",
+    "4_prod.tmp._events_feed_condition_stage",
+    "4_prod.tmp._events_feed_endoscopy_finding",
+    "4_prod.tmp._events_feed_registry_entry",
+    "4_prod.tmp._events_feed_device",
+    "4_prod.tmp._events_feed_condition",
+    "4_prod.tmp._events_feed_procedure",
+    "4_prod.tmp._events_feed_pathology_order",
+    "4_prod.tmp._events_feed_specimen",
+    "4_prod.tmp._events_feed_pathology_report",
+    "4_prod.tmp._events_feed_pathology_result",
+    "4_prod.tmp._events_feed_genomic_test",
+    "4_prod.tmp._events_feed_genomic_result",
+    "4_prod.tmp._events_feed_indication",
+    "4_prod.tmp._events_feed_microbiology_isolate",
+    "4_prod.tmp._events_feed_susceptibility_result",
+    "4_prod.tmp._events_feed_form",
+    "4_prod.tmp._events_feed_vital_sign",
+    "4_prod.tmp._events_feed_clinical_score",
+    "4_prod.tmp._events_feed_medication_admin",
+    "4_prod.tmp._events_feed_medication_order",
+    "4_prod.tmp._events_feed_medication_dispense",
+    "4_prod.tmp._events_feed_clinical_finding",
+    "4_prod.tmp._events_feed_imaging_exam",
+    "4_prod.tmp._events_feed_artifact_asset",
+    "4_prod.tmp._events_feed_text_document",
+    "4_prod.tmp._events_feed_appointment",
+    "4_prod.tmp._events_feed_referral",
+    "4_prod.tmp._events_feed_rtt_pathway",
+    "4_prod.tmp._events_feed_rtt_activity",
+    "4_prod.tmp._events_feed_waiting_list_entry",
+    "4_prod.tmp._events_feed_community_care_activity",
+    "4_prod.tmp._events_feed_community_care_contact",
+    "4_prod.tmp._events_feed_hrg_grouping",
+    "4_prod.tmp._events_feed_costed_activity",
+    "4_prod.tmp._events_feed_drug_expenditure",
+    "4_prod.tmp._events_feed_medication_supply",
+    "4_prod.tmp._events_feed_elective_access_entry",
+    "4_prod.tmp._events_feed_pathway_tracking",
+    "4_prod.tmp._events_feed_critical_care_period",
+    "4_prod.tmp._events_feed_critical_care_activity",
+    "4_prod.tmp._events_feed_critical_care_admission",
+    "4_prod.tmp._events_feed_critical_care_daily_score",
+    "4_prod.tmp._events_feed_neonatal_episode",
+    "4_prod.tmp._events_feed_neonatal_care_day",
+    "4_prod.tmp._events_feed_neonatal_examination",
+    "4_prod.tmp._events_feed_baby_delivery",
+    "4_prod.tmp._events_feed_labour_delivery",
+    "4_prod.tmp._events_feed_maternity_care_contact",
+    "4_prod.tmp._events_feed_research_enrollment",
+    "4_prod.tmp._events_feed_safety_incident",
+]
+
+
+def _event_feed_union():
+    """The retired events_patient_event, rebuilt as the union of the silver event feeds."""
+    for name in EVENT_FEED_TABLES:
+        if not name.startswith("4_prod.tmp._events_feed_"):
+            raise ValueError(f"event feed outside the allowlist rejected: {name!r}")
+    frames = [spark.read.table(name) for name in EVENT_FEED_TABLES]
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return out
+
+
+@dp.materialized_view(
+    name="_om_patient_event",
+    comment="Internal: the union of the silver event feeds, materialized once (EIR_20261021_V2). The router "
+            "reads src_patient_event ~60 times; reading the 55-feed union inline put 3,355 scans in one plan "
+            "and exhausted executors. One union table keeps the plan the shape it had on events_patient_event, "
+            "and refreshes incrementally: an edit to one feed moves only that feed's rows.",
+)
+def _om_patient_event():
+    return _event_feed_union()
+
+
 def read_source(key):
+    if key == "src_patient_event":
+        return _apply_source_compat(key, spark.read.table("_om_patient_event"))
     if key in PIPELINE_DATASETS:
         return spark.read.table(PIPELINE_DATASETS[key])
     try:

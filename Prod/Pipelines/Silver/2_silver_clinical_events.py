@@ -124,7 +124,7 @@ SRC_S3B_REGISTRY_ROUTE = "3_lookup.omop.registry_field_route"
 @materialized_view(
     name=_n("journey_clinical._qc_family_history"),
     comment="Private JSON bridge and Gold cross-rule flags for family_history.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_family_history():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -226,7 +226,7 @@ FAMILY_HISTORY_COLUMN_COMMENTS = {
     name=_n("journey_clinical.family_history"),
     comment="One family-history assertion with the Journey Model standard event block and CodeableConcept mappings.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=FAMILY_HISTORY_COLUMN_COMMENTS,
 )
 def family_history():
@@ -253,7 +253,7 @@ def _s3_component_metadata(public_relation, qc_relation, columns):
     name=_n('journey_clinical._family_history_metadata'),
     comment='Internal quality and batch metadata for clinical_family_history; same row grain as the research table. Join keys: patient_event_key, fhx_activity_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def family_history_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -301,7 +301,7 @@ PRESENTING_COMPLAINT_COLUMN_COMMENTS["complaint_map_component_index"] = (
 )
 
 @materialized_view(name=_n("journey_clinical._qc_presenting_complaint"), private=True,
-                   comment="Private source-grain stage for presenting complaint and reason for visit.", refresh_policy="incremental")
+                   comment="Private source-grain stage for presenting complaint and reason for visit.", refresh_policy="auto")
 def _qc_presenting_complaint():
     # Build the declared dataset: Private source-grain stage for presenting complaint and reason
     # for visit.
@@ -309,7 +309,7 @@ def _qc_presenting_complaint():
 
 @materialized_view(name=_n("journey_clinical.presenting_complaint"),
                    comment="One presenting-complaint or reason-for-visit component per encounter and source statement.",
-                   cluster_by=["person_id", "event_datetime"], refresh_policy="incremental",
+                   cluster_by=["person_id", "event_datetime"], refresh_policy="auto",
                    column_comments=PRESENTING_COMPLAINT_COLUMN_COMMENTS)
 def presenting_complaint():
     # Build the declared dataset: One presenting-complaint or reason-for-visit component per
@@ -320,7 +320,7 @@ def presenting_complaint():
 
 @materialized_view(name=_n("journey_clinical._presenting_complaint_metadata"),
                    comment="Internal quality metadata at presenting-complaint component grain.",
-                   refresh_policy="incremental", column_comments=LIFECYCLE_COLUMN_COMMENTS)
+                   refresh_policy="auto", column_comments=LIFECYCLE_COLUMN_COMMENTS)
 def presenting_complaint_lifecycle():
     # Build the declared dataset: Internal quality metadata at presenting-complaint component
     # grain.
@@ -420,7 +420,7 @@ def _problem_revision_grouped_query():
     name=_n("journey_clinical._problem_revision_grouped"),
     private=True,
     comment="Internal condition primitive with ordered problem-revision history and deterministic JSON boundaries.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _problem_revision_grouped():
     # Build the declared dataset: Internal condition primitive with ordered problem-revision
@@ -437,7 +437,7 @@ def _problem_revision_grouped():
 @materialized_view(
     name=_n("journey_clinical._qc_condition"),
     comment="Private JSON bridge and Gold cross-rule flags for condition.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_condition():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for condition.
@@ -585,7 +585,7 @@ CONDITION_COLUMN_COMMENTS = {
     name=_n("journey_clinical.condition"),
     comment="Diagnosis and problem assertions from registered bronze feeds; no cross-feed deduplication or active-only filtering.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CONDITION_COLUMN_COMMENTS,
 )
 def condition():
@@ -603,7 +603,7 @@ def condition():
     name=_n('journey_clinical._condition_metadata'),
     comment='Internal quality and batch metadata for clinical_condition; same row grain as the research table. Join keys: patient_event_key, source_object, diagnosis_id, problem_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def condition_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_condition;
@@ -667,7 +667,7 @@ def _implant_attribute_grouped_query():
     name=_n("journey_clinical._implant_attribute_grouped"),
     private=True,
     comment="Internal ordered implant-attribute aggregate keyed by implant procedure event.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _implant_attribute_grouped():
     # Build the declared dataset: Internal ordered implant-attribute aggregate keyed by implant
@@ -796,7 +796,7 @@ def _opcs_procedure_block_query():
     name=_n("journey_clinical._opcs_procedure_block"),
     private=True,
     comment="Internal OPCS-4 coded-operation runs (OPCS_QUALIFIER_BLOCK_V1): every OPCS map_procedure row with its role and its operation's site and side.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _opcs_procedure_block():
     # Build the declared dataset: every OPCS-4 row with the operation it qualifies.
@@ -860,7 +860,7 @@ def _implant_opcs_link_query():
     name=_n("journey_clinical._implant_opcs_link"),
     private=True,
     comment="Internal implant to OPCS-4 operation link (IMPLANT_OPCS_LINK_V1): same-encounter operations on the implant's London date, else the adjacent day.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _implant_opcs_link():
     # Build the declared dataset: each implant's candidate operations, side and site.
@@ -1047,7 +1047,7 @@ def _procedure_primitive_query():
     name=_n("journey_clinical._procedure_primitive"),
     private=True,
     comment="Internal orderable procedure union; CodeableConcept JSON crosses the incremental boundary.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _procedure_primitive():
     # Build the declared dataset: Internal orderable procedure union; CodeableConcept JSON
@@ -1064,7 +1064,7 @@ def _procedure_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_procedure"),
     comment="Private JSON bridge and Gold cross-rule flags for procedure.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_procedure():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for procedure.
@@ -1147,7 +1147,7 @@ PROCEDURE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.procedure"),
     comment="Performed procedure and implant-placement evidence from registered bronze feeds; source facts remain separate.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PROCEDURE_COLUMN_COMMENTS,
 )
 def procedure():
@@ -1165,7 +1165,7 @@ def procedure():
     name=_n('journey_clinical._procedure_metadata'),
     comment='Internal quality and batch metadata for clinical_procedure; same row grain as the research table. Join keys: patient_event_key, source_object, endobase_exam_id, implant_event_id, implant_sequence, procedure_id, surg_case_proc_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def procedure_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_procedure;
@@ -1296,7 +1296,7 @@ def _lifecycle_source_condition_revision():
     name=_n("journey_clinical.condition_revision"),
     comment="One Millennium problem-history revision per parent clinical_condition problem row.",
     column_comments=CONDITION_REVISION_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def condition_revision():
     # Build the declared dataset: One Millennium problem-history revision per parent
@@ -1341,7 +1341,7 @@ PROCEDURE_IMPLANT_ATTRIBUTE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.procedure_implant_attribute"),
     comment="One source implant attribute per parent implant clinical_procedure row.",
     column_comments=PROCEDURE_IMPLANT_ATTRIBUTE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def procedure_implant_attribute():
     # Build the declared dataset: One source implant attribute per parent implant
@@ -1579,7 +1579,7 @@ def _pathology_parent_link_canonical():
     private=True,
     comment="INTERNAL source-parent linkage: source_parent_key -> alias-resolved accession, "
             "report series (1:1 parent->version->series, preflight-verified), and parent encounter.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _pathology_parent_link():
     # Build the declared dataset: INTERNAL source-parent linkage: source_parent_key -> alias-
@@ -1600,7 +1600,7 @@ def _pathology_parent_link():
     comment="INTERNAL accession identity: status-honest registry person columns plus MRN/NHS "
             "evidence aggregated from accession_source. Survivor accessions only; aliases resolve "
             "before grouping so retired evidence follows the survivor.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _pathology_accession_identity():
     # Build the declared dataset: INTERNAL accession identity: status-honest registry person
@@ -1649,7 +1649,7 @@ def _pathology_accession_identity():
 @materialized_view(
     name=_n("journey_clinical._qc_specimen"),
     comment="Private JSON bridge and Gold cross-rule flags for specimen.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_specimen():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for specimen.
@@ -1774,7 +1774,7 @@ SPECIMEN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.specimen"),
     comment="One canonical pathology accession with collection and request evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=SPECIMEN_COLUMN_COMMENTS,
 )
 def specimen():
@@ -1792,7 +1792,7 @@ def specimen():
     name=_n('journey_clinical._specimen_metadata'),
     comment='Internal quality and batch metadata for clinical_specimen; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def specimen_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_specimen;
@@ -1809,7 +1809,7 @@ def specimen_lifecycle():
 @materialized_view(
     name=_n("journey_clinical._qc_pathology_report"),
     comment="Private JSON bridge and Gold cross-rule flags for pathology_report.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_pathology_report():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -1924,7 +1924,7 @@ PATHOLOGY_REPORT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.pathology_report"),
     comment="One pathology report series; latest-version projection; versions in journey_text.document.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PATHOLOGY_REPORT_COLUMN_COMMENTS,
 )
 def pathology_report():
@@ -1942,7 +1942,7 @@ def pathology_report():
     name=_n('journey_clinical._pathology_report_metadata'),
     comment='Internal quality and batch metadata for clinical_pathology_report; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def pathology_report_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2032,7 +2032,7 @@ SRC_PATHOLOGY_RESULT_EQUIVALENCE = "4_prod.bronze.map_pathology_result_equivalen
     comment="Internal repointed result rows; CodeableConcept JSON crosses the incremental "
             "boundary — a VARIANT output column on a join-shaped flow crashes Enzyme planning "
             "(GROUP_EXPRESSION_TYPE_IS_NOT_ORDERABLE) and forces complete recompute every update.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _pathology_result_primitive():
     # Build the declared dataset: Internal repointed result rows; CodeableConcept JSON crosses
@@ -2076,7 +2076,7 @@ def _pathology_result_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_pathology_result"),
     comment="Private JSON bridge and Gold cross-rule flags for pathology_result.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_pathology_result():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -2152,7 +2152,7 @@ PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.pathology_result"),
     comment="One pathology result with typed values, units, ranges and retained mapping evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PATHOLOGY_RESULT_COLUMN_COMMENTS,
 )
 def pathology_result():
@@ -2170,7 +2170,7 @@ def pathology_result():
     name=_n('journey_clinical._pathology_result_metadata'),
     comment='Internal quality and batch metadata for clinical_pathology_result; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def pathology_result_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2259,7 +2259,7 @@ def _lifecycle_source_pathology_order():
     name=_n("journey_clinical.pathology_order"),
     comment="One requested-test occurrence across TFC_LIMS and CERNER; anchors accession-scoped request threads.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PATHOLOGY_ORDER_COLUMN_COMMENTS,
 )
 def pathology_order():
@@ -2271,7 +2271,7 @@ def pathology_order():
     name=_n('journey_clinical._pathology_order_metadata'),
     comment='Internal quality and batch metadata for clinical_pathology_order; same row grain as the research table. Join keys: patient_event_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def pathology_order_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2301,7 +2301,7 @@ EXTERNAL_SITE_RULE = "source_site_code LIKE 'E%' OR source_site_code = 'XQA'"
     comment="INTERNAL PATH_ENCOUNTER_V2 evidence: for genomic accessions without a Millennium encounter, the "
             "patient's encounter whose period contains the sample date (Barts sites only; external referral "
             "sites E*/XQA are marked none_external_referral).",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _genomic_encounter_window():
     # One row per alias-resolved genomic accession that V1 leaves unlinked, with window_method set and
@@ -2555,7 +2555,7 @@ def _lifecycle_source_genomic_test():
             "record_status supersedes on is_current). Vocab and panel columns are all-NULL "
             "in the current build and lanes are pre-wired.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=GENOMIC_TEST_COLUMN_COMMENTS,
 )
 def genomic_test():
@@ -2568,7 +2568,7 @@ def genomic_test():
     name=_n('journey_clinical._genomic_test_metadata'),
     comment='Internal quality and batch metadata for clinical_genomic_test; same row grain as the research table. Join keys: patient_event_key, genetic_test_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def genomic_test_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_genomic_test;
@@ -2841,7 +2841,7 @@ def _lifecycle_source_genomic_result():
     comment="One reportable molecular/cytogenetic finding. Schema-first: zero rows in both "
             "catalogs as of 2026-08-18 (empty_by_design — no detected assays upstream).",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=GENOMIC_RESULT_COLUMN_COMMENTS,
 )
 def genomic_result():
@@ -2854,7 +2854,7 @@ def genomic_result():
     name=_n('journey_clinical._genomic_result_metadata'),
     comment='Internal quality and batch metadata for clinical_genomic_result; same row grain as the research table. Join keys: patient_event_key, genetic_result_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def genomic_result_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -2919,7 +2919,7 @@ def _lifecycle_source_gene_tested():
     comment="Assay-gene denominator, HGNC-normalized; reference surface, no event index. "
             "Covers 42.6% of assays in the current build (BCRL/FLT3 complete; "
             "MNGS 10.5%, TNGS 16.6%) — recorded, not gated.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=GENE_TESTED_COLUMN_COMMENTS,
 )
 def gene_tested():
@@ -3099,7 +3099,7 @@ def _lifecycle_source_indication():
             "diagnosis_context_window_v1). Source/evidence text are coded diagnosis display "
             "strings; ig_release_status published verbatim; prod activation is gated.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=INDICATION_COLUMN_COMMENTS,
 )
 def indication():
@@ -3112,7 +3112,7 @@ def indication():
     name=_n('journey_clinical._indication_metadata'),
     comment='Internal quality and batch metadata for clinical_indication; same row grain as the research table. Join keys: patient_event_key, indication_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def indication_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_indication;
@@ -3285,7 +3285,7 @@ def _lifecycle_source_microbiology_isolate():
     name=_n("journey_clinical.microbiology_isolate"),
     comment="One organism/isolate finding per accession, parsed from the packed WinPath antibiogram in map_pathology (S2.5, parser 1.0.0). Person linkage follows the accession identity; unresolved rows stay here and drop at gold.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=MICROBIOLOGY_ISOLATE_COLUMN_COMMENTS,
 )
 def microbiology_isolate():
@@ -3298,7 +3298,7 @@ def microbiology_isolate():
     name=_n('journey_clinical._microbiology_isolate_metadata'),
     comment='Internal quality and batch metadata for clinical_microbiology_isolate; same row grain as the research table. Join keys: patient_event_key, microbiology_isolate_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def microbiology_isolate_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -3475,7 +3475,7 @@ def _lifecycle_source_susceptibility_result():
     name=_n("journey_clinical.susceptibility_result"),
     comment="One antimicrobial, mechanism-marker or unparsed token per isolate, parsed from the packed WinPath antibiogram (S2.5, parser 1.0.0). Categorical S/I/R only; MIC columns are null by source.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=SUSCEPTIBILITY_RESULT_COLUMN_COMMENTS,
 )
 def susceptibility_result():
@@ -3488,7 +3488,7 @@ def susceptibility_result():
     name=_n('journey_clinical._susceptibility_result_metadata'),
     comment='Internal quality and batch metadata for clinical_susceptibility_result; same row grain as the research table. Join keys: patient_event_key, susceptibility_result_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def susceptibility_result_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -3637,7 +3637,7 @@ def _lifecycle_source_request_thread():
 @materialized_view(
     name=_n("journey_spine.request_thread"),
     comment="Directed request-to-response edges: pathology order-to-report, medication order-to-administration, waiting-list entry-to-appointment.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=REQUEST_THREAD_COLUMN_COMMENTS,
 )
 def request_thread():
@@ -3649,7 +3649,7 @@ def request_thread():
     name=_n('journey_spine._request_thread_metadata'),
     comment='Internal quality and batch metadata for spine_request_thread; same row grain as the research table. Join keys: request_thread_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def request_thread_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_request_thread;
@@ -3871,7 +3871,7 @@ def _form_grouped_query():
     name=_n("journey_clinical._form_grouped"),
     private=True,
     comment="Internal top-level aggregate for incrementally maintained ordered PowerForm responses.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _form_grouped():
     # Build the declared dataset: Internal top-level aggregate for incrementally maintained
@@ -3888,7 +3888,7 @@ def _form_grouped():
 @materialized_view(
     name=_n("journey_clinical._qc_form"),
     comment="Private JSON bridge and Gold cross-rule flags for form.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_form():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for form.
@@ -4002,7 +4002,7 @@ FORM_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form"),
     comment="One PowerForm instance with ordered lossless responses and reconciliation evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=FORM_COLUMN_COMMENTS,
 )
 def form():
@@ -4020,7 +4020,7 @@ def form():
     name=_n('journey_clinical._form_metadata'),
     comment='Internal quality and batch metadata for clinical_form; same row grain as the research table. Join keys: patient_event_key, dcp_forms_activity_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_form; same
@@ -4087,7 +4087,7 @@ def _registry_observation_query():
     name=_n("journey_clinical._registry_observations"),
     private=True,
     comment="Source-linked long observations for governed fields in the ten typed iWeb registry products.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _registry_observations():
     # Build the declared dataset: Source-linked long observations for governed fields in the ten
@@ -4175,7 +4175,7 @@ VITAL_LIFECYCLE_COLUMNS = [
     name=_n("journey_clinical._numeric_vital_sign"),
     private=True,
     comment="Internal incrementally maintained native numeric-event vital route.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _numeric_vital_sign():
     # Build the declared dataset: Internal incrementally maintained native numeric-event vital
@@ -4279,7 +4279,7 @@ def _promoted_vital_canonical():
     name=_n("journey_clinical._promoted_vital_sign_primitive"),
     private=True,
     comment="Internal incrementally maintained governed form-promotion vital route.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _promoted_vital_sign_primitive():
     # Build the declared dataset: Internal incrementally maintained governed form-promotion
@@ -4296,7 +4296,7 @@ def _promoted_vital_sign_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_vital_sign"),
     comment="Private JSON bridge and Gold cross-rule flags for vital_sign.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_vital_sign():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for vital_sign.
@@ -4365,7 +4365,7 @@ VITAL_SIGN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.vital_sign"),
     comment="Native numeric-event measurements and governed form-promoted vital signs, retaining source identifiers, measurement values and units.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=VITAL_SIGN_COLUMN_COMMENTS,
 )
 def vital_sign():
@@ -4383,7 +4383,7 @@ def vital_sign():
     name=_n('journey_clinical._vital_sign_metadata'),
     comment='Internal quality and batch metadata for clinical_vital_sign; same row grain as the research table. Join keys: patient_event_key, source_object, doc_response_key, event_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def vital_sign_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_vital_sign;
@@ -4460,7 +4460,7 @@ SCORE_LIFECYCLE_COLUMNS = [
     name=_n("journey_clinical._numeric_clinical_score"),
     private=True,
     comment="Internal incrementally maintained native numeric-event clinical-score route.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _numeric_clinical_score():
     # Build the declared dataset: Internal incrementally maintained native numeric-event
@@ -4555,7 +4555,7 @@ def _promoted_score_canonical():
     name=_n("journey_clinical._promoted_clinical_score_primitive"),
     private=True,
     comment="Internal incrementally maintained governed form-promotion clinical-score route.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _promoted_clinical_score_primitive():
     # Build the declared dataset: Internal incrementally maintained governed form-promotion
@@ -4572,7 +4572,7 @@ def _promoted_clinical_score_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_clinical_score"),
     comment="Private JSON bridge and Gold cross-rule flags for clinical_score.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_clinical_score():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -4638,7 +4638,7 @@ CLINICAL_SCORE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.clinical_score"),
     comment="Native numeric-event and governed form-promoted clinical score results.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CLINICAL_SCORE_COLUMN_COMMENTS,
 )
 def clinical_score():
@@ -4658,7 +4658,7 @@ def clinical_score():
     name=_n('journey_clinical._clinical_score_metadata'),
     comment='Internal quality and batch metadata for clinical_clinical_score; same row grain as the research table. Join keys: patient_event_key, source_object, doc_response_key, event_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def clinical_score_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4703,7 +4703,7 @@ CLINICAL_SCORE_COMPONENT_COLUMN_COMMENTS.update(axis_comments("component", "scor
     name=_n("journey_clinical.clinical_score_component"),
     comment="One ordered component per native or governed promoted clinical score.",
     column_comments=CLINICAL_SCORE_COMPONENT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def clinical_score_component():
     # Build the declared dataset: One ordered component per native or governed promoted clinical
@@ -4810,7 +4810,7 @@ def _med_admin_ingredient_grouped_query():
     name=_n("journey_clinical._med_admin_ingredient_grouped"),
     private=True,
     comment="Internal ordered ingredient aggregate for medication administrations.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _med_admin_ingredient_grouped():
     # Build the declared dataset: Internal ordered ingredient aggregate for medication
@@ -4856,7 +4856,7 @@ def _med_order_action_grouped_query():
     name=_n("journey_clinical._med_order_action_grouped"),
     private=True,
     comment="Internal ordered status-history aggregate for medication orders.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _med_order_action_grouped():
     # Build the declared dataset: Internal ordered status-history aggregate for medication
@@ -4913,7 +4913,7 @@ def _med_order_ingredient_grouped_query():
     name=_n("journey_clinical._med_order_ingredient_grouped"),
     private=True,
     comment="Internal ordered ingredient aggregate for medication orders.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _med_order_ingredient_grouped():
     # Build the declared dataset: Internal ordered ingredient aggregate for medication orders.
@@ -4957,7 +4957,7 @@ def _med_order_detail_grouped_query():
     name=_n("journey_clinical._med_order_detail_grouped"),
     private=True,
     comment="Internal ordered latest-action-detail aggregate for medication orders.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _med_order_detail_grouped():
     # Build the declared dataset: Internal ordered latest-action-detail aggregate for medication
@@ -5179,7 +5179,7 @@ def _medication_admin_primitive_query():
     name=_n("journey_clinical._medication_admin_primitive"),
     private=True,
     comment="Internal primitive medication-administration join with deterministic JSON boundaries.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _medication_admin_primitive():
     # Build the declared dataset: Internal primitive medication-administration join with
@@ -5303,7 +5303,7 @@ def _medication_order_primitive_query():
     name=_n("journey_clinical._medication_order_primitive"),
     private=True,
     comment="Internal primitive medication-order join with deterministic JSON boundaries.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _medication_order_primitive():
     # Build the declared dataset: Internal primitive medication-order join with deterministic
@@ -5320,7 +5320,7 @@ def _medication_order_primitive():
 @materialized_view(
     name=_n("journey_clinical._qc_medication_admin"),
     comment="Private JSON bridge and Gold cross-rule flags for medication_admin.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_medication_admin():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -5480,7 +5480,7 @@ MEDICATION_ADMIN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_admin"),
     comment="One Millennium medication-administration event with current state and ordered history.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=MEDICATION_ADMIN_COLUMN_COMMENTS,
 )
 def medication_admin():
@@ -5500,7 +5500,7 @@ def medication_admin():
     name=_n('journey_clinical._medication_admin_metadata'),
     comment='Internal quality and batch metadata for clinical_medication_admin; same row grain as the research table. Join keys: patient_event_key, event_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_admin_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -5518,7 +5518,7 @@ def medication_admin_lifecycle():
 @materialized_view(
     name=_n("journey_clinical._qc_medication_order"),
     comment="Private JSON bridge and Gold cross-rule flags for medication_order.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_medication_order():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -5661,7 +5661,7 @@ MEDICATION_ORDER_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_order"),
     comment="One Millennium medication order with current state and ordered action, ingredient, and detail evidence.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=MEDICATION_ORDER_COLUMN_COMMENTS,
 )
 def medication_order():
@@ -5681,7 +5681,7 @@ def medication_order():
     name=_n('journey_clinical._medication_order_metadata'),
     comment='Internal quality and batch metadata for clinical_medication_order; same row grain as the research table. Join keys: patient_event_key, order_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_order_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -5740,7 +5740,7 @@ MEDICATION_ORDER_INGREDIENT_COLUMN_COMMENTS.update(axis_comments("ingredient", "
     name=_n("journey_clinical.medication_order_ingredient"),
     comment="One ordered ingredient component per medication order, linked to its parent by the retained event key.",
     column_comments=MEDICATION_ORDER_INGREDIENT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_order_ingredient():
     # Build the declared dataset: One ordered ingredient component per medication order, linked
@@ -5826,7 +5826,7 @@ MEDICATION_ORDER_STATUS_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_order_status"),
     comment="One ordered source action or status row per medication order.",
     column_comments=MEDICATION_ORDER_STATUS_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_order_status():
     # Build the declared dataset: One ordered source action or status row per medication order.
@@ -5892,7 +5892,7 @@ MEDICATION_ORDER_DETAIL_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_order_detail"),
     comment="One latest-action detail row per medication order field.",
     column_comments=MEDICATION_ORDER_DETAIL_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_order_detail():
     # Build the declared dataset: One latest-action detail row per medication order field.
@@ -5965,7 +5965,7 @@ MEDICATION_ADMIN_INGREDIENT_COLUMN_COMMENTS.update(axis_comments("ingredient", "
     name=_n("journey_clinical.medication_admin_ingredient"),
     comment="One ingredient component per medication administration, retaining source component order and its parent event key.",
     column_comments=MEDICATION_ADMIN_INGREDIENT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_admin_ingredient():
     # Contract v2 parent/child conservation: medication_admin publishes only the
@@ -6054,7 +6054,7 @@ MEDICATION_ADMIN_STATUS_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_admin_status"),
     comment="One status milestone per medication administration, retaining source sequence and the parent event key.",
     column_comments=MEDICATION_ADMIN_STATUS_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_admin_status():
     # Contract v2 parent/child conservation: medication_admin publishes only the
@@ -6100,7 +6100,7 @@ def medication_admin_status():
 @materialized_view(
     name=_n("journey_clinical._qc_medication_dispense"),
     comment="Private JSON bridge and Gold cross-rule flags for medication_dispense.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_medication_dispense():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -6207,7 +6207,7 @@ MEDICATION_DISPENSE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.medication_dispense"),
     comment="JAC ISSUE transactions admitted directly as typed dispense facts.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=MEDICATION_DISPENSE_COLUMN_COMMENTS,
 )
 def medication_dispense():
@@ -6225,7 +6225,7 @@ def medication_dispense():
     name=_n('journey_clinical._medication_dispense_metadata'),
     comment='Internal quality and batch metadata for clinical_medication_dispense; same row grain as the research table. Join keys: patient_event_key, pharmacy_issue_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def medication_dispense_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -6380,7 +6380,7 @@ def _registry_finding_canonical():
 @materialized_view(
     name=_n("journey_clinical._qc_clinical_finding"),
     comment="Private JSON bridge and Gold cross-rule flags for clinical_finding.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_clinical_finding():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -6453,7 +6453,7 @@ CLINICAL_FINDING_COLUMN_COMMENTS = {
     name=_n("journey_clinical.clinical_finding"),
     comment="Governed residual clinical observations from exhaustive generic-event routes.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CLINICAL_FINDING_COLUMN_COMMENTS,
 )
 def clinical_finding():
@@ -6471,7 +6471,7 @@ def clinical_finding():
     name=_n('journey_clinical._clinical_finding_metadata'),
     comment='Internal quality and batch metadata for clinical_clinical_finding; same row grain as the research table. Join keys: patient_event_key, source_object, event_id, sequence_nbr.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def clinical_finding_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -6597,7 +6597,7 @@ IMAGING_EXAM_LIFECYCLE_COLUMNS = [
 @materialized_view(
     name=_n("journey_clinical._qc_imaging_exam"),
     comment="Private JSON bridge and Gold cross-rule flags for imaging_exam.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_imaging_exam():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -6669,7 +6669,7 @@ IMAGING_EXAM_COLUMN_COMMENTS.update(IMAGING_INTEGRATION_COLUMN_COMMENTS)
     name=_n("journey_clinical.imaging_exam"),
     comment="One PACS examination/study from the governed bronze landing with report linkage.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=IMAGING_EXAM_COLUMN_COMMENTS,
 )
 def imaging_exam():
@@ -6687,7 +6687,7 @@ def imaging_exam():
     name=_n('journey_clinical._imaging_exam_metadata'),
     comment='Internal quality and batch metadata for clinical_imaging_exam; same row grain as the research table. Join keys: patient_event_key, source_object, event_id, pacs_examination_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def imaging_exam_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_imaging_exam;
@@ -6720,7 +6720,7 @@ IMAGING_ACCESSION_MEMBER_PUBLIC_COMMENTS = {
     name=_n("journey_clinical.imaging_accession_member"),
     comment="One row per accession-bearing imaging examination member (PACS examination or Millennium examination event) with default-selection eligibility and blocking reasons. Group by accession_key for accession-level selection.",
     cluster_by=["accession_key"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=IMAGING_ACCESSION_MEMBER_PUBLIC_COMMENTS,
 )
 def imaging_accession_member():
@@ -6739,7 +6739,7 @@ def imaging_accession_member():
     name=_n("journey_clinical.imaging_report_link"),
     comment="Relational imaging report links: examination-, request- and Cerner-event-scoped report documents with version decisions, text and approved-anonymisation availability. Multiple reports and addenda stay separate rows.",
     cluster_by=["accession_key"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=IMAGING_REPORT_LINK_COLUMN_COMMENTS,
 )
 def imaging_report_link():
@@ -6756,7 +6756,7 @@ def imaging_report_link():
 @materialized_view(
     name=_n("journey_clinical._qc_allergy_intolerance"),
     comment="Private JSON bridge and Gold cross-rule flags for allergy_intolerance.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_allergy_intolerance():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -6868,7 +6868,7 @@ ALLERGY_INTOLERANCE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.allergy_intolerance"),
     comment="One Millennium allergy or intolerance assertion, with recorded substance, reaction and source-history information.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ALLERGY_INTOLERANCE_COLUMN_COMMENTS,
 )
 def allergy_intolerance():
@@ -6886,7 +6886,7 @@ def allergy_intolerance():
     name=_n('journey_clinical._allergy_intolerance_metadata'),
     comment='Internal quality and batch metadata for clinical_allergy_intolerance; same row grain as the research table. Join keys: patient_event_key, allergy_instance_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def allergy_intolerance_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7057,7 +7057,7 @@ def _lifecycle_source_transfusion():
     name=_n("journey_clinical.transfusion"),
     comment="One paired BloodTrack unit-recipient transfusion episode, retaining available timing and source-event linkage.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=TRANSFUSION_COLUMN_COMMENTS,
 )
 def transfusion():
@@ -7069,7 +7069,7 @@ def transfusion():
     name=_n('journey_clinical._transfusion_metadata'),
     comment='Internal quality and batch metadata for clinical_transfusion; same row grain as the research table. Join keys: patient_event_key, transfusion_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def transfusion_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for clinical_transfusion;
@@ -7177,7 +7177,7 @@ def _lifecycle_source_transfusion_event():
 @materialized_view(
     name=_n("journey_clinical.transfusion_event"),
     comment="BloodTrack scan-grain workflow evidence including failed and safety-check attempts.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=TRANSFUSION_EVENT_COLUMN_COMMENTS,
 )
 def transfusion_event():
@@ -7189,7 +7189,7 @@ def transfusion_event():
     name=_n('journey_clinical._transfusion_event_metadata'),
     comment='Internal quality and batch metadata for clinical_transfusion_event; same row grain as the research table. Join keys: transfusion_event_key, bloodtrack_transaction_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def transfusion_event_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7207,7 +7207,7 @@ def transfusion_event_lifecycle():
 @materialized_view(
     name=_n("journey_clinical._qc_cancer_treatment"),
     comment="Private JSON bridge and Gold cross-rule flags for cancer_treatment.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_cancer_treatment():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -7329,7 +7329,7 @@ CANCER_TREATMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.cancer_treatment"),
     comment="One SACT constituent-drug treatment fact, separate from Millennium medication administration.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CANCER_TREATMENT_COLUMN_COMMENTS,
 )
 def cancer_treatment():
@@ -7347,7 +7347,7 @@ def cancer_treatment():
     name=_n('journey_clinical._cancer_treatment_metadata'),
     comment='Internal quality and batch metadata for clinical_cancer_treatment; same row grain as the research table. Join keys: patient_event_key, treatment_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def cancer_treatment_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7440,7 +7440,7 @@ def _lifecycle_source_cancer_treatment_cycle():
 @materialized_view(
     name=_n("journey_clinical.cancer_treatment_cycle"),
     comment="One iQemo chemotherapy cycle record linked to its parent treatment course, with recorded cycle timing.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CANCER_TREATMENT_CYCLE_COLUMN_COMMENTS,
 )
 def cancer_treatment_cycle():
@@ -7452,7 +7452,7 @@ def cancer_treatment_cycle():
     name=_n('journey_clinical._cancer_treatment_cycle_metadata'),
     comment='Internal quality and batch metadata for clinical_cancer_treatment_cycle; same row grain as the research table. Join keys: cancer_treatment_cycle_key, chemotherapy_course_id, treatment_cycle_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def cancer_treatment_cycle_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7470,7 +7470,7 @@ def cancer_treatment_cycle_lifecycle():
 @materialized_view(
     name=_n("journey_clinical._qc_condition_stage"),
     comment="Private JSON bridge and Gold cross-rule flags for condition_stage.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _qc_condition_stage():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for
@@ -7581,7 +7581,7 @@ CONDITION_STAGE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.condition_stage"),
     comment="One diagnosis-and-staging assertion from the frozen ARIA source, retaining its composite identifiers and staging details.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CONDITION_STAGE_COLUMN_COMMENTS,
 )
 def condition_stage():
@@ -7599,7 +7599,7 @@ def condition_stage():
     name=_n('journey_clinical._condition_stage_metadata'),
     comment='Internal quality and batch metadata for clinical_condition_stage; same row grain as the research table. Join keys: patient_event_key, aria_pt_id, aria_dx_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def condition_stage_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7619,7 +7619,7 @@ def condition_stage_lifecycle():
     private=True,
     comment="Incremental boundary for joined Endobase finding scalars and deterministic coding JSON.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _endoscopy_finding_stage():
     # Build the declared dataset: Incremental boundary for joined Endobase finding scalars and
@@ -7770,7 +7770,7 @@ def _lifecycle_source_endoscopy_finding():
     name=_n("journey_clinical.endoscopy_finding"),
     comment="One coded Endobase report term with parent-exam clinical time.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ENDOSCOPY_FINDING_COLUMN_COMMENTS,
 )
 def endoscopy_finding():
@@ -7789,7 +7789,7 @@ def endoscopy_finding():
     name=_n('journey_clinical._endoscopy_finding_metadata'),
     comment='Internal quality and batch metadata for clinical_endoscopy_finding; same row grain as the research table. Join keys: patient_event_key, endobase_exam_term_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def endoscopy_finding_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -7960,7 +7960,7 @@ def _lifecycle_source_critical_care_period():
     name=_n("journey_clinical.critical_care_period"),
     comment="One critical-care period per CCMDS business key; version history stays in bronze.",
     cluster_by=["person_id", "event_datetime"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CRITICAL_CARE_PERIOD_COLUMN_COMMENTS,
 )
 def critical_care_period():
@@ -7972,7 +7972,7 @@ def critical_care_period():
     name=_n('journey_clinical._critical_care_period_metadata'),
     comment='Internal quality and batch metadata for clinical_critical_care_period; same row grain as the research table. Join keys: patient_event_key, period_business_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def critical_care_period_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -8112,7 +8112,7 @@ ORDER_ATTRIBUTE_COLUMN_COMMENTS = {
 @materialized_view(
     name=_n("journey_clinical.medication_order_attribute"),
     comment="Order-grain pivot of medication_order_detail: latest value per field meaning. Join key: order_id.",
-    cluster_by=["order_id"], refresh_policy="incremental",
+    cluster_by=["order_id"], refresh_policy="auto",
     column_comments=ORDER_ATTRIBUTE_COLUMN_COMMENTS,
 )
 def medication_order_attribute():

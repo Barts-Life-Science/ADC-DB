@@ -24,58 +24,15 @@ def _qtable(name):
     return ".".join(_qident(value) for value in name.split("."))
 
 
-def ensure_patient_event_clustering():
-    """Preserve the existing patient-event clustering check and repair, failing on ambiguous targets."""
-    catalog = _qident("4_prod")
-    candidates = spark.sql(f"""
-        SELECT table_name
-        FROM {catalog}.information_schema.tables
-        WHERE table_schema = 'silver'
-          AND table_name RLIKE
-              '^__materialization_mat_[0-9a-f_]+_events_patient_event_[0-9]+$'
-        ORDER BY table_name
-    """).collect()
-
-    if len(candidates) != 1:
-        names = [row.table_name for row in candidates]
-        raise RuntimeError(
-            "expected exactly one physical events_patient_event materialization; "
-            f"found {names}"
-        )
-
-    physical = f"4_prod.silver.{candidates[0].table_name}"
-    detail = spark.sql(f"DESCRIBE DETAIL {_qtable(physical)}").first()
-    current = [str(value).lower() for value in (detail.clusteringColumns or [])]
-    expected = ["person_id", "event_datetime"]
-
-    if current != expected:
-        spark.sql(
-            f"ALTER TABLE {_qtable(physical)} SET TBLPROPERTIES "
-            "('delta.dataSkippingStatsColumns'='person_id,event_datetime')"
-        )
-        spark.sql(f"ANALYZE TABLE {_qtable(physical)} COMPUTE DELTA STATISTICS")
-        spark.sql(
-            f"ALTER TABLE {_qtable(physical)} "
-            "CLUSTER BY (person_id, event_datetime)"
-        )
-        detail = spark.sql(f"DESCRIBE DETAIL {_qtable(physical)}").first()
-        current = [
-            str(value).lower() for value in (detail.clusteringColumns or [])
-        ]
-
-    if current != expected:
-        raise RuntimeError(
-            f"patient-event clustering verification failed for {physical}: {current}"
-        )
-
-    return {"table": physical, "columns": current}
+# EIR_20261021_V1: ensure_patient_event_clustering retired with events_patient_event;
+# the per-fact-table event feeds declare cluster_by in the pipeline.
 
 # COMMAND ----------
 
 result = {
     "started_at": datetime.now(timezone.utc).isoformat(),
     "form_instruments": {"status": "managed_by_pipeline", "notebook": "6_silver_forms"},
-    "patient_event_clustering": ensure_patient_event_clustering(),
+    "patient_event_clustering": "retired: events_patient_event removed by EIR_20261021_V1",
     "completed_at": datetime.now(timezone.utc).isoformat(),
 }
 

@@ -149,7 +149,7 @@ CLINICAL_FORM_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._clinical_form"),
     comment="Internal quality-controlled twin of clinical_form: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_FORM_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_FORM_ADVISORY_RULES)
@@ -167,7 +167,7 @@ def _gold_qc_clinical_form():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_form():
     """Contract-v2 public twin of clinical_form; QC support columns remain internal."""
@@ -244,7 +244,7 @@ def _s3b_form_qc(table_name, axes):
 @dp.materialized_view(
     name=_n("gold_qc._clinical_form_response"),
     comment="Internal S3b Gold twin of response-grain PowerForm observations.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_FORM_RESPONSE_MANDATORY_RULES)
 def _gold_qc_clinical_form_response():
@@ -254,7 +254,7 @@ def _gold_qc_clinical_form_response():
 @dp.materialized_view(
     name=_n("gold_clinical.form_response"), table_properties={"quality": "gold"},
     comment="Response-grain PowerForm observations with governed question, answer and unit targets.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_form_response():
     """Publish clinical_form_response with its existing research columns and quality policy."""
@@ -266,7 +266,7 @@ def gold_clinical_form_response():
 @dp.materialized_view(
     name=_n("gold_qc._clinical_form_smoking_status"),
     comment="Internal S3b Gold twin of the smoking-status instrument.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_FORM_SMOKING_STATUS_MANDATORY_RULES)
 def _gold_qc_clinical_form_smoking_status():
@@ -279,7 +279,7 @@ def _gold_qc_clinical_form_smoking_status():
 @dp.materialized_view(
     name=_n("gold_clinical.form_smoking_status"), table_properties={"quality": "gold"},
     comment="Smoking status and cessation support with separate governed semantic axes.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_clinical_form_smoking_status():
     """Publish clinical_form_smoking_status with its existing research columns and quality policy."""

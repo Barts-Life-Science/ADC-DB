@@ -11,6 +11,10 @@
 
 # Shared projections also serve the patient event index.
 from silver_journey_shared import (
+    EVENT_FEED_NAMES,  # EIR_20261021_V1
+    EVENT_GRAIN_COLUMNS,  # EIR_20261021_V1
+    _event_feed_events,  # EIR_20261021_V1
+    _event_feed_union,  # EIR_20261021_V1
     F,
     INTERNAL_SCHEMA,
     LIFECYCLE_COLUMN_COMMENTS,
@@ -216,7 +220,7 @@ SRC_S3B_ETHNICITY_MAP = "3_lookup.omop.ethnicity_snomed_map"
     name=_n("journey_reference._snomed_concept_crosswalk"),
     private=True,
     comment="Internal S3 OMOP-to-SNOMED crosswalk restricted to valid SNOMED concepts.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _s3_snomed_concept_crosswalk():
     # Build the declared dataset: Internal S3 OMOP-to-SNOMED crosswalk restricted to valid
@@ -434,7 +438,7 @@ def _lifecycle_source_person():
 @materialized_view(
     name=_n("journey_spine.person"),
     comment="One resolved Millennium person. Silver retains inactive, implausible-looking, and deceased rows. Current MRN / NHS number selected deterministically from map_patient_identifier; multi-active pools publish as ambiguous, never tiebroken.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments={**PERSON_COLUMN_COMMENTS, **axis_comments("ethnicity", "ethnic category"), 'record_status': "Derived person-row status: active only when map_person.active_ind is 1 and end_effective_dt_tm is null or not earlier than 2100-01-01; otherwise superseded, including a missing active_ind. This is a normalized row-status label, not the source numeric ACTIVE_IND.", 'record_status_effective_from': "Source person active-status timestamp carried from `active_status_dt_tm` without a fallback timestamp.", 'record_status_effective_to': "Source `end_effective_dt_tm` when earlier than 2100-01-01; otherwise null, including missing or open-ended sentinel timestamps.", 'source_update_timestamp': "Greatest of map_person.source_updt_dt_tm and the maximum map_patient_identifier.SOURCE_ADC_UPDT in each matching MRN and NHS alias pool. The pool maxima include all aliases, even when the displayed identifier is ambiguous; missing alias clocks fall back to the person clock. This is not the Silver refresh time; null only when all contributing clocks are null.", 'loaded_at': "Greatest of map_person.ADC_UPDT and the maximum map_patient_identifier.PIPELINE_UPDT_DT_TM in each matching MRN and NHS alias pool. These are pool-wide clocks, not just the displayed winning alias; missing alias clocks fall back to the person clock. This is contributing ingestion provenance, not the Silver refresh time; null only when all contributing clocks are null."},
 )
 def person():
@@ -456,7 +460,7 @@ def person():
     name=_n('journey_spine._person_metadata'),
     comment='Internal quality and batch metadata for spine_person; same row grain as the research table. Join keys: person_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def person_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_person; same row
@@ -731,7 +735,7 @@ def _lifecycle_source_person_identifier():
 @materialized_view(
     name=_n("journey_spine.person_identifier"),
     comment="One source identifier assignment. subject_key is person-keyed where resolution exists and source-keyed otherwise.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PERSON_IDENTIFIER_COLUMN_COMMENTS,
 )
 def person_identifier():
@@ -743,7 +747,7 @@ def person_identifier():
     name=_n('journey_spine._person_identifier_metadata'),
     comment='Internal quality and batch metadata for spine_person_identifier; same row grain as the research table. Join keys: person_identifier_key, source_identifier_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def person_identifier_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -867,7 +871,7 @@ def _lifecycle_source_episode():
     comment="One Millennium episode container (map_episode). Source-backed only; the direct "
             "encounter reference is agreement-gated evidence, never containment.",
     cluster_by=["person_id", "period_start"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=EPISODE_COLUMN_COMMENTS,
 )
 def episode():
@@ -879,7 +883,7 @@ def episode():
     name=_n('journey_spine._episode_metadata'),
     comment='Internal quality and batch metadata for spine_episode; same row grain as the research table. Join keys: episode_key, episode_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def episode_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_episode; same
@@ -927,7 +931,7 @@ EPISODE_ENCOUNTER_LIFECYCLE_COLUMNS = [
     comment="N:M episode-encounter membership (map_episode_encounter). Multi-relation pairs "
             "preserved; orphan episode references retained with their source classification.",
     cluster_by=["episode_id"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=EPISODE_ENCOUNTER_COLUMN_COMMENTS,
 )
 def episode_encounter():
@@ -940,7 +944,7 @@ def episode_encounter():
     name=_n('journey_spine._episode_encounter_metadata'),
     comment='Internal quality and batch metadata for spine_episode_encounter; same row grain as the research table. Join keys: episode_encounter_key, episode_encounter_reltn_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def episode_encounter_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -1028,7 +1032,7 @@ def _lifecycle_source_encounter_identifier():
     comment="One source encounter identifier assignment (map_encounter_identifier); reference "
             "surface parallel to person_identifier. Feed family has no ADC_UPDT: loaded_at rides "
             "the bronze pipeline write timestamp.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ENCOUNTER_IDENTIFIER_COLUMN_COMMENTS,
 )
 def encounter_identifier():
@@ -1041,7 +1045,7 @@ def encounter_identifier():
     name=_n('journey_spine._encounter_identifier_metadata'),
     comment='Internal quality and batch metadata for spine_encounter_identifier; same row grain as the research table. Join keys: encounter_identifier_key, source_identifier_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def encounter_identifier_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -1252,7 +1256,7 @@ def _lifecycle_source_location():
 @materialized_view(
     name=_n("journey_reference.location"),
     comment="Effective-dated Millennium location hierarchy: facilities, buildings and nurse units from bronze care sites, and every other location code (rooms, beds, theatres, radiology, ambulatory) from bronze map_location_unit.",  # SDI_LOCATION_LANE_V1
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=LOCATION_COLUMN_COMMENTS,
 )
 def location():
@@ -1264,7 +1268,7 @@ def location():
     name=_n('journey_reference._location_metadata'),
     comment='Internal quality and batch metadata for reference_location; same row grain as the research table. Join keys: location_key, location_code.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def location_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for reference_location;
@@ -1539,7 +1543,7 @@ def _lifecycle_source_practitioner():
 @materialized_view(
     name=_n("journey_reference.practitioner"),
     comment="One effective-dated Millennium practitioner/personnel row; inactive rows are retained.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=PRACTITIONER_COLUMN_COMMENTS,
 )
 def practitioner():
@@ -1551,7 +1555,7 @@ def practitioner():
     name=_n('journey_reference._practitioner_metadata'),
     comment='Internal quality and batch metadata for reference_practitioner; same row grain as the research table. Join keys: practitioner_key, practitioner_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def practitioner_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -1624,7 +1628,7 @@ def _lifecycle_source_service():
 @materialized_view(
     name=_n("journey_reference.service"),
     comment="Thin v1 medical-service dimension from practitioner group assignments.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=SERVICE_COLUMN_COMMENTS,
 )
 def service():
@@ -1636,7 +1640,7 @@ def service():
     name=_n('journey_reference._service_metadata'),
     comment='Internal quality and batch metadata for reference_service; same row grain as the research table. Join keys: service_key, service_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def service_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for reference_service;
@@ -1715,7 +1719,7 @@ def _lifecycle_source_organization():
 @materialized_view(
     name=_n("journey_reference.organization"),
     comment="Thin v1 provider organization dimension derived from bronze care sites.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ORGANIZATION_COLUMN_COMMENTS,
 )
 def organization():
@@ -1727,7 +1731,7 @@ def organization():
     name=_n('journey_reference._organization_metadata'),
     comment='Internal quality and batch metadata for reference_organization; same row grain as the research table. Join keys: organization_key, organization_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def organization_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -1863,152 +1867,7 @@ def _s3b_event_index_supplement():
         out = out.unionByName(frame)
     return out.dropDuplicates(["patient_event_key"])
 
-@materialized_view(
-    name=_n("journey_events._event_index"),
-    private=True,
-    comment="INTERNAL event-grain stage (one row per admitted event) behind patient_event. "
-            "Internal consumers needing event grain read THIS, never the public N-row table.",
-    refresh_policy="incremental",
-)
-def _event_index():
-    # Build the declared dataset: INTERNAL event-grain stage (one row per admitted event) behind
-    # patient_event. Internal consumers needing event grain read THIS, never the public N-row
-    # table.
-    lanes = [
-        _event_index_projection(_family_history_canonical(), "family_history",
-                                "journey_clinical.family_history", "clinical"),
-        _event_index_projection(_presenting_complaint_canonical(), "presenting_complaint",
-                                "journey_clinical.presenting_complaint", "clinical"),
-        _event_index_projection(_allergy_canonical(), "allergy_intolerance",
-                                "journey_clinical.allergy_intolerance", "clinical"),
-        _event_index_projection(_transfusion_canonical(), "transfusion",
-                                "journey_clinical.transfusion", "clinical"),
-        _event_index_projection(_cancer_treatment_canonical(), "cancer_treatment",
-                                "journey_clinical.cancer_treatment", "clinical"),
-        _event_index_projection(_condition_stage_canonical(), "condition_stage",
-                                "journey_clinical.condition_stage", "clinical"),
-        _event_index_projection(_endoscopy_finding_canonical(), "endoscopy_finding",
-                                "journey_clinical.endoscopy_finding", "clinical"),
-        _event_index_projection(_registry_entry_canonical(), "registry_entry",
-                                "journey_clinical.registry_entry", "clinical"),
-        _event_index_projection(_device_canonical(), "device",
-                                "journey_clinical.device", "clinical"),
-        _event_index_projection(_condition_diagnosis_canonical(), "condition",
-                                "journey_clinical.condition", "clinical"),
-        _event_index_projection(_condition_problem_canonical(), "condition",
-                                "journey_clinical.condition", "clinical"),
-        _event_index_projection(_procedure_canonical(), "procedure",
-                                "journey_clinical.procedure", "clinical"),
-        _event_index_projection(_implant_procedure_canonical(), "procedure",
-                                "journey_clinical.procedure", "clinical"),
-        _event_index_projection(_theatre_procedure_canonical(), "procedure",
-                                "journey_clinical.procedure", "clinical"),
-        _event_index_projection(_endobase_procedure_canonical(), "procedure",
-                                "journey_clinical.procedure", "clinical"),
-        _event_index_projection(_pathology_requested_test_canonical(), "pathology_order",
-                                "journey_clinical.pathology_order", "clinical"),
-        _event_index_projection(_pathology_specimen_canonical(), "specimen",
-                                "journey_clinical.specimen", "clinical"),
-        _event_index_projection(_pathology_report_series_canonical(), "pathology_report",
-                                "journey_clinical.pathology_report", "clinical"),
-        _event_index_projection(_pathology_result_canonical(include_accession_encounter=True), "pathology_result",  # PATH_ENCOUNTER_V1
-                                "journey_clinical.pathology_result", "clinical"),
-        _event_index_projection(_genomic_test_canonical(), "genomic_test",
-                                "journey_clinical.genomic_test", "clinical"),
-        _event_index_projection(_genomic_result_canonical(), "genomic_result",
-                                "journey_clinical.genomic_result", "clinical"),
-        _event_index_projection(_indication_canonical(), "indication",
-                                "journey_clinical.indication", "clinical"),
-        _event_index_projection(_micro_isolate_canonical(), "microbiology_isolate",
-                                "journey_clinical.microbiology_isolate", "clinical"),
-        _event_index_projection(_susceptibility_canonical(), "susceptibility_result",
-                                "journey_clinical.susceptibility_result", "clinical"),
-        _event_index_projection(_form_canonical(), "form",
-                                "journey_clinical.form", "clinical"),
-        _event_index_projection(_vital_sign_canonical(), "vital_sign",
-                                "journey_clinical.vital_sign", "clinical"),
-        _event_index_projection(_clinical_score_canonical(), "clinical_score",
-                                "journey_clinical.clinical_score", "clinical"),
-        _event_index_projection(_medication_admin_canonical(), "medication_admin",
-                                "journey_clinical.medication_admin", "clinical"),
-        _event_index_projection(_medication_order_canonical(), "medication_order",
-                                "journey_clinical.medication_order", "clinical"),
-        _event_index_projection(_medication_dispense_canonical(), "medication_dispense",
-                                "journey_clinical.medication_dispense", "clinical"),
-        _event_index_projection(_coded_finding_typed(), "clinical_finding",
-                                "journey_clinical.clinical_finding", "clinical"),
-        _event_index_projection(_nomen_finding_typed(), "clinical_finding",
-                                "journey_clinical.clinical_finding", "clinical"),
-        _event_index_projection(_date_finding_typed(), "clinical_finding",
-                                "journey_clinical.clinical_finding", "clinical"),
-        _event_index_projection(_text_finding_typed(), "clinical_finding",
-                                "journey_clinical.clinical_finding", "clinical"),
-        _event_index_projection(_imaging_exam_canonical(), "imaging_exam",
-                                "journey_clinical.imaging_exam", "clinical"),
-        _event_index_projection(_artifact_asset_canonical(), "artifact",
-                                "journey_artifact.asset", "clinical"),
-        _event_index_projection(_document_canonical(), "document",
-                                "journey_text.document", "clinical"),
-        _event_index_projection(_appointment_canonical(), "appointment",
-                                "journey_clinical.appointment", "administrative"),
-        _event_index_projection(_referral_canonical(), "referral",
-                                "journey_clinical.referral", "administrative"),
-        _event_index_projection(_rtt_pathway_canonical(), "rtt_pathway",
-                                "journey_clinical.rtt_pathway", "administrative"),
-        _event_index_projection(_rtt_activity_canonical(), "rtt_activity",
-                                "journey_clinical.rtt_activity", "administrative"),
-        _event_index_projection(_waiting_list_index_representative(), "waiting_list_entry",
-                                "journey_clinical.waiting_list_entry", "administrative"),
-        _event_index_projection(_community_care_activity_canonical(), "community_care_activity",
-                                "journey_clinical.community_care_activity", "clinical"),
-        _event_index_projection(_community_care_contact_canonical(), "community_care_contact",
-                                "journey_clinical.community_care_contact", "administrative"),
-        _event_index_projection(_hrg_grouping_canonical(), "hrg_grouping",
-                                "journey_clinical.hrg_grouping", "administrative"),
-        _event_index_projection(_costed_activity_canonical(), "costed_activity",
-                                "journey_clinical.costed_activity", "administrative"),
-        _event_index_projection(_drug_expenditure_canonical(), "drug_expenditure",
-                                "journey_clinical.drug_expenditure", "administrative"),
-        _event_index_projection(_medication_supply_canonical(), "medication_supply",
-                                "journey_clinical.medication_supply", "clinical"),
-        _event_index_projection(_elective_access_entry_canonical(), "elective_access_entry",
-                                "journey_clinical.elective_access_entry", "administrative"),
-        _event_index_projection(_pathway_tracking_canonical(), "pathway_tracking",
-                                "journey_clinical.pathway_tracking", "administrative"),
-        _event_index_projection(_critical_care_period_canonical(), "critical_care_period",
-                                "journey_clinical.critical_care_period", "administrative"),
-        _event_index_projection(_critical_care_activity_canonical(), "critical_care_activity",
-                                "journey_clinical.critical_care_activity", "clinical"),
-        _event_index_projection(_cc_procedure_canonical(), "procedure",
-                                "journey_clinical.procedure", "clinical"),
-        _event_index_projection(_critical_care_admission_canonical(), "critical_care_admission",
-                                "journey_clinical.critical_care_admission", "administrative"),
-        _event_index_projection(_cc_daily_score_canonical(), "critical_care_daily_score",
-                                "journey_clinical.critical_care_daily_score", "clinical"),
-        _event_index_projection(_neonatal_episode_canonical(), "neonatal_episode",
-                                "journey_clinical.neonatal_episode", "administrative"),
-        _event_index_projection(_neonatal_care_day_canonical(), "neonatal_care_day",
-                                "journey_clinical.neonatal_care_day", "clinical"),
-        _event_index_projection(_neonatal_examination_canonical(), "neonatal_examination",
-                                "journey_clinical.neonatal_examination", "clinical"),
-        _event_index_projection(_baby_delivery_canonical(), "baby_delivery",
-                                "journey_clinical.baby_delivery", "clinical"),
-        _event_index_projection(_labour_delivery_canonical(), "labour_delivery",
-                                "journey_clinical.labour_delivery", "clinical"),
-        _event_index_projection(_maternity_care_contact_canonical(), "maternity_care_contact",
-                                "journey_clinical.maternity_care_contact", "administrative"),
-        _event_index_projection(_maternity_diagnosis_canonical(), "condition",
-                                "journey_clinical.condition", "clinical"),
-        _event_index_projection(_research_enrollment_canonical(), "research_enrollment",
-                                "journey_clinical.research_enrollment", "administrative"),
-        _event_index_projection(_mill_radiology_exam_canonical(), "imaging_exam",
-                                "journey_clinical.imaging_exam", "clinical"),
-        _event_index_projection(spark.read.table(INTERNAL_SCHEMA + "._clinical_safety_incident_index_lane"), "safety_incident", "journey_clinical.safety_incident", "clinical"),
-    ]
-    out = lanes[0]
-    for lane in lanes[1:]:
-        out = out.unionByName(lane)
-    return out.unionByName(_s3b_event_index_supplement())
+
 
 # COMMAND ----------
 
@@ -2078,10 +1937,13 @@ S3_EVENT_AXIS_SOURCES = [
     ("journey_clinical.form_smoking_status", "dependence_level"),
 ]
 
-def _s3_axis_event_map():
-    """Carry every selected flat SNOMED target into the one-to-many event child."""
+def _s3_axis_event_map(axis_sources=None):
+    """Carry the selected flat SNOMED targets into the one-to-many event child.
+
+    `axis_sources` limits the (relation, axis) pairs; a feed passes its own (EIR_20261021_V1).
+    """
     frames = []
-    for relation, axis in S3_EVENT_AXIS_SOURCES:
+    for relation, axis in (S3_EVENT_AXIS_SOURCES if axis_sources is None else axis_sources):
         source = spark.read.table(_n(relation))
         code = F.col(f"{axis}_snomed_code")
         method = F.col(f"{axis}_map_method")
@@ -2160,333 +2022,7 @@ def _transfusion_blood_group_event_map():
     )
     return unit.unionByName(patient)
 
-@materialized_view(
-    name=_n("journey_events._event_map"),
-    private=True,
-    comment="INTERNAL mapping-lane union (one row per event x mapping) behind patient_event.",
-    refresh_policy="incremental",
-)
-def _event_map():
-    # Build the declared dataset: INTERNAL mapping-lane union (one row per event x mapping)
-    # behind patient_event.
-    family = _family_history_canonical()
-    base = (
-        _map_projection(family, "_snomed_code", "_snomed_display",
-                        "http://snomed.info/sct", "family_history", "bronze.map_family_history")
-        .unionByName(
-            _map_projection(family, "_icd10_code", "_icd10_display",
-                            "http://hl7.org/fhir/sid/icd-10", "family_history", "bronze.map_family_history")
-        )
-        .unionByName(
-            _map_projection(family, "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "family_history", "bronze.map_family_history")
-        )
-        .unionByName(
-            _map_projection(_medication_dispense_canonical(), "_dmd_code", "_dmd_display",
-                            "http://snomed.info/sct", "drug", "bronze.map_pharmacy_issue")
-        )
-        .unionByName(
-            _map_projection(_condition_diagnosis_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "condition", "bronze.map_diagnosis")
-        )
-        .unionByName(
-            _map_projection(_condition_diagnosis_canonical(), "_icd10_code", "_icd10_display",
-                            "http://hl7.org/fhir/sid/icd-10", "condition", "bronze.map_diagnosis")
-        )
-        .unionByName(
-            _map_projection(_condition_diagnosis_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "condition", "bronze.map_diagnosis")
-        )
-        .unionByName(
-            _map_projection(_condition_problem_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "condition", "bronze.map_problem")
-        )
-        .unionByName(
-            _map_projection(_condition_problem_canonical(), "_icd10_code", "_icd10_display",
-                            "http://hl7.org/fhir/sid/icd-10", "condition", "bronze.map_problem")
-        )
-        .unionByName(
-            _map_projection(_condition_problem_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "condition", "bronze.map_problem")
-        )
-        .unionByName(
-            _map_projection(_procedure_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "procedure", "bronze.map_procedure")
-        )
-        .unionByName(
-            _map_projection(_procedure_canonical(), "_opcs4_code", "_opcs4_display",
-                            "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure", "bronze.map_procedure")
-        )
-        .unionByName(
-            _map_projection(_cc_procedure_canonical(), "_opcs4_code", "_opcs4_display",
-                            "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
-                            "bronze.map_critical_care_procedure")
-        )
-        .unionByName(
-            _map_projection(_maternity_diagnosis_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "condition",
-                            "bronze.map_maternity_diagnosis")
-        )
-        .unionByName(
-            _map_projection(_procedure_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "procedure", "bronze.map_procedure")
-        )
-        .unionByName(
-            _map_projection(_implant_procedure_canonical(), "_device_snomed_code", "_device_snomed_display",
-                            "http://snomed.info/sct", "device", "bronze.map_implant_details")
-        )
-        .unionByName(
-            _map_projection(_pathology_requested_test_canonical(), "_test_snomed_code", "_test_snomed_display",
-                            "http://snomed.info/sct", "measurement", "bronze.map_pathology_requested_test")
-        )
-        .unionByName(
-            _map_projection(_pathology_requested_test_canonical(), "_test_omop_code", "_test_omop_display",
-                            "urn:omop:concept_id", "measurement", "bronze.map_pathology_requested_test")
-        )
-        .unionByName(
-            _map_projection(_genomic_test_canonical(), "_gt_snomed_code", "_gt_snomed_display",
-                            "http://snomed.info/sct", "measurement", "bronze.map_pathology_genetic_test")
-        )
-        .unionByName(
-            _map_projection(_genomic_test_canonical(), "_gt_loinc_code", "_gt_loinc_display",
-                            "http://loinc.org", "measurement", "bronze.map_pathology_genetic_test")
-        )
-        .unionByName(
-            _map_projection(_genomic_test_canonical(), "_gt_omop_code", "_gt_omop_display",
-                            "urn:omop:concept_id", "measurement", "bronze.map_pathology_genetic_test")
-        )
-        .unionByName(
-            _map_projection(_genomic_result_canonical(), "_gr_snomed_code", "_gr_snomed_display",
-                            "http://snomed.info/sct", "measurement", "bronze.map_pathology_genetic_result")
-        )
-        .unionByName(
-            _map_projection(_genomic_result_canonical(), "_gr_clinvar_code", "_gr_clinvar_display",
-                            "urn:clinvar", "measurement", "bronze.map_pathology_genetic_result:clinvar")
-        )
-        .unionByName(
-            _map_projection(_genomic_result_canonical(), "_gr_omop_code", "_gr_omop_display",
-                            "urn:omop:concept_id", "measurement", "bronze.map_pathology_genetic_result:omop-genomic")
-        )
-        .unionByName(
-            _map_projection(_indication_canonical(), "_ind_snomed_code", "_ind_snomed_display",
-                            "http://snomed.info/sct", "condition", "bronze.map_pathology_indication")
-        )
-        .unionByName(
-            _map_projection(_indication_canonical(), "_ind_omop_code", "_ind_omop_display",
-                            "urn:omop:concept_id", "condition", "bronze.map_pathology_indication")
-        )
-        .unionByName(
-            _map_projection(_micro_isolate_canonical(), "_iso_snomed_code", "_iso_snomed_display",
-                            "http://snomed.info/sct", "measurement_value", "bronze.map_pathology_microbiology_isolate")
-        )
-        .unionByName(
-            _map_projection(_micro_isolate_canonical(), "_iso_omop_code", "_iso_omop_display",
-                            "urn:omop:concept_id", "measurement_value", "bronze.map_pathology_microbiology_isolate")
-        )
-        .unionByName(
-            _map_projection(_susceptibility_canonical(), "_sus_code_code", "_sus_code_display",
-                            "urn:barts:pathology:antimicrobial", "drug", "bronze.map_pathology_antimicrobial_susceptibility")
-        )
-        .unionByName(
-            _map_projection(_susceptibility_canonical(), "_sus_omop_code", "_sus_omop_display",
-                            "urn:omop:concept_id", "drug", "bronze.map_pathology_antimicrobial_susceptibility")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_test_snomed_code", "_test_snomed_display",
-                            "http://snomed.info/sct", "measurement", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_test_loinc_code", "_test_loinc_display",
-                            "http://loinc.org", "measurement", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_test_omop_code", "_test_omop_display",
-                            "urn:omop:concept_id", "measurement", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_result_snomed_code", "_result_snomed_display",
-                            "http://snomed.info/sct", "measurement_value", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_result_loinc_code", "_result_loinc_display",
-                            "http://loinc.org", "measurement_value", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_pathology_result_canonical(), "_result_omop_code", "_result_omop_display",
-                            "urn:omop:concept_id", "measurement_value", "bronze.map_pathology")
-        )
-        .unionByName(
-            _map_projection(_vital_sign_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "measurement", "bronze.map_numeric_events_or_form")
-        )
-        .unionByName(
-            _map_projection(_clinical_score_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "observation", "bronze.map_numeric_events_or_form")
-        )
-        .unionByName(
-            _map_projection(_medication_admin_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "drug", "bronze.map_med_admin")
-        )
-        .unionByName(
-            _map_projection(_medication_admin_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "drug", "bronze.map_med_admin")
-        )
-        .unionByName(
-            _map_projection(_medication_admin_canonical(), "_rxnorm_code", "_rxnorm_display",
-                            "http://www.nlm.nih.gov/research/umls/rxnorm", "drug",
-                            "bronze.map_med_admin")
-        )
-        .unionByName(_coded_bridge_event_map())
-        .unionByName(
-            _dynamic_map_projection(
-                _coded_finding_typed(), "_omop_code", "_omop_display",
-                "urn:omop:concept_id", "_omop_domain", "bronze.map_coded_events:manual",
-            )
-        )
-        .unionByName(
-            _dynamic_map_projection(
-                _nomen_finding_typed(), "_omop_code", "_omop_display",
-                "urn:omop:concept_id", "_omop_domain", "bronze.map_nomen_events",
-            )
-        )
-        .unionByName(
-            _map_projection(
-                _nomen_finding_typed(), "_snomed_code", "_snomed_display",
-                "http://snomed.info/sct", "observation", "bronze.map_nomen_events",
-            )
-        )
-        .unionByName(
-            _dynamic_map_projection(
-                _text_finding_typed(), "_omop_code", "_omop_display",
-                "urn:omop:concept_id", "_omop_domain", "bronze.map_text_events:concept",
-            )
-        )
-        .unionByName(
-            _dynamic_map_projection(
-                _text_finding_typed(), "_omop_value_code", "_omop_value_display",
-                "urn:omop:concept_id", "_omop_value_domain", "bronze.map_text_events:value",
-            )
-        )
-        .unionByName(_luna_code_event_map(
-            _referral_canonical(), "treatment_function_code",
-            "urn:barts:luna:treatment-function"))
-        .unionByName(_luna_code_event_map(
-            _rtt_pathway_canonical(), "treatment_function_code",
-            "urn:barts:luna:treatment-function"))
-        .unionByName(_luna_code_event_map(
-            _rtt_activity_canonical(), "treatment_function_code",
-            "urn:barts:luna:treatment-function"))
-        .unionByName(_luna_code_event_map(
-            _rtt_pathway_canonical(), "current_status_code",
-            "urn:barts:luna:rtt-status"))
-        .unionByName(_luna_code_event_map(
-            _rtt_activity_canonical(), "status_code",
-            "urn:barts:luna:rtt-status"))
-        .unionByName(_seed_code_event_map(
-            _waiting_list_index_representative(), "status_code",
-            "urn:cerner:code_value", "wl_status_cdf_meaning"))
-        .unionByName(
-            _map_projection(_allergy_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "condition", "bronze.map_allergy")
-        )
-        .unionByName(
-            _map_projection(_transfusion_canonical(), "product_concept_id", "product_concept_name",
-                            "http://snomed.info/sct", "device",
-                            "lookup.bloodtrack_product_group_map:applied")
-        )
-        .unionByName(
-            _map_projection(_transfusion_canonical(), "_product_proc_concept_id",
-                            "_product_proc_concept_name", "http://snomed.info/sct", "procedure",
-                            "lookup.bloodtrack_product_group_map:applied")
-        )
-        .unionByName(_transfusion_blood_group_event_map())
-        .unionByName(
-            _map_projection(_cancer_treatment_canonical(), "_drug_omop_code", "_drug_omop_display",
-                            "urn:omop:concept_id", "drug",
-                            "lookup.cancer_treatment_term_map:applied")
-        )
-        .unionByName(
-            _map_projection(_cancer_treatment_canonical(), "_procurement_omop_code",
-                            "_procurement_omop_display", "urn:omop:concept_id", "procedure",
-                            "bronze.map_cancer_treatment:procurement")
-        )
-        .unionByName(
-            _map_projection(_cancer_treatment_canonical(), "_procurement_opcs4_code",
-                            "_procurement_opcs4_display",
-                            "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
-                            "bronze.map_cancer_treatment:procurement")
-        )
-        .unionByName(
-            _map_projection(_cancer_treatment_canonical(), "_delivery_omop_code",
-                            "_delivery_omop_display", "urn:omop:concept_id", "procedure",
-                            "bronze.map_cancer_treatment:delivery")
-        )
-        .unionByName(
-            _map_projection(_cancer_treatment_canonical(), "_delivery_opcs4_code",
-                            "_delivery_opcs4_display",
-                            "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
-                            "bronze.map_cancer_treatment:delivery")
-        )
-        .unionByName(
-            _map_projection(_condition_stage_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "condition",
-                            "bronze.map_aria_diagnosis_staging")
-        )
-        .unionByName(
-            _map_projection(_endoscopy_finding_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "observation",
-                            "bronze.map_endobase_exam_term:c4")
-        )
-        .unionByName(
-            _map_projection(_endoscopy_finding_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "observation",
-                            "bronze.map_endobase_exam_term:c4")
-        )
-        .unionByName(
-            _map_projection(_device_canonical(), "_snomed_code", "_snomed_display",
-                            "http://snomed.info/sct", "device",
-                            "lookup.mediconnect_device_type_map:applied")
-        )
-        .unionByName(
-            _map_projection(_medication_supply_canonical(), "_dmd_code", "_dmd_display",
-                            "http://snomed.info/sct", "drug", "bronze.map_homecare_request")
-        )
-        .unionByName(
-            _map_projection(_drug_expenditure_canonical(), "_dmd_code", "_dmd_display",
-                            "http://snomed.info/sct", "drug",
-                            "bronze.map_finance_hcd_expenditure")
-        )
-        .unionByName(
-            _map_projection(_drug_expenditure_canonical(), "_omop_code", "_omop_display",
-                            "urn:omop:concept_id", "drug",
-                            "bronze.map_finance_hcd_expenditure")
-        )
-        .unionByName(
-            _map_projection(_community_care_activity_canonical(),
-                            "_snomed_candidate_code", "_snomed_candidate_name",
-                            "http://snomed.info/sct", "community_activity",
-                            "bronze.map_community_care_activity")
-        )
-        .unionByName(
-            _map_projection(_community_care_activity_canonical(),
-                            "_snomed_candidate_omop_code", "_snomed_candidate_omop_display",
-                            "urn:omop:concept_id", "community_activity",
-                            "bronze.map_community_care_activity")
-        )
-        .unionByName(
-            _map_projection(_elective_access_entry_canonical(), "_opcs4_code", "_opcs4_display",
-                            "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
-                            "bronze.map_elective_access_list_procedure")
-        )
-        .unionByName(_iweb_multiselect_event_map())
-    )
-    out = base.unionByName(_s3_axis_event_map())
-    s3_json = F.regexp_replace(F.col("map_source"), r"^s3_axis:", "")
-    is_s3 = F.col("map_source").startswith("s3_axis:")
-    return (out.withColumn("map_method", F.when(is_s3, F.get_json_object(s3_json, "$.method")))
-               .withColumn("map_confidence", F.when(is_s3, F.expr("try_cast(get_json_object(regexp_replace(map_source, '^s3_axis:', ''), '$.confidence') as double)")))
-               .withColumn("map_rule_id", F.when(is_s3, F.get_json_object(s3_json, "$.rule")))
-               .withColumn("map_candidate_count", F.when(is_s3, F.expr("try_cast(get_json_object(regexp_replace(map_source, '^s3_axis:', ''), '$.candidate_count') as int)"))))
+
 
 def _dynamic_map_projection(df, code_col, display_col, system, domain_col, map_source):
     # Create patient-event mapping rows using each row's mapped target domain, defaulting to
@@ -2716,7 +2252,7 @@ PATIENT_EVENT_COLUMN_COMMENTS = {
     "loaded_at": "Per-event loaded_at carried unchanged from the contributing canonical arm through internal_event_index, then selected from the event side of the public mapping join. Source arms have different clock expressions, including typed nulls; this is not uniformly one bronze row's write time. Mapping clocks do not contribute, and mapping fan-out does not calculate a new maximum. Later typed-product enrichment, such as implant attribute clocks or additional document-history rows, is not folded back into this event-index clock. No current Silver refresh timestamp is substituted.",
 }
 
-# Physical person/time clustering is applied by _jm_pipeline_admin post-update, exactly as for
+# (EIR_20261021_V1) Feed clustering is declared on each feed MV via cluster_by., exactly as for
 # the v1 UNION-backed index (the join-backed MV keeps the same repair pathway).
 
 PATIENT_EVENT_LIFECYCLE_FIELDS = [
@@ -2736,11 +2272,11 @@ PATIENT_EVENT_LIFECYCLE_COLUMNS = [
 ]
 
 # contract v2: one canonical DataFrame feeds the research table and any internal metadata projection.
-def _lifecycle_source_patient_event():
-    # Assemble patient event rows with lifecycle and source evidence for the public product and
-    # its internal metadata.
-    e = spark.read.table(_n("journey_events._event_index")).alias("e")
-    m = spark.read.table(_n("journey_events._event_map")).alias("m")
+def _lifecycle_source_patient_event(events, maps):
+    # Assemble patient event rows with lifecycle and source evidence from one feed's event rows
+    # and mapping rows (EIR_20261021_V1: previously the whole event index and event map).
+    e = events.alias("e")
+    m = maps.alias("m")
     # contract v2: publish patient-event and row hashes under key names and join the event index on patient_event_key
     return (
         e.join(m, F.col("e.patient_event_key") == F.col("m.patient_event_key"), "left")
@@ -2797,34 +2333,1131 @@ def _lifecycle_source_patient_event():
             ).cast("int").alias("map_candidate_count"),
             F.col("e.load_batch_id").alias("load_batch_id"),
             F.col("e.loaded_at").alias("loaded_at"),
+            # EIR_20261021_V1: the mapping row's own clock (null on unmapped rows), so
+            # concept_registry can keep timestamping mapped codes by their mapping.
+            F.col("m.loaded_at").alias("map_loaded_at"),
         )
     )
 
-@materialized_view(
-    name=_n("journey_events.patient_event"),
-    comment="One row per admitted event x standard mapping (unmapped events carry one row with "
-            "a null mapping block). Who/when/what, plain-language source, and standard-terms "
-            "meaning in a single read. Timeline counts use COUNT(DISTINCT patient_event_key).",
-    refresh_policy="incremental",
-    column_comments=PATIENT_EVENT_COLUMN_COMMENTS,
-)
-def patient_event():
-    # Build the declared dataset: One row per admitted event x standard mapping (unmapped events
-    # carry one row with a null mapping block). Who/when/what, plain-language source, and
-    # standard-terms meaning in a single read. Timeline counts use COUNT(DISTINCT
-    # patient_event_key).
-    return _lifecycle_source_patient_event().drop(*PATIENT_EVENT_LIFECYCLE_FIELDS, *PATIENT_EVENT_RETIRED_COLUMNS)
 
-@materialized_view(
-    name=_n('journey_events._patient_event_metadata'),
-    comment='Internal quality and batch metadata for events_patient_event; same row grain as the research table. Join keys: patient_event_row_key, patient_event_key.',
-    column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
-)
-def patient_event_lifecycle():
-    # Build the declared dataset: Internal quality and batch metadata for events_patient_event;
-    # same row grain as the research table. Join keys: patient_event_row_key, patient_event_key.
-    return (_lifecycle_source_patient_event()).select(*PATIENT_EVENT_LIFECYCLE_COLUMNS)
+def _with_s3_map_columns(out):
+    """Derive map_method/confidence/rule_id/candidate_count from the s3_axis JSON provenance.
+
+    Moved verbatim out of the retired _event_map MV so each event feed applies it (EIR_20261021_V1).
+    """
+    s3_json = F.regexp_replace(F.col("map_source"), r"^s3_axis:", "")
+    is_s3 = F.col("map_source").startswith("s3_axis:")
+    return (out.withColumn("map_method", F.when(is_s3, F.get_json_object(s3_json, "$.method")))
+               .withColumn("map_confidence", F.when(is_s3, F.expr("try_cast(get_json_object(regexp_replace(map_source, '^s3_axis:', ''), '$.confidence') as double)")))
+               .withColumn("map_rule_id", F.when(is_s3, F.get_json_object(s3_json, "$.rule")))
+               .withColumn("map_candidate_count", F.when(is_s3, F.expr("try_cast(get_json_object(regexp_replace(map_source, '^s3_axis:', ''), '$.candidate_count') as int)"))))
+
+# EIR_20261021_V1: the event index is retired.
+# The old design built two giant private MVs - `_event_index` (every canonical lane in one union) and
+# `_event_map` (every mapping arm in one union) - and joined them into events_patient_event. Any edit
+# to any lane changed the fingerprint of the whole union, so each release rewrote ~9.4bn index rows,
+# ~14.2bn map rows and then 17bn patient_event rows in silver and again in gold.
+#
+# Now each fact table has its own internal feed MV (journey_events._feed_<fact>, physically
+# <internal>._events_feed_<fact>). A feed holds exactly the events_patient_event rows of that fact
+# table: its lanes LEFT JOIN its mapping arms, with the same keys and columns. The OMOP model and the
+# OMOP id registry read the union of the feeds, so their inputs are unchanged row for row, and an edit
+# to one lane only rebuilds that lane's feed.
+
+EVENT_FEED_SPECS = {
+    'family_history': {
+        "fact_table": 'journey_clinical.family_history',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_family_history_canonical(), "family_history",
+                "journey_clinical.family_history", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_family_history_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "family_history", "bronze.map_family_history"),
+            _map_projection(_family_history_canonical(), "_icd10_code", "_icd10_display",
+                "http://hl7.org/fhir/sid/icd-10", "family_history", "bronze.map_family_history"),
+            _map_projection(_family_history_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "family_history", "bronze.map_family_history"),
+        ],
+        "s3_axes": [('journey_clinical.family_history', 'condition')],
+        "supplement": [('journey_clinical.family_history', 'family_history', 'journey_clinical.family_history', 'condition', 'family_history')],
+        "registry_findings": False,
+    },
+    'presenting_complaint': {
+        "fact_table": 'journey_clinical.presenting_complaint',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_presenting_complaint_canonical(), "presenting_complaint",
+                "journey_clinical.presenting_complaint", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [('journey_clinical.presenting_complaint', 'complaint')],
+        "supplement": [('journey_clinical.presenting_complaint', 'presenting_complaint', 'journey_clinical.presenting_complaint', 'complaint', 'presenting_complaint')],
+        "registry_findings": False,
+    },
+    'allergy_intolerance': {
+        "fact_table": 'journey_clinical.allergy_intolerance',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_allergy_canonical(), "allergy_intolerance",
+                "journey_clinical.allergy_intolerance", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_allergy_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "condition", "bronze.map_allergy"),
+        ],
+        "s3_axes": [('journey_clinical.allergy_intolerance', 'substance')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'transfusion': {
+        "fact_table": 'journey_clinical.transfusion',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_transfusion_canonical(), "transfusion",
+                "journey_clinical.transfusion", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_transfusion_canonical(), "product_concept_id", "product_concept_name",
+                "http://snomed.info/sct", "device",
+                "lookup.bloodtrack_product_group_map:applied"),
+            _map_projection(_transfusion_canonical(), "_product_proc_concept_id",
+                "_product_proc_concept_name", "http://snomed.info/sct", "procedure",
+                "lookup.bloodtrack_product_group_map:applied"),
+            _transfusion_blood_group_event_map(),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'cancer_treatment': {
+        "fact_table": 'journey_clinical.cancer_treatment',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_cancer_treatment_canonical(), "cancer_treatment",
+                "journey_clinical.cancer_treatment", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_cancer_treatment_canonical(), "_drug_omop_code", "_drug_omop_display",
+                "urn:omop:concept_id", "drug",
+                "lookup.cancer_treatment_term_map:applied"),
+            _map_projection(_cancer_treatment_canonical(), "_procurement_omop_code",
+                "_procurement_omop_display", "urn:omop:concept_id", "procedure",
+                "bronze.map_cancer_treatment:procurement"),
+            _map_projection(_cancer_treatment_canonical(), "_procurement_opcs4_code",
+                "_procurement_opcs4_display",
+                "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
+                "bronze.map_cancer_treatment:procurement"),
+            _map_projection(_cancer_treatment_canonical(), "_delivery_omop_code",
+                "_delivery_omop_display", "urn:omop:concept_id", "procedure",
+                "bronze.map_cancer_treatment:delivery"),
+            _map_projection(_cancer_treatment_canonical(), "_delivery_opcs4_code",
+                "_delivery_opcs4_display",
+                "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
+                "bronze.map_cancer_treatment:delivery"),
+        ],
+        "s3_axes": [('journey_clinical.cancer_treatment', 'drug')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'condition_stage': {
+        "fact_table": 'journey_clinical.condition_stage',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_condition_stage_canonical(), "condition_stage",
+                "journey_clinical.condition_stage", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_condition_stage_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "condition",
+                "bronze.map_aria_diagnosis_staging"),
+        ],
+        "s3_axes": [('journey_clinical.condition_stage', 'stage_diagnosis'), ('journey_clinical.condition_stage', 'stage_group')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'endoscopy_finding': {
+        "fact_table": 'journey_clinical.endoscopy_finding',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_endoscopy_finding_canonical(), "endoscopy_finding",
+                "journey_clinical.endoscopy_finding", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_endoscopy_finding_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "observation",
+                "bronze.map_endobase_exam_term:c4"),
+            _map_projection(_endoscopy_finding_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "observation",
+                "bronze.map_endobase_exam_term:c4"),
+        ],
+        "s3_axes": [('journey_clinical.endoscopy_finding', 'finding')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'registry_entry': {
+        "fact_table": 'journey_clinical.registry_entry',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_registry_entry_canonical(), "registry_entry",
+                "journey_clinical.registry_entry", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _iweb_multiselect_event_map(),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'device': {
+        "fact_table": 'journey_clinical.device',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_device_canonical(), "device",
+                "journey_clinical.device", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_device_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "device",
+                "lookup.mediconnect_device_type_map:applied"),
+        ],
+        "s3_axes": [('journey_clinical.device', 'device')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'condition': {
+        "fact_table": 'journey_clinical.condition',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_condition_diagnosis_canonical(), "condition",
+                "journey_clinical.condition", "clinical"),
+            _event_index_projection(_condition_problem_canonical(), "condition",
+                "journey_clinical.condition", "clinical"),
+            _event_index_projection(_maternity_diagnosis_canonical(), "condition",
+                "journey_clinical.condition", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_condition_diagnosis_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "condition", "bronze.map_diagnosis"),
+            _map_projection(_condition_diagnosis_canonical(), "_icd10_code", "_icd10_display",
+                "http://hl7.org/fhir/sid/icd-10", "condition", "bronze.map_diagnosis"),
+            _map_projection(_condition_diagnosis_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "condition", "bronze.map_diagnosis"),
+            _map_projection(_condition_problem_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "condition", "bronze.map_problem"),
+            _map_projection(_condition_problem_canonical(), "_icd10_code", "_icd10_display",
+                "http://hl7.org/fhir/sid/icd-10", "condition", "bronze.map_problem"),
+            _map_projection(_condition_problem_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "condition", "bronze.map_problem"),
+            _map_projection(_maternity_diagnosis_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "condition",
+                "bronze.map_maternity_diagnosis"),
+        ],
+        "s3_axes": [('journey_clinical.condition', 'condition')],
+        "supplement": [('journey_clinical.condition', 'condition', 'journey_clinical.condition', 'condition', 'condition')],
+        "registry_findings": False,
+    },
+    'procedure': {
+        "fact_table": 'journey_clinical.procedure',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_procedure_canonical(), "procedure",
+                "journey_clinical.procedure", "clinical"),
+            _event_index_projection(_implant_procedure_canonical(), "procedure",
+                "journey_clinical.procedure", "clinical"),
+            _event_index_projection(_theatre_procedure_canonical(), "procedure",
+                "journey_clinical.procedure", "clinical"),
+            _event_index_projection(_endobase_procedure_canonical(), "procedure",
+                "journey_clinical.procedure", "clinical"),
+            _event_index_projection(_cc_procedure_canonical(), "procedure",
+                "journey_clinical.procedure", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_procedure_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "procedure", "bronze.map_procedure"),
+            _map_projection(_procedure_canonical(), "_opcs4_code", "_opcs4_display",
+                "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure", "bronze.map_procedure"),
+            _map_projection(_cc_procedure_canonical(), "_opcs4_code", "_opcs4_display",
+                "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
+                "bronze.map_critical_care_procedure"),
+            _map_projection(_procedure_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "procedure", "bronze.map_procedure"),
+            _map_projection(_implant_procedure_canonical(), "_device_snomed_code", "_device_snomed_display",
+                "http://snomed.info/sct", "device", "bronze.map_implant_details"),
+        ],
+        "s3_axes": [('journey_clinical.procedure', 'procedure'), ('journey_clinical.procedure', 'device')],
+        "supplement": [('journey_clinical.procedure', 'procedure', 'journey_clinical.procedure', 'procedure', 'procedure')],
+        "registry_findings": False,
+    },
+    'pathology_order': {
+        "fact_table": 'journey_clinical.pathology_order',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_pathology_requested_test_canonical(), "pathology_order",
+                "journey_clinical.pathology_order", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_pathology_requested_test_canonical(), "_test_snomed_code", "_test_snomed_display",
+                "http://snomed.info/sct", "measurement", "bronze.map_pathology_requested_test"),
+            _map_projection(_pathology_requested_test_canonical(), "_test_omop_code", "_test_omop_display",
+                "urn:omop:concept_id", "measurement", "bronze.map_pathology_requested_test"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'specimen': {
+        "fact_table": 'journey_clinical.specimen',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_pathology_specimen_canonical(), "specimen",
+                "journey_clinical.specimen", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [('journey_clinical.specimen', 'specimen_type')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'pathology_report': {
+        "fact_table": 'journey_clinical.pathology_report',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_pathology_report_series_canonical(), "pathology_report",
+                "journey_clinical.pathology_report", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'pathology_result': {
+        "fact_table": 'journey_clinical.pathology_result',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_pathology_result_canonical(include_accession_encounter=True), "pathology_result",  # PATH_ENCOUNTER_V1
+                "journey_clinical.pathology_result", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_pathology_result_canonical(), "_test_snomed_code", "_test_snomed_display",
+                "http://snomed.info/sct", "measurement", "bronze.map_pathology"),
+            _map_projection(_pathology_result_canonical(), "_test_loinc_code", "_test_loinc_display",
+                "http://loinc.org", "measurement", "bronze.map_pathology"),
+            _map_projection(_pathology_result_canonical(), "_test_omop_code", "_test_omop_display",
+                "urn:omop:concept_id", "measurement", "bronze.map_pathology"),
+            _map_projection(_pathology_result_canonical(), "_result_snomed_code", "_result_snomed_display",
+                "http://snomed.info/sct", "measurement_value", "bronze.map_pathology"),
+            _map_projection(_pathology_result_canonical(), "_result_loinc_code", "_result_loinc_display",
+                "http://loinc.org", "measurement_value", "bronze.map_pathology"),
+            _map_projection(_pathology_result_canonical(), "_result_omop_code", "_result_omop_display",
+                "urn:omop:concept_id", "measurement_value", "bronze.map_pathology"),
+        ],
+        "s3_axes": [('journey_clinical.pathology_result', 'test'), ('journey_clinical.pathology_result', 'result')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'genomic_test': {
+        "fact_table": 'journey_clinical.genomic_test',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_genomic_test_canonical(), "genomic_test",
+                "journey_clinical.genomic_test", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_genomic_test_canonical(), "_gt_snomed_code", "_gt_snomed_display",
+                "http://snomed.info/sct", "measurement", "bronze.map_pathology_genetic_test"),
+            _map_projection(_genomic_test_canonical(), "_gt_loinc_code", "_gt_loinc_display",
+                "http://loinc.org", "measurement", "bronze.map_pathology_genetic_test"),
+            _map_projection(_genomic_test_canonical(), "_gt_omop_code", "_gt_omop_display",
+                "urn:omop:concept_id", "measurement", "bronze.map_pathology_genetic_test"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'genomic_result': {
+        "fact_table": 'journey_clinical.genomic_result',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_genomic_result_canonical(), "genomic_result",
+                "journey_clinical.genomic_result", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_genomic_result_canonical(), "_gr_snomed_code", "_gr_snomed_display",
+                "http://snomed.info/sct", "measurement", "bronze.map_pathology_genetic_result"),
+            _map_projection(_genomic_result_canonical(), "_gr_clinvar_code", "_gr_clinvar_display",
+                "urn:clinvar", "measurement", "bronze.map_pathology_genetic_result:clinvar"),
+            _map_projection(_genomic_result_canonical(), "_gr_omop_code", "_gr_omop_display",
+                "urn:omop:concept_id", "measurement", "bronze.map_pathology_genetic_result:omop-genomic"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'indication': {
+        "fact_table": 'journey_clinical.indication',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_indication_canonical(), "indication",
+                "journey_clinical.indication", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_indication_canonical(), "_ind_snomed_code", "_ind_snomed_display",
+                "http://snomed.info/sct", "condition", "bronze.map_pathology_indication"),
+            _map_projection(_indication_canonical(), "_ind_omop_code", "_ind_omop_display",
+                "urn:omop:concept_id", "condition", "bronze.map_pathology_indication"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'microbiology_isolate': {
+        "fact_table": 'journey_clinical.microbiology_isolate',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_micro_isolate_canonical(), "microbiology_isolate",
+                "journey_clinical.microbiology_isolate", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_micro_isolate_canonical(), "_iso_snomed_code", "_iso_snomed_display",
+                "http://snomed.info/sct", "measurement_value", "bronze.map_pathology_microbiology_isolate"),
+            _map_projection(_micro_isolate_canonical(), "_iso_omop_code", "_iso_omop_display",
+                "urn:omop:concept_id", "measurement_value", "bronze.map_pathology_microbiology_isolate"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'susceptibility_result': {
+        "fact_table": 'journey_clinical.susceptibility_result',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_susceptibility_canonical(), "susceptibility_result",
+                "journey_clinical.susceptibility_result", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_susceptibility_canonical(), "_sus_code_code", "_sus_code_display",
+                "urn:barts:pathology:antimicrobial", "drug", "bronze.map_pathology_antimicrobial_susceptibility"),
+            _map_projection(_susceptibility_canonical(), "_sus_omop_code", "_sus_omop_display",
+                "urn:omop:concept_id", "drug", "bronze.map_pathology_antimicrobial_susceptibility"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'form': {
+        "fact_table": 'journey_clinical.form',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_form_canonical(), "form",
+                "journey_clinical.form", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [('journey_clinical.form_response', 'question'), ('journey_clinical.form_response', 'answer'), ('journey_clinical.form_response', 'unit'), ('journey_clinical.form_smoking_status', 'smoking_status'), ('journey_clinical.form_smoking_status', 'cessation_advice'), ('journey_clinical.form_smoking_status', 'cessation_referral'), ('journey_clinical.form_smoking_status', 'nicotine_treatment'), ('journey_clinical.form_smoking_status', 'dependence_level')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'vital_sign': {
+        "fact_table": 'journey_clinical.vital_sign',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_vital_sign_canonical(), "vital_sign",
+                "journey_clinical.vital_sign", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_vital_sign_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "measurement", "bronze.map_numeric_events_or_form"),
+        ],
+        "s3_axes": [('journey_clinical.vital_sign', 'vital'), ('journey_clinical.vital_sign', 'unit'), ('journey_clinical.vital_sign', 'method'), ('journey_clinical.vital_sign', 'body_site'), ('journey_clinical.vital_sign', 'interpretation')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'clinical_score': {
+        "fact_table": 'journey_clinical.clinical_score',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_clinical_score_canonical(), "clinical_score",
+                "journey_clinical.clinical_score", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_clinical_score_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "observation", "bronze.map_numeric_events_or_form"),
+        ],
+        "s3_axes": [('journey_clinical.clinical_score', 'score'), ('journey_clinical.clinical_score_component', 'component')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'medication_admin': {
+        "fact_table": 'journey_clinical.medication_admin',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_medication_admin_canonical(), "medication_admin",
+                "journey_clinical.medication_admin", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_medication_admin_canonical(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "drug", "bronze.map_med_admin"),
+            _map_projection(_medication_admin_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "drug", "bronze.map_med_admin"),
+            _map_projection(_medication_admin_canonical(), "_rxnorm_code", "_rxnorm_display",
+                "http://www.nlm.nih.gov/research/umls/rxnorm", "drug",
+                "bronze.map_med_admin"),
+        ],
+        "s3_axes": [('journey_clinical.medication_admin', 'medication')],
+        "supplement": [('journey_clinical.medication_admin', 'medication_admin', 'journey_clinical.medication_admin', 'medication', 'medication_admin')],
+        "registry_findings": False,
+    },
+    'medication_order': {
+        "fact_table": 'journey_clinical.medication_order',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_medication_order_canonical(), "medication_order",
+                "journey_clinical.medication_order", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [('journey_clinical.medication_order', 'medication')],
+        "supplement": [('journey_clinical.medication_order', 'medication_order', 'journey_clinical.medication_order', 'medication', 'medication_order')],
+        "registry_findings": False,
+    },
+    'medication_dispense': {
+        "fact_table": 'journey_clinical.medication_dispense',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_medication_dispense_canonical(), "medication_dispense",
+                "journey_clinical.medication_dispense", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_medication_dispense_canonical(), "_dmd_code", "_dmd_display",
+                "http://snomed.info/sct", "drug", "bronze.map_pharmacy_issue"),
+        ],
+        "s3_axes": [('journey_clinical.medication_dispense', 'medication')],
+        "supplement": [('journey_clinical.medication_dispense', 'medication_dispense', 'journey_clinical.medication_dispense', 'medication', 'medication_dispense')],
+        "registry_findings": False,
+    },
+    'clinical_finding': {
+        "fact_table": 'journey_clinical.clinical_finding',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_coded_finding_typed(), "clinical_finding",
+                "journey_clinical.clinical_finding", "clinical"),
+            _event_index_projection(_nomen_finding_typed(), "clinical_finding",
+                "journey_clinical.clinical_finding", "clinical"),
+            _event_index_projection(_date_finding_typed(), "clinical_finding",
+                "journey_clinical.clinical_finding", "clinical"),
+            _event_index_projection(_text_finding_typed(), "clinical_finding",
+                "journey_clinical.clinical_finding", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _coded_bridge_event_map(),
+            _dynamic_map_projection(
+                _coded_finding_typed(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "_omop_domain", "bronze.map_coded_events:manual",
+                ),
+            _dynamic_map_projection(
+                _nomen_finding_typed(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "_omop_domain", "bronze.map_nomen_events",
+                ),
+            _map_projection(
+                _nomen_finding_typed(), "_snomed_code", "_snomed_display",
+                "http://snomed.info/sct", "observation", "bronze.map_nomen_events",
+                ),
+            _dynamic_map_projection(
+                _text_finding_typed(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "_omop_domain", "bronze.map_text_events:concept",
+                ),
+            _dynamic_map_projection(
+                _text_finding_typed(), "_omop_value_code", "_omop_value_display",
+                "urn:omop:concept_id", "_omop_value_domain", "bronze.map_text_events:value",
+                ),
+        ],
+        "s3_axes": [('journey_clinical.clinical_finding', 'finding'), ('journey_clinical.clinical_finding', 'value')],
+        "supplement": [],
+        "registry_findings": True,
+    },
+    'imaging_exam': {
+        "fact_table": 'journey_clinical.imaging_exam',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_imaging_exam_canonical(), "imaging_exam",
+                "journey_clinical.imaging_exam", "clinical"),
+            _event_index_projection(_mill_radiology_exam_canonical(), "imaging_exam",
+                "journey_clinical.imaging_exam", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [('journey_clinical.imaging_exam', 'exam')],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'artifact_asset': {
+        "fact_table": 'journey_artifact.asset',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_artifact_asset_canonical(), "artifact",
+                "journey_artifact.asset", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'text_document': {
+        "fact_table": 'journey_text.document',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_document_canonical(), "document",
+                "journey_text.document", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'appointment': {
+        "fact_table": 'journey_clinical.appointment',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_appointment_canonical(), "appointment",
+                "journey_clinical.appointment", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'referral': {
+        "fact_table": 'journey_clinical.referral',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_referral_canonical(), "referral",
+                "journey_clinical.referral", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _luna_code_event_map(
+                _referral_canonical(), "treatment_function_code",
+                "urn:barts:luna:treatment-function"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'rtt_pathway': {
+        "fact_table": 'journey_clinical.rtt_pathway',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_rtt_pathway_canonical(), "rtt_pathway",
+                "journey_clinical.rtt_pathway", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _luna_code_event_map(
+                _rtt_pathway_canonical(), "treatment_function_code",
+                "urn:barts:luna:treatment-function"),
+            _luna_code_event_map(
+                _rtt_pathway_canonical(), "current_status_code",
+                "urn:barts:luna:rtt-status"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'rtt_activity': {
+        "fact_table": 'journey_clinical.rtt_activity',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_rtt_activity_canonical(), "rtt_activity",
+                "journey_clinical.rtt_activity", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _luna_code_event_map(
+                _rtt_activity_canonical(), "treatment_function_code",
+                "urn:barts:luna:treatment-function"),
+            _luna_code_event_map(
+                _rtt_activity_canonical(), "status_code",
+                "urn:barts:luna:rtt-status"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'waiting_list_entry': {
+        "fact_table": 'journey_clinical.waiting_list_entry',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_waiting_list_index_representative(), "waiting_list_entry",
+                "journey_clinical.waiting_list_entry", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _seed_code_event_map(
+                _waiting_list_index_representative(), "status_code",
+                "urn:cerner:code_value", "wl_status_cdf_meaning"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'community_care_activity': {
+        "fact_table": 'journey_clinical.community_care_activity',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_community_care_activity_canonical(), "community_care_activity",
+                "journey_clinical.community_care_activity", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_community_care_activity_canonical(),
+                "_snomed_candidate_code", "_snomed_candidate_name",
+                "http://snomed.info/sct", "community_activity",
+                "bronze.map_community_care_activity"),
+            _map_projection(_community_care_activity_canonical(),
+                "_snomed_candidate_omop_code", "_snomed_candidate_omop_display",
+                "urn:omop:concept_id", "community_activity",
+                "bronze.map_community_care_activity"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'community_care_contact': {
+        "fact_table": 'journey_clinical.community_care_contact',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_community_care_contact_canonical(), "community_care_contact",
+                "journey_clinical.community_care_contact", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'hrg_grouping': {
+        "fact_table": 'journey_clinical.hrg_grouping',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_hrg_grouping_canonical(), "hrg_grouping",
+                "journey_clinical.hrg_grouping", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'costed_activity': {
+        "fact_table": 'journey_clinical.costed_activity',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_costed_activity_canonical(), "costed_activity",
+                "journey_clinical.costed_activity", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'drug_expenditure': {
+        "fact_table": 'journey_clinical.drug_expenditure',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_drug_expenditure_canonical(), "drug_expenditure",
+                "journey_clinical.drug_expenditure", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_drug_expenditure_canonical(), "_dmd_code", "_dmd_display",
+                "http://snomed.info/sct", "drug",
+                "bronze.map_finance_hcd_expenditure"),
+            _map_projection(_drug_expenditure_canonical(), "_omop_code", "_omop_display",
+                "urn:omop:concept_id", "drug",
+                "bronze.map_finance_hcd_expenditure"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'medication_supply': {
+        "fact_table": 'journey_clinical.medication_supply',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_medication_supply_canonical(), "medication_supply",
+                "journey_clinical.medication_supply", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_medication_supply_canonical(), "_dmd_code", "_dmd_display",
+                "http://snomed.info/sct", "drug", "bronze.map_homecare_request"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'elective_access_entry': {
+        "fact_table": 'journey_clinical.elective_access_entry',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_elective_access_entry_canonical(), "elective_access_entry",
+                "journey_clinical.elective_access_entry", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+            _map_projection(_elective_access_entry_canonical(), "_opcs4_code", "_opcs4_display",
+                "http://fhir.hl7.org.uk/CodeSystem/OPCS-4", "procedure",
+                "bronze.map_elective_access_list_procedure"),
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'pathway_tracking': {
+        "fact_table": 'journey_clinical.pathway_tracking',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_pathway_tracking_canonical(), "pathway_tracking",
+                "journey_clinical.pathway_tracking", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'critical_care_period': {
+        "fact_table": 'journey_clinical.critical_care_period',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_critical_care_period_canonical(), "critical_care_period",
+                "journey_clinical.critical_care_period", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'critical_care_activity': {
+        "fact_table": 'journey_clinical.critical_care_activity',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_critical_care_activity_canonical(), "critical_care_activity",
+                "journey_clinical.critical_care_activity", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'critical_care_admission': {
+        "fact_table": 'journey_clinical.critical_care_admission',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_critical_care_admission_canonical(), "critical_care_admission",
+                "journey_clinical.critical_care_admission", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'critical_care_daily_score': {
+        "fact_table": 'journey_clinical.critical_care_daily_score',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_cc_daily_score_canonical(), "critical_care_daily_score",
+                "journey_clinical.critical_care_daily_score", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'neonatal_episode': {
+        "fact_table": 'journey_clinical.neonatal_episode',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_neonatal_episode_canonical(), "neonatal_episode",
+                "journey_clinical.neonatal_episode", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'neonatal_care_day': {
+        "fact_table": 'journey_clinical.neonatal_care_day',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_neonatal_care_day_canonical(), "neonatal_care_day",
+                "journey_clinical.neonatal_care_day", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'neonatal_examination': {
+        "fact_table": 'journey_clinical.neonatal_examination',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_neonatal_examination_canonical(), "neonatal_examination",
+                "journey_clinical.neonatal_examination", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'baby_delivery': {
+        "fact_table": 'journey_clinical.baby_delivery',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_baby_delivery_canonical(), "baby_delivery",
+                "journey_clinical.baby_delivery", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'labour_delivery': {
+        "fact_table": 'journey_clinical.labour_delivery',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_labour_delivery_canonical(), "labour_delivery",
+                "journey_clinical.labour_delivery", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'maternity_care_contact': {
+        "fact_table": 'journey_clinical.maternity_care_contact',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_maternity_care_contact_canonical(), "maternity_care_contact",
+                "journey_clinical.maternity_care_contact", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'research_enrollment': {
+        "fact_table": 'journey_clinical.research_enrollment',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(_research_enrollment_canonical(), "research_enrollment",
+                "journey_clinical.research_enrollment", "administrative"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+    'safety_incident': {
+        "fact_table": 'journey_clinical.safety_incident',
+        # Event rows: the canonical lanes that publish this fact table.
+        "lanes": lambda: [
+            _event_index_projection(spark.read.table(INTERNAL_SCHEMA + "._clinical_safety_incident_index_lane"), "safety_incident", "journey_clinical.safety_incident", "clinical"),
+        ],
+        # Mapping rows for those events (legacy source/vocabulary arms).
+        "maps": lambda: [
+        ],
+        "s3_axes": [],
+        "supplement": [],
+        "registry_findings": False,
+    },
+}
+
+def _feed_supplement(spec):
+    """S3 split-component (and registry) event rows for one feed, deduplicated on the event key.
+
+    Same rows as the old _s3b_event_index_supplement, restricted to this feed's fact table.
+    """
+    frames = []
+    for relation, event_type, fact_table, axis, source_object in spec["supplement"]:
+        source = spark.read.table(_n(relation))
+        if "source_patient_event_key" not in source.columns:
+            continue
+        components = source.where(
+            ~F.col("patient_event_key").eqNullSafe(F.col("source_patient_event_key"))
+        )
+        frames.append(_s3b_public_event_index_projection(
+            components, event_type, fact_table, axis, source_object
+        ))
+    if spec["registry_findings"]:
+        registry_findings = spark.read.table(_n("journey_clinical.clinical_finding")).where(
+            F.col("source_object").startswith("registry:")
+        )
+        frames.append(_s3b_public_event_index_projection(
+            registry_findings, "clinical_finding", "journey_clinical.clinical_finding",
+            "value", "registry_observation"
+        ))
+    if not frames:
+        return None
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return out.dropDuplicates(["patient_event_key"])
+
+
+def _feed_events(spec):
+    """Event-grain rows for one feed: its canonical lanes plus its S3 supplement rows."""
+    lanes = spec["lanes"]()
+    out = lanes[0]
+    for lane in lanes[1:]:
+        out = out.unionByName(lane)
+    supplement = _feed_supplement(spec)
+    return out if supplement is None else out.unionByName(supplement)
+
+
+def _feed_s3_axis_maps(spec):
+    """Flat S3 SNOMED targets of this feed's relations, exactly as the old _s3_axis_event_map."""
+    if not spec["s3_axes"]:
+        return None
+    return _s3_axis_event_map(spec["s3_axes"])
+
+
+def _feed_maps(spec):
+    """Event x mapping rows for one feed, with the derived S3 map_* columns of the old _event_map."""
+    frames = spec["maps"]()
+    s3 = _feed_s3_axis_maps(spec)
+    if s3 is not None:
+        frames = frames + [s3]
+    if not frames:
+        return None
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return _with_s3_map_columns(out)
+
+
+def _empty_feed_maps():
+    """A typed, row-free mapping frame for feeds that have no mapping arms.
+
+    Built from a real Delta table outside the pipeline with a false predicate (not
+    createDataFrame), so the feed stays incrementally refreshable and gains no dependency edge.
+    """
+    return _with_s3_map_columns(
+        spark.read.table(SRC_CODED_EVENT_FINDING_MAPPING).where(F.lit(False)).select(
+            F.lit(None).cast("string").alias("patient_event_map_id"),
+            F.lit(None).cast("string").alias("patient_event_key"),
+            F.lit(None).cast("string").alias("mapped_coding_system"),
+            F.lit(None).cast("string").alias("mapped_code"),
+            F.lit(None).cast("string").alias("mapped_display"),
+            F.lit(None).cast("string").alias("target_domain"),
+            F.lit(None).cast("string").alias("map_source"),
+            F.lit(None).cast("string").alias("map_version"),
+            F.lit(None).cast("timestamp").alias("valid_from"),
+            F.lit(None).cast("timestamp").alias("valid_to"),
+            F.lit(None).cast("timestamp").alias("loaded_at"),
+        )
+    )
+
+
+def _declare_event_feed(feed, spec):
+    """Declare one internal feed MV: this fact table's events_patient_event rows."""
+    @materialized_view(
+        name=_n(f"journey_events._feed_{feed}"),
+        comment=(f"INTERNAL event feed for {spec['fact_table']}: one row per admitted event x standard "
+                 "mapping (unmapped events carry one row with a null mapping block), identical to the "
+                 "rows the retired events_patient_event held for this fact table. Read by the OMOP "
+                 "model and the OMOP id registry as a union over all feeds."),
+        column_comments={**PATIENT_EVENT_COLUMN_COMMENTS,
+                         "map_loaded_at": "loaded_at of the mapping row (null when the event has no mapping); "
+                                          "the clock concept_registry uses for mapped codes."},
+        cluster_by=["person_id", "event_datetime"],
+        refresh_policy="auto",
+    )
+    def event_feed():
+        # Join the feed's events to its mappings and project the patient-event columns.
+        maps = _feed_maps(spec)
+        return _lifecycle_source_patient_event(
+            _feed_events(spec), maps if maps is not None else _empty_feed_maps()
+        ).drop(*PATIENT_EVENT_LIFECYCLE_FIELDS, *PATIENT_EVENT_RETIRED_COLUMNS)
+    return event_feed
+
+
+for _feed, _spec in EVENT_FEED_SPECS.items():
+    _declare_event_feed(_feed, _spec)
+
+
+# The shared module lists the feeds for every reader (notebook 4, concept_registry); keep them in step.
+assert list(EVENT_FEED_SPECS) == EVENT_FEED_NAMES, "EVENT_FEED_SPECS and shared EVENT_FEED_NAMES differ"
+
+
+
+
+
 
 # COMMAND ----------
 
@@ -2907,7 +3540,7 @@ ADMISSION_METRICS_COLUMN_COMMENTS = {
             "without source_code are exempt; registry_entry is exempt as a "
             "code-free class. Exclusions are counted here and "
             "retained nowhere.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ADMISSION_METRICS_COLUMN_COMMENTS,
 )
 def admission_metrics():
@@ -3404,7 +4037,7 @@ ENCOUNTER_COLUMN_COMMENTS = {
     name=_n("journey_spine.encounter"),
     comment="One source encounter with evidence-based timestamps. Parent remains null where bronze supplies no governed containment key.",
     cluster_by=["person_id", "period_start"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=ENCOUNTER_COLUMN_COMMENTS,
 )
 def encounter():
@@ -3416,7 +4049,7 @@ def encounter():
     name=_n('journey_spine._encounter_metadata'),
     comment='Internal quality and batch metadata for spine_encounter; same row grain as the research table. Join keys: encounter_key, encounter_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def encounter_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_encounter; same
@@ -3625,7 +4258,7 @@ def _lifecycle_source_location_stay():
     name=_n("journey_spine.location_stay"),
     comment="One physical location stop per encounter, anchored on the source encounter and preserving bed/room detail.",
     cluster_by=["person_id", "period_start"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=LOCATION_STAY_COLUMN_COMMENTS,
 )
 def location_stay():
@@ -3637,7 +4270,7 @@ def location_stay():
     name=_n('journey_spine._location_stay_metadata'),
     comment='Internal quality and batch metadata for spine_location_stay; same row grain as the research table. Join keys: location_stay_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def location_stay_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for spine_location_stay;
@@ -3806,7 +4439,7 @@ def _lifecycle_source_care_participation():
 @materialized_view(
     name=_n("journey_spine.care_participation"),
     comment="Practitioner participation: encounter source fields, ENCNTR_PRSNL_RELTN care roles and the registered GP (person-scoped).",  # OGR_PARTICIPATION_V1
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CARE_PARTICIPATION_COLUMN_COMMENTS,
 )
 def care_participation():
@@ -3818,7 +4451,7 @@ def care_participation():
     name=_n('journey_spine._care_participation_metadata'),
     comment='Internal quality and batch metadata for spine_care_participation; same row grain as the research table. Join keys: care_participation_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def care_participation_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4302,7 +4935,7 @@ def _lifecycle_source_concept_map():
 @materialized_view(
     name=_n("journey_reference.concept_map"),
     comment="Versioned one-to-many source-to-target mappings observed in governed bronze products; no winner is selected.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CONCEPT_MAP_COLUMN_COMMENTS,
 )
 def concept_map():
@@ -4332,15 +4965,17 @@ CONCEPT_REGISTRY_COLUMN_COMMENTS = {
 @materialized_view(
     name=_n("journey_reference.concept_registry"),
     comment="Observed source and target coding-system/code pairs across the event index and concept map.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=CONCEPT_REGISTRY_COLUMN_COMMENTS,
 )
 def concept_registry():
     # Build the declared dataset: Observed source and target coding-system/code pairs across the
     # event index and concept map.
     mappings = _lifecycle_source_concept_map()
-    events = spark.read.table(_n("journey_events._event_index"))
-    event_mappings = spark.read.table(_n("journey_events._event_map"))
+    # EIR_20261021_V1: event codes come from the event grain of the feeds (one row per event);
+    # mapped codes from the feeds' mapping rows (one row per event x mapping, mapped rows only).
+    events = _event_feed_events()
+    event_mappings = _event_feed_union().where(F.col("mapped_code").isNotNull())
     event_codes = events.where(events.source_code.isNotNull()).select(
         F.coalesce(events.source_coding_system, F.lit("urn:unknown")).alias("coding_system"),
         events.source_code.alias("code"),
@@ -4371,7 +5006,7 @@ def concept_registry():
         F.col("mapped_display").alias("display"),
         F.lit(0).cast("long").alias("source_use_count"),
         F.lit(1).cast("long").alias("target_use_count"),
-        F.col("loaded_at").alias("observed_at"),
+        F.col("map_loaded_at").alias("observed_at"),
     )
     grouped = (
         event_codes.unionByName(map_sources).unionByName(map_targets).unionByName(event_map_targets)
@@ -4458,7 +5093,7 @@ def _lifecycle_source_value_set():
     name=_n("journey_reference.value_set"),
     comment="Pinned value-set membership from the governed value_set_release lookup asset; "
             "v3-ServiceDeliveryLocationRoleType is a recorded v1 exclusion.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=VALUE_SET_COLUMN_COMMENTS,
 )
 def value_set():
@@ -4471,7 +5106,7 @@ def value_set():
     name=_n('journey_reference._value_set_metadata'),
     comment='Internal quality and batch metadata for reference_value_set; same row grain as the research table. Join keys: value_set_key.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def value_set_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for reference_value_set;
@@ -4554,7 +5189,7 @@ def _lifecycle_source_research_study():
 @materialized_view(
     name=_n("journey_reference.research_study"),
     comment="Cerner research protocol amendments with parent and previous protocol lineage.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
     column_comments=RESEARCH_STUDY_COLUMN_COMMENTS,
 )
 def research_study():
@@ -4772,7 +5407,7 @@ def _lifecycle_source_research_enrollment():
 @materialized_view(
     name=_n("journey_clinical.research_enrollment"),
     comment="One Cerner research-subject registration using clean sentinel-safe dates.",
-    cluster_by=["person_id", "event_datetime"], refresh_policy="incremental",
+    cluster_by=["person_id", "event_datetime"], refresh_policy="auto",
     column_comments=RESEARCH_ENROLLMENT_COLUMN_COMMENTS,
 )
 def research_enrollment():
@@ -4784,7 +5419,7 @@ def research_enrollment():
     name=_n('journey_clinical._research_enrollment_metadata'),
     comment='Internal quality and batch metadata for clinical_research_enrollment; same row grain as the research table. Join keys: patient_event_key, pt_prot_reg_id.',
     column_comments=LIFECYCLE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def research_enrollment_lifecycle():
     # Build the declared dataset: Internal quality and batch metadata for
@@ -4968,7 +5603,7 @@ def _lifecycle_source_person_address():
 @materialized_view(
     name=_n("journey_reference.person_address"),
     comment="Address assignments with EPC extension; direct address/postcode/UPRN fields are IG-sensitive.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=PERSON_ADDRESS_COLUMN_COMMENTS,
 )
 def person_address():
@@ -5000,7 +5635,7 @@ AREA_IOD2025_LSOA_COLUMN_COMMENTS = {'lsoa': '2021 LSOA code (England); primary 
 @materialized_view(
     name=_n("journey_reference.area_census2021_oa"),
     comment="Census 2021 topic summaries for every England and Wales output area (52 tables, 489 counts from NOMIS bulk files), one row per output_area. Counts are ONS-perturbed for disclosure control.",
-    cluster_by=["output_area"], refresh_policy="incremental",
+    cluster_by=["output_area"], refresh_policy="auto",
     column_comments=AREA_CENSUS2021_OA_COLUMN_COMMENTS,
 )
 def area_census2021_oa():
@@ -5013,7 +5648,7 @@ def area_census2021_oa():
 @materialized_view(
     name=_n("journey_reference.area_iod2025_lsoa"),
     comment="English Indices of Deprivation 2025 for every England LSOA (2021 boundaries): IMD and all domain and sub-domain scores, ranks and deciles, with mid-2022 populations. One row per lsoa.",
-    cluster_by=["lsoa"], refresh_policy="incremental",
+    cluster_by=["lsoa"], refresh_policy="auto",
     column_comments=AREA_IOD2025_LSOA_COLUMN_COMMENTS,
 )
 def area_iod2025_lsoa():
@@ -5172,7 +5807,7 @@ def aq_location_estimates_join(addresses, geometry, observations):
 @materialized_view(
     name=_n("journey_reference._air_quality_assignments"), private=True,
     comment="Internal eligible address assignments with exact residency months and air-quality coordinates; supports location-level estimate reuse.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _air_quality_assignments():
     # Build the declared dataset: Internal eligible address assignments with exact residency
@@ -5185,7 +5820,7 @@ def _air_quality_assignments():
 @materialized_view(
     name=_n("journey_reference._air_quality_geometry"), private=True,
     comment="Internal great-circle distances for distinct address locations and monitoring-site positions within the original 5x5 cells and 25 km; retains all eligible sites.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _air_quality_geometry():
     # Build the declared dataset: Internal great-circle distances for distinct address locations
@@ -5199,7 +5834,7 @@ def _air_quality_geometry():
 @materialized_view(
     name=_n("journey_reference._air_quality_estimates"), private=True,
     comment="Internal location/month/pollutant estimates, using the nearest three reporting observations and parity-proven inverse-square weights; exact person residency is attached by the research product.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _air_quality_estimates():
     # Build the declared dataset: Internal location/month/pollutant estimates, using the nearest
@@ -5224,7 +5859,7 @@ def _air_quality_estimates():
              "using sites that reported each pollutant-month. Publishes nearest-site within 2 km "
              "and inverse-square-distance weighted nearest-three within 25 km DAR059 methods."),
     column_comments=PERSON_ADDRESS_AIR_QUALITY_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def person_address_air_quality():
     # Geometry and location estimates are reused internally. Exact original
@@ -5308,7 +5943,7 @@ def _lifecycle_source_person_death_evidence():
 @materialized_view(
     name=_n("journey_reference.person_death_evidence"),
     comment="Corroborating death-register evidence; person-spine deceased fields remain authoritative.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS,
 )
 def person_death_evidence():
@@ -5453,7 +6088,7 @@ def _lifecycle_source_device_mapping():
 @materialized_view(
     name=_n("journey_reference.device_mapping"),
     comment="Best-effort implant-device decode with complete mapping provenance; identifiers are IG-sensitive.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=DEVICE_MAPPING_COLUMN_COMMENTS,
 )
 def device_mapping():
@@ -5546,7 +6181,7 @@ def _lifecycle_source_encounter_bounds():
 @materialized_view(
     name=_n("journey_reference.encounter_bounds"),
     comment="Full-outer encounter activity/event bounds with source-arm presence flags.",
-    cluster_by=["encounter_id"], refresh_policy="incremental",
+    cluster_by=["encounter_id"], refresh_policy="auto",
     column_comments=ENCOUNTER_BOUNDS_COLUMN_COMMENTS,
 )
 def encounter_bounds():
@@ -5617,7 +6252,7 @@ def _lifecycle_source_practitioner_identifier():
 @materialized_view(
     name=_n("journey_reference.practitioner_identifier"),
     comment="Staff aliases including postcode-type identifiers; alias values are IG-sensitive.",
-    cluster_by=["practitioner_id"], refresh_policy="incremental",
+    cluster_by=["practitioner_id"], refresh_policy="auto",
     column_comments=PRACTITIONER_IDENTIFIER_COLUMN_COMMENTS,
 )
 def practitioner_identifier():
@@ -5700,7 +6335,7 @@ def _lifecycle_source_practitioner_group():
 @materialized_view(
     name=_n("journey_reference.practitioner_group"),
     comment="Staff-group memberships; personnel-dimension orphans are retained and flagged.",
-    cluster_by=["practitioner_id"], refresh_policy="incremental",
+    cluster_by=["practitioner_id"], refresh_policy="auto",
     column_comments=PRACTITIONER_GROUP_COLUMN_COMMENTS,
 )
 def practitioner_group():
@@ -5767,7 +6402,7 @@ def _lifecycle_source_practitioner_location_evidence():
 @materialized_view(
     name=_n("journey_reference.practitioner_location_evidence"),
     comment="Staff location evidence with raw and sentinel-clamped event bounds.",
-    cluster_by=["practitioner_id"], refresh_policy="incremental",
+    cluster_by=["practitioner_id"], refresh_policy="auto",
     column_comments=PRACTITIONER_LOCATION_EVIDENCE_COLUMN_COMMENTS,
 )
 def practitioner_location_evidence():
@@ -5857,7 +6492,7 @@ def _lifecycle_source_encounter_attribute():
 @materialized_view(
     name=_n("journey_reference.encounter_attribute"),
     comment="Allowlisted encounter attributes with source-record identifiers and current or effective-period evidence, linked to the native encounter.",
-    cluster_by=["encounter_id"], refresh_policy="incremental",
+    cluster_by=["encounter_id"], refresh_policy="auto",
     column_comments=ENCOUNTER_ATTRIBUTE_COLUMN_COMMENTS,
 )
 def encounter_attribute():
@@ -5919,7 +6554,7 @@ def _lifecycle_source_person_attribute():
 @materialized_view(
     name=_n("journey_reference.person_attribute"),
     comment="Allowlisted person attributes; NO_FIXED_ABODE and CHILD_IN_PUBLIC_CARE are IG-sensitive.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=PERSON_ATTRIBUTE_COLUMN_COMMENTS,
 )
 def person_attribute():
@@ -5970,7 +6605,7 @@ GP_COMMENTS = {
 @materialized_view(
     name=_n("journey_reference.person_gp_registration"),
     comment="Registered GP practice history per person (Millennium Registered Practice relationship); practice code/name are quasi-identifiers.",
-    cluster_by=["person_id"], refresh_policy="incremental",
+    cluster_by=["person_id"], refresh_policy="auto",
     column_comments=GP_COMMENTS,
 )
 def person_gp_registration():

@@ -38,7 +38,7 @@ CLINICAL_TRACKING_EPISODE_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_episode",
     comment="TDX v2.1 Gold QC twin for clinical_tracking_episode.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_EPISODE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_TRACKING_EPISODE_ADVISORY_RULES)
@@ -49,7 +49,7 @@ def gold_clinical_tracking_episode():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_tracking_episode",
     comment="Compatibility evidence of admitted clinical_tracking_episode rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_tracking_episode():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -76,7 +76,7 @@ CLINICAL_TRACKING_ATTENDANCE_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_attendance",
     comment="TDX v2.1 Gold QC twin for clinical_tracking_attendance.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_ATTENDANCE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_TRACKING_ATTENDANCE_ADVISORY_RULES)
@@ -87,7 +87,7 @@ def gold_clinical_tracking_attendance():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_tracking_attendance",
     comment="Compatibility evidence of admitted clinical_tracking_attendance rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_tracking_attendance():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -114,7 +114,7 @@ CLINICAL_TRACKING_LOCATION_STAY_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_location_stay",
     comment="TDX v2.1 Gold QC twin for clinical_tracking_location_stay.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_LOCATION_STAY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_TRACKING_LOCATION_STAY_ADVISORY_RULES)
@@ -125,7 +125,7 @@ def gold_clinical_tracking_location_stay():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_tracking_location_stay",
     comment="Compatibility evidence of admitted clinical_tracking_location_stay rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_tracking_location_stay():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -154,7 +154,7 @@ CLINICAL_TRACKING_MILESTONE_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_milestone",
     comment="TDX v2.1 Gold QC twin for clinical_tracking_milestone.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_MILESTONE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_TRACKING_MILESTONE_ADVISORY_RULES)
@@ -165,7 +165,7 @@ def gold_clinical_tracking_milestone():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_tracking_milestone",
     comment="Compatibility evidence of admitted clinical_tracking_milestone rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_tracking_milestone():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -192,7 +192,7 @@ CLINICAL_PREARRIVAL_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_prearrival",
     comment="TDX v2.1 Gold QC twin for clinical_prearrival.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_PREARRIVAL_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_PREARRIVAL_ADVISORY_RULES)
@@ -203,7 +203,7 @@ def gold_clinical_prearrival():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_prearrival",
     comment="Compatibility evidence of admitted clinical_prearrival rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_prearrival():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -230,7 +230,7 @@ CLINICAL_PENDING_MOVEMENT_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_pending_movement",
     comment="TDX v2.1 Gold QC twin for clinical_pending_movement.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_PENDING_MOVEMENT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_PENDING_MOVEMENT_ADVISORY_RULES)
@@ -241,7 +241,7 @@ def gold_clinical_pending_movement():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_pending_movement",
     comment="Compatibility evidence of admitted clinical_pending_movement rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_pending_movement():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -268,7 +268,7 @@ CLINICAL_APPOINTMENT_ACTION_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_appointment_action",
     comment="TDX v2.1 Gold QC twin for clinical_appointment_action.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_APPOINTMENT_ACTION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_APPOINTMENT_ACTION_ADVISORY_RULES)
@@ -279,7 +279,7 @@ def gold_clinical_appointment_action():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_appointment_action",
     comment="Compatibility evidence of admitted clinical_appointment_action rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_appointment_action():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -304,7 +304,7 @@ CLINICAL_BED_STATUS_OBSERVATION_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_bed_status_observation",
     comment="TDX v2.1 Gold QC twin for clinical_bed_status_observation.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_BED_STATUS_OBSERVATION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_BED_STATUS_OBSERVATION_ADVISORY_RULES)
@@ -315,7 +315,7 @@ def gold_clinical_bed_status_observation():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_bed_status_observation",
     comment="Compatibility evidence of admitted clinical_bed_status_observation rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_bed_status_observation():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -340,7 +340,7 @@ CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_bed_status_observation_coverage",
     comment="TDX v2.1 Gold QC twin for clinical_bed_status_observation_coverage.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_ADVISORY_RULES)
@@ -351,7 +351,7 @@ def gold_clinical_bed_status_observation_coverage():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_clinical_bed_status_observation_coverage",
     comment="Compatibility evidence of admitted clinical_bed_status_observation_coverage rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_clinical_bed_status_observation_coverage():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -376,7 +376,7 @@ REFERENCE_LOCATION_UNIT_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.reference_location_unit",
     comment="TDX v2.1 Gold QC twin for reference_location_unit.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_LOCATION_UNIT_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_LOCATION_UNIT_ADVISORY_RULES)
@@ -387,7 +387,7 @@ def gold_reference_location_unit():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_reference_location_unit",
     comment="Compatibility evidence of admitted reference_location_unit rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_location_unit():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
@@ -412,7 +412,7 @@ REFERENCE_LOCATION_ATTRIBUTE_HISTORY_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.reference_location_attribute_history",
     comment="TDX v2.1 Gold QC twin for reference_location_attribute_history.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_LOCATION_ATTRIBUTE_HISTORY_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_LOCATION_ATTRIBUTE_HISTORY_ADVISORY_RULES)
@@ -423,9 +423,8 @@ def gold_reference_location_attribute_history():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_reference_location_attribute_history",
     comment="Compatibility evidence of admitted reference_location_attribute_history rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_location_attribute_history():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""
     return _tdx_qc("reference_location_attribute_history", "location_attribute_key")
-

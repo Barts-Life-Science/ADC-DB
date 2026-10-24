@@ -6555,7 +6555,7 @@ FORM_CONFIG_CENSUS_COLUMN_COMMENTS = {
     private=True,
     comment="Internal census of the 30 reviewed PowerForm instrument configurations.",
     column_comments=FORM_CONFIG_CENSUS_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _form_config_census():
     # Build the declared dataset: Internal census of the 30 reviewed PowerForm instrument
@@ -6798,7 +6798,7 @@ def _wildcard_column_expr(slug_col, label_col):
         "and the public clinical_form_response child."
     ),
     column_comments=FORM_RESPONSE_BASE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _form_response_primitive():
     # Build the declared dataset: Internal plain response-grain projection used by selection,
@@ -6942,7 +6942,7 @@ FORM_RESPONSE_SELECTION_COLUMN_COMMENTS = {
     private=True,
     comment="Internal production-equivalent selection rank per configured response candidate.",
     column_comments=FORM_RESPONSE_SELECTION_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _form_response_selection():
     # Build the declared dataset: Internal production-equivalent selection rank per configured
@@ -6999,7 +6999,7 @@ def _form_response_selection():
         "production selection."
     ),
     column_comments=FORM_RESPONSE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_response():
     # Build the declared dataset: One PowerForm response row per form instance (contract v2
@@ -7081,7 +7081,7 @@ FORM_WILDCARD_AMBIGUITY_COLUMN_COMMENTS = {
         "matched more than one source section and blocks cutover."
     ),
     column_comments=FORM_WILDCARD_AMBIGUITY_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _form_wildcard_ambiguity():
     # Build the declared dataset: Internal acceptance evidence. Any row means a section-wildcard
@@ -7934,7 +7934,7 @@ FORM_AUDIT_C_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_audit_c"),
     comment="AUDIT-C alcohol screening (both form eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_AUDIT_C_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["audit_c"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_audit_c():
     # Build the declared dataset: AUDIT-C alcohol screening (both form eras): one row per form
@@ -8118,7 +8118,7 @@ FORM_DELIRIUM_DEMENTIA_SCREENING_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_delirium_dementia_screening"),
     comment="Delirium and dementia screening (current and legacy eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_DELIRIUM_DEMENTIA_SCREENING_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_delirium_dementia_screening():
     # Build the declared dataset: Delirium and dementia screening (current and legacy eras): one
@@ -8214,7 +8214,7 @@ for _axis in ("smoking_status", "cessation_advice", "cessation_referral", "nicot
     name=_n("journey_clinical.form_smoking_status"),
     comment="Smoking status and cessation support: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_SMOKING_STATUS_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["smoking_status"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_smoking_status():
     # Build the declared dataset: Smoking status and cessation support: one row per form
@@ -8267,7 +8267,7 @@ FORM_FRAILTY_SCORE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_frailty_score"),
     comment="Rockwood clinical frailty score (both form eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_FRAILTY_SCORE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_frailty_score():
     # Build the declared dataset: Rockwood clinical frailty score (both form eras): one row per
@@ -8385,7 +8385,7 @@ FORM_ADULT_SEPSIS_SCREENING_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_adult_sepsis_screening"),
     comment="Adult sepsis screening and SBAR escalation (both form eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_ADULT_SEPSIS_SCREENING_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["adult_sepsis_screening"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_adult_sepsis_screening():
     # Build the declared dataset: Adult sepsis screening and SBAR escalation (both form eras):
@@ -8468,7 +8468,7 @@ FORM_SWALLOWING_SCREEN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_swallowing_screen"),
     comment="Swallowing screen: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_SWALLOWING_SCREEN_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["swallowing_screen"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_swallowing_screen():
     # Build the declared dataset: Swallowing screen: one row per form instance with configured
@@ -8571,7 +8571,7 @@ FORM_MUST_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_must"),
     comment="Malnutrition Universal Screening Tool: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_MUST_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_must():
     # Build the declared dataset: Malnutrition Universal Screening Tool: one row per form
@@ -8651,7 +8651,7 @@ FORM_MOOD_RANKIN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_mood_rankin"),
     comment="Mood screening and Modified Rankin Scale: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_MOOD_RANKIN_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_mood_rankin():
     # Build the declared dataset: Mood screening and Modified Rankin Scale: one row per form
@@ -8820,7 +8820,7 @@ FORM_NIH_STROKE_SCORE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_nih_stroke_score"),
     comment="NIH Stroke Score form layout: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_NIH_STROKE_SCORE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_nih_stroke_score():
     # Build the declared dataset: NIH Stroke Score form layout: one row per form instance with
@@ -8934,7 +8934,7 @@ FORM_MATERNITY_CO_SMOKING_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_maternity_co_smoking"),
     comment="Maternity carbon monoxide and smoking assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_MATERNITY_CO_SMOKING_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_maternity_co_smoking():
     # Build the declared dataset: Maternity carbon monoxide and smoking assessment: one row per
@@ -9033,7 +9033,7 @@ FORM_POMS_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_poms"),
     comment="Post-Operative Morbidity Survey: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_POMS_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_poms():
     # Build the declared dataset: Post-Operative Morbidity Survey: one row per form instance
@@ -9231,7 +9231,7 @@ FORM_MOCA_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_moca"),
     comment="Montreal Cognitive Assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_MOCA_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["moca"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_moca():
     # Build the declared dataset: Montreal Cognitive Assessment: one row per form instance with
@@ -9424,7 +9424,7 @@ FORM_WATERLOW_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_waterlow"),
     comment="Waterlow pressure-ulcer risk assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_WATERLOW_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["waterlow"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_waterlow():
     # Build the declared dataset: Waterlow pressure-ulcer risk assessment: one row per form
@@ -9553,7 +9553,7 @@ FORM_INFECTION_PREVENTION_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_infection_prevention"),
     comment="Infection prevention admission assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_INFECTION_PREVENTION_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_infection_prevention():
     # Build the declared dataset: Infection prevention admission assessment: one row per form
@@ -9882,7 +9882,7 @@ FORM_VTE_RISK_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_vte_risk_assessment"),
     comment="Adult VTE risk assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_VTE_RISK_ASSESSMENT_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["vte_risk_assessment"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_vte_risk_assessment():
     # Build the declared dataset: Adult VTE risk assessment: one row per form instance with
@@ -10035,7 +10035,7 @@ FORM_ADULT_CAPACITY_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_adult_capacity_assessment"),
     comment="Adult capacity admission assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_ADULT_CAPACITY_ASSESSMENT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_adult_capacity_assessment():
     # Build the declared dataset: Adult capacity admission assessment: one row per form instance
@@ -10157,7 +10157,7 @@ FORM_ED_ANDERSON_PRESSURE_RISK_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_ed_anderson_pressure_risk"),
     comment="ED Anderson pressure-area risk assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_ED_ANDERSON_PRESSURE_RISK_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["ed_anderson_pressure_risk"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_ed_anderson_pressure_risk():
     # Build the declared dataset: ED Anderson pressure-area risk assessment: one row per form
@@ -10239,7 +10239,7 @@ FORM_MENTAL_HEALTH_LIAISON_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_mental_health_liaison_assessment"),
     comment="Mental-health liaison assessment (current and RAID eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_MENTAL_HEALTH_LIAISON_ASSESSMENT_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["mental_health_liaison_assessment"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_mental_health_liaison_assessment():
     # Build the declared dataset: Mental-health liaison assessment (current and RAID eras): one
@@ -10326,7 +10326,7 @@ FORM_ENHANCED_CARE_RISK_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_enhanced_care_risk"),
     comment="Enhanced care risk assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_ENHANCED_CARE_RISK_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["enhanced_care_risk"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_enhanced_care_risk():
     # Build the declared dataset: Enhanced care risk assessment: one row per form instance with
@@ -10491,7 +10491,7 @@ FORM_RESUSCITATION_PLAN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_resuscitation_plan"),
     comment="Resuscitation plan and consultant validation: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_RESUSCITATION_PLAN_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["resuscitation_plan"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_resuscitation_plan():
     # Build the declared dataset: Resuscitation plan and consultant validation: one row per form
@@ -10771,7 +10771,7 @@ FORM_PALLIATIVE_CARE_HOLISTIC_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_palliative_care_holistic_assessment"),
     comment="Palliative care holistic assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_PALLIATIVE_CARE_HOLISTIC_ASSESSMENT_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["palliative_care_holistic_assessment"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_palliative_care_holistic_assessment():
     # Build the declared dataset: Palliative care holistic assessment: one row per form instance
@@ -11044,7 +11044,7 @@ FORM_MATERNITY_VTE_RISK_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_maternity_vte_risk_assessment"),
     comment="Maternity and obstetric VTE risk assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_MATERNITY_VTE_RISK_ASSESSMENT_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["maternity_vte_risk_assessment"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_maternity_vte_risk_assessment():
     # Build the declared dataset: Maternity and obstetric VTE risk assessment: one row per form
@@ -11477,7 +11477,7 @@ FORM_MATERNITY_PERSONALISED_CARE_PLAN_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_maternity_personalised_care_plan"),
     comment="Maternity personalised care plan: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_MATERNITY_PERSONALISED_CARE_PLAN_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_maternity_personalised_care_plan():
     # Build the declared dataset: Maternity personalised care plan: one row per form instance
@@ -11636,7 +11636,7 @@ FORM_FAMILY_ORIGIN_QUESTIONNAIRE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_family_origin_questionnaire"),
     comment="Family origin questionnaire: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_FAMILY_ORIGIN_QUESTIONNAIRE_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_family_origin_questionnaire():
     # Build the declared dataset: Family origin questionnaire: one row per form instance with
@@ -12383,7 +12383,7 @@ FORM_PREOPERATIVE_ASSESSMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_preoperative_assessment"),
     comment="Pre-operative assessment (both form eras): one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_PREOPERATIVE_ASSESSMENT_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["preoperative_assessment"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_preoperative_assessment():
     # Build the declared dataset: Pre-operative assessment (both form eras): one row per form
@@ -12945,7 +12945,7 @@ FORM_HARS_HIV_CARE_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_hars_hiv_care"),
     comment="HARS HIV care assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_HARS_HIV_CARE_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["hars_hiv_care"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_hars_hiv_care():
     # Build the declared dataset: HARS HIV care assessment: one row per form instance with
@@ -13104,7 +13104,7 @@ FORM_DIABETES_IN_PREGNANCY_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_diabetes_in_pregnancy"),
     comment="Diabetes in pregnancy specialist assessment: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_DIABETES_IN_PREGNANCY_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["diabetes_in_pregnancy"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_diabetes_in_pregnancy():
     # Build the declared dataset: Diabetes in pregnancy specialist assessment: one row per form
@@ -13405,7 +13405,7 @@ FORM_ACUTE_HAEMODIALYSIS_TREATMENT_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_acute_haemodialysis_treatment"),
     comment="Acute haemodialysis treatment record: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments=FORM_ACUTE_HAEMODIALYSIS_TREATMENT_COLUMN_COMMENTS,
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_acute_haemodialysis_treatment():
     # Build the declared dataset: Acute haemodialysis treatment record: one row per form
@@ -13570,7 +13570,7 @@ FORM_SBAR_ESCALATION_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_sbar_escalation"),
     comment="SBAR escalation and response: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_SBAR_ESCALATION_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["sbar_escalation"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_sbar_escalation():
     # Build the declared dataset: SBAR escalation and response: one row per form instance with
@@ -13768,7 +13768,7 @@ FORM_MAJOR_TRAUMA_REHABILITATION_COLUMN_COMMENTS = {
     name=_n("journey_clinical.form_major_trauma_rehabilitation"),
     comment="Adult major-trauma rehabilitation data: one row per form instance with configured questions as columns. Residual responses are in clinical_form_response.",
     column_comments={**FORM_MAJOR_TRAUMA_REHABILITATION_COLUMN_COMMENTS, **_multi_value_column_comments(FORM_CONFIG_BY_SLUG["major_trauma_rehabilitation"])},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def form_major_trauma_rehabilitation():
     # Build the declared dataset: Adult major-trauma rehabilitation data: one row per form

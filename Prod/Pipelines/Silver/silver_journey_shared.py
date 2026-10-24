@@ -1540,7 +1540,7 @@ def declare_s3_domain_stages(model_name, twin_name, variant_json_columns, public
                 .withColumn("_s3d_split_quantities", F.lit(False)))
 
     distinct_inputs.__name__ = f"_s3_dom_{model_name}_0"
-    materialized_view(name=names[0], refresh_policy="incremental",
+    materialized_view(name=names[0], refresh_policy="auto",
                       comment=f"S3 mapping inputs of {model_name}: one row per distinct input, keyed by _s3d_key.")(distinct_inputs)
     for index, stage in enumerate(stages, start=1):
         def apply_stage(previous=names[index - 1], stage=stage):
@@ -1551,7 +1551,7 @@ def declare_s3_domain_stages(model_name, twin_name, variant_json_columns, public
             return df
 
         apply_stage.__name__ = f"_s3_dom_{model_name}_{index}"
-        materialized_view(name=names[index], refresh_policy="incremental",
+        materialized_view(name=names[index], refresh_policy="auto",
                           comment=f"S3 mapping chain of {model_name}, stage {index} of {len(stages)}.")(apply_stage)
 
 
@@ -10304,3 +10304,35 @@ def _imaging_report_link_canonical():
         _pacs_report_links(docs).select(*IMAGING_REPORT_LINK_COLUMNS)
         .unionByName(_cerner_report_links(docs).select(*IMAGING_REPORT_LINK_COLUMNS))
     )
+
+
+# EIR_20261021_V1: the event index is retired. Silver publishes one internal event feed per fact table
+# (1_silver_spine_and_reference EVENT_FEED_SPECS); readers that need every event read their union.
+EVENT_FEED_NAMES = ['family_history', 'presenting_complaint', 'allergy_intolerance', 'transfusion', 'cancer_treatment', 'condition_stage', 'endoscopy_finding', 'registry_entry', 'device', 'condition', 'procedure', 'pathology_order', 'specimen', 'pathology_report', 'pathology_result', 'genomic_test', 'genomic_result', 'indication', 'microbiology_isolate', 'susceptibility_result', 'form', 'vital_sign', 'clinical_score', 'medication_admin', 'medication_order', 'medication_dispense', 'clinical_finding', 'imaging_exam', 'artifact_asset', 'text_document', 'appointment', 'referral', 'rtt_pathway', 'rtt_activity', 'waiting_list_entry', 'community_care_activity', 'community_care_contact', 'hrg_grouping', 'costed_activity', 'drug_expenditure', 'medication_supply', 'elective_access_entry', 'pathway_tracking', 'critical_care_period', 'critical_care_activity', 'critical_care_admission', 'critical_care_daily_score', 'neonatal_episode', 'neonatal_care_day', 'neonatal_examination', 'baby_delivery', 'labour_delivery', 'maternity_care_contact', 'research_enrollment', 'safety_incident']
+
+# Event-side columns of a feed row (everything that came from the old event index).
+EVENT_GRAIN_COLUMNS = [
+    "patient_event_key", "subject_key", "subject_id_system", "person_id", "encounter_id",
+    "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
+    "event_type", "fact_category", "fact_table", "fact_row_key", "source_system", "source_object",
+    "source_row_key", "source_coding_system", "source_code", "source_display", "record_status",
+    "confidentiality_code", "vip_ind", "withheld_identity_ind", "loaded_at",
+]
+
+
+def _event_feed_union():
+    """All event feeds as one frame: the rows the retired events_patient_event held."""
+    frames = [spark.read.table(_n(f"journey_events._feed_{feed}")) for feed in EVENT_FEED_NAMES]
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.unionByName(frame)
+    return out
+
+
+def _event_feed_events():
+    """Event grain (one row per admitted event) recovered from the feeds.
+
+    A feed repeats the event columns on every mapping row of the event, and they are identical
+    across those rows, so a distinct over them gives back the event row.
+    """
+    return _event_feed_union().select(*EVENT_GRAIN_COLUMNS).distinct()

@@ -139,7 +139,7 @@ SPINE_CARE_PARTICIPATION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_care_participation"),
     comment="Internal quality-controlled twin of spine_care_participation: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_CARE_PARTICIPATION_ADVISORY_RULES)
 def _gold_qc_spine_care_participation():
@@ -163,7 +163,7 @@ def _gold_qc_spine_care_participation():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_care_participation():
     """Contract-v2 public twin of spine_care_participation; QC support columns remain internal."""
@@ -321,7 +321,7 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_encounter"),
     comment="Internal quality-controlled twin of spine_encounter: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_spine_encounter():
     """Quality-controlled twin of journey_spine.encounter."""
@@ -352,7 +352,7 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS.update({'inferred_close_datetime': "Gold-inferre
 @dp.materialized_view(
     name=_n("gold_qc._spine_encounter_close_inference"),
     comment="Internal: one row per spell or emergency visit the source still holds open (status Active, no departure) for which later evidence shows it had ended: the person's next spell or emergency visit, or death. Read once by gold spine_encounter; kept separate so that MV joins one small table.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_spine_encounter_close_inference():
     """Closure evidence for source-open spells and emergency visits; one row per encounter with evidence."""
@@ -431,7 +431,7 @@ def _with_close_inference(df):
         "rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_encounter():
     """Contract-v2 public twin of spine_encounter; QC support columns remain internal."""
@@ -552,7 +552,7 @@ SPINE_ENCOUNTER_IDENTIFIER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_encounter_identifier"),
     comment="Internal quality-controlled twin of spine_encounter_identifier: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_ENCOUNTER_IDENTIFIER_MANDATORY_RULES)
 def _gold_qc_spine_encounter_identifier():
@@ -574,7 +574,7 @@ def _gold_qc_spine_encounter_identifier():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_encounter_identifier():
     """Contract-v2 public twin of spine_encounter_identifier; QC support columns remain internal."""
@@ -678,7 +678,7 @@ SPINE_EPISODE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_episode"),
     comment="Internal quality-controlled twin of spine_episode: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_EPISODE_ADVISORY_RULES)
 def _gold_qc_spine_episode():
@@ -703,7 +703,7 @@ def _gold_qc_spine_episode():
         "on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_episode():
     """Contract-v2 public twin of spine_episode; QC support columns remain internal."""
@@ -794,7 +794,7 @@ SPINE_EPISODE_ENCOUNTER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_episode_encounter"),
     comment="Internal quality-controlled twin of spine_episode_encounter: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_EPISODE_ENCOUNTER_MANDATORY_RULES)
 def _gold_qc_spine_episode_encounter():
@@ -817,7 +817,7 @@ def _gold_qc_spine_episode_encounter():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_episode_encounter():
     """Contract-v2 public twin of spine_episode_encounter; QC support columns remain internal."""
@@ -914,7 +914,7 @@ SPINE_JOURNEY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_journey"),
     comment="Internal quality-controlled twin of spine_journey: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_JOURNEY_ADVISORY_RULES)
 def _gold_qc_spine_journey():
@@ -938,7 +938,7 @@ def _gold_qc_spine_journey():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_journey():
     """Contract-v2 public twin of spine_journey; QC support columns remain internal."""
@@ -1051,7 +1051,7 @@ SPINE_JOURNEY_LINK_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_journey_link"),
     comment="Internal quality-controlled twin of spine_journey_link: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_JOURNEY_LINK_MANDATORY_RULES)
 @dp.expect_all(SPINE_JOURNEY_LINK_ADVISORY_RULES)
@@ -1069,7 +1069,7 @@ def _gold_qc_spine_journey_link():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_journey_link():
     """Contract-v2 public twin of spine_journey_link; QC support columns remain internal."""
@@ -1157,7 +1157,7 @@ SPINE_JOURNEY_PARTICIPANT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_journey_participant"),
     comment="Internal quality-controlled twin of spine_journey_participant: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_JOURNEY_PARTICIPANT_ADVISORY_RULES)
 def _gold_qc_spine_journey_participant():
@@ -1181,7 +1181,7 @@ def _gold_qc_spine_journey_participant():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_journey_participant():
     """Contract-v2 public twin of spine_journey_participant; QC support columns remain internal."""
@@ -1320,7 +1320,7 @@ SPINE_LOCATION_STAY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_location_stay"),
     comment="Internal quality-controlled twin of spine_location_stay: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_LOCATION_STAY_ADVISORY_RULES)
 def _gold_qc_spine_location_stay():
@@ -1348,7 +1348,7 @@ def _gold_qc_spine_location_stay():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_location_stay():
     """Contract-v2 public twin of spine_location_stay; QC support columns remain internal."""
@@ -1489,7 +1489,7 @@ SPINE_PERSON_COLUMN_COMMENTS.update({
 @dp.materialized_view(
     name=_n("gold_qc._spine_person"),
     comment="Internal quality-controlled twin of spine_person: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_spine_person():
     """Quality-controlled twin of journey_spine.person."""
@@ -1505,7 +1505,7 @@ def _gold_qc_spine_person():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_person():
     """Contract-v2 public twin of spine_person; QC support columns remain internal."""
@@ -1638,7 +1638,7 @@ SPINE_PERSON_IDENTIFIER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_person_identifier"),
     comment="Internal quality-controlled twin of spine_person_identifier: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_PERSON_IDENTIFIER_MANDATORY_RULES)
 @dp.expect_all(SPINE_PERSON_IDENTIFIER_ADVISORY_RULES)
@@ -1660,7 +1660,7 @@ def _gold_qc_spine_person_identifier():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_person_identifier():
     """Contract-v2 public twin of spine_person_identifier; QC support columns remain internal."""
@@ -1744,7 +1744,7 @@ SPINE_PERSON_RELATIONSHIP_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_person_relationship"),
     comment="Internal quality-controlled twin of spine_person_relationship: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(SPINE_PERSON_RELATIONSHIP_ADVISORY_RULES)
 def _gold_qc_spine_person_relationship():
@@ -1762,7 +1762,7 @@ def _gold_qc_spine_person_relationship():
         "update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_person_relationship():
     """Contract-v2 public twin of spine_person_relationship; QC support columns remain internal."""
@@ -1844,7 +1844,7 @@ SPINE_REQUEST_THREAD_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._spine_request_thread"),
     comment="Internal quality-controlled twin of spine_request_thread: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_spine_request_thread():
     """Quality-controlled twin of journey_spine.request_thread."""
@@ -1865,7 +1865,7 @@ def _gold_qc_spine_request_thread():
     name=_n("gold_spine.request_thread"),
     comment="Directed indexed-event edges for pathology order-to-report, medication order-to-administration, and waiting-list entry-to-appointment routes. Pathology edges are accession-scoped co-membership (requested test and report series share an accession), not result-level attribution. Gold QC twin of the silver product: 4 columns are repaired or nulled, 0 check(s) are advisory. Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule matched on each update.",
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_spine_request_thread():
     """Contract-v2 public twin of spine_request_thread; QC support columns remain internal."""
@@ -1964,7 +1964,7 @@ REFERENCE_CONCEPT_MAP_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_concept_map"),
     comment="Internal quality-controlled twin of reference_concept_map: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_CONCEPT_MAP_ADVISORY_RULES)
 def _gold_qc_reference_concept_map():
@@ -1982,7 +1982,7 @@ def _gold_qc_reference_concept_map():
         "matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_concept_map():
     """Contract-v2 public twin of reference_concept_map; QC support columns remain internal."""
@@ -2045,7 +2045,7 @@ REFERENCE_CONCEPT_REGISTRY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_concept_registry"),
     comment="Internal quality-controlled twin of reference_concept_registry: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_concept_registry():
     """Quality-controlled twin of journey_reference.concept_registry."""
@@ -2061,7 +2061,7 @@ def _gold_qc_reference_concept_registry():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_concept_registry():
     """Contract-v2 public twin of reference_concept_registry; QC support columns remain internal."""
@@ -2216,7 +2216,7 @@ REFERENCE_DEVICE_MAPPING_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_device_mapping"),
     comment="Internal quality-controlled twin of reference_device_mapping: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_DEVICE_MAPPING_ADVISORY_RULES)
 def _gold_qc_reference_device_mapping():
@@ -2233,7 +2233,7 @@ def _gold_qc_reference_device_mapping():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_device_mapping():
     """Contract-v2 public twin of reference_device_mapping; QC support columns remain internal."""
@@ -2362,7 +2362,7 @@ REFERENCE_ENCOUNTER_ATTRIBUTE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_encounter_attribute"),
     comment="Internal quality-controlled twin of reference_encounter_attribute: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_ENCOUNTER_ATTRIBUTE_MANDATORY_RULES)
 def _gold_qc_reference_encounter_attribute():
@@ -2383,7 +2383,7 @@ def _gold_qc_reference_encounter_attribute():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_encounter_attribute():
     """Contract-v2 public twin of reference_encounter_attribute; QC support columns remain internal."""
@@ -2485,7 +2485,7 @@ REFERENCE_ENCOUNTER_BOUNDS_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_encounter_bounds"),
     comment="Internal quality-controlled twin of reference_encounter_bounds: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_ENCOUNTER_BOUNDS_MANDATORY_RULES)
 def _gold_qc_reference_encounter_bounds():
@@ -2506,7 +2506,7 @@ def _gold_qc_reference_encounter_bounds():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_encounter_bounds():
     """Contract-v2 public twin of reference_encounter_bounds; QC support columns remain internal."""
@@ -2583,7 +2583,7 @@ REFERENCE_GENE_TESTED_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_gene_tested"),
     comment="Internal quality-controlled twin of reference_gene_tested: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_gene_tested():
     """Quality-controlled twin of journey_reference.gene_tested."""
@@ -2600,7 +2600,7 @@ def _gold_qc_reference_gene_tested():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_gene_tested():
     """Contract-v2 public twin of reference_gene_tested; QC support columns remain internal."""
@@ -2673,7 +2673,7 @@ REFERENCE_LOCATION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_location"),
     comment="Internal quality-controlled twin of reference_location: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_location():
     """Quality-controlled twin of journey_reference.location."""
@@ -2689,7 +2689,7 @@ def _gold_qc_reference_location():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_location():
     """Contract-v2 public twin of reference_location; QC support columns remain internal."""
@@ -2753,7 +2753,7 @@ REFERENCE_ORGANIZATION_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_organization"),
     comment="Internal quality-controlled twin of reference_organization: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_organization():
     """Quality-controlled twin of journey_reference.organization."""
@@ -2769,7 +2769,7 @@ def _gold_qc_reference_organization():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_organization():
     """Contract-v2 public twin of reference_organization; QC support columns remain internal."""
@@ -2997,7 +2997,7 @@ REFERENCE_PERSON_ADDRESS_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_address"),
     comment="Internal quality-controlled twin of reference_person_address: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_ADDRESS_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_ADDRESS_ADVISORY_RULES)
@@ -3020,7 +3020,7 @@ def _gold_qc_reference_person_address():
         "matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_person_address():
     """Contract-v2 public twin of reference_person_address; QC support columns remain internal."""
@@ -3131,7 +3131,7 @@ REFERENCE_PERSON_ADDRESS_AIR_QUALITY_COLUMN_COMMENTS = {'person_address_key': 'D
     ),
     table_properties={"quality": "gold"},
     cluster_by=["person_id"],
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_person_address_air_quality():
     """Public twin of reference_person_address_air_quality, contained by the gold address assignments."""
@@ -3154,7 +3154,7 @@ REFERENCE_AREA_CENSUS2021_OA_COLUMN_COMMENTS = {'output_area': '2021 Output Area
 @dp.materialized_view(
     name=_n("gold_qc._reference_area_census2021_oa"),
     comment="Internal quality-controlled twin of reference_area_census2021_oa. No repairs or rules: Census 2021 output-area counts are published lookup values.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_area_census2021_oa():
     """Quality-controlled twin of journey_reference.area_census2021_oa."""
@@ -3164,7 +3164,7 @@ def _gold_qc_reference_area_census2021_oa():
     name=_n("gold_reference.area_census2021_oa"),
     comment="Census 2021 output-area counts, one row per output_area. Gold twin of the silver reference table; no rows dropped or repaired.",
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_area_census2021_oa():
     """Public twin of reference_area_census2021_oa."""
@@ -3182,7 +3182,7 @@ REFERENCE_AREA_IOD2025_LSOA_COLUMN_COMMENTS = {'lsoa': '2021 LSOA code (England)
 @dp.materialized_view(
     name=_n("gold_qc._reference_area_iod2025_lsoa"),
     comment="Internal quality-controlled twin of reference_area_iod2025_lsoa. No repairs or rules: English Indices of Deprivation 2025 LSOA values are published lookup values.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_area_iod2025_lsoa():
     """Quality-controlled twin of journey_reference.area_iod2025_lsoa."""
@@ -3192,7 +3192,7 @@ def _gold_qc_reference_area_iod2025_lsoa():
     name=_n("gold_reference.area_iod2025_lsoa"),
     comment="English indices of deprivation 2025 lsoa values, one row per lsoa. Gold twin of the silver reference table; no rows dropped or repaired.",
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_area_iod2025_lsoa():
     """Public twin of reference_area_iod2025_lsoa."""
@@ -3262,7 +3262,7 @@ REFERENCE_PERSON_ATTRIBUTE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_attribute"),
     comment="Internal quality-controlled twin of reference_person_attribute: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_ATTRIBUTE_MANDATORY_RULES)
 def _gold_qc_reference_person_attribute():
@@ -3278,7 +3278,7 @@ def _gold_qc_reference_person_attribute():
     name=_n("gold_reference.person_attribute"),
     comment="One allowlisted person attribute; no-fixed-abode and public-care flags are IG-sensitive. Gold QC twin of the silver product: 2 columns are repaired or nulled, 1 rule(s) drop rows, 0 check(s) are advisory. Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule matched on each update.",
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_person_attribute():
     """Contract-v2 public twin of reference_person_attribute; QC support columns remain internal."""
@@ -3386,7 +3386,7 @@ REFERENCE_PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_death_evidence"),
     comment="Internal quality-controlled twin of reference_person_death_evidence: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_DEATH_EVIDENCE_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_DEATH_EVIDENCE_ADVISORY_RULES)
@@ -3408,7 +3408,7 @@ def _gold_qc_reference_person_death_evidence():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_person_death_evidence():
     """Contract-v2 public twin of reference_person_death_evidence; QC support columns remain internal."""
@@ -3513,7 +3513,7 @@ REFERENCE_PRACTITIONER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_practitioner"),
     comment="Internal quality-controlled twin of reference_practitioner: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_PRACTITIONER_ADVISORY_RULES)
 def _gold_qc_reference_practitioner():
@@ -3530,7 +3530,7 @@ def _gold_qc_reference_practitioner():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_practitioner():
     """Contract-v2 public twin of reference_practitioner; QC support columns remain internal."""
@@ -3632,7 +3632,7 @@ REFERENCE_PRACTITIONER_GROUP_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_practitioner_group"),
     comment="Internal quality-controlled twin of reference_practitioner_group: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PRACTITIONER_GROUP_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PRACTITIONER_GROUP_ADVISORY_RULES)
@@ -3650,7 +3650,7 @@ def _gold_qc_reference_practitioner_group():
         "Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_practitioner_group():
     """Contract-v2 public twin of reference_practitioner_group; QC support columns remain internal."""
@@ -3757,7 +3757,7 @@ REFERENCE_PRACTITIONER_IDENTIFIER_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_practitioner_identifier"),
     comment="Internal quality-controlled twin of reference_practitioner_identifier: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PRACTITIONER_IDENTIFIER_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PRACTITIONER_IDENTIFIER_ADVISORY_RULES)
@@ -3775,7 +3775,7 @@ def _gold_qc_reference_practitioner_identifier():
         "and Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_practitioner_identifier():
     """Contract-v2 public twin of reference_practitioner_identifier; QC support columns remain internal."""
@@ -3844,7 +3844,7 @@ REFERENCE_PRACTITIONER_LOCATION_EVIDENCE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_practitioner_location_evidence"),
     comment="Internal quality-controlled twin of reference_practitioner_location_evidence: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_practitioner_location_evidence():
     """Quality-controlled twin of journey_reference.practitioner_location_evidence."""
@@ -3860,7 +3860,7 @@ def _gold_qc_reference_practitioner_location_evidence():
         "report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_practitioner_location_evidence():
     """Contract-v2 public twin of reference_practitioner_location_evidence; QC support columns remain internal."""
@@ -3961,7 +3961,7 @@ REFERENCE_RESEARCH_STUDY_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_research_study"),
     comment="Internal quality-controlled twin of reference_research_study: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_RESEARCH_STUDY_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_RESEARCH_STUDY_ADVISORY_RULES)
@@ -3979,7 +3979,7 @@ def _gold_qc_reference_research_study():
         "and Lakeflow expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_research_study():
     """Contract-v2 public twin of reference_research_study; QC support columns remain internal."""
@@ -4041,7 +4041,7 @@ REFERENCE_SERVICE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_service"),
     comment="Internal quality-controlled twin of reference_service: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_service():
     """Quality-controlled twin of journey_reference.service."""
@@ -4057,7 +4057,7 @@ def _gold_qc_reference_service():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_service():
     """Contract-v2 public twin of reference_service; QC support columns remain internal."""
@@ -4125,7 +4125,7 @@ REFERENCE_THEATRE_ATTENDANCE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_attendance"),
     comment="Internal quality-controlled twin of reference_theatre_attendance: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_theatre_attendance():
     """Quality-controlled twin of journey_reference.theatre_attendance."""
@@ -4151,7 +4151,7 @@ def _gold_qc_reference_theatre_attendance():
         "metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_theatre_attendance():
     """Contract-v2 public twin of reference_theatre_attendance; QC support columns remain internal."""
@@ -4222,7 +4222,7 @@ REFERENCE_THEATRE_CASE_MILESTONE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_case_milestone"),
     comment="Internal quality-controlled twin of reference_theatre_case_milestone: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_theatre_case_milestone():
     """Quality-controlled twin of journey_reference.theatre_case_milestone."""
@@ -4248,7 +4248,7 @@ def _gold_qc_reference_theatre_case_milestone():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_theatre_case_milestone():
     """Contract-v2 public twin of reference_theatre_case_milestone; QC support columns remain internal."""
@@ -4345,7 +4345,7 @@ REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_implant"),
     comment="Internal quality-controlled twin of reference_theatre_implant: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_THEATRE_IMPLANT_ADVISORY_RULES)
 def _gold_qc_reference_theatre_implant():
@@ -4369,7 +4369,7 @@ def _gold_qc_reference_theatre_implant():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_theatre_implant():
     """Contract-v2 public twin of reference_theatre_implant; QC support columns remain internal."""
@@ -4510,7 +4510,7 @@ REFERENCE_THEATRE_CASE_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_case"),
     comment="Internal quality-controlled twin of reference_theatre_case: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_THEATRE_CASE_ADVISORY_RULES)
 def _gold_qc_reference_theatre_case():
@@ -4529,7 +4529,7 @@ def _gold_qc_reference_theatre_case():
         "Gold QC twin of the silver product: encounter_id is nulled when the spine lacks it, 1 check is advisory."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_theatre_case():
     df = spark.read.table(_n("gold_qc._reference_theatre_case")).selectExpr(
@@ -4612,7 +4612,7 @@ REFERENCE_VALUE_SET_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._reference_value_set"),
     comment="Internal quality-controlled twin of reference_value_set: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_reference_value_set():
     """Quality-controlled twin of journey_reference.value_set."""
@@ -4630,7 +4630,7 @@ def _gold_qc_reference_value_set():
         "what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_reference_value_set():
     """Contract-v2 public twin of reference_value_set; QC support columns remain internal."""
@@ -4666,7 +4666,7 @@ REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES = {
 REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS = {c: f"reference_person_gp_registration field {c}; see silver column comment." for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS}
 
 @dp.materialized_view(name=_n("gold_qc._reference_person_gp_registration"),
-    comment="Internal quality-controlled twin of reference_person_gp_registration.", refresh_policy="incremental")
+    comment="Internal quality-controlled twin of reference_person_gp_registration.", refresh_policy="auto")
 @dp.expect_all_or_drop(REFERENCE_PERSON_GP_REGISTRATION_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES)
 def _gold_qc_reference_person_gp_registration():
@@ -4676,7 +4676,7 @@ def _gold_qc_reference_person_gp_registration():
 
 @dp.materialized_view(name=_n("gold_reference.person_gp_registration"),
     comment="Registered GP practice history per person. Gold QC twin: 1 rule drops rows (no spine person), 1 advisory.",
-    table_properties={"quality": "gold"}, refresh_policy="incremental")
+    table_properties={"quality": "gold"}, refresh_policy="auto")
 def gold_reference_person_gp_registration():
     """Contract-v2 public twin of reference_person_gp_registration."""
     df = spark.read.table(_n("gold_qc._reference_person_gp_registration")).selectExpr(*REFERENCE_PERSON_GP_REGISTRATION_SELECT)

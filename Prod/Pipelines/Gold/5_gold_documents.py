@@ -272,7 +272,7 @@ TEXT_DOCUMENT_COLUMN_COMMENTS = {
 @dp.materialized_view(
     name=_n("gold_qc._text_document"),
     comment="Internal quality-controlled twin of text_document: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(TEXT_DOCUMENT_MANDATORY_RULES)
 @dp.expect_all(TEXT_DOCUMENT_ADVISORY_RULES)
@@ -292,7 +292,7 @@ def _gold_qc_text_document():
         "expectation metrics report what every rule matched on each update."
     ),
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_text_document():
     """Contract-v2 public twin of text_document; QC support columns remain internal."""
@@ -414,7 +414,7 @@ TEXT_DOCUMENT_SENSITIVITY_LABEL_MANDATORY_RULES = {
 @dp.materialized_view(
     name=_n("gold_qc._text_document_sensitivity_label"),
     comment="Internal QC of text_document_sensitivity_label; counts rows whose Gold parent is absent.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(TEXT_DOCUMENT_SENSITIVITY_LABEL_MANDATORY_RULES)
 def _gold_qc_text_document_sensitivity_label():
@@ -430,7 +430,7 @@ def _gold_qc_text_document_sensitivity_label():
     name=_n("gold_text.document_sensitivity_label"),
     comment='One ordered sensitivity label per clinical text document.',
     table_properties={"quality": "gold"},
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def gold_text_document_sensitivity_label():
     """Publish text_document_sensitivity_label without exposing the internal parent-admission marker."""
@@ -454,7 +454,7 @@ TEXT_SAFETY_DOCUMENT_ADVISORY_RULES = {
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.text_safety_document",
     comment="TDX v2.1 Gold QC twin for text_safety_document.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 @dp.expect_all_or_drop(TEXT_SAFETY_DOCUMENT_MANDATORY_RULES)
 @dp.expect_all(TEXT_SAFETY_DOCUMENT_ADVISORY_RULES)
@@ -465,7 +465,7 @@ def gold_text_safety_document():
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._gold_qc_text_safety_document",
     comment="Compatibility evidence of admitted text_safety_document rows; advisory outcomes are in Lakeflow expectation metrics.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def _gold_qc_text_safety_document():
     """Keep the existing admitted-row evidence schema; passed is not an advisory all-clear."""

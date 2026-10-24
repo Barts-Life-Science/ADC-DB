@@ -147,7 +147,7 @@ def declare_product(source_name, target_name, keys, key_name, namespace):
         return canonical(source_name, target_name, list(keys), key_name, namespace)
     build.__name__ = f"build_{target_name}"
     globals()[build.__name__] = dp.materialized_view(
-        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=f"TDX v2.1 Silver research product {target_name}.", refresh_policy="incremental"
+        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=f"TDX v2.1 Silver research product {target_name}.", refresh_policy="auto"
     )(build)
 
     def metadata():
@@ -160,7 +160,7 @@ def declare_product(source_name, target_name, keys, key_name, namespace):
     globals()[metadata.__name__] = dp.materialized_view(
         name=f"{INTERNAL_SCHEMA}._{target_name}_metadata",
         comment=f"Internal TDX v2.1 quality and batch metadata for {target_name}.",
-        refresh_policy="incremental",
+        refresh_policy="auto",
     )(metadata)
 
 SAFETY_SPECS = [
@@ -179,7 +179,7 @@ for _spec in SAFETY_SPECS:
 @dp.materialized_view(
     name=f"{INTERNAL_SCHEMA}._clinical_safety_incident_index_lane",
     comment="Internal S4-compatible event-index projection lane for one row per Datix safety incident.",
-    refresh_policy="incremental",
+    refresh_policy="auto",
 )
 def build_clinical_safety_incident_index_lane():
     # Build the declared dataset: Internal S4-compatible event-index projection lane for one row
