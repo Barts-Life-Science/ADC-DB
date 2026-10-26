@@ -182,6 +182,40 @@ def _semantic_specimen_map_keys(changes):
     )
     return changed.unionByName(base).filter(F.col("specimen_type_code").isNotNull()).dropDuplicates()
 
+# PATH_ORDERABLES_SEMANTIC_V1 (BRONZE_FIX_20261025): raw.path_master_orderables is rebuilt weekly with CREATE OR
+# REPLACE, so its change feed removes and re-adds every row even when nothing changed. Compare what was removed with
+# what was added, per (WkgCode, TLCCode), on the columns the specimen default reads; only keys that really differ count.
+ORDERABLE_SPECIMEN_COLUMNS = ("CSpecTypeCode", "LastUpdatedDT")
+
+
+def _semantic_orderable_keys(changes):
+    """(_wkg, _tlc) keys whose specimen-default payload differs between removed and added change-feed rows."""
+    _, F = _imports()
+    keyed = changes.select(
+        F.upper(F.trim("WkgCode")).alias("_wkg"),
+        F.upper(F.trim("TLCCode")).alias("_tlc"),
+        F.xxhash64(*[F.col(column) for column in ORDERABLE_SPECIMEN_COLUMNS]).alias("_payload"),
+        F.col("_change_type").isin("delete", "update_preimage").alias("_removed"),
+    )
+    removed = keyed.where("_removed").groupBy("_wkg", "_tlc", "_payload").count().withColumnRenamed("count", "_n_removed")
+    added = keyed.where("NOT _removed").groupBy("_wkg", "_tlc", "_payload").count().withColumnRenamed("count", "_n_added")
+    same_key = (
+        F.col("r._wkg").eqNullSafe(F.col("a._wkg"))
+        & F.col("r._tlc").eqNullSafe(F.col("a._tlc"))
+        & F.col("r._payload").eqNullSafe(F.col("a._payload"))
+    )
+    return (
+        removed.alias("r")
+        .join(added.alias("a"), same_key, "full")
+        .where(F.coalesce(F.col("r._n_removed"), F.lit(0)) != F.coalesce(F.col("a._n_added"), F.lit(0)))
+        .select(
+            F.coalesce(F.col("r._wkg"), F.col("a._wkg")).alias("_wkg"),
+            F.coalesce(F.col("r._tlc"), F.col("a._tlc")).alias("_tlc"),
+        )
+        .dropDuplicates()
+    )
+
+
 def changed_parent_keys(spark, config: PipelineConfig):
     """Return touched source parents and pending source versions.
 
@@ -266,9 +300,7 @@ def changed_parent_keys(spark, config: PipelineConfig):
         spark, config.master_orderable_table, orderables_start, versions["path_master_orderables"]
     )
     if orderables_changes is not None:
-        changed_tlcs = orderables_changes.select(
-            F.upper(F.trim("WkgCode")).alias("_wkg"), F.upper(F.trim("TLCCode")).alias("_tlc")
-        ).dropDuplicates()
+        changed_tlcs = _semantic_orderable_keys(orderables_changes)  # PATH_ORDERABLES_SEMANTIC_V1
         requested = spark.table(config.sample_table).select(
             F.col("LIMSNo").cast("int").alias("LIMSNo"), F.col("LabNo").alias("lab_no"), "TLCsRequested"
         )

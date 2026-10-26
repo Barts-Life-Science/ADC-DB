@@ -2703,8 +2703,7 @@ EVENT_FEED_SPECS = {
         ],
         # Mapping rows for those events (legacy source/vocabulary arms).
         "maps": lambda: [
-            _map_projection(_genomic_result_canonical(), "_gr_snomed_code", "_gr_snomed_display",
-                "http://snomed.info/sct", "measurement", "bronze.map_pathology_genetic_result"),
+            # SILVER_RELEASE_20261025 item 7: the SNOMED arm is retired (bronze snomed_code was never populated).
             _map_projection(_genomic_result_canonical(), "_gr_clinvar_code", "_gr_clinvar_display",
                 "urn:clinvar", "measurement", "bronze.map_pathology_genetic_result:clinvar"),
             _map_projection(_genomic_result_canonical(), "_gr_omop_code", "_gr_omop_display",

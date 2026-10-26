@@ -1389,6 +1389,7 @@ PROCEDURE_INDICATION_RULE = "procedure_site_finding_site_v1"
 PROCEDURE_INDICATION_MAX_LEVELS = 2
 
 PROCEDURE_INDICATION_PUBLIC_COLUMNS = [
+    "procedure_indication_key",  # SILVER_RELEASE_20261025 item 3
     "procedure_patient_event_key", "procedure_source_object", "procedure_id", "implant_event_id", "implant_sequence",
     "condition_patient_event_key", "diagnosis_id", "problem_id", "person_id", "encounter_id",
     "procedure_site_code", "procedure_site_display", "condition_site_code", "condition_site_display",
@@ -1396,6 +1397,7 @@ PROCEDURE_INDICATION_PUBLIC_COLUMNS = [
 ]
 
 PROCEDURE_INDICATION_COLUMN_COMMENTS = {
+    "procedure_indication_key": "Deterministic SHA-256 key of the candidate: stable_id('procedure_indication', procedure_patient_event_key, condition_patient_event_key). Primary key: the table holds one row per (procedure, condition) pair.",
     "procedure_patient_event_key": "patient_event_key of the clinical_procedure row: an OPCS-4 operation, or an implant linked to exactly one operation.",
     "procedure_source_object": "source_object of the procedure row: millennium_procedure or implant.",
     "procedure_id": "Millennium PROCEDURE_ID of the operation row (NULL for implant rows).",
@@ -1510,6 +1512,10 @@ def _procedure_indication_query():
             .join(_snomed_names("procedure_site"), "procedure_site_id", "left")
             .join(_snomed_names("condition_site"), "condition_site_id", "left")
             .select(
+                # SILVER_RELEASE_20261025 item 3: one row per (procedure, condition) pair by construction (the
+                # pair_order row_number above), so this key is unique.
+                stable_id("procedure_indication", F.col("patient_event_key"), F.col("condition_patient_event_key"))
+                .alias("procedure_indication_key"),
                 F.col("patient_event_key").alias("procedure_patient_event_key"),
                 F.col("source_object").alias("procedure_source_object"),
                 "procedure_id", "implant_event_id", "implant_sequence",
@@ -2628,10 +2634,17 @@ GENOMIC_RESULT_SOURCE_COLUMNS = [
     "iscn_raw",
     "clinvar_concept_id",
     "omop_genomic_concept_id",
-    "snomed_code",
     "cosmic_id",  # GEN4
     "itd_length_bp",  # GEN4
     "reported_pathogenicity",  # GEN4
+    "pathogenicity_loinc_code",  # SILVER_RELEASE_20261025 item 7
+    "pathogenicity_omop_concept_id",  # SILVER_RELEASE_20261025 item 7
+    "pathogenicity_display",  # SILVER_RELEASE_20261025 item 7
+    "pathogenicity_question_loinc_code",  # SILVER_RELEASE_20261025 item 7
+    "pathogenicity_question_omop_concept_id",  # SILVER_RELEASE_20261025 item 7
+    "tier_system",  # SILVER_RELEASE_20261025 item 7
+    "tier_code",  # SILVER_RELEASE_20261025 item 7
+    "tier_display",  # SILVER_RELEASE_20261025 item 7
     "resolved_transcript",  # GEN4
     "transcript_source",  # GEN4
     "variant_key",  # GEN4
@@ -2709,10 +2722,17 @@ GENOMIC_RESULT_PUBLIC_COLUMNS = [
     'iscn_raw',
     'clinvar_concept_id',
     'omop_genomic_concept_id',
-    'snomed_code',
     'cosmic_id',  # GEN4
     'itd_length_bp',  # GEN4
     'reported_pathogenicity',  # GEN4
+    'pathogenicity_loinc_code',  # SILVER_RELEASE_20261025 item 7
+    'pathogenicity_omop_concept_id',  # SILVER_RELEASE_20261025 item 7
+    'pathogenicity_display',  # SILVER_RELEASE_20261025 item 7
+    'pathogenicity_question_loinc_code',  # SILVER_RELEASE_20261025 item 7
+    'pathogenicity_question_omop_concept_id',  # SILVER_RELEASE_20261025 item 7
+    'tier_system',  # SILVER_RELEASE_20261025 item 7
+    'tier_code',  # SILVER_RELEASE_20261025 item 7
+    'tier_display',  # SILVER_RELEASE_20261025 item 7
     'resolved_transcript',  # GEN4
     'transcript_source',  # GEN4
     'variant_key',  # GEN4
@@ -2795,10 +2815,17 @@ GENOMIC_RESULT_COLUMN_COMMENTS = {
     "iscn_raw": "Raw ISCN notation.",
     "clinvar_concept_id": "ClinVar concept identifier.",
     "omop_genomic_concept_id": "OMOP Genomic concept identifier.",
-    "snomed_code": "Not populated: SNOMED has no variant-finding concepts; see omop_genomic_concept_id.",
     "cosmic_id": 'COSMIC identifier exactly as reported by the laboratory; not enriched from COSMIC.',
     "itd_length_bp": 'Reported FLT3/NPM1 insertion length in base pairs.',
     "reported_pathogenicity": 'Laboratory pathogenicity class: pathogenic, likely_pathogenic, uncertain_significance, likely_benign, benign.',
+    "pathogenicity_loinc_code": 'LOINC answer code for reported_pathogenicity, answering LOINC 53037-8 (Genetic variation clinical significance [Imp]): LA6668-3 Pathogenic, LA26332-9 Likely pathogenic, LA26333-7 Uncertain significance, LA26334-5 Likely benign, LA6675-8 Benign. Deterministic code table in silver; NULL when the laboratory reported no pathogenicity class.',
+    "pathogenicity_omop_concept_id": 'Standard OMOP concept_id (vocabulary LOINC, class Answer, domain Meas Value) of pathogenicity_loinc_code: 45884094 Pathogenic, 21498358 Likely pathogenic, 21498841 Uncertain significance, 21498359 Likely benign, 45880925 Benign.',
+    "pathogenicity_display": 'LOINC answer display of pathogenicity_loinc_code.',
+    "pathogenicity_question_loinc_code": 'LOINC question the coded pathogenicity answers: 53037-8 Genetic variation clinical significance [Imp]. Set exactly when pathogenicity_loinc_code is set.',
+    "pathogenicity_question_omop_concept_id": 'Standard OMOP concept_id of the question, 3039641 (LOINC 53037-8). Set exactly when pathogenicity_loinc_code is set.',
+    "tier_system": 'Coding system of tier_code: urn:barts:genomics:amp-asco-cap-2017-somatic-tier, the AMP/ASCO/CAP 2017 somatic variant tiers (no standard vocabulary concept exists for them in 3_lookup.omop). Set when reported_tier is I, II, III or IV.',
+    "tier_code": 'AMP/ASCO/CAP somatic variant tier from reported_tier: I, II, III or IV; NULL otherwise.',
+    "tier_display": 'Meaning of tier_code: Tier I strong, Tier II potential, Tier III unknown clinical significance; Tier IV benign or likely benign.',
     "resolved_transcript": "RefSeq transcript the c. HGVS refers to: as reported, else the report's panel list, else the gene's MANE Select (see transcript_source).",
     "transcript_source": 'reported, report_panel_list or mane_select.',
     "variant_key": 'GRCh38 VCF key chrN:pos:ref:alt (left-normalised), derived in-estate from resolved_transcript + hgvs_c_parsed.',
@@ -8072,6 +8099,9 @@ declare_s3_domain_stages("vital_sign", "journey_clinical._qc_vital_sign", {"vita
                          VITAL_PUBLIC_COLUMNS, VITAL_LIFECYCLE_COLUMNS)
 declare_s3_domain_stages("pathology_result", "journey_clinical._qc_pathology_result", {"result_code": "_result_code_json"},
                          RESULT_PUBLIC_COLUMNS, RESULT_LIFECYCLE_COLUMNS)
+# FINDING_AXIS_EVENTCD_V1: the clinical_finding finding axis (EVENT_CD lookup) maps once per distinct input.
+declare_s3_domain_stages("clinical_finding", "journey_clinical._qc_clinical_finding", {"finding_code": "_qc_finding_code_json"},
+                         CLINICAL_FINDING_PUBLIC_COLUMNS, CLINICAL_FINDING_LIFECYCLE_COLUMNS)
 
 # COMMAND ----------
 

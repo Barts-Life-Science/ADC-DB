@@ -40,6 +40,8 @@ LINK = f"{SOURCE_SCHEMA}.clinical_imaging_report_link"
 
 # (column, comment, ig_risk, ig_severity), in view order.
 COLUMNS = [
+    # SILVER_RELEASE_20261025 item 4: a publishable row key (accession_key itself is an ig_risk 4 identifier).
+    ("accession_row_key", "Deterministic SHA-256 row key of the accession: the estate stable_id convention over the namespace 'imaging_accession' and accession_key (sha2 of base64-encoded parts joined by ':'). Unique per row; publishable where the ig_risk 4 accession_key is not.", "1", "2"),
     ("accession_key", "upper(trim(sectra_accession_number)); the accession grouping key.", "4", "2"),
     ("sectra_accession_number", "Barts/Sectra extraction accession (smallest spelling among eligible members).", "4", "2"),
     ("person_id", "The accession's single resolved Millennium PERSON_ID. Accessions with conflicting persons are not in this view.", "2", "1"),
@@ -137,6 +139,11 @@ reports AS (
   GROUP BY accession_key
 )
 SELECT
+  -- accession_row_key: the estate stable_id convention (silver_journey_shared.stable_id) in SQL: each part is
+  -- base64(trim(text)) (NULL as '~'), parts joined by ':', then SHA-256.
+  sha2(concat_ws(':', base64(cast('imaging_accession' AS BINARY)),
+                 CASE WHEN a.accession_key IS NULL THEN '~'
+                      ELSE base64(cast(trim(cast(a.accession_key AS STRING)) AS BINARY)) END), 256),
   a.accession_key, a.sectra_accession_number, a.person_id, a.accession_person_status,
   a.first_performed_datetime, a.last_performed_datetime, a.examination_count,
   a.study_instance_uid_count, a.cerner_event_count, a.eligible_member_count, m.member_count,
@@ -168,4 +175,3 @@ tagged = spark.sql(f"""
 """).first().n
 assert tagged == len(COLUMNS), f"{tagged} of {len(COLUMNS)} columns tagged"
 print(f"{VIEW}: {len(COLUMNS)} columns, all tagged")
-

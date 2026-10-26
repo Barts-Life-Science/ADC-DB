@@ -337,6 +337,10 @@ SRC_S3C_RXNORM_CLASS_MAP = "3_lookup.omop.rxnorm_class_residue"
 
 SRC_S3C_DMD_ID_MAP = "3_lookup.omop.dmd_id_map"
 
+# FINDING_AXIS_EVENTCD_V1: Cerner EVENT_CD -> finding (question/observable) concept, built by
+# CC/FindingAxis_20261025 from the curated Barts catalogues, OMOP exact names and Opus-verified S5 proposals.
+SRC_S3_FINDING_EVENT_CODE_MAP = "3_lookup.omop.finding_event_code_snomed_map"
+
 S3B_BRONZE_MED_EMBED_MODEL = "bronze_med_admin_vector:unversioned"
 
 S3B_HIERARCHY_VERSION = spark.conf.get("journey.s3b_hierarchy_version", "")
@@ -649,6 +653,46 @@ def _s3_snomed_from_omop(df, axis):
               .withColumn(f"{axis}_map_component_index",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_component_index")))
               .withColumn(f"{axis}_map_component_count",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_component_count")))
               .drop("_s3_xw_id","_s3_xw_code","_s3_xw_display"))
+
+# SILVER_RELEASE_20261025 item 1: the axes whose models use the fixed crosswalk step below, and their model.
+# These axis names occur in no other model (S3_PUBLIC_CODED_AXES / S3_TABLE_AXIS_SPECS), so choosing the step by
+# axis changes exactly these three models' plans and leaves every other clinical table's plan as it was.
+S3_SNOMED_FROM_OMOP_V2_AXES = {
+    "vital": "vital_sign",
+    "score": "clinical_score",
+    "stage_diagnosis": "condition_stage",
+    "stage_group": "condition_stage",
+}
+
+
+def _s3_snomed_from_omop_v2(df, axis):
+    """Recover SNOMED code/display when a bronze row carried only its OMOP concept id (fixed copy).
+
+    The original step builds its predicate from `{axis}_snomed_code` and then overwrites that column first, so
+    every later withColumn re-resolves the predicate against the new value and sees false: only the code was
+    filled, never the display, target or provenance. Here the predicate is materialised as `_s3_xw_use` before
+    any column it reads is written, and dropped at the end.
+    """
+    xw = (spark.read.table(_n("journey_reference._snomed_concept_crosswalk"))
+          .select(F.col("concept_id").alias("_s3_xw_id"),
+                  F.col("concept_code").alias("_s3_xw_code"),
+                  F.col("concept_name").alias("_s3_xw_display")))
+    df = df.join(xw, F.col(f"{axis}_omop_concept_id") == F.col("_s3_xw_id"), "left")
+    df = df.withColumn("_s3_xw_use", F.col(f"{axis}_snomed_code").isNull() & F.col("_s3_xw_code").isNotNull())
+    use = F.col("_s3_xw_use")
+    return (df.withColumn(f"{axis}_snomed_code", F.when(use, F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_snomed_code")))
+              .withColumn(f"{axis}_snomed_display", F.when(use, F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_snomed_display")))
+              .withColumn(f"{axis}_target_system", F.when(use, F.lit(SNOMED_URI)).otherwise(F.col(f"{axis}_target_system")))
+              .withColumn(f"{axis}_target_code", F.when(use, F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_target_code")))
+              .withColumn(f"{axis}_target_display", F.when(use, F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_target_display")))
+              .withColumn(f"{axis}_map_method", F.when(use, F.coalesce(F.col(f"{axis}_map_method"), F.lit("rule"))).otherwise(F.col(f"{axis}_map_method")))
+              .withColumn(f"{axis}_map_rule_id", F.when(use, F.coalesce(F.col(f"{axis}_map_rule_id"), F.lit("omop:snomed_concept_crosswalk"))).otherwise(F.col(f"{axis}_map_rule_id")))
+              .withColumn(f"{axis}_map_candidate_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_candidate_count")))
+              .withColumn(f"{axis}_map_status", F.when(use, F.lit("mapped")).otherwise(F.col(f"{axis}_map_status")))
+              .withColumn(f"{axis}_map_competing_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_competing_count")))
+              .withColumn(f"{axis}_map_component_index", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_component_index")))
+              .withColumn(f"{axis}_map_component_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_component_count")))
+              .drop("_s3_xw_id", "_s3_xw_code", "_s3_xw_display", "_s3_xw_use"))
 
 def _s3_enforce_omop_standard_target(df, axis):
     """A12: a non-standard OMOP id is source provenance, never a target."""
@@ -1298,8 +1342,13 @@ def _s3_lookup_step(axis, *args, allow_split=False, **kwargs):
 
 
 def _s3_crosswalk_steps(axis):
-    """SNOMED recovery from the OMOP id, then the OMOP standard-target check, for one axis."""
-    return [_S3Step(axis, 1, lambda df: _s3_snomed_from_omop(df, axis)),
+    """SNOMED recovery from the OMOP id, then the OMOP standard-target check, for one axis.
+
+    SILVER_RELEASE_20261025 item 1: the axes of vital_sign, clinical_score and condition_stage take the fixed
+    recovery step; every other axis keeps the original one (Ben's decision: no plan change elsewhere).
+    """
+    recover = _s3_snomed_from_omop_v2 if axis in S3_SNOMED_FROM_OMOP_V2_AXES else _s3_snomed_from_omop
+    return [_S3Step(axis, 1, lambda df: recover(df, axis)),
             _S3Step(axis, 1, lambda df: _s3_enforce_omop_standard_target(df, axis))]
 
 
@@ -1327,6 +1376,10 @@ def _s3_mapping_steps(model_name):
         steps.append(_s3_lookup_step("substance", SRC_S3_ALLERGY_MAP, "urn:cerner:allergy-substance-text",
                                      F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))), model_name=model_name))
     elif model_name == "clinical_finding":
+        # FINDING_AXIS_EVENTCD_V1: the finding axis is the Cerner EVENT_CD; mapped per distinct input (S3 domain).
+        steps.append(_s3_lookup_step("finding", SRC_S3_FINDING_EVENT_CODE_MAP, "urn:cerner:code_value",
+                                     F.when(F.col("finding_source_system") == "urn:cerner:code_value",
+                                            F.col("finding_source_code")), model_name=model_name))
         steps.append(_s3_lookup_step("value", SRC_S3_VALUE_TEXT_MAP, "urn:cerner:nomenclature:answer-text",
                                      F.lower(F.trim(F.regexp_replace(F.coalesce(F.col("value_display"), F.col("value_text")), r"\s+", " "))), model_name=model_name))
     elif model_name == "condition_stage":
@@ -1474,6 +1527,9 @@ S3_DOMAIN_MODELS = {
     "vital_sign": {"axes": ("unit", "method", "body_site", "interpretation", "vital"),
                    "inputs": ("unit_source_value", "method_display", "body_site_display", "interpretation_display")},
     "pathology_result": {"axes": ("test",), "inputs": ()},
+    # FINDING_AXIS_EVENTCD_V1: ~27k distinct finding inputs over ~1.6bn rows; the value axis keys on answer text,
+    # so it stays per row.
+    "clinical_finding": {"axes": ("finding",), "inputs": ()},
 }
 
 S3_STAGE_JOIN_BUDGET = 3
@@ -3991,6 +4047,67 @@ def _genomic_test_canonical():
 
 
 
+# SILVER_RELEASE_20261025 item 7: coded genomic pathogenicity and tier (Ben, 2026-10-25).
+# reported_pathogenicity is bronze's normalised laboratory class; each maps to its standard LOINC answer concept
+# (3_lookup.omop.concept, vocabulary LOINC, class Answer) for the question LOINC 53037-8 "Genetic variation clinical
+# significance [Imp]". Deterministic table, no curation queue: an unlisted class publishes NULL codes.
+GENOMIC_PATHOGENICITY_LOINC = {
+    # reported_pathogenicity: (LOINC answer code, OMOP concept_id, LOINC answer display)
+    "pathogenic": ("LA6668-3", 45884094, "Pathogenic"),
+    "likely_pathogenic": ("LA26332-9", 21498358, "Likely pathogenic"),
+    "uncertain_significance": ("LA26333-7", 21498841, "Uncertain significance"),
+    "likely_benign": ("LA26334-5", 21498359, "Likely benign"),
+    "benign": ("LA6675-8", 45880925, "Benign"),
+}
+GENOMIC_PATHOGENICITY_QUESTION_LOINC = "53037-8"
+GENOMIC_PATHOGENICITY_QUESTION_CONCEPT_ID = 3039641
+# reported_tier: AMP/ASCO/CAP 2017 somatic variant tiers (Li et al., J Mol Diagn 2017). There is no standard
+# vocabulary concept for these tiers in 3_lookup.omop, so the code is the tier numeral under a local system URI.
+GENOMIC_TIER_SYSTEM = "urn:barts:genomics:amp-asco-cap-2017-somatic-tier"
+GENOMIC_TIER_DISPLAY = {
+    "I": "Tier I: variant of strong clinical significance",
+    "II": "Tier II: variant of potential clinical significance",
+    "III": "Tier III: variant of unknown clinical significance",
+    "IV": "Tier IV: benign or likely benign variant",
+}
+
+
+def _genomic_code_from_table(source, table, pick):
+    """CASE over a small literal code table: the picked value for the matching key, else NULL."""
+    coded = None
+    for key, values in table.items():
+        value = F.lit(pick(values))
+        coded = F.when(source == key, value) if coded is None else coded.when(source == key, value)
+    return coded
+
+
+def _genomic_pathogenicity_columns(pathogenicity):
+    """Coded pathogenicity columns (LOINC answer + OMOP concept + question) for a reported_pathogenicity column."""
+    known = pathogenicity.isin(*GENOMIC_PATHOGENICITY_LOINC)
+    return [
+        _genomic_code_from_table(pathogenicity, GENOMIC_PATHOGENICITY_LOINC, lambda v: v[0])
+        .cast("string").alias("pathogenicity_loinc_code"),
+        _genomic_code_from_table(pathogenicity, GENOMIC_PATHOGENICITY_LOINC, lambda v: v[1])
+        .cast("bigint").alias("pathogenicity_omop_concept_id"),
+        _genomic_code_from_table(pathogenicity, GENOMIC_PATHOGENICITY_LOINC, lambda v: v[2])
+        .cast("string").alias("pathogenicity_display"),
+        F.when(known, F.lit(GENOMIC_PATHOGENICITY_QUESTION_LOINC)).cast("string")
+        .alias("pathogenicity_question_loinc_code"),
+        F.when(known, F.lit(GENOMIC_PATHOGENICITY_QUESTION_CONCEPT_ID)).cast("bigint")
+        .alias("pathogenicity_question_omop_concept_id"),
+    ]
+
+
+def _genomic_tier_columns(tier):
+    """Coded AMP/ASCO/CAP tier columns (system, code, display) for a reported_tier column."""
+    known = tier.isin(*GENOMIC_TIER_DISPLAY)
+    return [
+        F.when(known, F.lit(GENOMIC_TIER_SYSTEM)).cast("string").alias("tier_system"),
+        F.when(known, tier).cast("string").alias("tier_code"),
+        _genomic_code_from_table(tier, GENOMIC_TIER_DISPLAY, lambda v: v).cast("string").alias("tier_display"),
+    ]
+
+
 def _genomic_result_canonical_pregate():
     # Normalize genomic result source rows before the downstream admission filter so excluded
     # evidence remains countable.
@@ -4062,11 +4179,13 @@ def _genomic_result_canonical_pregate():
         F.col("g.copy_number"), F.col("g.ratio_raw"), F.col("g.iscn_raw"),
         F.col("g.clinvar_concept_id").cast("string").alias("clinvar_concept_id"),
         F.col("g.omop_genomic_concept_id").cast("string").alias("omop_genomic_concept_id"),
-        F.col("g.snomed_code").cast("string").alias("snomed_code"),
         # GEN4: finding extras, GRCh38 coordinates and concept provenance
         F.col("g.cosmic_id"),
         F.col("g.itd_length_bp"),
         F.col("g.reported_pathogenicity"),
+        # SILVER_RELEASE_20261025 item 7: coded pathogenicity and tier (snomed_code retired: never populated)
+        *_genomic_pathogenicity_columns(F.col("g.reported_pathogenicity")),
+        *_genomic_tier_columns(F.col("g.reported_tier")),
         F.col("g.resolved_transcript"),
         F.col("g.transcript_source"),
         F.col("g.variant_key"),
@@ -4099,9 +4218,6 @@ def _genomic_result_canonical_pregate():
         F.lit("laboratory").alias("_source_system"),
         F.lit(SRC_PATHOLOGY_GENETIC_RESULT).alias("_source_table"),
         F.col("g.genetic_result_id").alias("_source_row_id"),
-        F.col("g.snomed_code").cast("string").alias("_gr_snomed_code"),
-        F.coalesce(F.col("g.reported_classification"), F.col("g.alteration_type"))
-         .alias("_gr_snomed_display"),
         F.col("g.clinvar_concept_id").cast("string").alias("_gr_clinvar_code"),
         F.col("g.reported_classification").alias("_gr_clinvar_display"),
         F.col("g.omop_genomic_concept_id").cast("string").alias("_gr_omop_code"),
@@ -6444,11 +6560,17 @@ def _text_document_canonical():
         F.lit("direct").alias("_linkage_route"),
     )
 
-# contract v2: publish Millennium document EVENT_ID and native encounter, author, and verifier identifiers
-def _mill_blob_document_canonical():
-    # Assemble normalized mill blob document rows for downstream dataset builders, preserving
-    # the existing source and identity rules.
-    raw = read_source(SRC_MILL_BLOB_TEXT).where(F.col("STATUS") == F.lit("Decoded"))
+def _mill_blob_version_rows(raw, native_columns=()):
+    """One mill_blob_text row per governed document-version key (EVENT_ID, UPDT_CNT, VALID_FROM_DT_TM).
+
+    `raw` is mill_blob_text (decoded rows, optionally narrowed by EVENT_ID; narrowing keeps every row of a kept
+    key, so the winner is unchanged). Moved verbatim out of _mill_blob_document_canonical so the Cerner imaging
+    report links pick the same physical row the document lane publishes (SILVER_RELEASE_20261025 item 2).
+
+    The winning row is round-tripped through JSON, which keeps timestamps to the millisecond. `native_columns`
+    are carried beside it unconverted (the winner is unchanged: order_key decides first and embeds the full-row
+    hash); with none, the expressions are exactly the document lane's original ones.
+    """
     source_hash = F.sha2(F.to_json(F.struct(*[raw[c] for c in raw.columns])), 256)
     # Source occasionally contains more than one physical extraction row for the same governed
     # document-version key. Collapse those rows with an incrementalizable aggregate rather than a
@@ -6465,16 +6587,35 @@ def _mill_blob_document_canonical():
     )
     # MAX over an orderable struct is deterministic and incrementally composable. The winning
     # source row is round-tripped through its exact Spark schema after selection.
-    selected_row = F.max(
-        F.struct(order_key.alias("order_key"), source_json.alias("source_json"))
-    )
-    b = (
+    if not native_columns:
+        selected_row = F.max(
+            F.struct(order_key.alias("order_key"), source_json.alias("source_json"))
+        )
+        return (
+            raw.groupBy("EVENT_ID", "UPDT_CNT", "VALID_FROM_DT_TM")
+            .agg(selected_row.alias("_selected"))
+            .select(F.from_json(F.col("_selected.source_json"), raw.schema).alias("_source"))
+            .select("_source.*")
+        )
+    selected_row = F.max(F.struct(
+        order_key.alias("order_key"), source_json.alias("source_json"),
+        *[raw[c].alias(f"_native_{c}") for c in native_columns],
+    ))
+    return (
         raw.groupBy("EVENT_ID", "UPDT_CNT", "VALID_FROM_DT_TM")
         .agg(selected_row.alias("_selected"))
-        .select(F.from_json(F.col("_selected.source_json"), raw.schema).alias("_source"))
-        .select("_source.*")
-        .alias("b")
+        .select(F.from_json(F.col("_selected.source_json"), raw.schema).alias("_source"), "_selected")
+        .select(*[F.col(f"_selected._native_{c}").alias(c) if c in native_columns else F.col(f"_source.{c}")
+                  for c in raw.columns])
     )
+
+
+# contract v2: publish Millennium document EVENT_ID and native encounter, author, and verifier identifiers
+def _mill_blob_document_canonical():
+    # Assemble normalized mill blob document rows for downstream dataset builders, preserving
+    # the existing source and identity rules.
+    raw = read_source(SRC_MILL_BLOB_TEXT).where(F.col("STATUS") == F.lit("Decoded"))
+    b = _mill_blob_version_rows(raw).alias("b")
     e = read_source(SRC_ENCOUNTER).select(
         F.col("ENCNTR_ID").alias("_context_encounter_id"),
         F.col("PERSON_ID").alias("_context_person_id"),
@@ -10229,7 +10370,16 @@ def _cerner_report_links(docs):
         F.countDistinct(F.when(F.col("_doc_has_text"), F.col("_doc_text_sha256")))
         .alias("_distinct_texts"),
     )
-    blob = read_source(SRC_MILL_BLOB_TEXT)
+    # SILVER_RELEASE_20261025 item 2: anonymised text comes from the same collapsed decoded version row the
+    # document lane published, so the (event, update count, valid-from) join below is one-to-one. Raw
+    # mill_blob_text can hold several rows per version key (blob version-dup defect), which repeated link_key.
+    # Only radiology report events are collapsed: narrowing by EVENT_ID keeps every row of a kept key.
+    report_events = doc_events.select(F.col("_doc_evt").cast("bigint").alias("_blob_report_event_id"))
+    decoded = read_source(SRC_MILL_BLOB_TEXT).where(F.col("STATUS") == F.lit("Decoded"))
+    decoded = decoded.join(report_events, decoded["EVENT_ID"].cast("bigint") == F.col("_blob_report_event_id"),
+                           "left_semi")
+    # anon_processed_at is published as anonymised_at: carry it unconverted (the JSON round trip keeps milliseconds).
+    blob = _mill_blob_version_rows(decoded, native_columns=("anon_processed_at",))
     a_anon, a_anon_version, a_anon_at = _anon_lane(blob, "anon_text", ["BLOB_TEXT"])
     blob_anon = blob.select(
         F.col("EVENT_ID").cast("bigint").alias("_a_event_id"),

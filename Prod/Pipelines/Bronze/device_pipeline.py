@@ -3408,6 +3408,30 @@ def _source_rows_requiring_remap(
     return changed_ids, deleted_ids
 
 
+# DEVICE_REFERENCE_METADATA_ONLY_V1 (BRONZE_FIX_20261025): commits that cannot change row values.
+_DEVICE_METADATA_ONLY_OPERATIONS = {
+    'CHANGE COLUMN', 'SET TBLPROPERTIES', 'UNSET TBLPROPERTIES', 'OPTIMIZE', 'VACUUM START', 'VACUUM END',
+    'COMPUTE STATS', 'ANALYZE', 'ADD CONSTRAINT', 'DROP CONSTRAINT', 'UPGRADE PROTOCOL', 'SET TAGS', 'UNSET TAGS',
+    'CLUSTER BY', 'SET COMMENT', 'COMMENT ON TABLE',
+}
+
+
+def _device_reference_commit_operations(table_name: str, previous_version: int, current_version: int) -> List[str]:
+    """Operation names of the commits after previous_version up to current_version (history survives VACUUM)."""
+    history = (
+        spark.sql('DESCRIBE HISTORY ' + _device_hardening_sql_identifier(table_name))
+        .where((F.col('version') > int(previous_version)) & (F.col('version') <= int(current_version)))
+        .select('version', 'operation')
+        .collect()
+    )
+    found_versions = {int(row['version']) for row in history}
+    expected_versions = set(range(int(previous_version) + 1, int(current_version) + 1))
+    if found_versions != expected_versions:
+        # A gap means history was trimmed; we cannot prove the commits were metadata-only.
+        return ['UNKNOWN (history incomplete)']
+    return [str(row['operation']).upper() for row in history]
+
+
 def _device_reference_semantically_changed(
     table_name: str,
     previous_version: int,
@@ -3416,7 +3440,19 @@ def _device_reference_semantically_changed(
     """Detect actual reference payload changes, not overwrite/version churn."""
     if int(current_version) <= int(previous_version):
         return False
-    before = _read_snapshot(table_name, {table_name: int(previous_version)})
+    operations = _device_reference_commit_operations(table_name, previous_version, current_version)
+    if all(operation in _DEVICE_METADATA_ONLY_OPERATIONS for operation in operations):
+        print(f'[INFO] {table_name} v{previous_version}->v{current_version}: metadata-only commits '
+              f'{sorted(set(operations))}; reference payload unchanged.')
+        return False
+    try:
+        before = _read_snapshot(table_name, {table_name: int(previous_version)})
+    except Exception as exc:
+        if not _device_hardening_snapshot_fallback_allowed(exc):
+            raise
+        print(f'[WARN] {table_name} v{previous_version} is past Delta retention and commits {sorted(set(operations))} '
+              'may change rows; treating the reference as changed (full remap).')
+        return True
     after = _read_snapshot(table_name, {table_name: int(current_version)})
     technical = {
         'ADC_UPDT', 'LOAD_DT_TM', 'LOADED_AT', 'INGESTED_AT', 'UPDATED_AT',

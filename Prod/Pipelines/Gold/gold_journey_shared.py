@@ -897,6 +897,45 @@ def _select_alias(expression):
     return match.group(2), match.group(1)
 
 
+# LIFECYCLE_ONE_ROW_V1 (2026-10-25)
+# Each internal silver metadata MV must hold one row per join key, but a ROW_BASED silver
+# update on 2026-10-17 left 5.47M stale duplicate rows in _clinical_pathology_order_metadata
+# and the left join in _qc() copied every affected gold row twice. For tables listed here,
+# gold first reduces that metadata to one row per key in its own internal MV
+# (<internal>._qc_lifecycle_<table>, declared next to the table's twin) and _qc() joins that
+# MV instead. A separate MV keeps the twin's plan shape unchanged; doing the group-by inside
+# the twin made Enzyme reject its incremental plan (EXCESSIVE_OPERATOR_NESTING, dev 10-25).
+# Adding a table here also needs its _qc_lifecycle_ MV declared, and fully recomputes that
+# twin once. silver_journey_post_refresh reports duplicate keys in every metadata MV.
+GOLD_LIFECYCLE_ONE_ROW_PER_KEY = {"clinical_pathology_order"}
+
+
+def _lifecycle_one_row_source(table_name):
+    """One row per join key of a table's internal silver metadata (body of its _qc_lifecycle_ MV).
+
+    Per key it keeps the greatest struct of the support columns, so a whole row survives
+    intact and the same input always gives the same survivor (dropDuplicates would keep an
+    arbitrary row). The struct leads with the load clocks, so the most recently loaded copy
+    wins; copies from the same load fall back to comparing the remaining columns in order,
+    which for identity_status keeps 'unresolved' over 'resolved' (the conservative choice:
+    the row leaves the research surface rather than being published on a disputed identity;
+    9 such keys in prod on 2026-10-25). Identical duplicates collapse to themselves and clean
+    keys are unchanged. A single-source group-by is Enzyme-eligible (EXPLAIN CREATE
+    MATERIALIZED VIEW on 8_dev.incr_probe; dev updates planned GROUP_AGGREGATE).
+    """
+    lifecycle = GOLD_V2_LIFECYCLE[table_name]
+    keys = lifecycle["join_keys"]
+    internal_source = spark.conf.get("journey.silver_internal_catalog_schema")
+    metadata = spark.read.table(internal_source + "._" + table_name + "_metadata")
+    support = [column for column in lifecycle["support_columns"] if column in metadata.columns]
+    clocks = [column for column in ("load_batch_id", "loaded_at", "source_update_timestamp") if column in support]
+    ordered = clocks + [column for column in support if column not in clocks]
+    chosen = F.max(F.struct(*[F.col(column) for column in ordered])).alias("__gold_lifecycle_row")
+    return metadata.groupBy(*keys).agg(chosen).select(
+        *keys, *[F.col("__gold_lifecycle_row." + column).alias(column) for column in support]
+    )
+
+
 def _qc(table_name, select_exprs, fk_columns=(), date_flags=()):
     """Apply Gold repairs while keeping lifecycle and QC fields internal.
 
@@ -928,7 +967,10 @@ def _qc(table_name, select_exprs, fk_columns=(), date_flags=()):
         internal_support = [column for column in support if column not in source.columns]
         if internal_support:
             internal_source = spark.conf.get("journey.silver_internal_catalog_schema")
-            life = spark.read.table(internal_source + "._" + table_name + "_metadata").select(*keys, *internal_support)
+            life_table = internal_source + "._" + table_name + "_metadata"
+            if table_name in GOLD_LIFECYCLE_ONE_ROW_PER_KEY:  # LIFECYCLE_ONE_ROW_V1
+                life_table = _n("gold_qc._lifecycle_" + table_name)
+            life = spark.read.table(life_table).select(*keys, *internal_support)
             source = source.join(life, keys, "left")
     else:
         support = []

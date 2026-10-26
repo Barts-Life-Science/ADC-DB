@@ -178,15 +178,33 @@ _RETRY_DELAYS = (15, 30, 60, 120, 240)
 _RETRYABLE_HTTP = {408, 429}
 
 
+# AQ_MAINTENANCE_PAGE_V1 (BRONZE_FIX_20261025B): on 2026-10-25 every network host answered HTTP 200 with an HTML
+# "Website Temporarily Unavailable" page. An R file is never HTML, so such a body is an outage, not a file.
+_HTML_PREFIXES = (b"<!doctype html", b"<html", b"<head", b"<body", b"<?xml")
+
+
+def _is_html_page(payload, content_type):
+    """True when a 200 response is a web page (maintenance, login, error page) rather than an R data file."""
+    start = payload[:512].lstrip().lower()
+    return start.startswith(_HTML_PREFIXES) or "text/html" in (content_type or "").lower()
+
+
 def _download(url):
-    """Bytes, or None on 404. 5xx/408/429, network errors and timeouts retry with backoff; other HTTP errors raise."""
+    """Bytes, or None on 404. 5xx/408/429, network errors and timeouts retry with backoff; other HTTP errors raise.
+
+    A 200 response carrying an HTML page raises SourceUnavailable straight away (AQ_MAINTENANCE_PAGE_V1).
+    """
     last_error = None
     for attempt in range(len(_RETRY_DELAYS) + 1):
         retry_after = None
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "barts-bronze-air-quality/2"})
             with urllib.request.urlopen(request, timeout=120) as response:
-                return response.read()
+                payload = response.read()
+                if _is_html_page(payload, response.headers.get("Content-Type")):
+                    title = payload[:2000].decode("utf-8", "replace").split("<title>")[-1].split("</title>")[0]
+                    raise SourceUnavailable(f"{url} returned an HTML page instead of an R file: {title.strip()[:120]!r}")
+                return payload
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None

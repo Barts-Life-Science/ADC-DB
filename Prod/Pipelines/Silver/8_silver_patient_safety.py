@@ -104,7 +104,8 @@ def canonical(source_name, target_name, keys, key_name, namespace):
     else:
         df = df.withColumn("identity_status", F.lit("not_applicable"))
     if "encounter_id" in df.columns:
-        df = df.withColumn("encounter_id", F.col("encounter_id").cast("string"))
+        # SILVER_RELEASE_20261025 item 6: Millennium ENCNTR_ID, published as BIGINT like every other silver table.
+        df = df.withColumn("encounter_id", F.col("encounter_id").cast("bigint"))
     if "source_adc_updt" in df.columns:
         df = df.withColumn("source_update_timestamp", F.col("source_adc_updt"))
 
@@ -136,6 +137,11 @@ def canonical(source_name, target_name, keys, key_name, namespace):
         )
         df = df.withColumn("text_sha256", F.sha2("document_text", 256))
         df = df.withColumn("text_length", F.length("document_text"))
+    # SILVER_RELEASE_20261025 item 6: person_id is Millennium PERSON_ID, published as BIGINT like every other silver
+    # table. Keys and subject_key above hash its canonical text form, which a full census showed equal to the
+    # BIGINT's text for every non-null value, so no key changes.
+    if "person_id" in df.columns:
+        df = df.withColumn("person_id", F.col("person_id").cast("bigint"))
     return _with_comments(df, target_name)
 
 def declare_product(source_name, target_name, keys, key_name, namespace):

@@ -1402,12 +1402,8 @@ def pin_decode_lookup() -> tuple[DataFrame, dict]:
             "Scoped mill_code_value failed non-null/unique gate: "
             f"cast_null_rows={metrics['cast_null_rows']}, duplicate_groups={duplicate_groups}"
         )
-    code_map = pinned.agg(
-        F.map_from_entries(
-            F.collect_list(F.struct(F.col("__CODE_VALUE"), F.col("__DESCRIPTION")))
-        ).alias("__CODE_MAP")
-    )
-    return F.broadcast(code_map), {
+    # WL_DECODE_JOIN_V1 (BRONZE_FIX_20261025): return the gated two-column lookup itself; add_decodes joins it.
+    return pinned, {
         "status": "PASS",
         "pinned_version": int(CODE_VALUE_VERSION),
         "live_version": int(CODE_VALUE_LIVE_VERSION),
@@ -1415,19 +1411,26 @@ def pin_decode_lookup() -> tuple[DataFrame, dict]:
         "cast_null_rows": int(metrics["cast_null_rows"] or 0),
         "duplicate_groups": int(duplicate_groups),
         "mode_trigger": False,
-        "decode_strategy": "ONE_BROADCAST_ONE_ROW_MAP; ONE_CROSS_JOIN; ELEMENT_AT",
+        "decode_strategy": "UNIQUE_CODE_VALUE_GATE; ONE_BROADCAST_LEFT_JOIN_PER_CODE_COLUMN",
         "driver_identifier_collection": False,
     }
 
 
-def add_decodes(df: DataFrame, lookup_map: DataFrame) -> DataFrame:
-    result = df.crossJoin(lookup_map)
+def add_decodes(df: DataFrame, lookup: DataFrame) -> DataFrame:
+    """Add {base}_DESC for every DECODE_FIELDS code column: one broadcast left join per column (WL_DECODE_JOIN_V1).
+
+    `lookup` is the pinned (__CODE_VALUE, __DESCRIPTION) frame from pin_decode_lookup, already gated to one row per
+    non-NULL code, so each left join keeps exactly one output row per input row. A NULL or unknown code gets a NULL
+    description, as the previous map lookup did.
+    """
+    result = df
     for base, code_column in DECODE_FIELDS:
-        result = result.withColumn(
-            f"{base}_DESC",
-            F.element_at(F.col("__CODE_MAP"), F.col(code_column)),
+        key = f"__{base}_CODE_KEY"
+        decode = F.broadcast(
+            lookup.select(F.col("__CODE_VALUE").alias(key), F.col("__DESCRIPTION").alias(f"{base}_DESC"))
         )
-    return result.drop("__CODE_MAP")
+        result = result.join(decode, result[code_column] == decode[key], "left").drop(key)
+    return result
 
 
 def cast_projection(source: DataFrame, row_source: str) -> DataFrame:
@@ -1615,7 +1618,7 @@ def finalize_stage_quality(staged: DataFrame, union_gate: dict) -> dict:
         },
         "version_datetime_null_rows": version_nulls,
         "hist_sentinel_collision_rows": sentinel_collisions,
-        "decode_fanout_policy": "ONE_ROW_MAP_CROSS_JOIN_CANNOT_MULTIPLY_SOURCE_ROWS",
+        "decode_fanout_policy": "UNIQUE_CODE_VALUE_LEFT_JOINS_CANNOT_MULTIPLY_SOURCE_ROWS",
         "decode_quality": decode_quality,
         "removal_future_performed_gate": removal_future_performed_gate(staged),
         "planned_future_year_2100_gate": planned_future_year_2100_gate(staged),
@@ -3279,7 +3282,6 @@ finally:
 
 print(json.dumps(SUMMARY, indent=2, sort_keys=True, default=str))
 dbutils.notebook.exit(json.dumps(SUMMARY, sort_keys=True, default=str))
-
 
 
 

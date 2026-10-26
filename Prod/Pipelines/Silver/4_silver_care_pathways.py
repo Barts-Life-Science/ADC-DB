@@ -208,6 +208,8 @@ def _pregnancy_journey_canonical():
         F.lit("Pregnancy").alias("journey_type_display"),
         F.col("_period_start").alias("period_start"),
         F.col("_period_end").alias("period_end"),
+        F.col("_period_start_basis").alias("period_start_basis"),
+        F.col("_period_end_basis").alias("period_end_basis"),
         F.col("_status_code").alias("status_code"),
         F.lit("http://snomed.info/sct").alias("defining_coding_system"),
         F.lit("77386006").alias("defining_code"),
@@ -216,7 +218,7 @@ def _pregnancy_journey_canonical():
         F.col("_pregnancy_outcome_display").alias("outcome_display"),
         F.col("_pregnancy_id").alias("source_journey_identifier"),
         F.lit("pregnancy").alias("construction_rule"),
-        F.lit("pregnancy-v1").alias("construction_version"),
+        F.lit("pregnancy-v2").alias("construction_version"),  # PREGNANCY_DATES_V2
         F.lit("millennium-maternity").alias("source_system"),
         F.lit(SRC_MAT_PREGNANCY).alias("source_table"),
         F.col("_pregnancy_id").alias("source_row_id"),
@@ -244,6 +246,15 @@ def _pregnancy_journey_canonical():
         F.when(F.col("_period_end").isNull(), nominal_end)
         .otherwise(F.least(nominal_end, F.col("_period_end"))),
     )
+    # PREGNANCY_DATES_V2: trimester boundaries derive from the pregnancy's, so they carry its bases; the fixed
+    # 98-day ends of trimesters 1 and 2 are marked trimester_nominal unless the pregnancy end cut them short.
+    child_start_basis = F.when(child_start.isNotNull(), F.col("_period_start_basis"))
+    child_end_basis = (
+        F.when(child_end.isNull(), F.lit(None).cast("string"))
+        .when((F.col("_trimester") < 3) & (F.col("_period_end").isNull() | (nominal_end <= F.col("_period_end"))),
+              F.lit("trimester_nominal"))
+        .otherwise(F.col("_period_end_basis"))
+    )
     child = expanded.select(
         stable_id(
             "journey:pregnancy:trimester", F.col("_pregnancy_id"), F.col("_trimester")
@@ -256,6 +267,8 @@ def _pregnancy_journey_canonical():
         F.concat(F.lit("Pregnancy trimester "), F.col("_trimester")).alias("journey_type_display"),
         child_start.alias("period_start"),
         child_end.alias("period_end"),
+        child_start_basis.alias("period_start_basis"),
+        child_end_basis.alias("period_end_basis"),
         F.col("_status_code").alias("status_code"),
         F.lit("urn:journey:pregnancy-structure").alias("defining_coding_system"),
         F.concat(F.lit("trimester-"), F.col("_trimester")).alias("defining_code"),
@@ -264,7 +277,7 @@ def _pregnancy_journey_canonical():
         F.lit(None).cast("string").alias("outcome_display"),
         F.col("_pregnancy_id").alias("source_journey_identifier"),
         F.lit("pregnancy-trimester").alias("construction_rule"),
-        F.lit("pregnancy-v1").alias("construction_version"),
+        F.lit("pregnancy-v2").alias("construction_version"),  # PREGNANCY_DATES_V2
         F.lit("millennium-maternity").alias("source_system"),
         F.lit(SRC_MAT_PREGNANCY).alias("source_table"),
         F.concat_ws(":", F.col("_pregnancy_id"), F.lit("trimester"), F.col("_trimester"))
@@ -292,6 +305,8 @@ JOURNEY_PUBLIC_COLUMNS = [
     "journey_type_display",
     "period_start",
     "period_end",
+    "period_start_basis",  # SILVER_RELEASE_20261025 item 5
+    "period_end_basis",  # SILVER_RELEASE_20261025 item 5
     "status_code",
     "defining_coding_system",
     "defining_code",
@@ -309,6 +324,90 @@ JOURNEY_PUBLIC_COLUMNS = [
     "loaded_at",
 ]
 
+# SILVER_RELEASE_20261025 item 5: PREGNANCY_DATES_V2 pregnancy boundaries (Ben, 2026-10-25).
+# v1 took the first available of LMP / EDD-280 / first contact / first antenatal appointment as the start and of
+# discharge / last birth / EDD as the end, so a late discharge or an early contact date could stretch a pregnancy
+# over years. v2 trusts an observed birth first, accepts weaker dates only inside a 308-day (44-week) window, and
+# records the rule behind each boundary in period_start_basis / period_end_basis. Nothing is queued for review.
+PREGNANCY_MAX_SPAN_DAYS = 308            # 44 weeks: the longest plausible pregnancy
+PREGNANCY_NOMINAL_DAYS = 280             # EDD - 280 days = the dated start (40 weeks)
+PREGNANCY_MIN_GESTATION_DAYS = 140       # 20 weeks: shortest recorded gestation treated as plausible
+PREGNANCY_DATING_TOLERANCE_DAYS = 14     # LMP/EDD dating "contradicts" the birth gestation beyond this
+# When the span guard fires, the boundary from the less-trusted rule is NULLed (never both; ties null the start).
+PREGNANCY_START_TRUST = {"birth_minus_gestation": 4, "last_menstrual_period": 3,
+                         "expected_delivery_date_minus_280": 2, "first_contact": 1,
+                         "first_antenatal_appointment": 1}
+PREGNANCY_END_TRUST = {"last_birth": 4, "expected_delivery_date": 2, "maternity_service_discharge": 1}
+
+
+def _birth_gestation_days():
+    """Recorded gestation at birth in days (weeks * 7 + remainder days) for a map_mat_birth row."""
+    return F.col("GestationWeeks") * 7 + F.coalesce(F.col("GestationDays"), F.lit(0))
+
+
+def _plausible_birth_gestation():
+    """A birth with a timestamp and a gestation bronze did not flag implausible, within 140-308 days."""
+    return (F.col("BirthDateTime").isNotNull()
+            & ~F.coalesce(F.col("GestationImplausible_IND").cast("boolean"), F.lit(False))
+            & _birth_gestation_days().between(PREGNANCY_MIN_GESTATION_DAYS, PREGNANCY_MAX_SPAN_DAYS))
+
+
+def _trust(basis, table):
+    """Trust rank of a boundary basis (0 when there is no boundary)."""
+    rank = F.lit(0)
+    for name, value in table.items():
+        rank = F.when(basis == name, F.lit(value)).otherwise(rank)
+    return rank
+
+
+def _pregnancy_period(lmp, edd, first_contact, first_appointment, discharge, last_birth, gestation_start):
+    """PREGNANCY_DATES_V2: (start, start_basis, end, end_basis) for one pregnancy.
+
+    1. Anchored start: LMP, else EDD - 280; replaced by the latest plausible birth minus its gestation when that
+       exists and the LMP/EDD date is missing or more than 14 days away from it.
+    2. End: the last birth; else discharge, else EDD, each only 0-308 days after the anchored start (accepted
+       as-is when there is no anchored start).
+    3. Start fallback: first contact, else first antenatal appointment, only on or before the end and within
+       308 days of it (accepted as-is when there is no end).
+    4. Guard: a span still over 308 days, or negative, NULLs the boundary whose rule is less trusted.
+    """
+    days = lambda later, earlier: F.datediff(later, earlier)
+    edd_start = F.date_sub(edd, PREGNANCY_NOMINAL_DAYS).cast("timestamp")
+    dated_start = F.coalesce(lmp, edd_start)
+    dated_basis = (F.when(lmp.isNotNull(), F.lit("last_menstrual_period"))
+                   .when(edd.isNotNull(), F.lit("expected_delivery_date_minus_280")))
+    contradicted = gestation_start.isNotNull() & (
+        dated_start.isNull() | (F.abs(days(dated_start, gestation_start)) > PREGNANCY_DATING_TOLERANCE_DAYS))
+    anchored_start = F.when(contradicted, gestation_start).otherwise(dated_start)
+    anchored_basis = F.when(contradicted, F.lit("birth_minus_gestation")).otherwise(dated_basis)
+
+    def within_window(boundary):
+        # The boundary falls 0-308 days after the anchored start (or there is no anchored start to test against).
+        span = days(boundary, anchored_start)
+        return boundary.isNotNull() & (anchored_start.isNull() | span.between(0, PREGNANCY_MAX_SPAN_DAYS))
+
+    end = (F.when(last_birth.isNotNull(), last_birth)
+           .when(within_window(discharge), discharge)
+           .when(within_window(edd), edd))
+    end_basis = (F.when(last_birth.isNotNull(), F.lit("last_birth"))
+                 .when(within_window(discharge), F.lit("maternity_service_discharge"))
+                 .when(within_window(edd), F.lit("expected_delivery_date")))
+
+    contact = F.coalesce(first_contact, first_appointment)
+    contact_basis = (F.when(first_contact.isNotNull(), F.lit("first_contact"))
+                     .when(first_appointment.isNotNull(), F.lit("first_antenatal_appointment")))
+    contact_ok = contact.isNotNull() & (end.isNull() | days(end, contact).between(0, PREGNANCY_MAX_SPAN_DAYS))
+    start = F.when(anchored_start.isNotNull(), anchored_start).when(contact_ok, contact)
+    start_basis = F.when(anchored_start.isNotNull(), anchored_basis).when(contact_ok, contact_basis)
+
+    span = days(end, start)
+    implausible = start.isNotNull() & end.isNotNull() & ((span > PREGNANCY_MAX_SPAN_DAYS) | (span < 0))
+    null_start = implausible & (_trust(start_basis, PREGNANCY_START_TRUST) <= _trust(end_basis, PREGNANCY_END_TRUST))
+    null_end = implausible & ~null_start
+    guarded = F.lit("nulled_span_guard")
+    return (F.when(~null_start, start), F.when(null_start, guarded).otherwise(start_basis),
+            F.when(~null_end, end), F.when(null_end, guarded).otherwise(end_basis))
+
 def _pregnancy_constructor_base():
     # Combine deduplicated pregnancy records with birth dates and outcomes used to construct
     # maternity journeys.
@@ -323,6 +422,11 @@ def _pregnancy_constructor_base():
             F.max("PregOutcome_DESC").alias("_pregnancy_outcome_display"),
             F.max("ADC_UPDT").alias("_birth_loaded_at"),
             F.max("BirthSourceRecordUpdatedDateTime").alias("_birth_source_update"),
+            # PREGNANCY_DATES_V2: the latest birth with a plausible recorded gestation, and the start it implies.
+            F.max(F.when(_plausible_birth_gestation(), F.struct(
+                F.col("BirthDateTime").alias("birth"),
+                F.date_sub(F.col("BirthDateTime"), _birth_gestation_days()).cast("timestamp").alias("start"),
+            ))).alias("_gestation_birth"),
         )
         .alias("b")
     )
@@ -337,16 +441,9 @@ def _pregnancy_constructor_base():
         SRC_MAT_PREGNANCY,
         source_row_id,
     )
-    start = F.coalesce(
-        p.LastMensPeriodDate,
-        F.date_sub(p.ExpectedDeliveryDate, 280).cast("timestamp"),
-        p.PregnancyFirstContactDate,
-        p.FirstAntenatalAPPTDate,
-    )
-    end = F.coalesce(
-        p.MaternityServiceDischargeDate,
-        F.col("b._last_birth_datetime"),
-        p.ExpectedDeliveryDate,
+    start, start_basis, end, end_basis = _pregnancy_period(
+        p.LastMensPeriodDate, p.ExpectedDeliveryDate, p.PregnancyFirstContactDate, p.FirstAntenatalAPPTDate,
+        p.MaternityServiceDischargeDate, F.col("b._last_birth_datetime"), F.col("b._gestation_birth.start"),
     )
     deleted = F.coalesce(p.SOURCE_DELETED_IND.cast("boolean"), F.lit(False))
     completed = p.MaternityServiceDischargeDate.isNotNull() | F.col("b._last_birth_datetime").isNotNull()
@@ -370,6 +467,8 @@ def _pregnancy_constructor_base():
         p.Person_ID.cast("bigint").alias("_person_id"),
         start.alias("_period_start"),
         end.alias("_period_end"),
+        start_basis.alias("_period_start_basis"),
+        end_basis.alias("_period_end_basis"),
         status.alias("_status_code"),
         F.col("b._pregnancy_outcome_code"),
         F.col("b._pregnancy_outcome_display"),
@@ -385,8 +484,10 @@ JOURNEY_COLUMN_COMMENTS = {
     "person_id": "Millennium PERSON_ID; native primary-subject foreign key when resolved.",
     "journey_type_code": "Controlled journey type.",
     "journey_type_display": "Human-readable journey type.",
-    "period_start": "Earliest source-supported journey boundary.",
-    "period_end": "Latest source-supported journey boundary.",
+    "period_start": 'Journey start. Pregnancy (PREGNANCY_DATES_V2): last menstrual period, else expected delivery date - 280 days; the latest birth minus its plausible recorded gestation replaces either when missing or more than 14 days apart; first contact / first antenatal appointment only as a last resort within 308 days before period_end. See period_start_basis.',
+    "period_end": 'Journey end. Pregnancy (PREGNANCY_DATES_V2): the last birth; else maternity service discharge, else the expected delivery date, each only within 0-308 days after period_start. If the span still exceeds 308 days (or is negative) the less-trusted side is NULLed, never both. See period_end_basis.',
+    "period_start_basis": "Rule that set period_start (PREGNANCY_DATES_V2). Pregnancy rows: birth_minus_gestation (latest birth with a plausible recorded gestation of 140-308 days, used when LMP/EDD dating is missing or differs from it by more than 14 days), last_menstrual_period, expected_delivery_date_minus_280, first_contact or first_antenatal_appointment (last resort, only within 308 days before period_end), or nulled_span_guard (the span still exceeded 308 days or was negative and this was the less-trusted side). Trimester rows carry their pregnancy's start basis. NULL when no source date exists.",
+    "period_end_basis": "Rule that set period_end (PREGNANCY_DATES_V2). Pregnancy rows: last_birth, maternity_service_discharge (only within 0-308 days after the start), expected_delivery_date (only within 0-308 days after the start), or nulled_span_guard. Trimester rows: trimester_nominal for the fixed 98-day trimester ends, otherwise their pregnancy's end basis. NULL when no source date exists or none passed its rule.",
     "status_code": "Normalized journey lifecycle state.",
     "defining_coding_system": "Coding system for the constructor-defining concept.",
     "defining_code": "Constructor-defining concept code.",
@@ -5088,4 +5189,3 @@ def _lifecycle_source_theatre_case():
 def theatre_case():
     # Build the declared dataset: one SurgiNet surgical case.
     return _lifecycle_source_theatre_case().drop(*THEATRE_CASE_LIFECYCLE_FIELDS, *THEATRE_CASE_RETIRED_COLUMNS)
-

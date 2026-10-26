@@ -399,6 +399,30 @@ CONTRACTS: tuple[Contract, ...] = (
             c("research_qi_only", "BOOLEAN", "Always true in v1."),
         ) + COMMON,
     ),
+    # CONTEXT_LINK_V1 (BRONZE_FIX_20261025C): the diagnosis context as a narrow link, not as indications.
+    Contract(
+        "map_pathology_diagnosis_context",
+        "Diagnosis context of a pathology accession (CONTEXT_LINK_V1): one row per (canonical accession, diagnosis) "
+        "where the diagnosis is in the encounter of one of the accession's source rows or dated 30 days before to 7 "
+        "days after one; the strongest evidence (same encounter, then closest date) is kept. Not an "
+        "indication: it records what else was diagnosed around the test. No diagnosis text or codes; join "
+        "map_diagnosis on diagnosis_id.",
+        ("context_id",),
+        (
+            c("context_id", "STRING", "sha2('pathology_diagnosis_context|' || pathology_accession_id || '|' || diagnosis_id)."),
+            c("pathology_accession_id", "STRING", "Canonical accession identifier."),
+            c("diagnosis_id", "BIGINT", "map_diagnosis DIAGNOSIS_ID."),
+            c("person_id", "BIGINT", "PERSON_ID shared by the accession and the diagnosis."),
+            c("accession_encounter_id", "BIGINT", "Encounter of the accession source row that gave the strongest evidence (NULL for LIMS-only rows)."),
+            c("diagnosis_encounter_id", "BIGINT", "ENCNTR_ID of the diagnosis."),
+            c("accession_dt", "TIMESTAMP", "Accession date (sample, else request, else report datetime) of the source row that gave the strongest evidence."),
+            c("diagnosis_dt", "TIMESTAMP", "Diagnosis date: DIAG_DT_TM, else ASSERTED_DT_TM, else BEG_EFFECTIVE_DT_TM."),
+            c("same_encounter", "BOOLEAN", "True when the diagnosis is in the accession's encounter; otherwise it is in the date window."),
+            c("day_offset", "INT", "Days from accession_dt to diagnosis_dt (negative = diagnosis before the accession); NULL when either date is missing."),
+            c("rule_id", "STRING", "diagnosis_context_window_v1."),
+            c("rule_version", "STRING", "Rule version."),
+        ) + COMMON,
+    ),
 )
 
 

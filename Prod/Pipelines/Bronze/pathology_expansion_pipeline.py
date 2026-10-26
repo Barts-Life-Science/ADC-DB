@@ -96,7 +96,8 @@ def indications_lane_state(periodic: dict[str, object], target_schema: str) -> d
     current = int(spark.sql(f"DESCRIBE HISTORY {INDICATIONS_DIAGNOSIS_SOURCE} LIMIT 1").first()["version"])
     current_accession = int(spark.sql(
         f"DESCRIBE HISTORY {target_schema}.map_pathology_accession_source LIMIT 1").first()["version"])
-    table = f"{target_schema}.map_pathology_indication"
+    # CONTEXT_LINK_V1 (BRONZE_FIX_20261025C): the lane's versions live on the context link table.
+    table = f"{target_schema}.map_pathology_diagnosis_context"
     last = last_accession = None
     if spark.catalog.tableExists(table):
         props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
@@ -235,7 +236,7 @@ if indications_lane["enabled"]:
     )
     indications = {**indications, "scope": scope_stats}
     spark.sql(
-        f"ALTER TABLE {target_schema}.map_pathology_indication SET TBLPROPERTIES "
+        f"ALTER TABLE {target_schema}.map_pathology_diagnosis_context SET TBLPROPERTIES "  # CONTEXT_LINK_V1
         f"('{INDICATIONS_VERSION_PROPERTY}' = '{indications_lane['map_diagnosis_version']}', "
         f"'{INDICATIONS_ACCESSION_VERSION_PROPERTY}' = '{indications_lane['accession_source_version']}')"
     )

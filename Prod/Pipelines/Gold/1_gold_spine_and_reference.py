@@ -852,6 +852,8 @@ SPINE_JOURNEY_SELECT = [
     '`journey_type_display` AS `journey_type_display`',
     '`period_start` AS `period_start`',
     "CASE WHEN `period_start` IS NOT NULL AND `period_end` IS NOT NULL AND `period_start` > `period_end` THEN NULL ELSE CASE WHEN CAST(`period_end` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `period_end` END END AS `period_end`",
+    '`period_start_basis` AS `period_start_basis`',  # SILVER_RELEASE_20261025 item 5
+    '`period_end_basis` AS `period_end_basis`',  # SILVER_RELEASE_20261025 item 5
     '`status_code` AS `status_code`',
     '`defining_coding_system` AS `defining_coding_system`',
     '`defining_code` AS `defining_code`',
@@ -893,8 +895,10 @@ SPINE_JOURNEY_COLUMN_COMMENTS = {
     "person_id": "Millennium PERSON_ID; native primary-subject foreign key when resolved.",
     "journey_type_code": "Controlled journey type.",
     "journey_type_display": "Human-readable journey type.",
-    "period_start": "Earliest source-supported journey boundary.",
-    "period_end": "Latest source-supported journey boundary.",
+    "period_start": 'Journey start. Pregnancy (PREGNANCY_DATES_V2): last menstrual period, else expected delivery date - 280 days; the latest birth minus its plausible recorded gestation replaces either when missing or more than 14 days apart; first contact / first antenatal appointment only as a last resort within 308 days before period_end. See period_start_basis.',
+    "period_end": 'Journey end. Pregnancy (PREGNANCY_DATES_V2): the last birth; else maternity service discharge, else the expected delivery date, each only within 0-308 days after period_start. If the span still exceeds 308 days (or is negative) the less-trusted side is NULLed, never both. See period_end_basis.',
+    "period_start_basis": "Rule that set period_start (PREGNANCY_DATES_V2). Pregnancy rows: birth_minus_gestation (latest birth with a plausible recorded gestation of 140-308 days, used when LMP/EDD dating is missing or differs from it by more than 14 days), last_menstrual_period, expected_delivery_date_minus_280, first_contact or first_antenatal_appointment (last resort, only within 308 days before period_end), or nulled_span_guard (the span still exceeded 308 days or was negative and this was the less-trusted side). Trimester rows carry their pregnancy's start basis. NULL when no source date exists.",
+    "period_end_basis": "Rule that set period_end (PREGNANCY_DATES_V2). Pregnancy rows: last_birth, maternity_service_discharge (only within 0-308 days after the start), expected_delivery_date (only within 0-308 days after the start), or nulled_span_guard. Trimester rows: trimester_nominal for the fixed 98-day trimester ends, otherwise their pregnancy's end basis. NULL when no source date exists or none passed its rule.",
     "status_code": "Normalized journey lifecycle state.",
     "defining_coding_system": "Coding system for the constructor-defining concept.",
     "defining_code": "Constructor-defining concept code.",
@@ -952,6 +956,8 @@ def gold_spine_journey():
         '`journey_type_display` AS `journey_type_display`',
         '`period_start` AS `period_start`',
         '`period_end` AS `period_end`',
+        '`period_start_basis` AS `period_start_basis`',  # SILVER_RELEASE_20261025 item 5
+        '`period_end_basis` AS `period_end_basis`',  # SILVER_RELEASE_20261025 item 5
         '`status_code` AS `status_code`',
         '`defining_coding_system` AS `defining_coding_system`',
         '`defining_code` AS `defining_code`',

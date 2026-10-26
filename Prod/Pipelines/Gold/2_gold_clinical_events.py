@@ -12,6 +12,7 @@
 
 from gold_journey_shared import (
     F,
+    _lifecycle_one_row_source,  # LIFECYCLE_ONE_ROW_V1
     _n,
     _qc,
     _s3_axis_columns,
@@ -1608,10 +1609,17 @@ CLINICAL_GENOMIC_RESULT_SELECT = [
     '`iscn_raw` AS `iscn_raw`',
     '`clinvar_concept_id` AS `clinvar_concept_id`',
     '`omop_genomic_concept_id` AS `omop_genomic_concept_id`',
-    '`snomed_code` AS `snomed_code`',
     '`cosmic_id` AS `cosmic_id`',  # GEN4_GOLD_V1
     '`itd_length_bp` AS `itd_length_bp`',  # GEN4_GOLD_V1
     '`reported_pathogenicity` AS `reported_pathogenicity`',  # GEN4_GOLD_V1
+    '`pathogenicity_loinc_code` AS `pathogenicity_loinc_code`',  # SILVER_RELEASE_20261025 item 7
+    '`pathogenicity_omop_concept_id` AS `pathogenicity_omop_concept_id`',  # SILVER_RELEASE_20261025 item 7
+    '`pathogenicity_display` AS `pathogenicity_display`',  # SILVER_RELEASE_20261025 item 7
+    '`pathogenicity_question_loinc_code` AS `pathogenicity_question_loinc_code`',  # SILVER_RELEASE_20261025 item 7
+    '`pathogenicity_question_omop_concept_id` AS `pathogenicity_question_omop_concept_id`',  # SILVER_RELEASE_20261025 item 7
+    '`tier_system` AS `tier_system`',  # SILVER_RELEASE_20261025 item 7
+    '`tier_code` AS `tier_code`',  # SILVER_RELEASE_20261025 item 7
+    '`tier_display` AS `tier_display`',  # SILVER_RELEASE_20261025 item 7
     '`resolved_transcript` AS `resolved_transcript`',  # GEN4_GOLD_V1
     '`transcript_source` AS `transcript_source`',  # GEN4_GOLD_V1
     '`variant_key` AS `variant_key`',  # GEN4_GOLD_V1
@@ -1710,10 +1718,17 @@ CLINICAL_GENOMIC_RESULT_COLUMN_COMMENTS = {
     "iscn_raw": "Raw ISCN notation.",
     "clinvar_concept_id": "ClinVar concept identifier.",
     "omop_genomic_concept_id": "OMOP Genomic concept identifier.",
-    "snomed_code": "Not populated: SNOMED has no variant-finding concepts; see omop_genomic_concept_id.",
     "cosmic_id": 'COSMIC identifier exactly as reported by the laboratory; not enriched from COSMIC.',
     "itd_length_bp": 'Reported FLT3/NPM1 insertion length in base pairs.',
     "reported_pathogenicity": 'Laboratory pathogenicity class: pathogenic, likely_pathogenic, uncertain_significance, likely_benign, benign.',
+    "pathogenicity_loinc_code": 'LOINC answer code for reported_pathogenicity, answering LOINC 53037-8 (Genetic variation clinical significance [Imp]): LA6668-3 Pathogenic, LA26332-9 Likely pathogenic, LA26333-7 Uncertain significance, LA26334-5 Likely benign, LA6675-8 Benign. Deterministic code table in silver; NULL when the laboratory reported no pathogenicity class.',
+    "pathogenicity_omop_concept_id": 'Standard OMOP concept_id (vocabulary LOINC, class Answer, domain Meas Value) of pathogenicity_loinc_code: 45884094 Pathogenic, 21498358 Likely pathogenic, 21498841 Uncertain significance, 21498359 Likely benign, 45880925 Benign.',
+    "pathogenicity_display": 'LOINC answer display of pathogenicity_loinc_code.',
+    "pathogenicity_question_loinc_code": 'LOINC question the coded pathogenicity answers: 53037-8 Genetic variation clinical significance [Imp]. Set exactly when pathogenicity_loinc_code is set.',
+    "pathogenicity_question_omop_concept_id": 'Standard OMOP concept_id of the question, 3039641 (LOINC 53037-8). Set exactly when pathogenicity_loinc_code is set.',
+    "tier_system": 'Coding system of tier_code: urn:barts:genomics:amp-asco-cap-2017-somatic-tier, the AMP/ASCO/CAP 2017 somatic variant tiers (no standard vocabulary concept exists for them in 3_lookup.omop). Set when reported_tier is I, II, III or IV.',
+    "tier_code": 'AMP/ASCO/CAP somatic variant tier from reported_tier: I, II, III or IV; NULL otherwise.',
+    "tier_display": 'Meaning of tier_code: Tier I strong, Tier II potential, Tier III unknown clinical significance; Tier IV benign or likely benign.',
     "resolved_transcript": "RefSeq transcript the c. HGVS refers to: as reported, else the report's panel list, else the gene's MANE Select (see transcript_source).",
     "transcript_source": 'reported, report_panel_list or mane_select.',
     "variant_key": 'GRCh38 VCF key chrN:pos:ref:alt (left-normalised), derived in-estate from resolved_transcript + hgvs_c_parsed.',
@@ -1816,10 +1831,17 @@ def gold_clinical_genomic_result():
         '`iscn_raw` AS `iscn_raw`',
         '`clinvar_concept_id` AS `clinvar_concept_id`',
         '`omop_genomic_concept_id` AS `omop_genomic_concept_id`',
-        '`snomed_code` AS `snomed_code`',
         '`cosmic_id` AS `cosmic_id`',  # GEN4_GOLD_V1
         '`itd_length_bp` AS `itd_length_bp`',  # GEN4_GOLD_V1
         '`reported_pathogenicity` AS `reported_pathogenicity`',  # GEN4_GOLD_V1
+        '`pathogenicity_loinc_code` AS `pathogenicity_loinc_code`',  # SILVER_RELEASE_20261025 item 7
+        '`pathogenicity_omop_concept_id` AS `pathogenicity_omop_concept_id`',  # SILVER_RELEASE_20261025 item 7
+        '`pathogenicity_display` AS `pathogenicity_display`',  # SILVER_RELEASE_20261025 item 7
+        '`pathogenicity_question_loinc_code` AS `pathogenicity_question_loinc_code`',  # SILVER_RELEASE_20261025 item 7
+        '`pathogenicity_question_omop_concept_id` AS `pathogenicity_question_omop_concept_id`',  # SILVER_RELEASE_20261025 item 7
+        '`tier_system` AS `tier_system`',  # SILVER_RELEASE_20261025 item 7
+        '`tier_code` AS `tier_code`',  # SILVER_RELEASE_20261025 item 7
+        '`tier_display` AS `tier_display`',  # SILVER_RELEASE_20261025 item 7
         '`resolved_transcript` AS `resolved_transcript`',  # GEN4_GOLD_V1
         '`transcript_source` AS `transcript_source`',  # GEN4_GOLD_V1
         '`variant_key` AS `variant_key`',  # GEN4_GOLD_V1
@@ -2761,6 +2783,22 @@ def gold_clinical_imaging_report_link():
     """Public imaging report links."""
     df = spark.read.table(_n("gold_qc._clinical_imaging_report_link"))
     return _with_comments(df, CLINICAL_IMAGING_REPORT_LINK_COLUMN_COMMENTS)
+
+
+# SILVER_RELEASE_20261025 item 2: link_key is the table's primary key. Silver once repeated 3,721 keys (duplicate raw
+# blob rows fanned out its anonymised-text join); this audit holds every key that occurs more than once and fails the
+# Gold update when it holds any, so a repeat cannot reach Gold silently. Normally empty; incrementally maintained.
+@dp.materialized_view(
+    name=_n("gold_qc._clinical_imaging_report_link_key_audit"),
+    comment="Internal audit: link_key values occurring more than once in silver clinical_imaging_report_link. Must stay empty; any row fails the Gold update (expect_or_fail).",
+    refresh_policy="auto",
+)
+@dp.expect_or_fail("gold.clinical.imaging_report_link.link_key_unique", "link_rows = 1")
+def _gold_qc_clinical_imaging_report_link_key_audit():
+    """Repeated link_keys of the silver product, with how often each occurs."""
+    return (spark.read.table(_src("clinical_imaging_report_link"))
+            .groupBy("link_key").agg(F.count(F.lit(1)).alias("link_rows"))
+            .where(F.col("link_rows") > 1))
 
 # COMMAND ----------
 
@@ -4236,6 +4274,17 @@ CLINICAL_PATHOLOGY_ORDER_COLUMN_COMMENTS = {
     "source_update_timestamp": "Always NULL as a TIMESTAMP in the pathology-order projection. The contributing ADC_UPDT is published separately as loaded_at and is not copied into this field.",
     "loaded_at": "map_pathology_requested_test.ADC_UPDT carried unchanged for the requested-test occurrence. Accession alias and identity joins do not contribute another clock. This is ingestion provenance, not the request/sample event time or Silver refresh time; a missing timestamp remains null.",
 }
+
+# LIFECYCLE_ONE_ROW_V1: one lifecycle row per patient_event_key for the twin below (see
+# GOLD_LIFECYCLE_ONE_ROW_PER_KEY in gold_journey_shared.py for why it is its own MV).
+@dp.materialized_view(
+    name=_n("gold_qc._lifecycle_clinical_pathology_order"),
+    comment="Internal: silver _clinical_pathology_order_metadata reduced to exactly one row per patient_event_key (greatest support-column struct per key), so the QC twin's lifecycle join cannot copy rows. Join keys: patient_event_key.",
+    refresh_policy="auto",
+)
+def _gold_lifecycle_clinical_pathology_order():
+    """One internal lifecycle row per pathology-order key; read by _qc() for the twin below."""
+    return _lifecycle_one_row_source("clinical_pathology_order")
 
 @dp.materialized_view(
     name=_n("gold_qc._clinical_pathology_order"),
@@ -6988,6 +7037,7 @@ def gold_clinical_procedure_implant_attribute():
 
 # Child of both clinical_procedure and clinical_condition: a candidate is admitted only when Gold admitted both parents.
 CLINICAL_PROCEDURE_INDICATION_COLUMNS = [
+    "procedure_indication_key",  # SILVER_RELEASE_20261025 item 3
     "procedure_patient_event_key", "procedure_source_object", "procedure_id", "implant_event_id", "implant_sequence",
     "condition_patient_event_key", "diagnosis_id", "problem_id", "person_id", "encounter_id",
     "procedure_site_code", "procedure_site_display", "condition_site_code", "condition_site_display",
@@ -6995,6 +7045,7 @@ CLINICAL_PROCEDURE_INDICATION_COLUMNS = [
 ]
 CLINICAL_PROCEDURE_INDICATION_SELECT = [f"`{c}` AS `{c}`" for c in CLINICAL_PROCEDURE_INDICATION_COLUMNS]
 CLINICAL_PROCEDURE_INDICATION_COLUMN_COMMENTS = {
+    "procedure_indication_key": "Deterministic SHA-256 key of the candidate: stable_id('procedure_indication', procedure_patient_event_key, condition_patient_event_key). Primary key: the table holds one row per (procedure, condition) pair.",
     "procedure_patient_event_key": "patient_event_key of the clinical_procedure row: an OPCS-4 operation, or an implant linked to exactly one operation.",
     "procedure_source_object": "source_object of the procedure row: millennium_procedure or implant.",
     "procedure_id": "Millennium PROCEDURE_ID of the operation row (NULL for implant rows).",

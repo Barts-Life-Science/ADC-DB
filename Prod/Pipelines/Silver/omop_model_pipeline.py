@@ -4127,7 +4127,9 @@ def _genomic_variant_base():
         "position_start", "position_end", "vaf", "zygosity",
         "reported_classification", "reported_tier", "copy_number",
         F.expr("try_cast(omop_genomic_concept_id AS int)").alias("_omop_genomic"),
-        "snomed_code",
+        # SILVER_RELEASE_20261025 item 7: silver retired the never-populated snomed_code; the coded pathogenicity
+        # (standard LOINC answer concept) is carried instead.
+        F.col("pathogenicity_omop_concept_id").alias("_pathogenicity_concept"),
         F.col("specimen_id").alias("_specimen_event"),
     )
     published_people = (
@@ -4191,7 +4193,7 @@ def _genomic_variant_base():
         F.col("copy_number").cast("double").alias("copy_number"),
         F.coalesce(F.col("_omop_genomic"), F.lit(0)).cast("int")
         .alias("omop_genomic_concept_id"),
-        F.col("snomed_code").cast("string").alias("snomed_code"),
+        F.coalesce(F.col("_pathogenicity_concept"), F.lit(0)).cast("int").alias("pathogenicity_concept_id"),
         F.col("ref_allele").alias("reference_allele"),
         F.col("alt_allele").alias("alternate_allele"),
         F.col("_clinvar_variation_id").alias("clinvar_variation_id"),
@@ -4239,7 +4241,7 @@ genomic_variant_schema = T.StructType([
     T.StructField('reported_tier', T.StringType(), True, metadata={'comment': 'Reported tier.'}),
     T.StructField('copy_number', T.DoubleType(), True, metadata={'comment': 'Copy number where applicable.'}),
     T.StructField('omop_genomic_concept_id', T.IntegerType(), True, metadata={'comment': 'Castable OMOP Genomic concept where the parser resolves one; 0 otherwise.'}),
-    T.StructField('snomed_code', T.StringType(), True, metadata={'comment': 'Source SNOMED code where carried.'}),
+    T.StructField('pathogenicity_concept_id', T.IntegerType(), True, metadata={'comment': 'Standard LOINC answer concept for the reported pathogenicity (silver pathogenicity_omop_concept_id: 45884094, 21498358, 21498841, 21498359, 45880925); 0 when none was reported.'}),  # SILVER_RELEASE_20261025 item 7
     T.StructField('reference_allele', T.StringType(), True, metadata={'comment': 'GRCh38 reference allele (VCF), derived in-estate (silver variant_key).'}),
     T.StructField('alternate_allele', T.StringType(), True, metadata={'comment': 'GRCh38 alternate allele (VCF).'}),
     T.StructField('clinvar_variation_id', T.LongType(), True, metadata={'comment': 'ClinVar VariationID matched on the GRCh38 VCF key.'}),

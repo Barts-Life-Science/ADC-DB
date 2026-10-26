@@ -5,6 +5,7 @@
 # PMS_P1_T3_V1
 # BRONZE_FIX_857469999366132_V1
 # BRONZE_FIX_946452877034658_V1
+# TDX_P4_SAFETY_LINKAGE_V1
 # TDX Datix bronze writer. Default is an incident-linked bounded sample; full mode is guarded.
 
 # COMMAND ----------
@@ -252,7 +253,175 @@ def resolved_contacts():
         F.when(core_ok,"resolved_mrn_core_dob").otherwise(base).alias("PERSON_RESOLUTION_STATUS"),
         F.lit("TDX-P3 full-cohort join; alnum MRN (current aliases, else historic); NHS from con_nhsno else mod-11 10-digit con_number; multi-match-first except DOB+/-1d-unique MRN; single-identifier links withheld on DOB conflict beyond one-field typo; else unique MRN digit-core + DOB+/-1d; mrn>nhs unique-only 2026-09-29").alias("PERSON_RESOLUTION_RULE"),
         F.col("_dob"))
-resolved=resolved_contacts()
+# TDX_P4_SAFETY_LINKAGE_V1 (2026-10-25) — corroborated second pass over Datix patient contacts.
+# TDX-P3 above is unchanged. This pass only touches PATC contacts that P3 left 'unresolved' or withheld as
+# 'conflict_dob'; 'ambiguous' (MRN and NHS name different people) stays as it is. Every link it adds carries
+# its own PERSON_RESOLUTION_STATUS and a per-row PERSON_RESOLUTION_RULE naming key rule, alias pool and evidence.
+# Evidence is name-free: DOB agreement, an encounter of the candidate person overlapping the incident date
+# (+/-1 day), and contact sex vs Cerner sex as a refuter only.
+# Measured 2026-10-25 on prod bronze (distinct PATC contacts; sex agreement is the precision proxy: true
+# links ~0.99, random links ~0.50):
+#  - conflict_dob with an exact MRN person: 11,100. With an encounter on the incident date 7,384 (sex 0.94);
+#    without one 3,716 (sex 0.58, i.e. mostly wrong people). Random MRN pairings meet an encounter ~0.6%.
+#    Within the encounter group the DOB pattern matters: a placeholder/future Datix DOB (sex 0.99) or one
+#    within a year of Cerner's (0.97) is a typing error; a DOB near the incident date (0.89, typically a
+#    baby recorded under the mother's MRN) or 15-50 years away (0.90, typically a parent/child) is a
+#    different person, so those stay conflict_dob.
+#  - unresolved with a normalised MRN key: DOB +/-1d or one-field typo -> sex 0.97-1.00; DOB missing but an
+#    encounter on the incident date -> 0.94-1.00; DOB conflicting even with an encounter -> 0.80-0.92
+#    (rejected); dropping a Datix letter prefix to hit a bare-digit alias -> 0.48 (rule not used: it mostly
+#    lands on BHRUT 8-digit numbers).
+#  - BHRUT RF4 MRNs never collide with a Barts MRN on an exact key; for normalised keys Barts aliases win and
+#    BHRUT aliases are only a fallback when no Barts alias carries the key.
+P4_RULE_VERSION = "TDX-P4 2026-10-25"
+P4_POOL_TIER = {6200990: 1, 1115132483: 2}          # Barts RNJ MRN pool first, BHRUT RF4 MRN pool second
+P4_POOL_NAME = {1: "barts", 2: "bhrut", 3: "other"}
+P4_LABEL_PREFIX = "^(MRN|HOSPNO|HOSPITALNO|HOSPNUMBER|RNJ|PAS)"   # typed labels seen in front of real MRNs
+
+
+def p4_mrn_parts(key):
+    # Split an upper-case alphanumeric MRN key into (letter prefix, digit body with leading zeros dropped,
+    # letter suffix). All three are NULL when the key is not shaped letters-digits-letters.
+    shaped = key.rlike("^[A-Z]*[0-9]+[A-Z]*$")
+    prefix = F.when(shaped, F.regexp_extract(key, "^([A-Z]*)[0-9]", 1))
+    body = F.when(shaped, F.regexp_replace(F.regexp_extract(key, "^[A-Z]*([0-9]+)[A-Z]*$", 1), "^0+", ""))
+    suffix = F.when(shaped, F.regexp_extract(key, "^[A-Z]*[0-9]+([A-Z]*)$", 1))
+    return prefix, body, suffix
+
+
+def p4_alias_parts():
+    # All MRN aliases (current and historic) with their key parts and pool tier.
+    tier = F.coalesce(*[F.when(F.col("ALIAS_POOL_CD") == pool, F.lit(t)) for pool, t in P4_POOL_TIER.items()], F.lit(3))
+    aliases = (ids.where(F.col("ALIAS_TYPE") == "MRN")
+        .select(_alnum("ALIAS_VALUE").alias("_v"), F.col("PERSON_ID").cast("long").alias("_cand"), tier.alias("_tier"))
+        .where("_cand IS NOT NULL"))
+    prefix, body, suffix = p4_mrn_parts(F.col("_v"))
+    return aliases.select("_v", "_cand", "_tier", prefix.alias("_aL"), body.alias("_aD"), suffix.alias("_aS"))
+
+
+def p4_target_contacts(p3):
+    # PATC contacts that P3 left unresolved or withheld for a DOB conflict, with their keys, DOB, sex and the
+    # unique-MRN / unique-NHS persons P3 saw (used as the exact candidate and as the NHS veto).
+    patc = contacts.where(F.upper(F.trim("con_type")) == "PATC").select(
+        F.col("recordid").cast("long").alias("CON_ID"),
+        F.when(F.upper(F.trim("con_gender")).isin("M", "F"), F.upper(F.trim("con_gender"))).alias("_sex"))
+    stripped = F.regexp_replace(F.col("_mrn"), P4_LABEL_PREFIX, "")
+    prefix, body, suffix = p4_mrn_parts(stripped)
+    return (p3.where(F.col("PERSON_RESOLUTION_STATUS").isin("unresolved", "conflict_dob")).select("CON_ID", "PERSON_RESOLUTION_STATUS")
+        .join(patc, "CON_ID")
+        .join(keys, "CON_ID")
+        .join(mrn.select("_mrn", F.when(F.col("_mrn_n") == 1, F.col("_mrn_person")).alias("_exact_mrn_person")), "_mrn", "left")
+        .join(nhs.select("_nhs", F.when(F.col("_nhs_n") == 1, F.col("_nhs_person")).alias("_exact_nhs_person")), "_nhs", "left")
+        .select("CON_ID", "PERSON_RESOLUTION_STATUS", "_sex", "_dob", "_mrn", "_exact_mrn_person", "_exact_nhs_person",
+                stripped.alias("_k"), prefix.alias("_L"), body.alias("_D"), suffix.alias("_S")))
+
+
+def p4_candidates(targets):
+    # One row per (contact, rule, candidate person, pool tier). Rules in precedence order:
+    #  1 exact_mrn / exact_nhs: the unique person P3 found but refuted on DOB (conflict_dob only)
+    #  2 label_strip:   key equals an alias after removing a typed label such as 'MRN'
+    #  3 zero_pad:      same prefix, digits and suffix once leading zeros are ignored on both sides
+    #  4 alias_suffix:  Datix carries prefix+digits only; the alias adds trailing check letters
+    #  5 alias_prefix:  Datix carries digits(+suffix) only; the alias adds a site letter prefix
+    #  6 digit_core:    digits alone (>= 5 long, leading zeros ignored)
+    a = p4_alias_parts()
+    t = targets.alias("t")
+    def joined(rule, order, condition):
+        # Candidates for one normalisation rule, labelled with its name and precedence.
+        return (t.join(a, condition).select("t.CON_ID", F.lit(rule).alias("_rule"), F.lit(order).alias("_order"), "_cand", "_tier"))
+    exact = (t.where("PERSON_RESOLUTION_STATUS = 'conflict_dob'")
+        .select("CON_ID", F.when(F.col("_exact_mrn_person").isNotNull(), "exact_mrn").otherwise("exact_nhs").alias("_rule"), F.lit(1).alias("_order"),
+                F.coalesce("_exact_mrn_person", "_exact_nhs_person").alias("_cand"), F.lit(0).alias("_tier"))
+        .where("_cand IS NOT NULL"))
+    parts = [
+        exact,
+        joined("label_strip", 2, (F.col("t._k") != F.col("t._mrn")) & (F.col("_v") == F.col("t._k"))),
+        joined("zero_pad", 3, (F.col("_aL") == F.col("t._L")) & (F.col("_aD") == F.col("t._D")) & (F.col("_aS") == F.col("t._S"))),
+        joined("alias_suffix", 4, (F.col("_aL") == F.col("t._L")) & (F.col("_aD") == F.col("t._D")) & (F.col("t._S") == "") & (F.col("_aS") != "")),
+        joined("alias_prefix", 5, (F.col("t._L") == "") & (F.col("_aL") != "") & (F.col("_aD") == F.col("t._D")) & (F.col("_aS") == F.col("t._S"))),
+        joined("digit_core", 6, (F.length(F.col("t._D")) >= 5) & (F.col("_aD") == F.col("t._D"))),
+    ]
+    found = reduce(lambda x, y: x.unionByName(y), parts).dropDuplicates(["CON_ID", "_rule", "_cand"])
+    # Within a rule keep only the best pool tier present (Barts before BHRUT), then require one person.
+    best = Window.partitionBy("CON_ID", "_rule")
+    found = found.withColumn("_tier_best", F.min("_tier").over(best)).where(F.col("_tier") == F.col("_tier_best"))
+    return (found.groupBy("CON_ID", "_rule", "_order").agg(F.countDistinct("_cand").alias("_n"), F.max("_cand").alias("_cand"), F.min("_tier").alias("_tier"))
+        .where("_n = 1").drop("_n"))
+
+
+def p4_incident_dates():
+    # The (contact, incident date) pairs: classic links plus LFPSE patient rows, on clean incident dates.
+    lfpse_links = active_incident_filter(spark.table(SRC_LFPSE_PATIENT)).select("con_id", "inc_id")
+    pairs = links.select("con_id", "inc_id").unionByName(lfpse_links)
+    dates = incident_source.select(F.col("recordid").cast("long").alias("_iid"), F.to_date("inc_dincident").alias("_inc_date")).where(F.col("_inc_date") >= F.lit("1990-01-01").cast("date"))
+    return (pairs.select(F.col("con_id").cast("long").alias("CON_ID"), F.col("inc_id").cast("long").alias("_iid"))
+        .join(dates, "_iid").select("CON_ID", "_inc_date").distinct())
+
+
+def p4_encounter_hits(cands):
+    # (contact, candidate) pairs where the candidate has an IP/ED/OP/Recurring encounter overlapping one of the
+    # contact's incident dates, +/-1 day, on map_encounter *_BEST bounds converted to Europe/London.
+    people = cands.select(F.col("_cand").alias("_epid")).distinct()
+    enc_days = (spark.table(SRC_ENCOUNTER).where(F.col("encntr_type_class_desc").isin("Inpatient", "Emergency", "Outpatient", "Recurring"))
+        .select(F.col("PERSON_ID").cast("long").alias("_epid"),
+                F.to_date(F.from_utc_timestamp("ARRIVAL_DT_TM_BEST", "Europe/London")).alias("_a"),
+                F.to_date(F.from_utc_timestamp("DEPARTURE_DT_TM_BEST", "Europe/London")).alias("_d"))
+        .where("_a IS NOT NULL").join(people, "_epid", "left_semi")
+        .withColumn("_d", F.greatest(F.coalesce("_d", "_a"), F.col("_a"))))
+    pairs = cands.select("CON_ID", "_cand").distinct().join(p4_incident_dates(), "CON_ID")
+    return (pairs.join(enc_days, (F.col("_epid") == F.col("_cand")) & (F.col("_a") <= F.date_add("_inc_date", 1)) & (F.col("_d") >= F.date_sub("_inc_date", 1)))
+        .select("CON_ID", "_cand").distinct().withColumn("_enc", F.lit(True)))
+
+
+def extend_with_tdx_p4(p3):
+    # Apply the corroborated second pass and return P3's frame with the same columns, where rescued contacts
+    # gain PERSON_ID, a new status and a per-row rule. Acceptance (first rule in precedence order that passes):
+    #  exact_mrn / exact_nhs -> encounter on the incident date, no sex refutation, and the DOB conflict looks like
+    #                           a typing error: placeholder/future Datix DOB, or within a year of Cerner's
+    #                           (status resolved_<key>_encounter)
+    #  normalised rules      -> no sex refutation and (DOB +/-1d, or DOB one-field typo, or a DOB missing and an
+    #                           encounter on the incident date); a conflicting DOB is never accepted
+    #                           (status resolved_mrn_normalised)
+    # The NHS veto from P3's core rescue also applies: a unique NHS match naming someone else blocks the link.
+    targets = p4_target_contacts(p3)
+    cands = p4_candidates(targets)
+    person_sex = spark.table(SRC_PERSON).select(F.col("person_id").cast("long").alias("_cand"),
+        F.when(F.upper(F.substring("gender_display", 1, 1)).isin("M", "F"), F.upper(F.substring("gender_display", 1, 1))).alias("_csex"))
+    ev = (cands.join(targets.select("CON_ID", "_dob", "_sex", "_exact_nhs_person"), "CON_ID")
+        .join(person_dob.select(F.col("_pid").alias("_cand"), F.col("_birth_date").alias("_cbd")), "_cand", "left")
+        .join(person_sex, "_cand", "left")
+        .join(p4_encounter_hits(cands), ["CON_ID", "_cand"], "left")
+        .withColumn("_enc", F.coalesce("_enc", F.lit(False))))
+    dob_known = F.col("_dob").isNotNull() & F.col("_cbd").isNotNull()
+    dob_1d = dob_known & (F.abs(F.datediff("_cbd", "_dob")) <= 1)
+    dob_typo = dob_known & ~dob_1d & dob_consistent(F.col("_dob"), F.col("_cbd"))
+    dob_placeholder = (F.col("_dob") < F.lit("1901-01-01").cast("date")) | (F.col("_dob") > F.current_date())
+    dob_within_1y = dob_known & ~dob_1d & ~dob_typo & (F.abs(F.datediff("_cbd", "_dob")) <= 366)
+    sex_refuted = F.col("_sex").isNotNull() & F.col("_csex").isNotNull() & (F.col("_sex") != F.col("_csex"))
+    nhs_veto = F.col("_exact_nhs_person").isNotNull() & (F.col("_exact_nhs_person") != F.col("_cand")) & ~F.col("_rule").isin("exact_nhs")
+    is_exact = F.col("_rule").startswith("exact_")
+    exact_ok = F.col("_enc") & (dob_placeholder | dob_within_1y)
+    normalised_ok = dob_1d | dob_typo | (~dob_known & F.col("_enc"))
+    accepted = ~sex_refuted & ~nhs_veto & F.when(is_exact, exact_ok).otherwise(normalised_ok)
+    evidence = (F.when(dob_1d, "dob_1d").when(dob_typo, "dob_one_field_typo").when(dob_known & dob_placeholder, "dob_placeholder")
+        .when(dob_within_1y, "dob_within_1y").when(dob_known, "dob_conflict").otherwise("dob_missing"))
+    ev = ev.where(accepted).withColumn("_evidence", F.concat(evidence, F.when(F.col("_enc"), F.lit("+encounter_on_incident_date")).otherwise(F.lit(""))))
+    first = Window.partitionBy("CON_ID").orderBy(F.col("_order").asc(), F.col("_cand").asc())
+    pick = ev.withColumn("_rn", F.row_number().over(first)).where("_rn = 1")
+    pool_name = F.when(F.col("_tier") == 0, "exact").otherwise(F.coalesce(*[F.when(F.col("_tier") == t, F.lit(n)) for t, n in P4_POOL_NAME.items()]))
+    pick = pick.select("CON_ID", F.col("_cand").alias("_p4_person"),
+        F.when(F.col("_rule") == "exact_mrn", "resolved_mrn_encounter").when(F.col("_rule") == "exact_nhs", "resolved_nhs_encounter")
+         .otherwise("resolved_mrn_normalised").alias("_p4_status"),
+        F.concat_ws("; ", F.lit(P4_RULE_VERSION), F.concat(F.lit("key="), F.col("_rule")), F.concat(F.lit("pool="), pool_name),
+                    F.concat(F.lit("evidence="), F.col("_evidence"))).alias("_p4_rule"))
+    out = p3.join(pick, "CON_ID", "left")
+    return out.select("CON_ID",
+        F.coalesce("_p4_person", "PERSON_ID").alias("PERSON_ID"),
+        F.coalesce("_p4_status", "PERSON_RESOLUTION_STATUS").alias("PERSON_RESOLUTION_STATUS"),
+        F.coalesce("_p4_rule", "PERSON_RESOLUTION_RULE").alias("PERSON_RESOLUTION_RULE"),
+        "_dob")
+
+resolved=extend_with_tdx_p4(resolved_contacts())
 
 # COMMAND ----------
 
@@ -455,4 +624,3 @@ fragment_result=publish(frags,FRAGMENT,["FRAGMENT_ID"],snapshot=True)
 results=[incident_result,participant_result,injury_result,factor_result,lfpse_result,action_result,status_result,fragment_result]
 spark.createDataFrame([(RUN_ID,SAMPLE_MODE,SAMPLE_INCIDENTS,json.dumps(results,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, sample_mode boolean, sample_incidents long, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("6_mgmt.bronze.datix_pipeline_runs")
 dbutils.notebook.exit(json.dumps({"sample_mode":SAMPLE_MODE,"sample_incidents":SAMPLE_INCIDENTS,"results":results},sort_keys=True))
-
