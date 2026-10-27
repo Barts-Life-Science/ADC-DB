@@ -14,6 +14,7 @@ from rbi_schema import restrict_to_sample, try_bigint
 
 GOLD = spark.conf.get("rbi.gold_schema", "4_prod.gold")
 SAMPLE_MOD = int(spark.conf.get("rbi.sample_mod", "0"))
+WINDOW = spark.conf.get("rbi.window_start", "2019-04-01")  # RBI_REL_20261025: bounds the OP arm of costed_activity_unit
 
 
 def gold(name):
@@ -59,7 +60,7 @@ def service_day_activity():
 @dp.materialized_view(name="costed_activity_unit", comment="See governance comments.")
 def costed_activity_unit():
     return U.costed_activity_unit(sampled(gold("clinical_hrg_grouping")), spark.read.table("_fin_encounter"),
-                                  spark.read.table("resource_use_event"))
+                                  spark.read.table("resource_use_event"), WINDOW)
 
 
 @dp.materialized_view(name="attribution_summary", comment="See governance comments.")

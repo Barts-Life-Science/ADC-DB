@@ -12,12 +12,40 @@ from rbi_schema import (LONDON, event_key, exact_sum, financial_year, first_matc
                         status_from_map, to_stream, try_bigint)
 
 
-def _finish(df, *, domain, stream, unit_type, source_table, date_from="event_start"):
+def _observation_bound(df):
+    """Reclassify rows dated after their own source loaded_at: they cannot have been observed (RBI_REL_20261025).
+
+    Needs event_start, loaded_at, consumption_status and consumption_evidence on df.
+    - status consumed → 'unknown', evidence 'event_after_observation' (the source contradicts itself);
+    - any other status → 'scheduled', source evidence kept (a future booking, e.g. status:CONFIRMED).
+    Rows with a NULL event_start or loaded_at, and rows already reclassified, are left unchanged, so
+    applying it twice changes nothing. Both columns are computed from the incoming values.
+    """
+    already = ((F.col("consumption_status") == R.SCHEDULED_STATUS)
+               | (F.col("consumption_evidence") == R.AFTER_OBSERVATION_EVIDENCE))
+    after_load = F.coalesce((F.col("event_start") > F.col("loaded_at")) & ~already, F.lit(False))
+    was_consumed = F.col("consumption_status") == "consumed"
+    return df.withColumns({
+        "consumption_status": (F.when(after_load & was_consumed, F.lit("unknown"))
+                               .when(after_load, F.lit(R.SCHEDULED_STATUS))
+                               .otherwise(F.col("consumption_status"))),
+        "consumption_evidence": (F.when(after_load & was_consumed, F.lit(R.AFTER_OBSERVATION_EVIDENCE))
+                                 .otherwise(F.col("consumption_evidence"))),
+    })
+
+
+def _finish(df, *, domain, stream, unit_type, source_table, date_from="event_start", observation_bound=True):
     """Stamp the labels every stream row carries, derive the London date and FY, and project.
 
     `date_from` names the UTC column to derive event_date_local from; pass None when the
     builder has already set event_date_local itself (bed-days).
+    `observation_bound` (RBI_REL_20261025) applies _observation_bound when the rows still carry
+    their gold loaded_at. Builders that apply it earlier themselves (theatre, outpatients), bed-days
+    (own occupancy rule) and the HCD ledger (finance lines whose £ is carried whatever the date)
+    pass False; aggregated pathology rows carry no loaded_at, so it does not apply to them.
     """
+    if observation_bound and "loaded_at" in df.columns:
+        df = _observation_bound(df)
     if date_from is not None:
         df = df.withColumn("event_date_local", F.to_date(london(F.col(date_from))))
     return to_stream(df.withColumns({
@@ -94,9 +122,13 @@ def ward_bed_days(stays, encounters, window_start):
                 "consumption_status": F.lit("consumed"),
                 "resource_use_event_key": event_key(F.col("location_stay_key"), F.col("event_date_local")),
             }))
+    # RBI_REL_20261025: an unknown stay is dated by its observed occupancy start; failing that by its
+    # period start, but only when that is not after loaded_at; otherwise it carries no date at all.
+    unknown_start = (F.when(start_ok, F.col("occupancy_start"))
+                     .when(F.col("period_start") <= loaded, F.col("period_start")))
     unknown = (s.where(~F.col("_end_rule").isin("observed", "encounter_discharge_cap"))
                .withColumns({
-                   "event_start": F.coalesce(F.col("occupancy_start"), F.col("period_start")),
+                   "event_start": unknown_start,
                    "quantity": F.lit(None).cast("double"),
                    "consumption_status": F.lit("unknown"),
                    "resource_use_event_key": event_key(F.col("location_stay_key"), F.lit("unbounded")),
@@ -104,7 +136,7 @@ def ward_bed_days(stays, encounters, window_start):
                .withColumn("event_date_local", F.to_date(london(F.col("event_start")))))
     both = to_stream(days).unionByName(to_stream(unknown))
     return _finish(both, domain="beds", stream="ward_bed_day", unit_type="bed_day",
-                   source_table="gold.spine_location_stay", date_from=None)
+                   source_table="gold.spine_location_stay", date_from=None, observation_bound=False)
 
 
 # ---- Critical care and neonatal care (quantity-only in v1, spec §10.6) -----------------
@@ -169,18 +201,28 @@ def theatre_cases(cases, window_start):
     quantity_scheduled carries the scheduled minutes on every case, so scheduled vs used vs
     cancelled minutes can be compared (review fix 10). Cancelled cases are not_consumed with a
     NULL quantity and are never priced. A PERFORMED case without a duration is 'unknown'
-    (evidence performed_no_duration), because it cannot be measured.
+    (evidence performed_no_duration), because it cannot be measured. A case dated after its
+    loaded_at is 'scheduled' (or 'unknown' if the source already says PERFORMED), see
+    _observation_bound (RBI_REL_20261025).
     """
-    status = status_from_map(F.col("case_status"), R.THEATRE_CONSUMPTION)
     minutes = F.col("surgery_duration_minutes").cast("double")
-    no_duration = (status == "consumed") & ~F.coalesce(minutes > 0, F.lit(False))
+    # Source status first, then the observation bound, so a PERFORMED case dated after its load is
+    # 'unknown' (event_after_observation) rather than a booking.
     x = (cases.withColumn("event_start", F.coalesce("surgery_start", "scheduled_start", "checkin_datetime"))
          .where(in_window(F.col("event_start"), window_start))
-         .withColumn("consumption_status", F.when(no_duration, F.lit("unknown")).otherwise(status))
+         .withColumns({
+             "consumption_status": status_from_map(F.col("case_status"), R.THEATRE_CONSUMPTION),
+             "consumption_evidence": F.concat(F.lit("case_status:"), F.coalesce(F.col("case_status"), F.lit("<null>"))),
+         }))
+    x = _observation_bound(x)
+    # A still-consumed (observed) case without a positive duration cannot be measured.
+    no_duration = (F.col("consumption_status") == "consumed") & ~F.coalesce(minutes > 0, F.lit(False))
+    x = (x.withColumns({
+             "consumption_status": F.when(no_duration, F.lit("unknown")).otherwise(F.col("consumption_status")),
+             "consumption_evidence": F.when(no_duration, F.lit("performed_no_duration")).otherwise(F.col("consumption_evidence")),
+         })
          .withColumns({
              "resource_use_event_key": event_key(F.col("theatre_case_key")),
-             "consumption_evidence": F.when(no_duration, F.lit("performed_no_duration"))
-                                      .otherwise(F.concat(F.lit("case_status:"), F.coalesce(F.col("case_status"), F.lit("<null>")))),
              "quantity": F.when(F.col("consumption_status") == "consumed", minutes),
              "quantity_scheduled": F.col("scheduled_duration_minutes").cast("double"),
              "event_end": F.when(minutes > 0, F.timestamp_seconds(F.unix_timestamp("event_start") + minutes * 60)),
@@ -193,20 +235,28 @@ def theatre_cases(cases, window_start):
              "source_key": F.col("theatre_case_key"),
          }))
     return _finish(x, domain="theatres", stream="theatre_case", unit_type="theatre_minute",
-                   source_table="gold.reference_theatre_case")
+                   source_table="gold.reference_theatre_case", observation_bound=False)  # applied above
 
 
 # ---- Outpatients and ED ----------------------------------------------------------------
 
 def outpatient_appointments(appointments, window_start):
-    """One row per appointment: attended = consumed, DNA/cancelled = not_consumed, else unknown."""
+    """One row per appointment: attended = consumed, DNA/cancelled = not_consumed, else unknown.
+
+    An appointment dated after its loaded_at is 'scheduled' (or 'unknown' with evidence
+    event_after_observation when the source already says attended), see _observation_bound
+    (RBI_REL_20261025).
+    """
     x = (appointments.where(in_window(F.col("event_datetime"), window_start))
+         .withColumns({
+             "event_start": F.col("event_datetime"),
+             "consumption_status": status_from_map(F.col("status_meaning"), R.APPOINTMENT_CONSUMPTION),
+             "consumption_evidence": F.concat(F.lit("status:"), F.coalesce(F.col("status_meaning"), F.lit("<null>"))),
+         }))
+    x = (_observation_bound(x)
          .withColumns({
              "resource_use_event_key": event_key(F.col("patient_event_key")),
              "quantity": F.lit(1.0),
-             "consumption_status": status_from_map(F.col("status_meaning"), R.APPOINTMENT_CONSUMPTION),
-             "consumption_evidence": F.concat(F.lit("status:"), F.coalesce(F.col("status_meaning"), F.lit("<null>"))),
-             "event_start": F.col("event_datetime"),
              "event_end": F.col("event_end_datetime"),
              "clinic_code": F.col("clinic_resource_code"),
              "service_code": F.col("service_resource_code"),
@@ -216,7 +266,7 @@ def outpatient_appointments(appointments, window_start):
              "source_key": F.col("patient_event_key"),
          }))
     return _finish(x, domain="outpatients_ed", stream="outpatient_appointment", unit_type="attendance",
-                   source_table="gold.clinical_appointment")
+                   source_table="gold.clinical_appointment", observation_bound=False)  # applied above
 
 
 def tracking_attendances(attendances, window_start):
@@ -375,7 +425,7 @@ def high_cost_drug_lines(lines, window_start):
              "source_key": F.col("patient_event_key"),
          }))
     return _finish(x, domain="diagnostics_drugs", stream="high_cost_drug", unit_type="ledger_line",
-                   source_table="gold.clinical_drug_expenditure")
+                   source_table="gold.clinical_drug_expenditure", observation_bound=False)
 
 
 def transfusions(units, window_start):

@@ -15,8 +15,8 @@ TABLE_COMMENTS = {
     "costed_activity_unit": "SLAM APC spells (FIN-linked) and OP attendances (person + date) with their RBI £; the finance-recognisable view.",
     "spell_resource_summary": "One row per inpatient spell: bed-days, critical-care days, theatre minutes, tests, exams, administrations and £ by basis.",
     "journey_resource_summary": "One row per spine journey: cross-setting resource use and £ by domain.",
-    "person_month_resource": "One row per person × London calendar month: utilisation profile and £ by domain.",
-    "service_day_activity": "One row per stream × service unit × site × London day: throughput, consumption status counts, quantity, £ and median duration.",
+    "person_month_resource": "One row per person × London calendar month: utilisation profile and £ by domain. Rows dated beyond observation (scheduled bookings, event_after_observation) are left out.",
+    "service_day_activity": "One row per stream × service unit × site × London day: throughput, consumption status counts, quantity, £ and median duration. Rows dated beyond observation (scheduled bookings, event_after_observation) are left out.",
     "attribution_summary": "Rows per stream × attribution method, showing how each row found (or failed to find) its encounter.",
 }
 
@@ -45,7 +45,7 @@ C = {
     "quantity_performed_result": "Pathology: requested tests with a matching gold result.",
     "quantity_performed_reported": "Pathology: requested tests without a matching result whose accession was reported.",
     "quantity_unknown": "Pathology: requested tests with no evidence of being performed.",
-    "consumption_status": "consumed, not_consumed, unknown, or not_applicable (unallocated £ rows). Only consumed rows are priced.",
+    "consumption_status": "consumed, not_consumed, unknown, scheduled (a row, e.g. an appointment or theatre case, dated after its source row was loaded: a booking, not yet observed), or not_applicable (unallocated £ rows). Only consumed rows are priced.",
     "consumption_evidence": "Rule or source status that set consumption_status.",
     # time
     "event_start": "Start instant (UTC).",
@@ -53,11 +53,11 @@ C = {
     "event_date_local": "Europe/London calendar date of the row.",
     "financial_year": "NHS financial year (April start) of event_date_local.",
     "month": "Europe/London calendar month (first day).",
-    "first_event": "Earliest event_start in the group.",
-    "last_event": "Latest event_start in the group.",
-    "spell_first_event": "Earliest event_start in the spell.",
-    "spell_last_event": "Latest event_end in the spell.",
-    "activity_start": "SLAM activity start (admission or attendance).",
+    "first_event": "Earliest event_start of the group's consumed or not_consumed rows (scheduled, unknown and unallocated rows are ignored).",
+    "last_event": "Latest event_start of the group's consumed or not_consumed rows (scheduled, unknown and unallocated rows are ignored).",
+    "spell_first_event": "Earliest event_start of the spell's consumed or not_consumed rows (scheduled, unknown and unallocated rows are ignored).",
+    "spell_last_event": "Latest event_end of the spell's consumed or not_consumed rows.",
+    "activity_start": "SLAM activity start (admission or attendance). Dated OP attendances are kept only from the window start (FY2019/20) and when not dated after the SLAM row was loaded; undated ones are kept.",
     "activity_end": "SLAM activity end (discharge) where known.",
     # attribution
     "attribution_method": "native, interval_unique, interval_ambiguous, none, not_applicable, activity_link.",
@@ -82,7 +82,7 @@ C = {
     "cost_total": "Authoritative direct £ for this row (one source by precedence). Additive total = cost_total + cost_overhead.",
     "cost_overhead": "Support-cost £: actual SUP share for PLICS rows, modelled £ × setting ratio for modelled rows.",
     "cost_basis": "drug_expenditure_actual, actual_plics, actual_ncc_allocated, covered_by_hcd_ledger, modelled_bottom_up, none.",
-    "cost_reason": "Why cost_basis is none: not_consumed, consumption_unknown, priced_by_other_stream, unpriced_tracking_class, zero_quantity, hcd_drug_without_ledger, no_calibration.",
+    "cost_reason": "Why cost_basis is none: not_consumed, scheduled, consumption_unknown, priced_by_other_stream, unpriced_tracking_class, zero_quantity, hcd_drug_without_ledger, no_calibration.",
     "cost_modelled_shadow": "Modelled £ kept for comparison when an actual £ won.",
     "cost_superseded": "PLICS £ covered by a higher-precedence source (HCD ledger); not in cost_total.",
     "cost_stratum_level": "Calibration level that priced a modelled row: l1, l2, all.",
@@ -107,7 +107,7 @@ C = {
     "total_actual": "Σ actual PLICS £ of the tested activities.",
     "total_modelled": "Σ modelled £ of the tested activities.",
     # summaries
-    "rows": "Row count.",
+    "rows": "Row count. In service_day_activity, rows dated beyond observation (scheduled bookings, event_after_observation rows; no quantity, no £) are left out.",
     "consumed_rows": "Rows with consumption_status = consumed.",
     "not_consumed_rows": "Rows with consumption_status = not_consumed.",
     "unknown_rows": "Rows with consumption_status = unknown.",
@@ -180,7 +180,7 @@ TABLE_COMMENTS["cost_allocation_ledger"] = ("Every actual £ RBI received, one r
                                             "(or unallocated / superseded). Σ amount per activity × component = PLICS duplicate-weighted lines.")
 TABLE_COMMENTS["plics_activity_link"] = "Each PLICS/NCC costed activity with the gold encounter (or outpatient appointment) its £ belongs to."
 PUBLISHED_COLUMNS["rbi_sample_person"] = ["person_id"]
-PUBLISHED_COLUMNS["cost_allocation_ledger"] = ["extract_cd", "activity_record_id", "component", "resource_use_event_key",
+PUBLISHED_COLUMNS["cost_allocation_ledger"] = ["cost_allocation_ledger_key", "extract_cd", "activity_record_id", "component", "resource_use_event_key",
                                                "amount_kind", "amount", "cost_basis"]
 PUBLISHED_COLUMNS["plics_activity_link"] = ["extract_cd", "activity_record_id", "feed_type", "person_id", "encounter_id",
                                             "appointment_key", "link_method", "link_score", "candidate_count"]
@@ -191,6 +191,8 @@ COLUMN_COMMENTS.update({
     "component": "Cost component: ward_care, theatre, ed, imaging, pathology, pharmacy_hcd, pharmacy_other, blood, outpatient, overhead, unallocated, episode_total.",
     "amount_kind": "direct, overhead, unallocated (no receiving row) or superseded (covered by a higher-precedence source).",
     "amount": "£ in this ledger row.",
+    "cost_allocation_ledger_key": "SHA-256 row key over extract_cd, activity_record_id, component, resource_use_event_key ('~' when unattached), amount_kind and cost_basis — the ledger's unique grain.",
     "link_score": "1.0 for deterministic or unique links; NULL when unlinked.",
 })
 _PATIENT.add("activity_record_id")
+_SYNTHETIC.add("cost_allocation_ledger_key")  # RBI_REL_20261025: a hash, like resource_use_event_key

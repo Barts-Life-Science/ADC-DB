@@ -209,7 +209,7 @@ check("money:HCD ledger carried per line", r["bad"] == 0, r)
 
 # Row-level cost rules.
 r = one(f"""SELECT count_if(cost_total IS NULL OR cost_overhead IS NULL OR cost_basis IS NULL) AS null_cost,
-                   count_if(consumption_status IN ('not_consumed', 'unknown') AND (cost_total <> 0 OR cost_overhead <> 0)) AS priced_unconsumed,
+                   count_if(consumption_status IN ('not_consumed', 'unknown', 'scheduled') AND (cost_total <> 0 OR cost_overhead <> 0)) AS priced_unconsumed,
                    count_if(cost_basis = 'modelled_bottom_up' AND uplift_factor IS NULL) AS modelled_without_uplift,
                    count_if(cost_basis = 'none' AND cost_reason IS NULL) AS none_without_reason
             FROM {FACT}""")
@@ -222,10 +222,35 @@ KEYS = {
     "spell_resource_summary": "spell_encounter_id", "journey_resource_summary": "journey_key",
     "person_month_resource": "person_id, month", "service_day_activity": "stream, service_unit, site_code, event_date_local",
     "attribution_summary": "stream, attribution_method", "plics_activity_link": "extract_cd, activity_record_id",
+    "cost_allocation_ledger": "cost_allocation_ledger_key",  # RBI_REL_20261025
 }
 for table, key in KEYS.items():
     r = one(f"SELECT count(*) AS n FROM (SELECT {key} FROM {TARGET}.{table} GROUP BY {key} HAVING count(*) > 1)")
     check(f"keys:{table}", r["n"] == 0, {"duplicate_keys": r["n"], "key": key})
+
+# RBI_REL_20261025: the ledger's natural grain is unique too, and the key is never NULL (so the key check above is real).
+r = one(f"""SELECT count_if(cost_allocation_ledger_key IS NULL) AS null_keys,
+                   count(*) - count(DISTINCT extract_cd, activity_record_id, component, coalesce(resource_use_event_key, '~'),
+                                    amount_kind, cost_basis) AS duplicate_grain_rows
+            FROM {LEDGER}""")
+check("keys:cost_allocation_ledger grain", r["null_keys"] == 0 and r["duplicate_grain_rows"] == 0, r)
+
+# COMMAND ----------
+
+# RBI_REL_20261025: observation bound. Every source loaded_at is in the past, so nothing observed can be in the future.
+r = one(f"""SELECT
+      (SELECT count_if(stream NOT IN ('high_cost_drug', 'plics_unallocated') AND consumption_status IN ('consumed', 'not_consumed', 'unknown')
+                       AND coalesce(consumption_evidence, '') <> 'event_after_observation' AND event_start > current_timestamp()) FROM {FACT}) AS observed_rows_in_future,
+      (SELECT count_if(spell_first_event > current_timestamp()) FROM {TARGET}.spell_resource_summary) AS spells_in_future,
+      (SELECT count_if(first_event > current_timestamp() OR last_event > current_timestamp()) FROM {TARGET}.journey_resource_summary) AS journeys_in_future,
+      (SELECT count_if(setting = 'outpatient' AND (activity_start > current_timestamp() OR activity_start < TIMESTAMP'{W}'))
+       FROM {TARGET}.costed_activity_unit) AS op_units_out_of_bounds,
+      (SELECT count_if(month > current_date()) FROM {TARGET}.person_month_resource) AS person_months_in_future,
+      (SELECT count_if(event_date_local > current_date()) FROM {TARGET}.service_day_activity) AS service_days_in_future""")
+check("observation:no future-dated observed rows or rollups", all(v == 0 for v in r.values()), r)
+# spell_last_event is an event_end: a case or appointment observed in progress may legitimately end after now (report-only).
+r = one(f"SELECT count_if(spell_last_event > current_timestamp()) AS spell_last_event_after_now FROM {TARGET}.spell_resource_summary")
+check("observation:spell_last_event after now (report-only)", True, r)
 
 r = one(f"""SELECT (SELECT count(DISTINCT stream) FROM {FACT}) AS fact_streams,
                    (SELECT count(DISTINCT stream) FROM {TARGET}.attribution_summary) AS summary_streams""")

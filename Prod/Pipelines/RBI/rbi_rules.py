@@ -6,7 +6,17 @@ Changing a rule means bumping RULE_VERSION; every stream row records the version
 built under. Spec: docs/superpowers/specs/2026-10-16-rbi-resource-use-dataset-design.md (§3, §4, §10).
 """
 
-RULE_VERSION = "rbi-rules-1"
+RULE_VERSION = "rbi-rules-2"  # RBI_REL_20261025: observation bound on stream rows (not the HCD ledger) and unknown bed stays
+
+# ---- Observation bound (RBI_REL_20261025; same rule as silver/gold) ----------------------
+# An instant later than the source row's own loaded_at cannot have been observed. A booking
+# dated after its load is a plan, not an event: its row is kept as 'scheduled' (never priced,
+# never a first/last-event instant). A row the source already calls consumed but dates after
+# its load is contradictory, so it becomes 'unknown' with this evidence.
+SCHEDULED_STATUS = "scheduled"
+AFTER_OBSERVATION_EVIDENCE = "event_after_observation"
+# Statuses whose event instants count as observed activity (first/last-event rollups).
+OBSERVED_STATUSES = ("consumed", "not_consumed")
 
 # ---- Beds (spec §3, §10.8) -------------------------------------------------------------
 # Encounter types whose location stays hold a bed. Outpatient*, Pre-registration, Referral,

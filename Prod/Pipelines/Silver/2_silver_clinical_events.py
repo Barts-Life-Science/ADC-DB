@@ -66,6 +66,7 @@ from silver_journey_shared import (
     _imaging_report_link_canonical,
     _implant_procedure_canonical,
     _indication_canonical,
+    _pathology_diagnosis_context_canonical,  # CONTEXT_LINK_V1 (BRONZE_FIX_20261025D)
     _maternity_diagnosis_canonical,
     _medication_admin_canonical,
     _medication_dispense_canonical,
@@ -1538,6 +1539,50 @@ def _procedure_indication_query():
 def procedure_indication():
     # Build the declared dataset: anatomy-matched procedure to condition candidates.
     return _procedure_indication_query().select(*PROCEDURE_INDICATION_PUBLIC_COLUMNS)
+
+
+# ==== journey_clinical.pathology_diagnosis_context (CONTEXT_LINK_V1, BRONZE_FIX_20261025D) ====
+#
+# The patient's diagnoses recorded in a pathology accession's encounter, or dated 30 days before to 7 days after the
+# accession. This is context around the test, not the reason for it (until 2026-10-25 these rows were published as
+# clinical_indication). Built in bronze (map_pathology_diagnosis_context) as a narrow link; nothing is copied here
+# except keys and the relation, so the diagnosis text and codes are read from clinical_condition.
+PATHOLOGY_DIAGNOSIS_CONTEXT_PUBLIC_COLUMNS = [
+    "pathology_diagnosis_context_key", "specimen_patient_event_key", "condition_patient_event_key",
+    "accession_identifier", "diagnosis_id", "person_id", "accession_encounter_id", "diagnosis_encounter_id",
+    "same_encounter_ind", "day_offset", "accession_datetime", "diagnosis_datetime", "rule_id", "rule_version",
+    "loaded_at",
+]
+
+PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMN_COMMENTS = {
+    "pathology_diagnosis_context_key": "Deterministic SHA-256 key: stable_id('pathology_diagnosis_context', bronze pathology_accession_id, diagnosis_id). Primary key: one row per (accession, diagnosis).",
+    "specimen_patient_event_key": "patient_event_key of the clinical_specimen row of the (alias-resolved) pathology accession.",
+    "condition_patient_event_key": "patient_event_key of the clinical_condition row of the Millennium diagnosis; join clinical_condition for its code, display and status. Gold publishes only pairs whose specimen and condition Gold admitted.",
+    "accession_identifier": "Alias-resolved pathology accession identifier (the clinical_specimen accession).",
+    "diagnosis_id": "Millennium DIAGNOSIS_ID.",
+    "person_id": "Millennium PERSON_ID shared by the accession and the diagnosis.",
+    "accession_encounter_id": "Millennium ENCNTR_ID of the accession source row that gave the strongest evidence; NULL for LIMS-only rows.",
+    "diagnosis_encounter_id": "Millennium ENCNTR_ID of the diagnosis.",
+    "same_encounter_ind": "True when the diagnosis is recorded in the accession's encounter; false when it is linked only by date (30 days before to 7 days after the accession).",
+    "day_offset": "Days from accession_datetime to diagnosis_datetime by calendar date (negative = diagnosis before the accession); NULL when either date is missing.",
+    "accession_datetime": "Accession date (sample, else request, else report datetime) of the source row that gave the strongest evidence (NULL outside 1950-2099).",
+    "diagnosis_datetime": "Diagnosis date: DIAG_DT_TM, else ASSERTED_DT_TM, else BEG_EFFECTIVE_DT_TM (NULL outside 1950-2099).",
+    "rule_id": "Linking rule: diagnosis_context_window_v1 (same encounter, or diagnosis dated 30 days before to 7 days after the accession).",
+    "rule_version": "Rule version.",
+    "loaded_at": "ADC_UPDT of the bronze link row (when the link was last materially changed).",
+}
+
+
+@materialized_view(
+    name=_n("journey_clinical.pathology_diagnosis_context"),
+    comment="Diagnosis context of pathology accessions (CONTEXT_LINK_V1): the patient's diagnoses in the accession's encounter or dated 30 days before to 7 days after it. One row per (accession, diagnosis), keyed to clinical_specimen and clinical_condition. Context, not the indication for the test. Rule-based, no manual curation.",
+    column_comments=PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMN_COMMENTS,
+    cluster_by=["person_id"],
+    refresh_policy="auto",
+)
+def pathology_diagnosis_context():
+    # Build the declared dataset: the bronze diagnosis-context link with silver keys.
+    return _pathology_diagnosis_context_canonical().select(*PATHOLOGY_DIAGNOSIS_CONTEXT_PUBLIC_COLUMNS)
 
 # COMMAND ----------
 

@@ -4302,6 +4302,35 @@ def _indication_canonical():
 SRC_PATHOLOGY_INDICATION = "4_prod.bronze.map_pathology_indication"
 
 
+# CONTEXT_LINK_V1 (BRONZE_FIX_20261025D): the diagnosis context of a pathology accession comes from the narrow bronze
+# link. Bronze no longer writes clinical_context rows into map_pathology_indication, so clinical_indication now holds
+# rule-based indications only (none are active today).
+SRC_PATHOLOGY_DIAGNOSIS_CONTEXT = "4_prod.bronze.map_pathology_diagnosis_context"
+
+
+def _pathology_diagnosis_context_canonical():
+    """One row per bronze link: the specimen and condition keys and how the diagnosis relates to the accession."""
+    x = _alias_resolved_accession(read_source(SRC_PATHOLOGY_DIAGNOSIS_CONTEXT))
+    return x.select(
+        stable_id("pathology_diagnosis_context", F.col("pathology_accession_id"), F.col("diagnosis_id"))
+        .alias("pathology_diagnosis_context_key"),
+        stable_id("specimen:accession", F.col("_resolved_accession_id")).alias("specimen_patient_event_key"),
+        stable_id("condition:mill:diagnosis", F.col("diagnosis_id")).alias("condition_patient_event_key"),
+        F.col("_resolved_accession_id").alias("accession_identifier"),
+        F.col("diagnosis_id").cast("bigint").alias("diagnosis_id"),
+        F.col("person_id").cast("bigint").alias("person_id"),
+        F.col("accession_encounter_id").cast("bigint").alias("accession_encounter_id"),
+        F.col("diagnosis_encounter_id").cast("bigint").alias("diagnosis_encounter_id"),
+        F.col("same_encounter").alias("same_encounter_ind"),
+        F.col("day_offset").cast("int").alias("day_offset"),
+        _clamped_ts(F.col("accession_dt")).alias("accession_datetime"),
+        _clamped_ts(F.col("diagnosis_dt")).alias("diagnosis_datetime"),
+        F.col("rule_id"),
+        F.col("rule_version"),
+        F.col("ADC_UPDT").alias("loaded_at"),
+    )
+
+
 
 
 def _micro_isolate_canonical_pregate():

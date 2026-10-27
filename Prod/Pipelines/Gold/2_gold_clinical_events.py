@@ -7106,6 +7106,71 @@ def gold_clinical_procedure_indication():
     return (spark.read.table(_n("gold_qc._clinical_procedure_indication"))
             .drop("__gold_procedure_present", "__gold_condition_present"))
 
+
+# ==== journey_clinical.pathology_diagnosis_context (CONTEXT_LINK_V1, BRONZE_FIX_20261025D) ====
+
+# Child of both clinical_specimen and clinical_condition: a pair is admitted only when Gold admitted both parents.
+CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMNS = [
+    "pathology_diagnosis_context_key", "specimen_patient_event_key", "condition_patient_event_key",
+    "accession_identifier", "diagnosis_id", "person_id", "accession_encounter_id", "diagnosis_encounter_id",
+    "same_encounter_ind", "day_offset", "accession_datetime", "diagnosis_datetime", "rule_id", "rule_version",
+    "loaded_at",
+]
+CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_SELECT = [f"`{c}` AS `{c}`" for c in CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMNS]
+CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMN_COMMENTS = {
+    "pathology_diagnosis_context_key": "Deterministic SHA-256 key: stable_id('pathology_diagnosis_context', bronze pathology_accession_id, diagnosis_id). Primary key: one row per (accession, diagnosis).",
+    "specimen_patient_event_key": "patient_event_key of the clinical_specimen row of the pathology accession.",
+    "condition_patient_event_key": "patient_event_key of the clinical_condition row of the diagnosis; join clinical_condition for its code, display and status.",
+    "accession_identifier": "Alias-resolved pathology accession identifier (the clinical_specimen accession).",
+    "diagnosis_id": "Millennium DIAGNOSIS_ID.",
+    "person_id": "Millennium PERSON_ID shared by the accession and the diagnosis.",
+    "accession_encounter_id": "Millennium ENCNTR_ID of the accession source row that gave the strongest evidence; NULL for LIMS-only rows.",
+    "diagnosis_encounter_id": "Millennium ENCNTR_ID of the diagnosis.",
+    "same_encounter_ind": "True when the diagnosis is recorded in the accession's encounter; false when it is linked only by date (30 days before to 7 days after the accession).",
+    "day_offset": "Days from accession_datetime to diagnosis_datetime by calendar date (negative = diagnosis before the accession); NULL when either date is missing.",
+    "accession_datetime": "Accession date (sample, else request, else report datetime) of the source row that gave the strongest evidence (NULL outside 1950-2099).",
+    "diagnosis_datetime": "Diagnosis date: DIAG_DT_TM, else ASSERTED_DT_TM, else BEG_EFFECTIVE_DT_TM (NULL outside 1950-2099).",
+    "rule_id": "Linking rule: diagnosis_context_window_v1.",
+    "rule_version": "Rule version.",
+    "loaded_at": "ADC_UPDT of the bronze link row.",
+}
+CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_MANDATORY_RULES = {
+    # The pair belongs in Gold only when both its specimen and its condition were admitted to Gold.
+    "gold.clinical_pathology_diagnosis_context.specimen_admitted": "COALESCE(__gold_specimen_present, FALSE)",
+    "gold.clinical_pathology_diagnosis_context.condition_admitted": "COALESCE(__gold_condition_present, FALSE)",
+}
+
+@dp.materialized_view(
+    name=_n("gold_qc._clinical_pathology_diagnosis_context"),
+    comment="Internal QC of clinical_pathology_diagnosis_context; counts pairs whose specimen or condition Gold rejected.",
+    refresh_policy="auto",
+)
+@dp.expect_all_or_drop(CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_MANDATORY_RULES)
+def _gold_qc_clinical_pathology_diagnosis_context():
+    """CONTEXT_LINK_V1 Gold child of clinical_specimen and clinical_condition; parent-rejected pairs are excluded."""
+    specimens = (spark.read.table(_n("gold_clinical.specimen"))
+                 .select(F.col("patient_event_key").alias("specimen_patient_event_key")).dropDuplicates()
+                 .withColumn("__gold_specimen_present", F.lit(True)))
+    conditions = (spark.read.table(_n("gold_clinical.condition"))
+                  .select(F.col("patient_event_key").alias("condition_patient_event_key")).dropDuplicates()
+                  .withColumn("__gold_condition_present", F.lit(True)))
+    child = spark.read.table(_src("clinical_pathology_diagnosis_context"))
+    df = (child.join(specimens, "specimen_patient_event_key", "left")
+          .join(conditions, "condition_patient_event_key", "left")
+          .selectExpr(*CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_SELECT, "__gold_specimen_present", "__gold_condition_present"))
+    return _with_comments(df, CLINICAL_PATHOLOGY_DIAGNOSIS_CONTEXT_COLUMN_COMMENTS)
+
+@dp.materialized_view(
+    name=_n("gold_clinical.pathology_diagnosis_context"),
+    comment="Diagnosis context of pathology accessions: the patient's diagnoses in the accession's encounter or dated 30 days before to 7 days after it, one row per (accession, diagnosis), keyed to clinical_specimen and clinical_condition. Context, not the indication for the test. Rule-based (diagnosis_context_window_v1), no manual curation.",
+    table_properties={"quality": "gold"},
+    refresh_policy="auto",
+)
+def gold_clinical_pathology_diagnosis_context():
+    """Publish clinical_pathology_diagnosis_context without the internal parent-admission markers."""
+    return (spark.read.table(_n("gold_qc._clinical_pathology_diagnosis_context"))
+            .drop("__gold_specimen_present", "__gold_condition_present"))
+
 # COMMAND ----------
 
 # ==== journey_clinical.presenting_complaint (S3b) ====

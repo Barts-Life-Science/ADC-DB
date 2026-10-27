@@ -16,7 +16,7 @@ Money rules every function follows:
 from pyspark.sql import functions as F
 
 import rbi_rules as R
-from rbi_schema import exact_avg, exact_sum, financial_year, london
+from rbi_schema import event_key, exact_avg, exact_sum, financial_year, london  # RBI_REL_20261025: event_key
 
 COST_METHOD_VERSION = "rbi-cost-2"
 
@@ -293,15 +293,42 @@ def price_modelled(events, unit_costs, uplift, cover, min_n=R.MIN_CALIBRATION_AC
 
 # ---- Allocation ledger (spec §4.4) -------------------------------------------------------------
 
-LEDGER_COLUMNS = ["extract_cd", "activity_record_id", "component", "resource_use_event_key", "amount_kind", "amount", "cost_basis"]
+LEDGER_COLUMNS = ["cost_allocation_ledger_key", "extract_cd", "activity_record_id", "component", "resource_use_event_key",
+                  "amount_kind", "amount", "cost_basis"]
+
+
+def ledger_row_key(extract_cd, activity_record_id, component, resource_use_event_key, amount_kind, cost_basis):
+    """cost_allocation_ledger_key (RBI_REL_20261025): SHA-256 over the ledger's unique grain.
+
+    Grain = extract_cd × activity_record_id × component × receiving fact row × amount_kind × cost_basis.
+    Unattached rows (unallocated / superseded) have no fact row, so their NULL resource_use_event_key
+    enters the hash as '~'. One row per grain is guaranteed by construction (see _by_activity_component)
+    and asserted in rbi_validate.
+    """
+    return event_key(extract_cd, activity_record_id, component, F.coalesce(resource_use_event_key, F.lit("~")),
+                     amount_kind, cost_basis)
 
 
 def _ledger(df, kind, amount_col, basis, key_col=None):
-    """Shape allocation slices into ledger rows (key NULL = not attached to a fact row)."""
-    return df.select("extract_cd", "activity_record_id", "component",
-                     (F.col(key_col) if key_col else F.lit(None).cast("string")).alias("resource_use_event_key"),
-                     F.lit(kind).alias("amount_kind"), F.col(amount_col).cast("double").alias("amount"),
-                     F.lit(basis).alias("cost_basis"))
+    """Shape allocation slices into ledger rows (key NULL = not attached to a fact row), with the row key first."""
+    row = df.select("extract_cd", "activity_record_id", "component",
+                    (F.col(key_col) if key_col else F.lit(None).cast("string")).alias("resource_use_event_key"),
+                    F.lit(kind).alias("amount_kind"), F.col(amount_col).cast("double").alias("amount"),
+                    F.lit(basis).alias("cost_basis"))
+    key = ledger_row_key(F.col("extract_cd"), F.col("activity_record_id"), F.col("component"),
+                         F.col("resource_use_event_key"), F.col("amount_kind"), F.col("cost_basis"))
+    return row.withColumn("cost_allocation_ledger_key", key).select(*LEDGER_COLUMNS)
+
+
+def _by_activity_component(df, amount_col):
+    """Sum an unattached ledger branch to one row per extract_cd × activity_record_id × component (RBI_REL_20261025).
+
+    The branches arrive grouped by person_id, activity_month and stream too. Those are functions of the
+    activity today, but nothing enforces it, so collapsing here guarantees the ledger grain rather than
+    assuming it. DECIMAL sum (exact_sum): the £ total is unchanged.
+    """
+    return (df.groupBy("extract_cd", "activity_record_id", "component")
+            .agg(exact_sum(amount_col).alias(amount_col)))
 
 
 def allocate_plics_actuals(weighted_lines, links, events, cover):
@@ -342,12 +369,13 @@ def allocate_plics_actuals(weighted_lines, links, events, cover):
     sup_missed = sup.join(positive, keys, "left_anti").withColumn("component", F.lit("overhead"))
     other = live.where(F.col("stream").isNull() & (F.col("component") != "overhead"))
 
+    # Unattached branches are collapsed to the ledger grain first (RBI_REL_20261025).
     return (_ledger(direct_alloc, "direct", "_amt", "actual_plics", "resource_use_event_key")
             .unionByName(_ledger(sup_alloc, "overhead", "_amt", "actual_plics", "resource_use_event_key"))
-            .unionByName(_ledger(direct_missed, "unallocated", "_pounds", "actual_plics"))
-            .unionByName(_ledger(other, "unallocated", "_pounds", "actual_plics"))
+            .unionByName(_ledger(_by_activity_component(direct_missed, "_pounds"), "unallocated", "_pounds", "actual_plics"))
+            .unionByName(_ledger(_by_activity_component(other, "_pounds"), "unallocated", "_pounds", "actual_plics"))
             .unionByName(_ledger(sup_missed, "unallocated", "_sup", "actual_plics"))
-            .unionByName(_ledger(superseded, "superseded", "_pounds", "actual_plics")))
+            .unionByName(_ledger(_by_activity_component(superseded, "_pounds"), "superseded", "_pounds", "actual_plics")))
 
 
 def allocate_episode_totals(activities, links, events, modelled):
@@ -419,6 +447,7 @@ def apply_costs(events, modelled, allocations, overheads, cover):
     e = e.withColumn("cost_basis", basis)
     reason = (F.when(F.col("cost_basis") != "none", F.lit(None).cast("string"))
               .when(F.col("consumption_status") == "not_consumed", F.lit("not_consumed"))
+              .when(F.col("consumption_status") == R.SCHEDULED_STATUS, F.lit("scheduled"))  # RBI_REL_20261025
               .when(F.col("consumption_status") == "unknown", F.lit("consumption_unknown"))
               .when(F.coalesce(F.col("priced_by_other_stream"), F.lit(False)), F.lit("priced_by_other_stream"))
               .when((F.col("stream") == "tracking_attendance") & ~F.col("tracking_class").isin(*R.PRICED_TRACKING_CLASSES),
