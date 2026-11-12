@@ -2078,6 +2078,7 @@ def _waiting_list_snapshot_canonical():
         s.LAST_DNA_DT_TM.alias("last_dna_datetime"),
         s.STATUS_DT_TM.alias("status_datetime"),
         s.STATUS_END_DT_TM.alias("status_end_datetime"),
+        s.PLAUSIBLY_OPEN_IND.alias("plausibly_open_ind"),  # INSR_W2 W2.20
         s.LOC_NURSE_UNIT_CD.cast("string").alias("location_code"),
         s.LOC_NURSE_UNIT_DESC.alias("location_display"),
         s.LOC_FACILITY_DESC.alias("facility_display"),
@@ -3821,6 +3822,16 @@ MEDICATION_SUPPLY_SOURCE_COLUMNS = [
     "load_batch_id",
     "source_update_timestamp",
     "loaded_at",
+    "drug_mapping_rule_id",  # INSR_W2 W2.20
+    "drug_mapping_model",  # INSR_W2 W2.20
+    "drug_mapping_score",  # INSR_W2 W2.20
+    "homecare_contact_name",  # INSR_W2 W2.20
+    "homecare_contact_addr1",  # INSR_W2 W2.20
+    "homecare_contact_addr2",  # INSR_W2 W2.20
+    "homecare_contact_addr3",  # INSR_W2 W2.20
+    "homecare_contact_addr4",  # INSR_W2 W2.20
+    "homecare_contact_postcode",  # INSR_W2 W2.20
+    "homecare_contact_telephone",  # INSR_W2 W2.20
 ]
 
 # contract v2: the researcher-facing parent excludes lifecycle, QC and retired fields.
@@ -3885,6 +3896,16 @@ MEDICATION_SUPPLY_PUBLIC_COLUMNS = [
     'record_status_effective_to',
     'source_update_timestamp',
     'loaded_at',
+    "drug_mapping_rule_id",  # INSR_W2 W2.20
+    "drug_mapping_model",  # INSR_W2 W2.20
+    "drug_mapping_score",  # INSR_W2 W2.20
+    "homecare_contact_name",  # INSR_W2 W2.20
+    "homecare_contact_addr1",  # INSR_W2 W2.20
+    "homecare_contact_addr2",  # INSR_W2 W2.20
+    "homecare_contact_addr3",  # INSR_W2 W2.20
+    "homecare_contact_addr4",  # INSR_W2 W2.20
+    "homecare_contact_postcode",  # INSR_W2 W2.20
+    "homecare_contact_telephone",  # INSR_W2 W2.20
 ]
 
 MEDICATION_SUPPLY_LIFECYCLE_COLUMNS = [
@@ -4821,6 +4842,11 @@ def _lifecycle_source_theatre_implant():
     # and its internal metadata.
     s = read_source(SRC_THEATRE_IMPLANT).alias("s")
     d = s.join(_theatre_parent_keys(), s.SURG_CASE_ID == F.col("_parent_surg_case_id"), "left")
+    # INSR_W2 W2.06 (L5267): the implant log carries no date; the implant happened during its theatre case.
+    case_time = read_source(SRC_THEATRE_CASE).groupBy(F.col("SURG_CASE_ID").alias("_it_case")).agg(
+        F.max("SURG_START_DT_TM").alias("_it_surg_start"), F.max("CHECKIN_DT_TM").alias("_it_checkin"),
+        F.max("SCHED_START_DT_TM").alias("_it_sched"))
+    d = d.join(case_time, s.SURG_CASE_ID == F.col("_it_case"), "left")
     # contract v2: rename deterministic theatre identities as keys and publish native practitioner, person, and encounter ids
     return d.select(
         stable_id("theatre_implant:surginet", s.IMPLANT_LOG_ST_ID).alias("theatre_implant_key"),
@@ -4838,6 +4864,10 @@ def _lifecycle_source_theatre_implant():
         s.IMPLANT_LINK_METHOD.alias("implant_link_method"),
         s.PERSON_ID.cast("bigint").alias("person_id"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        F.coalesce("_it_surg_start", "_it_checkin", "_it_sched").alias("implant_datetime"),  # INSR_W2 W2.06
+        F.when(F.col("_it_surg_start").isNotNull(), F.lit("case_surgery_start"))
+         .when(F.col("_it_checkin").isNotNull(), F.lit("case_checkin"))
+         .when(F.col("_it_sched").isNotNull(), F.lit("case_scheduled_start")).alias("implant_datetime_basis"),
         s.DOC_TYPE_DESCRIPTION.alias("document_type_desc"),
         s.ADC_UPDT.alias("loaded_at"),
         F.lit("surginet").alias("_source_system"), F.lit(SRC_THEATRE_IMPLANT).alias("_source_table"),
@@ -5081,7 +5111,7 @@ THEATRE_CASE_COLUMN_COMMENTS = {
     "surgery_start_local": "surgery_start in Europe/London wall-clock time (GMT/BST), from the bronze *_LOCAL companion.",
     "surgery_start_quality": "Bronze quality flag for surgery_start (e.g. milestone vs fallback).",
     "surgery_stop": "Surgery stop as a UTC instant (Millennium).",
-    "surgery_duration_minutes": "Surgery stop minus start in minutes, as derived in bronze.",
+    "surgery_duration_minutes": "Surgery stop minus start in minutes, as derived in bronze. NULL when either time is missing; implausible values (negative or over 24 hours) are kept as recorded.",  # INSR_W8_COMMENTS_V1 W8.09 L1326
     "scheduled_duration_minutes": "Scheduled case duration in minutes.",
     "performed_milestone_ind": "Whether a performed milestone was recorded for the case.",
     "add_on_ind": "SurgiNet add-on flag: case added to a list after scheduling (emergency/urgent proxy).",

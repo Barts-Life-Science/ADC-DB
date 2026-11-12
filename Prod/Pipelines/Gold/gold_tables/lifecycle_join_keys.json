@@ -1,0 +1,283 @@
+{
+ "clinical_allergy_intolerance": [
+  "patient_event_key"
+ ],
+ "clinical_appointment": [
+  "patient_event_key"
+ ],
+ "clinical_baby_delivery": [
+  "patient_event_key"
+ ],
+ "clinical_cancer_treatment": [
+  "patient_event_key"
+ ],
+ "clinical_cancer_treatment_cycle": [
+  "cancer_treatment_cycle_key"
+ ],
+ "clinical_clinical_finding": [
+  "patient_event_key"
+ ],
+ "clinical_clinical_score": [
+  "patient_event_key"
+ ],
+ "clinical_community_care_activity": [
+  "patient_event_key"
+ ],
+ "clinical_community_care_contact": [
+  "patient_event_key"
+ ],
+ "clinical_condition": [
+  "patient_event_key"
+ ],
+ "clinical_condition_stage": [
+  "patient_event_key"
+ ],
+ "clinical_costed_activity": [
+  "patient_event_key"
+ ],
+ "clinical_critical_care_activity": [
+  "patient_event_key"
+ ],
+ "clinical_critical_care_admission": [
+  "patient_event_key"
+ ],
+ "clinical_critical_care_daily_score": [
+  "patient_event_key"
+ ],
+ "clinical_critical_care_period": [
+  "patient_event_key"
+ ],
+ "clinical_device": [
+  "patient_event_key"
+ ],
+ "clinical_drug_expenditure": [
+  "patient_event_key"
+ ],
+ "clinical_elective_access_entry": [
+  "patient_event_key"
+ ],
+ "clinical_endoscopy_finding": [
+  "patient_event_key"
+ ],
+ "clinical_family_history": [
+  "patient_event_key"
+ ],
+ "clinical_form": [
+  "patient_event_key"
+ ],
+ "clinical_genomic_result": [
+  "patient_event_key"
+ ],
+ "clinical_genomic_test": [
+  "patient_event_key"
+ ],
+ "clinical_hrg_grouping": [
+  "patient_event_key"
+ ],
+ "clinical_imaging_exam": [
+  "patient_event_key"
+ ],
+ "clinical_indication": [
+  "patient_event_key"
+ ],
+ "clinical_labour_delivery": [
+  "patient_event_key"
+ ],
+ "clinical_maternity_care_contact": [
+  "patient_event_key"
+ ],
+ "clinical_medication_admin": [
+  "patient_event_key"
+ ],
+ "clinical_medication_dispense": [
+  "patient_event_key"
+ ],
+ "clinical_medication_order": [
+  "patient_event_key"
+ ],
+ "clinical_medication_supply": [
+  "patient_event_key"
+ ],
+ "clinical_microbiology_isolate": [
+  "patient_event_key"
+ ],
+ "clinical_neonatal_care_day": [
+  "patient_event_key"
+ ],
+ "clinical_neonatal_episode": [
+  "patient_event_key"
+ ],
+ "clinical_neonatal_examination": [
+  "patient_event_key"
+ ],
+ "clinical_pathology_order": [
+  "patient_event_key"
+ ],
+ "clinical_pathology_report": [
+  "patient_event_key"
+ ],
+ "clinical_pathology_result": [
+  "patient_event_key"
+ ],
+ "clinical_pathway_tracking": [
+  "patient_event_key"
+ ],
+ "clinical_presenting_complaint": [
+  "patient_event_key"
+ ],
+ "clinical_procedure": [
+  "patient_event_key"
+ ],
+ "clinical_referral": [
+  "patient_event_key"
+ ],
+ "clinical_registry_entry": [
+  "patient_event_key"
+ ],
+ "clinical_research_enrollment": [
+  "patient_event_key"
+ ],
+ "clinical_rtt_activity": [
+  "patient_event_key"
+ ],
+ "clinical_rtt_pathway": [
+  "patient_event_key"
+ ],
+ "clinical_specimen": [
+  "patient_event_key"
+ ],
+ "clinical_susceptibility_result": [
+  "patient_event_key"
+ ],
+ "clinical_transfusion": [
+  "patient_event_key"
+ ],
+ "clinical_transfusion_event": [
+  "transfusion_event_key"
+ ],
+ "clinical_vital_sign": [
+  "patient_event_key"
+ ],
+ "clinical_waiting_list_entry": [
+  "patient_event_key",
+  "row_source",
+  "source_version_id"
+ ],
+ "clinical_waiting_list_snapshot": [
+  "waiting_list_snapshot_key"
+ ],
+ "reference_concept_map": [
+  "concept_map_key"
+ ],
+ "reference_cost_line_item": [
+  "cost_line_item_key"
+ ],
+ "reference_device_mapping": [
+  "device_mapping_key"
+ ],
+ "reference_elective_access_procedure": [
+  "elective_access_procedure_key"
+ ],
+ "reference_encounter_attribute": [
+  "encounter_attribute_key"
+ ],
+ "reference_encounter_bounds": [
+  "encounter_bounds_key"
+ ],
+ "reference_gene_tested": [
+  "gene_tested_row_key"
+ ],
+ "reference_location": [
+  "location_key"
+ ],
+ "reference_organization": [
+  "organization_key"
+ ],
+ "reference_person_address": [
+  "person_address_key"
+ ],
+ "reference_person_attribute": [
+  "person_attribute_key"
+ ],
+ "reference_person_death_evidence": [
+  "person_death_evidence_key"
+ ],
+ "reference_practitioner": [
+  "practitioner_key"
+ ],
+ "reference_practitioner_group": [
+  "practitioner_group_key"
+ ],
+ "reference_practitioner_identifier": [
+  "practitioner_identifier_key"
+ ],
+ "reference_practitioner_location_evidence": [
+  "practitioner_location_evidence_key"
+ ],
+ "reference_pregnancy_reconciliation": [
+  "pregnancy_reconciliation_key"
+ ],
+ "reference_research_study": [
+  "research_study_key"
+ ],
+ "reference_service": [
+  "service_key"
+ ],
+ "reference_theatre_attendance": [
+  "theatre_attendance_key"
+ ],
+ "reference_theatre_case": [
+  "theatre_case_key"
+ ],
+ "reference_theatre_case_milestone": [
+  "theatre_case_milestone_key"
+ ],
+ "reference_theatre_implant": [
+  "theatre_implant_key"
+ ],
+ "reference_value_set": [
+  "value_set_key"
+ ],
+ "spine_care_participation": [
+  "care_participation_key"
+ ],
+ "spine_encounter": [
+  "encounter_key"
+ ],
+ "spine_encounter_identifier": [
+  "encounter_identifier_key"
+ ],
+ "spine_episode": [
+  "episode_key"
+ ],
+ "spine_episode_encounter": [
+  "episode_encounter_key"
+ ],
+ "spine_journey": [
+  "journey_key"
+ ],
+ "spine_journey_link": [
+  "journey_link_key"
+ ],
+ "spine_journey_participant": [
+  "journey_participant_key"
+ ],
+ "spine_location_stay": [
+  "location_stay_key"
+ ],
+ "spine_person": [
+  "person_id"
+ ],
+ "spine_person_identifier": [
+  "person_identifier_key"
+ ],
+ "spine_person_relationship": [
+  "person_relationship_key"
+ ],
+ "spine_request_thread": [
+  "request_thread_key"
+ ],
+ "text_document": [
+  "patient_event_key"
+ ]
+}

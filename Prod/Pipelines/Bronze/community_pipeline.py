@@ -424,6 +424,8 @@ def mapping_value(column, mapping):
 def mapping_status(code_column, description_column):
     return (
         F.when(code_column.isNull(), F.lit("NULL"))
+        # R1FIX_20261109: a source that submitted several codes for one record ('01|02').
+        .when(code_column.contains("|"), F.lit("SOURCE_CONFLICT"))
         .when(description_column.isNotNull(), F.lit("MAPPED"))
         .otherwise(F.lit("UNRECOGNISED_OR_LEGACY"))
     )
@@ -666,6 +668,20 @@ def with_row_hash(df: DataFrame) -> DataFrame:
     return df.withColumn("ROW_HASH", stable_hash(columns))
 
 
+def rehash_stored_columns(projected: DataFrame) -> DataFrame:
+    """
+    BRONZE_PERF_20261101_COMMUNITY_HASH_V1: recompute ROW_HASH over the columns that are actually stored.
+
+    with_row_hash runs before bronze_project_contract, so its hash also covered working columns that the contract
+    then drops. One of them differs on every run, so every row looked changed and was rewritten each week (11-01:
+    all 15.7M activity and 3.0M contact rows were updated, and no stored value differed). Hashing the projected
+    frame limits the change test to stored values. The first run after this change rewrites each row once, to
+    store the new hash; after that only rows whose stored values change are written.
+    """
+    columns = sorted(column for column in projected.columns if column not in HASH_EXCLUDE)
+    return projected.withColumn("ROW_HASH", stable_hash(columns))
+
+
 def latest_delta_metrics(table: str) -> dict:
     history = spark.sql(f"DESCRIBE HISTORY {qname(table)} LIMIT 1").collect()[0]
     operation_metrics = history["operationMetrics"] or {}
@@ -684,9 +700,12 @@ def update_snapshot_table(
         df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
           .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
     )
-    staged = bronze_project_contract(
-        with_row_hash(staged_input),
-        target,
+    # BRONZE_PERF_20261101_COMMUNITY_HASH_V1: the change hash covers stored columns only (rehash_stored_columns).
+    staged = rehash_stored_columns(
+        bronze_project_contract(
+            with_row_hash(staged_input),
+            target,
+        )
     )
     if not bronze_table_exists(target):
         (
@@ -764,6 +783,20 @@ def assert_expected_columns() -> None:
         actual = set(spark.table(table).columns)
         missing = sorted(expected - actual)
         assert not missing, f"{table}: missing required columns {missing}"
+
+
+def collapse_contact_subject_conflicts(contact_source: DataFrame) -> DataFrame:
+    """R1FIX_20261109: CYP201 sometimes submits one care contact (CDB+CCI+SRI) twice, identical except CCSubject
+    (01 patient / 02 patient proxy; one contact on 2026-11-08). No column says which submission is current, so neither
+    is picked: rows identical in every other column collapse to one whose CCSubject lists every submitted code,
+    sorted and '|'-joined ('01|02'), which mapping_status reports as SOURCE_CONFLICT. Rows that differ anywhere else
+    are untouched, so any other duplicate key still fails the preflight."""
+    other_columns = [name for name in contact_source.columns if name != "CCSubject"]
+    return (
+        contact_source.groupBy(*other_columns)
+        .agg(F.concat_ws("|", F.array_sort(F.collect_set("CCSubject"))).alias("CCSubject"))
+        .select(*contact_source.columns)
+    )
 
 
 def run_preflight(
@@ -2585,6 +2618,13 @@ try:
         table: read_pinned(dependency_metadata[table])
         for table in PHYSICAL_DEPENDENCIES
     }
+    # R1FIX_20261109: one row per care contact before every use (preflight, contact stage, activity join).
+    pinned[SRC_CONTACT] = collapse_contact_subject_conflicts(pinned[SRC_CONTACT])
+    contact_source_rows = pinned[SRC_CONTACT].count()
+    contact_subject_conflicts = int(dependency_metadata[SRC_CONTACT]["row_count"]) - contact_source_rows
+    if contact_subject_conflicts:
+        print(f"[COMMUNITY] WARNING: {contact_subject_conflicts} duplicate CYP201 submissions collapsed "
+              "(care_contact_subject_mapping_status SOURCE_CONFLICT)")
 
     preflight = run_preflight(
         dependency_metadata,
@@ -2629,7 +2669,7 @@ try:
         )
         validation["contact"] = validate_contact_stage(
             contact_stage,
-            int(dependency_metadata[SRC_CONTACT]["row_count"]),
+            contact_source_rows,  # R1FIX_20261109: after collapsing subject conflicts
         )
 
     if rebuild[ACTIVITY_TABLE]:
@@ -2781,5 +2821,4 @@ except Exception as community_error:
     raise
 
 dbutils.notebook.exit(bronze_json(result_payload))
-
 

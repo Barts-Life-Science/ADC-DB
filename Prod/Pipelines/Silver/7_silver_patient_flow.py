@@ -16,6 +16,7 @@
 
 from pyspark.sql import Column, functions as F
 from silver_active_rows import active_rows  # ACTIVE_ROWS_V1
+from silver_value_policy import column_comments, finish_public, mill_fk  # INSR_W2 W2.02
 
 try:
     from pyspark import pipelines as dp
@@ -59,10 +60,22 @@ def subject_key_with_system(person_id, source_table, source_row_id):
     )
 
 def _with_comments(frame, product):
-    # Attach the product and source description to every output column's schema metadata.
+    # INSR_W8_COMMENTS_V1 (W8.04): every column's comment comes from the canonical dictionary in silver_tdx_comments.py.
+    # A column missing from it raises KeyError while the graph is built, so a template comment cannot be
+    # published again; assert_not_boilerplate rejects template text that reached the dictionary.
+    from silver_tdx_comments import SILVER_TDX_COLUMN_COMMENTS, assert_not_boilerplate
+    comments = SILVER_TDX_COLUMN_COMMENTS[product]
     for column in frame.columns:
-        frame = frame.withMetadata(column, {"comment": f"{product} field {column}; derived from the admitted TDX bronze source."})
+        text = comments[column]
+        assert_not_boilerplate(text, f"{product}.{column}")
+        frame = frame.withMetadata(column, {"comment": text})
     return frame
+
+
+def _tdx_table_comment(target_name):
+    # INSR_W8_COMMENTS_V1 (W8.04): the grain statement used as the product's MV table comment.
+    from silver_tdx_comments import SILVER_TDX_TABLE_COMMENTS
+    return SILVER_TDX_TABLE_COMMENTS[target_name]
 
 def canonical(source_name, target_name, keys, key_name, namespace):
     # Normalize a configured patient-flow bronze feed: standardize names, construct stable keys,
@@ -93,14 +106,18 @@ def canonical(source_name, target_name, keys, key_name, namespace):
     df = df.withColumn("record_status_effective_from", F.lit(None).cast("timestamp"))
 
     if "person_id" in df.columns:
-        df = df.withColumn("person_id", F.col("person_id").cast("string"))
-        subject_key, subject_system = subject_key_with_system(F.col("person_id"), F.lit(f"{BRONZE}.{source_name}"), source_row)
-        df = df.withColumn("identity_status", F.when(F.col("person_id").isNotNull(), "resolved").otherwise("unresolved"))
+        # INSR_W2 W2.02: subject_key hashes the source text form exactly as before; the published person_id is
+        # BIGINT with Millennium's 0 ("no person") as NULL.
+        person_text = F.col("person_id").cast("string")
+        subject_key, subject_system = subject_key_with_system(person_text, F.lit(f"{BRONZE}.{source_name}"), source_row)
         df = df.withColumn("subject_key", subject_key).withColumn("subject_id_system", subject_system)
+        df = df.withColumn("person_id", mill_fk("person_id"))
+        df = df.withColumn("identity_status", F.when(F.col("person_id").isNotNull(), "resolved").otherwise("unresolved"))
     else:
         df = df.withColumn("identity_status", F.lit("not_applicable"))
     if "encounter_id" in df.columns:
-        df = df.withColumn("encounter_id", F.col("encounter_id").cast("string"))
+        # INSR_W2 W2.02: BIGINT, 0 -> NULL (no key hashes encounter_id in this notebook).
+        df = df.withColumn("encounter_id", mill_fk("encounter_id"))
     if "source_adc_updt" in df.columns:
         df = df.withColumn("source_update_timestamp", F.col("source_adc_updt"))
 
@@ -123,7 +140,15 @@ def canonical(source_name, target_name, keys, key_name, namespace):
         df = df.withColumn("stay_minutes", F.when(valid, ((F.unix_timestamp("depart_dt_tm_clean") - F.unix_timestamp("arrive_dt_tm")) / 60).cast("int")))
     elif target_name == "clinical_tracking_milestone":
         df = df.withColumn("milestone_datetime", F.coalesce("complete_dt_tm", "onset_dt_tm", "requested_dt_tm"))
-    return _with_comments(df, target_name)
+    # INSR_W2 W2.02: zero codes/ids, system user and derived columns (silver_value_policy).
+    df = finish_public(df, target_name)
+    df = _with_comments(df, target_name)
+    # INSR_W2 W2.02: _with_comments writes a generic comment on every column; put back the policy's own
+    # comments (<role>_system_ind, milestone_config_era, ...) so UC carries the real meaning.
+    for column, text in column_comments(target_name).items():
+        if column in df.columns:
+            df = df.withMetadata(column, {"comment": text})
+    return df
 
 def declare_product(source_name, target_name, keys, key_name, namespace):
     # Register a configured public product and its internal lifecycle and batch-metadata
@@ -134,7 +159,7 @@ def declare_product(source_name, target_name, keys, key_name, namespace):
         return canonical(source_name, target_name, list(keys), key_name, namespace)
     build.__name__ = f"build_{target_name}"
     globals()[build.__name__] = dp.materialized_view(
-        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=f"TDX v2.1 Silver research product {target_name}.", refresh_policy="auto"
+        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=_tdx_table_comment(target_name), refresh_policy="auto"
     )(build)
 
     def metadata():

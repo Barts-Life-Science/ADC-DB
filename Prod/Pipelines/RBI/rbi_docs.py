@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Table and column documentation plus IG tags for every published RBI table.
 
 Pure Python. The governance notebook applies these after each pipeline update (MV comments
@@ -46,10 +47,11 @@ C = {
     "quantity_performed_reported": "Pathology: requested tests without a matching result whose accession was reported.",
     "quantity_unknown": "Pathology: requested tests with no evidence of being performed.",
     "consumption_status": "consumed, not_consumed, unknown, scheduled (a row, e.g. an appointment or theatre case, dated after its source row was loaded: a booking, not yet observed), or not_applicable (unallocated £ rows). Only consumed rows are priced.",
-    "consumption_evidence": "Rule or source status that set consumption_status.",
+    "consumption_evidence": "Rule or source status that set consumption_status; '|end_before_start' is appended when the "
+                            "source end was before the start and event_end was published NULL.",
     # time
     "event_start": "Start instant (UTC).",
-    "event_end": "End instant (UTC) where known.",
+    "event_end": "End instant (UTC) where known; NULL when the source end is before the start (see consumption_evidence).",
     "event_date_local": "Europe/London calendar date of the row.",
     "financial_year": "NHS financial year (April start) of event_date_local.",
     "month": "Europe/London calendar month (first day).",
@@ -57,7 +59,7 @@ C = {
     "last_event": "Latest event_start of the group's consumed or not_consumed rows (scheduled, unknown and unallocated rows are ignored).",
     "spell_first_event": "Earliest event_start of the spell's consumed or not_consumed rows (scheduled, unknown and unallocated rows are ignored).",
     "spell_last_event": "Latest event_end of the spell's consumed or not_consumed rows.",
-    "activity_start": "SLAM activity start (admission or attendance). Dated OP attendances are kept only from the window start (FY2019/20) and when not dated after the SLAM row was loaded; undated ones are kept.",
+    "activity_start": "SLAM activity start (admission or attendance). Dated OP attendances are kept only from the window start (rbi.window_start, 2019-04-01) and when not dated after the SLAM row was loaded; APC spells are kept when they end (or, with no end, start) on or after the window start; undated rows are kept.",
     "activity_end": "SLAM activity end (discharge) where known.",
     # attribution
     "attribution_method": "native, interval_unique, interval_ambiguous, none, not_applicable, activity_link.",
@@ -66,7 +68,13 @@ C = {
     "link_method": "How a SLAM/PLICS activity linked: fin_spell, fin_attendance, person_date, person_date_ambiguous, native, none.",
     # service attribution
     "nurse_unit_code": "Ward / nurse unit code.",
-    "site_code": "Site, facility or trust code as carried by the source.",
+    "site_code": "Millennium facility (reference_location facility location_code) for the streams in "
+                 "rbi_rules.SITE_FACILITY_STREAMS; other streams keep the label their source carries. See site_basis.",
+    "site_basis": "How site_code was set: location_stay (ward stay facility), location (the row's own location), "
+                  "encounter_location_stay (first stay of its encounter with a facility), source_label (the source's "
+                  "own label, for streams outside the facility vocabulary); NULL when no site is known.",
+    "site_source_value": "The site label the source itself carries (theatre institution, tracking trust, ward facility "
+                         "code, HCD finance site code), kept as context.",
     "service_code": "Service or specialty code as carried by the source.",
     "service_unit": "Ward, theatre, clinic or the stream's primary stratum.",
     "clinic_code": "Clinic resource code.",
@@ -81,7 +89,8 @@ C = {
     # cost
     "cost_total": "Authoritative direct £ for this row (one source by precedence). Additive total = cost_total + cost_overhead.",
     "cost_overhead": "Support-cost £: actual SUP share for PLICS rows, modelled £ × setting ratio for modelled rows.",
-    "cost_basis": "drug_expenditure_actual, actual_plics, actual_ncc_allocated, covered_by_hcd_ledger, modelled_bottom_up, none.",
+    "cost_basis": "drug_expenditure_actual, actual_plics, actual_ncc_allocated, actual_ncc_plan_b (NCC episode totals from "
+                  "the plan B landing, when configured), covered_by_hcd_ledger, modelled_bottom_up, none.",
     "cost_reason": "Why cost_basis is none: not_consumed, scheduled, consumption_unknown, priced_by_other_stream, unpriced_tracking_class, zero_quantity, hcd_drug_without_ledger, no_calibration.",
     "cost_modelled_shadow": "Modelled £ kept for comparison when an actual £ won.",
     "cost_superseded": "PLICS £ covered by a higher-precedence source (HCD ledger); not in cost_total.",
@@ -168,13 +177,27 @@ _PATIENT = {"person_id", "encounter_id", "spell_encounter_id", "appointment_key"
 _SYNTHETIC = {"resource_use_event_key", "activity_unit_key", "rule_version", "cost_method_version", "source_table"}
 
 
-def ig_tags(column):
-    """(ig_risk, ig_severity) for a published column name."""
+def own_class(column):
+    """The pre-J1 ig class of an RBI column with no gold counterpart: patient-grain keys and dates 3/1, synthetic
+    hashes and provenance 0/0, everything else 1/0."""
     if column in _PATIENT:
         return ("3", "1")
     if column in _SYNTHETIC:
         return ("0", "0")
     return ("1", "0")
+
+
+def ig_tags(column, estate=None):
+    """(ig_risk, ig_severity) for a published column name.
+
+    INSR_W6 W6.02 (J1, 2026-10-29): a column that also exists in gold takes the estate's modal gold tag for that name
+    (estate = estate_tags(spark) from Prod/Pipelines/_shared, ties to the higher risk), so RBI keys are tagged like
+    the gold keys they join to. Without an estate dict, or for a column gold does not have, own_class applies.
+    Always strings: estate_tags returns integers, UC tag values (and the before -> after diff) are strings.
+    """
+    if estate and column in estate:
+        return tuple(str(v) for v in estate[column])
+    return own_class(column)
 TABLE_COMMENTS["rbi_sample_person"] = "Dev only: the hashed 2% person cohort every stream is restricted to. Never present in prod."
 TABLE_COMMENTS["cost_allocation_ledger"] = ("Every actual £ RBI received, one row per PLICS/NCC activity × component × receiving fact row "
                                             "(or unallocated / superseded). Σ amount per activity × component = PLICS duplicate-weighted lines.")
@@ -195,4 +218,44 @@ COLUMN_COMMENTS.update({
     "link_score": "1.0 for deterministic or unique links; NULL when unlinked.",
 })
 _PATIENT.add("activity_record_id")
+# INSR_W6 W6.07: new columns and the rbi_coverage table.
+COLUMN_COMMENTS.update({
+    "meets_calibration_floor": "True when n_entities >= the calibration floor (rbi.min_calibration_activities, 100).",
+    "small_denominator_ind": "True when n_entities is below the calibration floor; such strata never price rows.",
+    "used_for_pricing": "True when the stratum can price rows: it clears the floor, has a unit cost and is in the "
+                        "stream's latest base FY (price_keys then picks the most specific of l1, l2, all).",
+    "unit_cost_outlier_ind": "True when unit_cost is more than 10x the median unit cost of its stream x base FY.",
+    "spell_admitted_before_window_ind": "True when the spell's encounter started before the window start, so its "
+                                        "earliest resource rows are outside RBI (left-censored).",
+    "spell_open_ind": "True when the spell's encounter has no discharge yet (right-censored); NULL when the encounter "
+                      "is not in gold spine_encounter (unknown).",
+    "journey_starts_before_window_ind": "True when the journey started before the window start (first_event is "
+                                        "left-censored).",
+    "journey_open_ind": "True when the journey has no end yet (last_event is right-censored); NULL when the journey "
+                        "is not in gold spine_journey (unknown).",
+    "measure": "plics_link_rate | plics_episode_end_defaulted | actual_cost_share.",
+    "dimension": "feed_type for the PLICS measures, stream for actual_cost_share.",
+    "numerator": "Linked activities, FY-end-default activities, or £ with an actual basis.",
+    "denominator": "All activities of the feed type in the FY, or all £ of the stream in the FY.",
+    "rate": "numerator / denominator; NULL when the denominator is 0.",
+})
+TABLE_COMMENTS["rbi_coverage"] = ("Coverage of RBI by financial year: PLICS/SLAM link rate and FY-end default episodes by "
+                                  "feed type, and the share of £ that is actual (not modelled) by stream.")
+PUBLISHED_COLUMNS["rbi_coverage"] = ["financial_year", "measure", "dimension", "numerator", "denominator", "rate"]
+PUBLISHED_COLUMNS["unit_cost_reference"] += ["meets_calibration_floor", "small_denominator_ind", "used_for_pricing",
+                                             "unit_cost_outlier_ind"]
+PUBLISHED_COLUMNS["spell_resource_summary"] += ["spell_admitted_before_window_ind", "spell_open_ind"]
+PUBLISHED_COLUMNS["journey_resource_summary"] += ["journey_starts_before_window_ind", "journey_open_ind"]
 _SYNTHETIC.add("cost_allocation_ledger_key")  # RBI_REL_20261025: a hash, like resource_use_event_key
+# INSR_W8_COMMENTS_V1 W8.09: documented limitations (INSR_20261029 coverage register; W0 ledger figures).
+TABLE_COMMENTS["spell_resource_summary"] += (" Spells starting before the FY2019/20 window or still open at the last load are "
+                                             "censored: only in-window resource use is counted.")
+TABLE_COMMENTS["journey_resource_summary"] += " Journeys crossing the window edges are censored in the same way as spells."
+TABLE_COMMENTS["resource_use_event"] += (" Administration rows start with electronic administration recording (2021-08/09); "
+                                         "scheduled rows dated after their load are bookings, not consumption.")
+TABLE_COMMENTS["plics_activity_link"] += (" About 31% of PLICS/SLAM activities have no gold encounter: outpatient attendances 18%, "
+                                          "other outpatient activity 95%, emergency care under 1%.")
+COLUMN_COMMENTS["cost_basis"] = COLUMN_COMMENTS["cost_basis"].rstrip(".") + (
+    ". actual_plics covers a minority of rows; most £ is modelled_bottom_up.")
+COLUMN_COMMENTS["event_start"] = COLUMN_COMMENTS["event_start"].rstrip(".") + (
+    ". A few rows remain dated after their load (scheduled bookings) or before the window; they are excluded from monthly rollups.")

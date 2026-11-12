@@ -170,6 +170,7 @@ from silver_journey_shared import (
     canonical_coding_system,
     materialized_view,
     read_source,
+    _code_value_decoder,  # INSR_W2 W2.09
     stable_id,
     subject_key_with_system,
 )
@@ -216,21 +217,6 @@ def _source_object_display(table_col):
 
 SRC_S3B_ETHNICITY_MAP = "3_lookup.omop.ethnicity_snomed_map"
 
-@materialized_view(
-    name=_n("journey_reference._snomed_concept_crosswalk"),
-    private=True,
-    comment="Internal S3 OMOP-to-SNOMED crosswalk restricted to valid SNOMED concepts.",
-    refresh_policy="auto",
-)
-def _s3_snomed_concept_crosswalk():
-    # Build the declared dataset: Internal S3 OMOP-to-SNOMED crosswalk restricted to valid
-    # SNOMED concepts.
-    return (read_source("3_lookup.omop.concept")
-            .where("vocabulary_id='SNOMED' AND invalid_reason IS NULL")
-            .select(F.col("concept_id").cast("bigint").alias("concept_id"),
-                    F.col("concept_code").cast("string").alias("concept_code"),
-                    F.col("concept_name").alias("concept_name"),
-                    F.col("standard_concept").alias("standard_concept")))
 
 # COMMAND ----------
 
@@ -328,6 +314,10 @@ PERSON_COLUMN_COMMENTS = {
     "marital_status_display": "Source marital-status display.",
     "religion_code": "Source religion code.",
     "religion_display": "Source religion display.",
+    'religion_snomed_code': 'SNOMED concept of the recorded religion (descendant of 108334009), matched exactly or by synonym on the Cerner display against RF2 descriptions (TRUD first) then OMOP synonyms; NULL when no concept matched (never imputed). BBR_FOLDIN_V1 BBR-16.',  # BBR_FOLDIN_V1
+    'religion_snomed_display': 'SNOMED preferred term of religion_snomed_code. BBR_FOLDIN_V1 BBR-16.',  # BBR_FOLDIN_V1
+    'religion_group': "Top-level religion group: Christian, Muslim, Hindu, Sikh, Jewish, Buddhist, Other, or Not stated/unknown (ancestor roll-up of religion_snomed_code; the source's 'Other' stays Other); NULL when a named religion matched no SNOMED concept (never imputed). BBR_FOLDIN_V1 BBR-16.",  # BBR_FOLDIN_V1
+    'religion_map_rule_id': 'Rule of the religion mapping (bbr:religion:v1, method exact_synonym) from 3_lookup.omop.religion_snomed_map; NULL when the code has no map row. BBR_FOLDIN_V1 BBR-16.',  # BBR_FOLDIN_V1
     "deceased_ind": "True when a death date is recorded or map_person.deceased_display is 'Deceased' (DECEASED_CD 3768549, CDF YES); false otherwise, including DECEASED_CD 'No' (684730) and 0. Never NULL.",  # SDI_DECEASED_V1/silver:
     "deceased_ind_source": "Evidence behind deceased_ind: death_date (a death timestamp is recorded) or deceased_code (DECEASED_CD displays 'Deceased' with no date); NULL when deceased_ind is false.",
     "deceased_datetime": "Source death timestamp.",
@@ -371,6 +361,10 @@ def _lifecycle_source_person():
     s = read_source(SRC_PERSON)
     mrn = _person_alias_selection("MRN", MRN_POOL_PREFERENCE).alias("mrn")  # SDI_MRN_POOL_V1/silver:
     nhs = _person_alias_selection("NHS").alias("nhs")
+    # BBR_FOLDIN_V1 (BBR-16): religion SNOMED crosswalk, one row per Cerner RELIGION_CD (built by INSR P1.BBR.lookups).
+    religion = read_source("3_lookup.omop.religion_snomed_map").select(
+        F.col("source_code").cast("string").alias("_rel_code"), "religion_snomed_code", "religion_snomed_display",
+        "religion_group", F.col("mapping_rule_id").alias("religion_map_rule_id")).alias("rel")
     ended = F.coalesce(
         s.end_effective_dt_tm < F.lit("2100-01-01").cast("timestamp"),
         F.lit(False),
@@ -378,6 +372,7 @@ def _lifecycle_source_person():
     joined = (
         s.join(mrn, s.person_id.cast("string") == F.col("mrn._pid"), "left")
          .join(nhs, s.person_id.cast("string") == F.col("nhs._pid"), "left")
+         .join(religion, s.religion_cd.cast("string") == F.col("rel._rel_code"), "left")  # BBR_FOLDIN_V1
     )
     # contract v2: publish Millennium PERSON_ID as the BIGINT person primary key
     return joined.select(
@@ -398,6 +393,8 @@ def _lifecycle_source_person():
         s.marital_type_display.alias("marital_status_display"),
         s.religion_cd.cast("string").alias("religion_code"),
         s.religion_display.alias("religion_display"),
+        F.col("rel.religion_snomed_code"), F.col("rel.religion_snomed_display"),  # BBR_FOLDIN_V1 BBR-16
+        F.col("rel.religion_group"), F.col("rel.religion_map_rule_id"),  # BBR_FOLDIN_V1 BBR-16
         # SDI_DECEASED_V1/silver: DECEASED_CD 684730 displays 'No'; only a date or the 'Deceased' code counts.
         (s.deceased_dt_tm.isNotNull()
          | F.coalesce(F.upper(F.trim(s.deceased_display)) == F.lit("DECEASED"), F.lit(False))).alias("deceased_ind"),
@@ -1202,6 +1199,28 @@ def _location_projection():
         F.date_format("ADC_UPDT", "yyyyMMddHHmmss").alias("load_batch_id"),
         F.col("ADC_UPDT").alias("loaded_at"),
     )
+    # INSR_W2 W2.11 (L4164): map_location_unit rows inherit the organisation of their nearest care-site ancestor
+    # (parent, grandparent, great-grandparent via PARENT_LOCATION_CD); care-site rows keep their own. Equi-joins only.
+    org_of = (care.where(F.col("organization_id").isNotNull())
+              .groupBy(F.col("location_code").alias("_oc"))
+              .agg(F.min("organization_id").alias("_olo"), F.max("organization_id").alias("_ohi"))
+              .where(F.col("_olo") == F.col("_ohi")).select("_oc", F.col("_olo").alias("_org")))
+    hop = u.groupBy(F.col("LOCATION_CD").cast("string").alias("_c")).agg(
+        F.min(F.col("PARENT_LOCATION_CD").cast("string")).alias("_p1"))
+    chain = (hop.join(hop.select(F.col("_c").alias("_c2"), F.col("_p1").alias("_p2")), F.col("_p1") == F.col("_c2"), "left")
+                .join(hop.select(F.col("_c").alias("_c3"), F.col("_p1").alias("_p3")), F.col("_p2") == F.col("_c3"), "left"))
+    for i in (1, 2, 3):
+        chain = chain.join(org_of.select(F.col("_oc").alias(f"_oc{i}"), F.col("_org").alias(f"_org{i}")),
+                           F.col(f"_p{i}") == F.col(f"_oc{i}"), "left")
+    chain = chain.select(
+        F.col("_c").alias("_lane_code"), F.coalesce("_org1", "_org2", "_org3").alias("_lane_org"),
+        F.when(F.col("_org1").isNotNull(), F.lit("parent_care_site")).when(F.col("_org2").isNotNull(), F.lit("grandparent_care_site"))
+         .when(F.col("_org3").isNotNull(), F.lit("great_grandparent_care_site")).alias("_lane_org_basis"))
+    lane = (lane.join(chain, F.col("location_code") == F.col("_lane_code"), "left")
+                .withColumn("organization_id", F.col("_lane_org"))
+                .withColumn("organization_id_basis", F.col("_lane_org_basis"))
+                .drop("_lane_code", "_lane_org", "_lane_org_basis"))
+    care = care.withColumn("organization_id_basis", F.when(F.col("organization_id").isNotNull(), F.lit("care_site_source")))
     return care.unionByName(lane)
 
 # COMMAND ----------
@@ -1223,8 +1242,10 @@ LOCATION_COLUMN_COMMENTS = {
     "physical_type_code": "FHIR physical location type code: si facility, bu building, wa nurse unit, ro room, bd bed; null for other Millennium location types.",  # SDI_LOCATION_LANE_V1
     "valid_from": "Source validity start.",
     "valid_to": "Source validity end.",
-    "latitude": "Source address latitude.",
-    "longitude": "Source address longitude.",
+    "latitude": "Latitude of the location: the Millennium address record's where it holds one; for a Trust care site with none, the ONS Postcode Directory centroid of the site postcode (see coordinate_source). Trust sites only, never a person's address (J15).",  # INSR_W7 W7.08
+    "longitude": "Longitude of the location; same source rule as latitude (see coordinate_source).",  # INSR_W7 W7.08
+    "coordinate_source": "Where latitude/longitude come from: source (the Millennium address record) or onspd_postcode_centroid (ONS Postcode Directory centroid of the site postcode, used when the source has none); null when the location has no coordinates (INSR W7.08, J15 ruling 2026-10-29).",  # INSR_W7 W7.08
+    "coordinate_status": "postcode_outside_trust_areas when the location's postcode area is not one of the Trust's own site postcode areas (the areas of its active facility-level care sites); its latitude, longitude and coordinate_source are then NULL (e.g. inactive Cerner template sites such as KINGS HOSP, TQ2 7AA). NULL otherwise (W7-S1 ruling 2026-10-31).",  # INSR_W7 W7.08
     "address_city": "Source address city.",
     "address_postcode_masked": "Privacy-aware source postcode.",
     "source_table": "Fully qualified bronze source table.",
@@ -1253,6 +1274,69 @@ def _lifecycle_source_location():
     # internal metadata.
     return _location_projection()
 
+
+SRC_ONSPD = "3_lookup.ons.onspd"  # INSR_W7 W7.08
+
+
+def _trust_site_areas(locations):
+    """Postcode areas of the Trust's own sites: the areas of ACTIVE facility-level care sites (W7-S1 ruling, Ben
+    2026-10-31). Derived from the data on every refresh, never a hard-coded list; inactive Cerner template sites (e.g.
+    'KINGS HOSP' at TQ2 7AA, 'KINGS TRUST' in PR) do not count. One row per area, for an equi-join."""
+    return (locations
+            .where((F.col("location_level") == "facility") & (F.col("status") == "active"))
+            .select(_postcode_area(F.col("address_postcode_masked")).alias("_ta_area"))
+            .where(F.col("_ta_area").isNotNull())
+            .distinct()
+            .withColumn("_trust_area", F.lit(True)))
+
+
+def _postcode_area(postcode):
+    """The postcode area (the leading letters, e.g. 'E', 'EC', 'TQ') of a postcode, upper-cased; NULL when none."""
+    area = F.regexp_extract(F.upper(F.trim(postcode)), r"^([A-Z]{1,2})[0-9]", 1)
+    return F.when(area != "", area)
+
+
+def _with_site_geocode(locations):
+    """INSR_W7_SITE_GEOCODE_V1 (W7.08; J15 ruling 2026-10-29, L651): fill a Trust site's missing coordinates.
+
+    Care-site rows carry the site's postcode in address_postcode_masked. Where Millennium gives no latitude, the
+    ONS Postcode Directory centroid of that postcode is used, and coordinate_source says which. Only Trust
+    locations pass through here (reference_location); person addresses are never touched. ONSPD gives postcodes
+    without a grid reference latitude 99.999999, so those never match (lat < 90). One equi-join to a lookup whose
+    postcode is unique, so the location grain is unchanged. The centroid choice is a column of its own before it
+    is used twice: a predicate built on `latitude` would re-resolve to the new latitude in the next withColumn.
+
+    W7-S1 ruling (Ben 2026-10-31): a location whose postcode area is not one of the Trust's own site areas
+    (_trust_site_areas) gets NULL coordinates and coordinate_status 'postcode_outside_trust_areas', whatever the
+    coordinates' source (e.g. the 27 'KINGS HOSP' template locations at TQ2 7AA). The area set is joined on the
+    area key (one row per area), so the grain is unchanged.
+    """
+    onspd = (read_source(SRC_ONSPD)
+             .where(F.col("lat") < 90)
+             .select(F.upper(F.regexp_replace(F.col("pcds"), " ", "")).alias("_pc_key"),
+                     F.col("lat").alias("_pc_lat"), F.col("long").alias("_pc_long")))
+    keyed = (locations
+             .withColumn("_pc_key", F.upper(F.regexp_replace(F.col("address_postcode_masked"), " ", "")))
+             .withColumn("_pc_area", _postcode_area(F.col("address_postcode_masked"))))
+    joined = (keyed.join(onspd, "_pc_key", "left")
+              .join(_trust_site_areas(locations), F.col("_pc_area") == F.col("_ta_area"), "left")
+              .withColumn("_outside", F.col("_pc_area").isNotNull() & F.col("_trust_area").isNull())
+              .withColumn("_use_centroid", F.col("latitude").isNull() & F.col("_pc_lat").isNotNull()))
+    return (joined
+            .withColumn("coordinate_source",
+                        F.when(F.col("_outside"), F.lit(None).cast("string"))
+                         .when(F.col("latitude").isNotNull(), F.lit("source"))
+                         .when(F.col("_use_centroid"), F.lit("onspd_postcode_centroid")))
+            .withColumn("coordinate_status",
+                        F.when(F.col("_outside"), F.lit("postcode_outside_trust_areas")))
+            .withColumn("latitude", F.when(F.col("_outside"), F.lit(None).cast("double"))
+                        .when(F.col("_use_centroid"), F.col("_pc_lat")).otherwise(F.col("latitude")))
+            .withColumn("longitude", F.when(F.col("_outside"), F.lit(None).cast("double"))
+                        .when(F.col("_use_centroid"), F.col("_pc_long")).otherwise(F.col("longitude")))
+            .drop("_pc_key", "_pc_lat", "_pc_long", "_pc_area", "_ta_area", "_trust_area", "_outside",
+                  "_use_centroid"))
+
+
 @materialized_view(
     name=_n("journey_reference.location"),
     comment="Effective-dated Millennium location hierarchy: facilities, buildings and nurse units from bronze care sites, and every other location code (rooms, beds, theatres, radiology, ambulatory) from bronze map_location_unit.",  # SDI_LOCATION_LANE_V1
@@ -1262,7 +1346,8 @@ def _lifecycle_source_location():
 def location():
     # Build the declared dataset: Effective-dated facility, building, and nurse-unit hierarchy
     # derived from bronze care sites.
-    return _lifecycle_source_location().drop(*LOCATION_LIFECYCLE_FIELDS, *LOCATION_RETIRED_COLUMNS)
+    # INSR_W7 W7.08: Trust sites with no source coordinates take their postcode centroid
+    return _with_site_geocode(_lifecycle_source_location()).drop(*LOCATION_LIFECYCLE_FIELDS, *LOCATION_RETIRED_COLUMNS)
 
 @materialized_view(
     name=_n('journey_reference._location_metadata'),
@@ -1625,6 +1710,25 @@ def _lifecycle_source_service():
          )
     )
 
+# INSR_W2 W2.11 (L4164): encounter MED_SERVICE_CD values (the MED_SERVICE code set, with the bronze description)
+# join the personnel-group services, so spine_location_stay.service_code and pending-movement services decode.
+def _insr_with_med_services(published):
+    """Personnel-group services plus one med_service_code row per MED_SERVICE_CD in use."""
+    e = read_source(SRC_ENCOUNTER)
+    codes = (e.select(F.expr("try_cast(MED_SERVICE_CD AS BIGINT)").alias("service_id"),
+                      F.col("med_service_desc").alias("_desc"), F.col("ADC_UPDT").alias("_updt"))
+              .where(F.col("service_id").isNotNull() & (F.col("service_id") != 0))
+              .groupBy("service_id").agg(F.max("_desc").alias("name"), F.max("_updt").alias("loaded_at")))
+    med = codes.select(
+        stable_id("service:mill:med_service_cd", F.col("service_id")).alias("service_key"),
+        F.col("service_id"), F.col("service_id").cast("string").alias("source_service_code"), F.col("name"),
+        F.lit("active").alias("status"), F.lit(SRC_ENCOUNTER).alias("source_table"),
+        F.col("service_id").cast("string").alias("source_row_id"), F.col("loaded_at"),
+        F.lit("med_service_code").alias("member_source"),
+    )
+    return published.withColumn("member_source", F.lit("personnel_group")).unionByName(med, allowMissingColumns=True)
+
+
 @materialized_view(
     name=_n("journey_reference.service"),
     comment="Thin v1 medical-service dimension from practitioner group assignments.",
@@ -1634,7 +1738,8 @@ def _lifecycle_source_service():
 def service():
     # Build the declared dataset: Thin v1 medical-service dimension from practitioner group
     # assignments.
-    return _lifecycle_source_service().drop(*SERVICE_LIFECYCLE_FIELDS, *SERVICE_RETIRED_COLUMNS)
+    return _insr_with_med_services(  # INSR_W2 W2.11
+        _lifecycle_source_service().drop(*SERVICE_LIFECYCLE_FIELDS, *SERVICE_RETIRED_COLUMNS))
 
 @materialized_view(
     name=_n('journey_reference._service_metadata'),
@@ -1716,6 +1821,39 @@ def _lifecycle_source_organization():
          )
     )
 
+# INSR_W2 W2.11 (L4164): organisation ids in use with no map_care_site row become member rows, so no FK in use is
+# orphaned. Bronze sources and their id column; zero is "no organisation" and never becomes a member.
+ORG_IN_USE_SOURCES = {
+    SRC_ENCOUNTER: "ORGANIZATION_ID",
+    SRC_APPOINTMENT: "ORGANIZATION_ID",
+    SRC_MEDICATION_ORDER: "ORGANIZATION_ID",
+    "4_prod.bronze.map_tracking_attendance": "ORGANIZATION_ID",
+}
+
+
+def _insr_with_in_use_organizations(published):
+    """Care-site organisations plus one referenced_only row per in-use id they lack (GROUP BY + equi-join only)."""
+    used = None
+    for source, column in ORG_IN_USE_SOURCES.items():
+        ids = read_source(source).select(F.expr(f"try_cast(`{column}` AS BIGINT)").alias("organization_id"))
+        used = ids if used is None else used.unionByName(ids)
+    used = used.where(F.col("organization_id").isNotNull() & (F.col("organization_id") != 0)) \
+        .groupBy("organization_id").agg(F.count(F.lit(1)).alias("_refs"))
+    known = published.select(F.col("organization_id").alias("_known"))
+    missing = used.join(known, F.col("organization_id") == F.col("_known"), "left").where(F.col("_known").isNull())
+    referenced = missing.select(
+        stable_id("organization:mill", F.col("organization_id")).alias("organization_key"),
+        F.col("organization_id"),
+        F.col("organization_id").cast("string").alias("source_organization_id"),
+        F.lit("referenced_only").alias("status"),
+        F.lit(",".join(sorted(ORG_IN_USE_SOURCES))).alias("source_table"),
+        F.col("organization_id").cast("string").alias("source_row_id"),
+        F.lit("in_use_fk").alias("member_source"),
+    )
+    return (published.withColumn("member_source", F.lit("map_care_site"))
+            .unionByName(referenced, allowMissingColumns=True))
+
+
 @materialized_view(
     name=_n("journey_reference.organization"),
     comment="Thin v1 provider organization dimension derived from bronze care sites.",
@@ -1725,7 +1863,8 @@ def _lifecycle_source_organization():
 def organization():
     # Build the declared dataset: Thin v1 provider organization dimension derived from bronze
     # care sites.
-    return _lifecycle_source_organization().drop(*ORGANIZATION_LIFECYCLE_FIELDS, *ORGANIZATION_RETIRED_COLUMNS)
+    return _insr_with_in_use_organizations(  # INSR_W2 W2.11
+        _lifecycle_source_organization().drop(*ORGANIZATION_LIFECYCLE_FIELDS, *ORGANIZATION_RETIRED_COLUMNS))
 
 @materialized_view(
     name=_n('journey_reference._organization_metadata'),
@@ -3454,6 +3593,188 @@ for _feed, _spec in EVENT_FEED_SPECS.items():
 assert list(EVENT_FEED_SPECS) == EVENT_FEED_NAMES, "EVENT_FEED_SPECS and shared EVENT_FEED_NAMES differ"
 
 
+# INSR_W2 W2.09 ====================================================================================================
+# person_scope: the single scope definition that gold (W3.02) and omop_gold (W5.03) read. Silver removes nobody.
+# C0 ruling 1 (2026-10-29): in_scope = has_encounter OR has_clinical_data.
+
+def _declare_person_activity(feed):
+    """Per-person activity of one event feed (row count, first/last event, last clinical-category event).
+    One small grouped MV per feed, so an edit to one feed re-aggregates only that feed."""
+    def person_activity():
+        # Group the feed's resolved-person rows by person.
+        f = spark.read.table(_n(f"journey_events._feed_{feed}")).where(F.col("person_id").isNotNull())
+        clinical = F.col("fact_category") == "clinical"
+        return f.groupBy(F.col("person_id").cast("bigint").alias("person_id")).agg(
+            F.count(F.lit(1)).cast("long").alias("n_rows"),
+            # C0 ruling 1: only clinical-category rows are clinical data (appointments incl. CANCELED/NOSHOW, waiting
+            # list, RTT, costing, HRG and drug expenditure are administrative and do not put a person in scope).
+            F.sum(clinical.cast("long")).cast("long").alias("n_clinical_rows"),
+            F.min("event_datetime").alias("first_event_datetime"),
+            F.max("event_datetime").alias("last_event_datetime"),
+            F.max(F.when(F.col("fact_category") == "clinical", F.col("event_datetime"))).alias("last_clinical_event_datetime"),
+        )
+    person_activity.__name__ = f"_person_activity_{feed}"
+    materialized_view(name=_n(f"journey_reference._person_activity_{feed}"), private=True,
+                      comment=f"INSR_W2 W2.09: per-person activity of the {feed} event feed.",
+                      refresh_policy="auto")(person_activity)
+
+
+for _feed in EVENT_FEED_NAMES:
+    _declare_person_activity(_feed)
+
+
+# Contact sources of the ruled encounter definition (P1e, S5; Ben 2026-10-29). Each yields (person_id, source).
+PERSON_CONTACT_SOURCES = {'mill_encounter': ('journey_spine.encounter',
+                    "attendance_evidence = 'OBSERVED' AND coalesce(type_class_display, '') NOT IN "
+                    "('Preadmit', 'Wait List', 'Results Only')"),
+ 'appointment_attended': ('journey_clinical.appointment',
+                          "upper(status_meaning) IN ('CHECKED OUT', 'CHECKED IN')"),
+ 'theatre_performed': ('journey_reference.theatre_case', "case_status = 'PERFORMED'"),
+ 'community_contact': ('journey_clinical.community_care_contact', 'true'),
+ 'maternity_attended': ('journey_clinical.maternity_care_contact',
+                        "CAST(attend_code AS STRING) IN ('5', '6')"),
+ 'ed_checkin': ('journey_clinical.tracking_attendance', 'checkin_dt_tm IS NOT NULL'),
+ 'critical_care_admission': ('journey_clinical.critical_care_admission', 'true'),
+ 'neonatal_episode': ('journey_clinical.neonatal_episode', 'true'),
+ 'slam_hrg_contact': ('journey_clinical.hrg_grouping', "source_object IN ('slam_op_hrg', 'slam_apc_hrg')")}
+
+
+@materialized_view(name=_n("journey_reference._person_contact"), private=True, refresh_policy="auto",
+                   comment="INSR_W2 W2.09: persons with a qualifying encounter, by contact source.")
+def _person_contact():
+    # Union the qualifying-contact persons of every source, then one row per (person, source).
+    frames = [spark.read.table(_n(table)).where(F.expr(predicate))
+              .select(F.col("person_id").cast("bigint").alias("person_id"), F.lit(source).alias("contact_source"))
+              for source, (table, predicate) in PERSON_CONTACT_SOURCES.items()]
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.where(F.col("person_id").isNotNull()).groupBy("person_id", "contact_source").agg(
+        F.count(F.lit(1)).cast("long").alias("n_rows"))
+
+
+def _person_scope_activity():
+    """All feeds' per-person activity, folded to one row per person."""
+    frames = [spark.read.table(_n(f"journey_reference._person_activity_{feed}")) for feed in EVENT_FEED_NAMES]
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.groupBy("person_id").agg(
+        F.sum("n_rows").cast("long").alias("activity_row_count"),
+        F.sum("n_clinical_rows").cast("long").alias("clinical_row_count"),
+        F.min("first_event_datetime").alias("first_activity_datetime"),
+        F.max("last_event_datetime").alias("last_activity_datetime"),
+        F.max("last_clinical_event_datetime").alias("last_clinical_event_datetime"))
+
+
+def _person_scope_sources():
+    """Per person: has a Barts MRN alias, has a BHRUT MRN alias, and the decoded Millennium person type."""
+    a = read_source(SRC_PATIENT_IDENTIFIER).where(F.col("ALIAS_TYPE") == "MRN")
+    pools = a.groupBy(F.col("PERSON_ID").cast("bigint").alias("person_id")).agg(
+        F.max((F.col("ALIAS_POOL_CD") == F.lit(6200990)).cast("int")).alias("_barts"),
+        F.max((F.col("ALIAS_POOL_CD") == F.lit(1115132483)).cast("int")).alias("_bhrut"))
+    return pools
+
+
+PERSON_SCOPE_COLUMN_COMMENTS = {
+    "person_id": "Native Millennium PERSON_ID; one row per spine_person person.",
+    "has_encounter": "True when the person has a qualifying encounter under the ruled definition (2026-10-29): an observed Millennium encounter that is not pre-registration, wait list or results only; an attended appointment; a performed theatre case; a community (CSDS) contact; an attended maternity contact; an ED check-in; a critical-care admission; a neonatal episode; or a SLAM OP/APC HRG attendance or admission.",
+    "encounter_sources": "Sorted, comma-separated contact sources that witnessed an encounter (see has_encounter).",
+    "has_clinical_data": "True when the person has at least one clinical-category row (fact_category = 'clinical') in any silver event feed, linked documents included. Administrative rows (appointments including cancelled and DNA, waiting list, RTT, costing, HRG, drug expenditure) do not count (C0 ruling 1).",
+    "in_scope": "has_encounter OR has_clinical_data: the gold and omop_gold person scope (C0 ruling 1, 2026-10-29). Silver keeps every person.",
+    "has_any_activity": "True when the person has a row of any category (clinical or administrative) in any silver event feed, or any Millennium encounter row (any class).",
+    "clinical_row_count": "Clinical-category rows across all silver event feeds for the person.",
+    "first_activity_date": "Earliest event date across the event feeds.",
+    "last_activity_date": "Latest event date across the event feeds.",
+    "last_clinical_event_datetime": "Latest event_datetime among clinical-category feed rows (administrative and bulk categories excluded); used for death evidence (L5145).",
+    "person_source": "barts, bhrut, both or none: which Trust MRN pools hold an alias for the person (RNJ 5C4 MRN = Barts, RF4 MRN = BHRUT).",
+    "test_patient_ind": "True when the Millennium person record matches a test-patient name pattern (ZZ/XX surname prefix, TEST/DUMMY/FICTITIOUS/TRAINING names) and is a Person-type record; false for other Person-type records. Warning only; nobody is dropped (J8).",
+    "test_patient_basis": "The name-key rule that set test_patient_ind (surname_zz_prefix, surname_test_exact, ...).",
+    "bhrut_mrn": "Current BHRUT MRN (RF4 MRN pool), selected by the same governed alias rule as spine_person.current_mrn; NULL when the person has no BHRUT alias or the pool is ambiguous. Identifier: tagged by copying spine_person.current_mrn's estate tags (W7.02 helper).",
+    "source_update_task": "map_person source_updt_task (raw UPDT_TASK) of the person record's last update (W1.12 carry); 0 marks a bulk administrative batch.",
+    "source_update_datetime": "map_person source_updt_dt_tm (raw UPDT_DT_TM) of the person record's last update (W1.12 carry).",
+    "source_update_basis": "How the person record was last updated: bulk_admin_batch_2025_10_11 (UPDT_TASK 0 in 2025-10/11: 83% of all task-0 updates, P_W112 L3863) or application_task; NULL without an update task.",
+    "person_record_type": "Decoded Millennium PERSON_TYPE_CD (Person, Freetext, Contributor System): non-Person records are not patients.",
+}
+
+
+@materialized_view(name=_n("journey_reference.person_scope"), refresh_policy="auto", cluster_by=["person_id"],
+                   comment="INSR_W2 W2.09: one row per person: encounter / clinical-data evidence and the gold scope flag.",
+                   column_comments=PERSON_SCOPE_COLUMN_COMMENTS)
+def person_scope():
+    # Join the spine to the grouped evidence; equi-joins and GROUP BY only.
+    spine = spark.read.table(_n("journey_spine.person")).select("person_id")
+    contact = spark.read.table(_n("journey_reference._person_contact")).groupBy("person_id").agg(
+        F.concat_ws(",", F.sort_array(F.collect_set("contact_source"))).alias("encounter_sources"),
+        F.max((F.col("contact_source") == "mill_encounter").cast("int")).alias("_mill"))
+    any_encounter = spark.read.table(_n("journey_spine.encounter")).where(F.col("person_id").isNotNull()) \
+        .groupBy(F.col("person_id").cast("bigint").alias("person_id")).agg(F.count(F.lit(1)).alias("_any_enc"))
+    activity = _person_scope_activity()
+    pools = _person_scope_sources()
+    # J8: the BHRUT MRN as its own column (RF4 pool), selected by the same governed rule as current_mrn.
+    bhrut = _person_alias_selection("MRN", {1115132483: ("bhrut", 1)}).select(
+        F.col("_pid").cast("bigint").alias("person_id"), F.col("_value").alias("bhrut_mrn"))
+    # W1.12 carries (required in this release, open issue 1): name keys for the test-patient flag and the
+    # person update task/time. Absent columns read as typed NULLs so the rest of the graph still builds in dev
+    # before W1.12 lands; the W2_09 assertion (test_patient_ind non-null on Person records) then fails, and that
+    # failure blocks W2.16, so the release cannot ship the flag empty.
+    source_person = read_source(SRC_PERSON)
+    cols = {c.lower(): c for c in source_person.columns}
+
+    def carried(name, data_type):
+        """A W1.12 map_person column, or a typed NULL while the bronze carry is not there yet."""
+        return F.col(cols[name]).cast(data_type) if name in cols else F.lit(None).cast(data_type)
+    person = source_person.select(
+        F.col(cols["person_id"]).cast("bigint").alias("person_id"),
+        F.col(cols["person_type_cd"]).cast("bigint").alias("_ptype"),
+        F.upper(carried("name_last_key", "string")).alias("_last"),
+        F.upper(carried("name_first_key", "string")).alias("_first"),
+        F.expr(f"try_cast(`{cols['source_updt_task']}` AS BIGINT)").alias("source_update_task") if "source_updt_task" in cols
+        else F.lit(None).cast("bigint").alias("source_update_task"),
+        carried("source_updt_dt_tm", "timestamp").alias("source_update_datetime"))
+    ptype = F.broadcast(_code_value_decoder(302, "_pt"))
+    df = (spine.join(contact, "person_id", "left").join(any_encounter, "person_id", "left")
+               .join(activity, "person_id", "left").join(pools, "person_id", "left")
+               .join(bhrut, "person_id", "left").join(person, "person_id", "left")
+               .join(ptype, F.col("_ptype") == F.col("_pt_code"), "left"))
+    has_encounter = F.col("encounter_sources").isNotNull()
+    has_clinical = F.coalesce(F.col("clinical_row_count"), F.lit(0)) > 0
+    has_any = (F.coalesce(F.col("activity_row_count"), F.lit(0)) > 0) | F.col("_any_enc").isNotNull()
+    # P1c2 buckets (W0.01 rule c): Person-type records only; Freetext / Contributor System records are not patients.
+    last, first = F.col("_last"), F.col("_first")
+    bucket = (F.when(last.isin("TEST", "TESTPATIENT", "TESTING"), "surname_test_exact")
+               .when(last.rlike("^ZZ"), "surname_zz_prefix").when(last.rlike("^XX"), "surname_xx_prefix")
+               .when(last.rlike("^TEST[0-9]|TESTPATIENT|^DUMMY|^FICTITIOUS|^TRAINING"), "surname_test_variant")
+               .when(last.rlike("^TEST"), "surname_test_prefix_other")
+               .when(first.rlike("^(TEST|DUMMY)"), "forename_test_dummy"))
+    is_person_record = F.upper(F.col("_pt_display")) == "PERSON"
+    has_name_keys = "name_last_key" in cols and "name_first_key" in cols
+    test_ind = F.when(is_person_record, bucket.isNotNull()) if has_name_keys else F.lit(None).cast("boolean")
+    # INSR_W2 W2.20 (W1.12, L3863): basis of the person record's last update.
+    update_basis = (F.when((F.col("source_update_task") == 0)
+                           & (F.col("source_update_datetime") >= F.lit("2025-10-01").cast("timestamp"))
+                           & (F.col("source_update_datetime") < F.lit("2025-12-01").cast("timestamp")),
+                           F.lit("bulk_admin_batch_2025_10_11"))
+                     .when(F.col("source_update_task").isNotNull(), F.lit("application_task")))
+    return df.select(
+        "person_id",
+        has_encounter.alias("has_encounter"), "encounter_sources",
+        has_clinical.alias("has_clinical_data"),
+        (has_encounter | has_clinical).alias("in_scope"),
+        has_any.alias("has_any_activity"),
+        F.coalesce(F.col("clinical_row_count"), F.lit(0)).cast("long").alias("clinical_row_count"),
+        F.to_date("first_activity_datetime").alias("first_activity_date"),
+        F.to_date("last_activity_datetime").alias("last_activity_date"),
+        "last_clinical_event_datetime",
+        F.when((F.col("_barts") == 1) & (F.col("_bhrut") == 1), "both").when(F.col("_barts") == 1, "barts")
+         .when(F.col("_bhrut") == 1, "bhrut").otherwise("none").alias("person_source"),
+        "bhrut_mrn",
+        test_ind.alias("test_patient_ind"), F.when(test_ind, bucket).alias("test_patient_basis"),
+        F.col("_pt_display").alias("person_record_type"),
+        "source_update_task", "source_update_datetime", update_basis.alias("source_update_basis"),
+    )
+
+
 
 
 
@@ -3639,7 +3960,11 @@ def admission_metrics():
             _cancer_treatment_canonical_pregate(), "cancer_treatment", "cancer_treatment"
         ))
         .unionByName(fact_lane(
-            _condition_stage_canonical_pregate(), "aria_staging", "condition_stage"
+            _condition_stage_canonical_pregate().where(F.col("_source_system") == "aria"), "aria_staging", "condition_stage"
+        ))
+        .unionByName(fact_lane(  # INSR_W2 W2.20 (W1.14 Millennium TNM arm)
+            _condition_stage_canonical_pregate().where(F.col("_source_system") == "millennium"), "cancer_stage_mill",
+            "condition_stage"
         ))
         .unionByName(fact_lane(
             _endobase_procedure_canonical_pregate(), "endobase_exam", "procedure"
@@ -4520,7 +4845,7 @@ def _concept_map_projection(
     # concept-map schema.
     staged = df.select(
         canonical_coding_system(source_system).alias("source_coding_system"),
-        source_code.cast("string").alias("source_code"),
+        F.trim(source_code.cast("string")).alias("source_code"),  # INSR_W2 W2.08 (S08.1 ruling): key + grouping
         source_display.cast("string").alias("source_display"),
         canonical_coding_system(target_system).alias("target_coding_system"),
         target_code.cast("string").alias("target_code"),
@@ -4566,15 +4891,15 @@ def _concept_map_projection(
         .withColumn("map_candidate_count", F.count(F.lit(1)).over(Window.partitionBy(
             "source_coding_system", "source_code", "map_source")).cast("int")))
     # contract v2: name the deterministic terminology-map identity concept_map_key
+    # INSR_W2 W2.08 (L5072, P5b_key): 906 keys covered rows differing only in source_table / review_status. Only
+    # those groups add the two parts to their key, so every other key is unchanged.
+    key_parts = [F.col(c) for c in ("source_coding_system", "source_code", "target_coding_system", "target_code",
+                                    "target_domain", "map_source", "map_version", "mapping_rule_id", "mapping_rank",
+                                    "valid_from", "valid_to")]
+    shared_key = F.count(F.lit(1)).over(Window.partitionBy(*key_parts)) > 1
     return grouped.select(
-        stable_id(
-            "terminology-map",
-            F.col("source_coding_system"), F.col("source_code"),
-            F.col("target_coding_system"), F.col("target_code"),
-            F.col("target_domain"), F.col("map_source"),
-            F.col("map_version"), F.col("mapping_rule_id"), F.col("mapping_rank"),
-            F.col("valid_from"), F.col("valid_to"),
-        ).alias("concept_map_key"),
+        F.when(shared_key, stable_id("terminology-map", *key_parts, F.col("source_table"), F.col("review_status")))
+         .otherwise(stable_id("terminology-map", *key_parts)).alias("concept_map_key"),
         "source_coding_system", "source_code", "source_display",
         "target_coding_system", "target_code", "target_display", "target_domain",
         F.lit(None).cast("string").alias("equivalence"),
@@ -4961,6 +5286,10 @@ CONCEPT_REGISTRY_COLUMN_COMMENTS = {
     "last_observed_at": "Latest represented bronze observation timestamp.",
 }
 
+# INSR R1: coding systems whose lane source codes the registry carries (today's registry, read-only query of R1 Task 17).
+R1_REGISTRY_SOURCE_SYSTEMS = ('urn:cerner:encounter:reason-for-visit', 'urn:cerner:clinical-event:presenting-complaint-text', 'urn:cerner:surginet:procedure', 'http://snomed.info/sct', 'urn:barts:pathology:gene-symbol', 'urn:cerner:code_value', 'urn:cerner:nomenclature', 'urn:sectra:examination-code', 'http://hl7.org/fhir/sid/icd-10', 'http://fhir.hl7.org.uk/CodeSystem/OPCS-4', 'urn:endobase:dgvs-term', 'urn:cerner:synonym_id', 'urn:jac:drug-id', 'urn:cerner:scheduling:appointment-type', 'urn:cerner:nomenclature:tfc', 'urn:barts:jac:drug-id', 'urn:barts:slam:hrg', 'urn:cerner:radiology-exam', 'urn:barts:pathology:report-code', 'urn:cerner:order_synonym_id', 'urn:sectra:imaging-report', 'urn:barts:pathology:specimen-type', 'urn:barts:implant:primary-procedure', 'urn:cerner:order-mnemonic', 'urn:cerner:nomenclature:cerner-testcode', 'urn:cerner:nomenclature:uk-ed-subset', 'urn:cerner:mill:planned-procedure', 'urn:barts:sact:drug-token', 'urn:barts:registry-field', 'urn:barts:winpath:lims2:organism-code', 'urn:cerner:form_ref_id', 'urn:barts:winpath:lims5:organism-code', 'urn:cerner:event_cd', 'urn:cerner:nomenclature:multum-drug-identifier', 'urn:barts:hcd:chargeable-item', 'urn:jac:homecare:item', 'urn:cerner:dcp_input_ref_id', 'urn:barts:luna:treatment-function', 'urn:cerner:nomenclature:patient-care', 'urn:cerner:nomenclature:ed-presenting-complaint', 'urn:barts:winpath:lims2:agent-code', 'urn:barts:pathology:unit', 'urn:barts:winpath:lims5:agent-code', 'urn:isbt:product-code', 'urn:nhs:ccmds:activity', 'urn:barts:endobase:exam-type', 'urn:cerner:nomenclature:winpath-lims2', 'urn:iweb:reg_cs2010g_post1:culturetxt', 'urn:cerner:nomenclature:winpath-lims5', 'urn:cerner:nomenclature:multum-allergy-category', 'urn:iweb:reg_mort:cardiologyattendeestxt', 'urn:iweb:reg_mdt:cardiologyattendeestxt', 'urn:dicom:sop-class-uid', 'urn:iweb:reg_noncoronary:interventionstxt', 'urn:omop:concept_id', 'urn:nhs:nccmds:activity', 'urn:iweb:reg_eracs:postprotamineact', 'urn:iweb:reg_cs2010g_pre1:ctaortaextentofdissectiontxt', 'urn:iweb:reg_cs2010g_pre1:otheractualcardiacprocedurestxt', 'urn:iweb:reg_ctmdt:cardiothoracicattendeestxt', 'urn:iweb:reg_coronary_subprocedure:drugselutedbystentstxt', 'urn:iweb:reg_mdt:cardiothoracicattendeestxt', 'urn:barts:luna:rtt-status', 'urn:iweb:reg_coronary_subprocedure:proceduraldevicesusedtxt', 'urn:iweb:reg_mort:significantcoexistingfactorstxt', 'urn:iweb:reg_cs2010g_pre2:aorticproceduretxt', 'urn:cerner:coded-event:event_result_txt', 'urn:iweb:reg_mort:specialitytxt', 'urn:iweb:reg_cs2010g_followup:postoperativecomplicationtxt', 'urn:iweb:reg_cs2010g_pre1:aetiologytxt', 'urn:iweb:reg_cs2010g_pre1:mpreoperationhistory', 'urn:iweb:reg_cs2010g_post1:cabgcodingtxt', 'urn:iweb:reg_cs2010g_pre2:aorticimplantlocationtxt', 'urn:iweb:reg_cs2010g_subprocedure:valveorringmodelnumber', 'urn:barts:mediconnect:device-type', 'urn:iweb:reg_dghminap:ecgsubcategoriestxt', 'urn:iweb:reg_dghminap:otherdischargediagnosistxt', 'urn:cerner:nomenclature:allergy', 'urn:iweb:reg_cs2010g_post2:postoperativecomplicationtxt', 'urn:iweb:reg_eracs:procedureperformedtxt', 'urn:iweb:reg_eracs:dripstxt', 'urn:iweb:reg_noncoronary:investigationstxt', 'urn:medicus:critical-care-score', 'urn:iweb:reg_noncoronary:arterialcomplicationstxt', 'urn:iweb:reg_cs2010g_pre1:mechanismofmitralregurgitationtxt', 'urn:iweb:reg_mdt:cardiacriskfactorstxt', 'urn:nhs:msds:delivery-method', 'urn:iweb:reg_ctmdt:cardiacriskfactorstxt', 'urn:iweb:reg_cs2010g_subprocedure:aorticpathologytxt', 'urn:iweb:reg_cs2010g_post1:procedureperformedtxt', 'urn:cerner:nomenclature:hrg', 'urn:barts:pathology:wkg-tlc', 'urn:iweb:reg_cs2010g_post1:valvesreplacementcodingtxt', 'urn:barts:slam:pod', 'urn:iweb:reg_cs2010g_pre2:arterialcannulationnicortxt', 'urn:barts:bloodtrack:blood-group', 'urn:iweb:reg_noncoronary:proceduralcomplicationtxt', 'urn:iweb:reg_coronary_subprocedure:diagnosticdevicesusedduringproceduretxt', 'urn:iweb:reg_cs2010g_subprocedure:reasonforrepeatvalvereplacementtxt', 'urn:iweb:reg_cs2010g_pre2:aorticpathologytxt', 'urn:bloodtrack:blood-group', 'urn:iweb:reg_ctmdt:aetiologytxt', 'urn:iweb:reg_cs2010g_pre1:previouscardiacsurgerytxt', 'urn:cerner:order-comment-type', 'urn:cerner:coded-event:event_cd', 'urn:iweb:reg_cs2010g_pre1:presentationtxt', 'urn:iweb:reg_cs2010g_post1:aorticrootandreplacementcodingtxt', 'urn:iweb:reg_cs2010g_post2:ssisitetxt', 'urn:iweb:reg_ctmdt:relevantmedicationtxt', 'urn:iweb:reg_cs2010g_post1:stagestxt', 'urn:iweb:reg_eracs:bloodproductsadministeredtxt', 'urn:iweb:reg_cs2010g_post1:returntotheatretxt', 'urn:iweb:reg_mdt:anginalmedicationtxt', 'urn:cerner:blob-content-type', 'urn:iweb:reg_cs2010g_pre1:surgicalincisiontxt', 'urn:iweb:reg_coronary_subprocedure:atherothrombusremovaldevicesusedtxt', 'urn:iweb:reg_cs2010g_pre1:clinicalpresentationmalperfusiontxt', 'urn:datix:incident-type', 'urn:iweb:reg_cs2010g_post1:mitralvalvecodingtxt', 'urn:iweb:reg_cs2010g_post1:postop_caretxt', 'urn:iweb:reg_cs2010g_post1:otheroperationsonventriclesofthehearttxt', 'urn:iweb:reg_cs2010g_subprocedure:svcharacteristicstxt', 'urn:iweb:reg_cs2010g_post1:commoncodingtxt', 'urn:iweb:reg_eracs:medicalhistorytxt', 'urn:iweb:reg_cs2010g_post1:bacteriatxt', 'urn:badgernet:narrative-field', 'urn:iweb:reg_eracs:underlyingrhythmtxt', 'urn:iweb:reg_cs2010g_post1:neuroprotectiontxt', 'urn:iweb:reg_dghminap:stressprecipitanttxt', 'urn:iweb:reg_eracs:postopanalgesiatxt', 'urn:iweb:reg_cs2010g_pre1:clinicalpresentationtxt', 'urn:iweb:reg_cs2010g_post1:aorticvalvecodingtxt', 'urn:iweb:reg_coronary_subprocedure:stenosisprepci', 'urn:barts:community:activity-type', 'urn:iweb:reg_cs2010g_pre2:aorticsegmentsoperatedontxt', 'urn:iweb:reg_cs2010g_post1:drain_sitetxt', 'urn:iweb:reg_cs2010g_pre1:historyofneurologicaldiseasetxt', 'urn:iweb:reg_cs2010g_post1:pacingwirestxt', 'urn:iweb:reg_cs2010g_post1:ventricularassistdeviceusedtxt', 'urn:iweb:reg_cs2010g_post1:avsdcodingtxt', 'urn:iweb:reg_cs2010g_post1:intraaorticballoonpumpusedtxt', 'urn:nhs:msds:labour-onset-method', 'urn:iweb:reg_cs2010g_followup:ixsatisfactorypriortodischargetxt', 'urn:barts:bloodtrack:product-group', 'urn:iweb:reg_mdt:causeofdeviationtxt', 'urn:iweb:reg_ctmdt:rationaleforcontradictingtxt', 'urn:barts:pathology:assay-code', 'urn:iweb:reg_cs2010g_post1:asdcodingtxt', 'urn:cerner:research-status', 'urn:iweb:reg_coronary_subprocedure:stenosispostpci', 'urn:bloodtrack:product-group', 'urn:iweb:reg_eracs:complicationstxt', 'urn:iweb:reg_eracs:veinharvestsitetxt', 'urn:iweb:reg_eracs:chestdrainstxt', 'urn:iweb:reg_cs2010g_subprocedure:maorticgraftdetail', 'urn:iweb:reg_ctmdt:cardiologyattendeestxt', 'urn:iweb:reg_cs2010g_subprocedure:harvestingcharacteristicstxt', 'urn:iweb:reg_cs2010g_pre1:ctaortadiagnosistxt', 'urn:iweb:reg_cs2010g_post1:mclosuredetails', 'urn:iweb:reg_cs2010g_post1:othersupportdeviceusedtxt', 'urn:iweb:reg_noncoronary:mdetailsofalldevicesimplanted', 'urn:iweb:reg_cs2010g_post1:newpost_operativeneurologicaldysfunctiontxt', 'urn:iweb:reg_mdt:epattendeestxt', 'urn:iweb:reg_cs2010g_pre1:ctaortaprimaryentryteartxt', 'urn:iweb:reg_noncoronary:mindicationsandbackgroundhistory', 'urn:iweb:reg_cs2010g_pre1:previousendovascularsurgerytxt', 'urn:iweb:reg_mdt:treatmentdeviationtxt', 'urn:iweb:reg_mdt:viabilityassessmenttxt', 'urn:iweb:reg_cs2010g_pre2:previouspercutaneousvalveimplantsitetxt', 'urn:iweb:reg_mdt:significantvalvediseasetxt', 'urn:iweb:reg_cs2010g_post1:sternalwiretxt', 'urn:iweb:reg_coronary_subprocedure:guidecathetertxt', 'urn:iweb:reg_cs2010g_post2:lrtitxt', 'urn:cerner:nomenclature:icnarccmp', 'urn:iweb:reg_ctmdt:viabilityassessmenttxt', 'urn:iweb:reg_cs2010g_followup:lrtitxt', 'urn:iweb:reg_ctmdt:significantvalvediseasetxt', 'urn:iweb:reg_cs2010g_post1:pericardialdraintxt', 'urn:iweb:reg_mdt:significantnoncoronarycardiachistorytxt', 'urn:iweb:reg_dghminap:positiveinotropicsupporttxt', 'urn:iweb:reg_cs2010g_pre1:myectomyoptionstxt', 'urn:iweb:reg_cs2010g_post1:leftpleuraldraintxt', 'urn:iweb:reg_cs2010g_pre2:venouscannulationnicortxt', 'urn:iweb:reg_cs2010g_post1:mediastinaldraintxt', 'urn:iweb:reg_cs2010g_pre1:preoperativetranscatheterinterventionstxt', 'urn:iweb:reg_cs2010g_post1:psvandpapvdcodingtxt', 'urn:iweb:reg_cs2010g_post1:rightpleuraldraintxt', 'urn:iweb:reg_cs2010g_post1:cardioplegia_temperaturetxt', 'urn:iweb:reg_cs2010g_post1:vsdcodingtxt', 'urn:iweb:reg_cs2010g_post1:tricuspidvalvecodingtxt', 'urn:iweb:reg_cs2010g_post1:veinharvestsitetxt', 'urn:iweb:reg_noncoronary:mdischargemanagementplan', 'urn:iweb:reg_eracs:antiplateletstxt', 'urn:iweb:reg_cs2010g_followup:postoperativepyrexiatreatmenttxt', 'urn:barts:community:consultation-type', 'urn:cerner:nomenclature:general-lab', 'urn:iweb:reg_eracs:postopplantxt', 'urn:iweb:reg_cs2010g_post1:woundsubcutaneoustissuedraintxt', 'urn:iweb:reg_mdt:mcmrdetail', 'urn:iweb:reg_cs2010g_pre1:pre_opsupportdevicesusedtxt', 'urn:iweb:reg_cs2010g_pre1:surgicalincisionnonnicoroptionstxt', 'urn:iweb:reg_cs2010g_pre1:mitralvalvediseasetxt', 'urn:iweb:reg_coronary_subprocedure:emboliprotectiondevicesusedtxt', 'urn:iweb:reg_cs2010g_post1:cardioplegia_infusionmodetxt', 'urn:iweb:reg_ctmdt:otherconsultantsname', 'urn:iweb:reg_eracs:antibioticstxt', 'urn:iweb:reg_mort:surgicalattendeestxt', 'urn:iweb:reg_ctmdt:significantnoncoronarycardiachistorytxt', 'urn:iweb:reg_cs2010g_pre1:aorticvalvediseasetxt', 'urn:iweb:reg_cs2010g_pre1:previousabdominaldescendingaorticsurgtxt', 'urn:iweb:reg_eracs:vcapthreshold', 'urn:iweb:reg_cs2010g_followup:sternalwoundinfectiontreatmenttxt', 'urn:iweb:reg_cs2010g_post1:mtoefindings', 'urn:iweb:reg_cs2010g_followup:harvestwoundinfectiontreatmenttxt', 'urn:iweb:reg_cs2010g_post1:pulmonaryvalvecodingtxt', 'urn:cerner:nomenclature:anatomic-pathology', 'urn:luna:eal-comment', 'urn:barts:pathology:alteration-type', 'urn:cerner:nomenclature:microbiology', 'urn:iweb:reg_noncoronary:mprocedurefindingsandreport', 'urn:badgernet:examination', 'urn:iweb:reg_coronary_subprocedure:guideextensiontxt', 'urn:iweb:reg_eracs:ulcerprophylaxistxt', 'urn:iweb:reg_mdt:mpresentinghistory', 'urn:iweb:reg_eracs:allergiestxt', 'urn:iweb:reg_cs2010g_post1:dorvcodingtxt', 'urn:iweb:reg_ctmdt:mdiscussion', 'urn:cerner:nomenclature:cerner', 'urn:cerner:nomenclature:icd-10-am', 'urn:iweb:reg_cs2010g_post1:impellerdeviceusedtxt', 'urn:endobase:document-type', 'urn:iweb:reg_cs2010g_post1:atrialappendagecodingtxt', 'urn:iweb:reg_eracs:antiemetictxt', 'urn:iweb:reg_cs2010g_post2:sendtonicortxt',)
+
+
 @materialized_view(
     name=_n("journey_reference.concept_registry"),
     comment="Observed source and target coding-system/code pairs across the event index and concept map.",
@@ -4968,61 +5297,61 @@ CONCEPT_REGISTRY_COLUMN_COMMENTS = {
     column_comments=CONCEPT_REGISTRY_COLUMN_COMMENTS,
 )
 def concept_registry():
-    # Build the declared dataset: Observed source and target coding-system/code pairs across the
-    # event index and concept map.
+    # Build the declared dataset: Observed source and target coding-system/code pairs across the bronze mapping
+    # lanes, the native arms and the concept map.
+    # INSR R1: rebased from the 55 event feeds onto bronze and 3_lookup (an S1 pass-through with no feed edges).
+    # Counts are now bronze source-grain rows per (lane, map_key) from mapping_resolution_usage, not silver feed
+    # rows after component split, dedup and scope; totals differ from the feed-based registry, keys do not.
+    # Native arms (method 'native') carry the coded feed columns of the models no lane maps. Lane source codes are
+    # kept only in the coding systems today's registry carries (R1_REGISTRY_SOURCE_SYSTEMS, read from prod in R1
+    # Task 17), so the free-text keys of the result/value lanes (tens of millions) do not enter the registry. The
+    # pathology result-value systems are left out of that list: today's registry carries their keys only through
+    # the concept map (map_sources below), never the unmapped result text.
+    # The constants live in the body: the edit replaces the def and keeps the decorator above it.
+    SRC_R1_RESOLUTION = "3_lookup.omop.mapping_resolution"   # INSR R1 (mapping into bronze)
+    SRC_R1_USAGE = "3_lookup.omop.mapping_resolution_usage"
     mappings = _lifecycle_source_concept_map()
-    # EIR_20261021_V1: event codes come from the event grain of the feeds (one row per event);
-    # mapped codes from the feeds' mapping rows (one row per event x mapping, mapped rows only).
-    events = _event_feed_events()
-    event_mappings = _event_feed_union().where(F.col("mapped_code").isNotNull())
-    event_codes = events.where(events.source_code.isNotNull()).select(
-        F.coalesce(events.source_coding_system, F.lit("urn:unknown")).alias("coding_system"),
-        events.source_code.alias("code"),
-        events.source_display.alias("display"),
-        F.lit(1).cast("long").alias("source_use_count"),
-        F.lit(0).cast("long").alias("target_use_count"),
-        events.loaded_at.alias("observed_at"),
-    )
+    usage = (read_source(SRC_R1_USAGE).groupBy("lane_id", "map_key")
+             .agg(F.sum("row_count").cast("long").alias("rows"), F.min("first_seen").alias("first_seen"),
+                  F.max("last_seen").alias("last_seen")))
+    resolved = read_source(SRC_R1_RESOLUTION).join(usage, ["lane_id", "map_key"])
+    lane_sources = resolved.where((F.col("component_index") == 1) & F.col("source_code").isNotNull()
+                                  & canonical_coding_system(F.coalesce(F.col("source_system"), F.lit("urn:unknown")))
+                                  .isin(*R1_REGISTRY_SOURCE_SYSTEMS)).select(
+        F.coalesce(F.col("source_system"), F.lit("urn:unknown")).alias("coding_system"),
+        F.col("source_code").alias("code"), F.col("source_display").alias("display"),
+        F.col("rows").alias("source_use_count"), F.lit(0).cast("long").alias("target_use_count"),
+        F.col("first_seen").alias("first_at"), F.col("last_seen").alias("last_at"))
+    lane_targets = resolved.where(F.col("target_code").isNotNull()).select(
+        F.col("target_system").alias("coding_system"), F.col("target_code").alias("code"),
+        F.col("target_display").alias("display"), F.lit(0).cast("long").alias("source_use_count"),
+        F.col("rows").alias("target_use_count"), F.col("first_seen").alias("first_at"),
+        F.col("last_seen").alias("last_at"))
     map_sources = mappings.select(
-        F.col("source_coding_system").alias("coding_system"),
-        F.col("source_code").alias("code"),
-        F.col("source_display").alias("display"),
-        F.col("source_row_count").cast("long").alias("source_use_count"),
-        F.lit(0).cast("long").alias("target_use_count"),
-        F.col("loaded_at").alias("observed_at"),
-    )
+        F.col("source_coding_system").alias("coding_system"), F.col("source_code").alias("code"),
+        F.col("source_display").alias("display"), F.col("source_row_count").cast("long").alias("source_use_count"),
+        F.lit(0).cast("long").alias("target_use_count"), F.col("loaded_at").alias("first_at"),
+        F.col("loaded_at").alias("last_at"))
     map_targets = mappings.select(
-        F.col("target_coding_system").alias("coding_system"),
-        F.col("target_code").alias("code"),
-        F.col("target_display").alias("display"),
-        F.lit(0).cast("long").alias("source_use_count"),
-        F.col("source_row_count").cast("long").alias("target_use_count"),
-        F.col("loaded_at").alias("observed_at"),
-    )
-    event_map_targets = event_mappings.select(
-        F.col("mapped_coding_system").alias("coding_system"),
-        F.col("mapped_code").alias("code"),
-        F.col("mapped_display").alias("display"),
-        F.lit(0).cast("long").alias("source_use_count"),
-        F.lit(1).cast("long").alias("target_use_count"),
-        F.col("map_loaded_at").alias("observed_at"),
-    )
+        F.col("target_coding_system").alias("coding_system"), F.col("target_code").alias("code"),
+        F.col("target_display").alias("display"), F.lit(0).cast("long").alias("source_use_count"),
+        F.col("source_row_count").cast("long").alias("target_use_count"), F.col("loaded_at").alias("first_at"),
+        F.col("loaded_at").alias("last_at"))
     grouped = (
-        event_codes.unionByName(map_sources).unionByName(map_targets).unionByName(event_map_targets)
+        lane_sources.unionByName(lane_targets).unionByName(map_sources).unionByName(map_targets)
         .withColumn("coding_system", canonical_coding_system(F.col("coding_system")))
         .groupBy("coding_system", "code")
         .agg(
             F.max("display").alias("preferred_display"),
             F.sum("source_use_count").cast("long").alias("source_use_count"),
             F.sum("target_use_count").cast("long").alias("target_use_count"),
-            F.min("observed_at").alias("first_observed_at"),
-            F.max("observed_at").alias("last_observed_at"),
+            F.min("first_at").alias("first_observed_at"),
+            F.max("last_at").alias("last_observed_at"),
         )
     )
     # contract v2: name the deterministic observed-concept identity concept_registry_key
     return grouped.select(
-        stable_id("terminology-concept", F.col("coding_system"), F.col("code"))
-          .alias("concept_registry_key"),
+        stable_id("terminology-concept", F.col("coding_system"), F.col("code")).alias("concept_registry_key"),
         "coding_system", "code", "preferred_display",
         F.lit("observed").alias("status"),
         "source_use_count", "target_use_count",
@@ -5872,6 +6201,67 @@ def person_address_air_quality():
         spark.read.table(_n("journey_reference._air_quality_estimates")),
     )
 
+
+# ==== journey_reference.person_air_quality_annual (INSR_W7_AQ_ANNUAL_V1, W7.07b; J15 ruling 2026-10-29) ====
+
+# The pollutants the browser offers; the others stay in the monthly product.  # INSR_W7 W7.07b
+AQ_ANNUAL_POLLUTANTS = ['no2', 'pm2_5', 'pm10', 'o3']
+
+PERSON_AIR_QUALITY_ANNUAL_COLUMN_COMMENTS = {'person_air_quality_year_key': 'Deterministic key of the person and calendar year.', 'person_id': 'Native Millennium PERSON_ID of the person whose address estimates are averaged.', 'year_start': 'First day of the calendar year the means cover. The current year is partial.', 'min_data_capture_pct': 'Lowest source data-capture percentage among the sites behind any monthly estimate in the year; a completeness caveat, not a quality gate.', 'no2_annual_mean': "Mean NO2 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'no2_nearest_2km_annual_mean': 'Mean NO2 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'no2_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting NO2 in each month.", 'no2_address_months': 'Address-months in the year with a NO2 estimate (12 per address for a full year; two addresses in one month count twice).', 'pm2_5_annual_mean': "Mean PM2.5 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'pm2_5_nearest_2km_annual_mean': 'Mean PM2.5 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'pm2_5_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting PM2.5 in each month.", 'pm2_5_address_months': 'Address-months in the year with a PM2.5 estimate (12 per address for a full year; two addresses in one month count twice).', 'pm10_annual_mean': "Mean PM10 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'pm10_nearest_2km_annual_mean': 'Mean PM10 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'pm10_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting PM10 in each month.", 'pm10_address_months': 'Address-months in the year with a PM10 estimate (12 per address for a full year; two addresses in one month count twice).', 'o3_annual_mean': "Mean O3 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'o3_nearest_2km_annual_mean': 'Mean O3 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'o3_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting O3 in each month.", 'o3_address_months': 'Address-months in the year with a O3 estimate (12 per address for a full year; two addresses in one month count twice).'}
+
+
+def _aq_pollutant_mean(pollutant, value_column):
+    """Mean of one monthly value over a pollutant's address-months: summed as DECIMAL(38,10), because an Enzyme
+    refresh refuses SUM/AVG over DOUBLE at run time, then divided by the count and cast back to DOUBLE."""
+    hit = F.col("pollutant") == pollutant
+    total = F.sum(F.when(hit, F.col(value_column).cast("decimal(38,10)")))
+    months = F.count(F.when(hit, F.col(value_column)))
+    return (total / months).cast("double")
+
+
+def _aq_annual_columns():
+    """Four aggregates per pollutant (tri-weighted mean, nearest-2 km mean, nearest-site distance, months) and the
+    year's lowest data capture."""
+    columns = []
+    for pollutant in AQ_ANNUAL_POLLUTANTS:
+        hit = F.col("pollutant") == pollutant
+        columns += [
+            _aq_pollutant_mean(pollutant, "tri_weighted_25km_value").alias(f"{pollutant}_annual_mean"),
+            _aq_pollutant_mean(pollutant, "nearest_within_2km_value").alias(f"{pollutant}_nearest_2km_annual_mean"),
+            _aq_pollutant_mean(pollutant, "nearest_site_distance_km").alias(
+                f"{pollutant}_nearest_site_distance_km_mean"),
+            F.count(F.when(hit, F.col("tri_weighted_25km_value"))).alias(f"{pollutant}_address_months"),
+        ]
+    return columns + [F.min("min_data_capture_pct").alias("min_data_capture_pct")]
+
+
+def aq_annual(monthly):
+    """One row per person and calendar year from the monthly address estimates. Pure (the W7 fixture notebook runs it on
+    hand-built rows): a filter, one GROUP BY and a deterministic key, with no window, literal date or join."""
+    return (monthly
+            .where(F.col("pollutant").isin(AQ_ANNUAL_POLLUTANTS) & F.col("person_id").isNotNull())
+            .groupBy("person_id", F.trunc(F.col("month"), "year").alias("year_start"))
+            .agg(*_aq_annual_columns())
+            .withColumn("person_air_quality_year_key",
+                        stable_id("person_air_quality_year:aq", F.col("person_id"), F.col("year_start")))
+            .select(*['person_air_quality_year_key', 'person_id', 'year_start', 'no2_annual_mean', 'no2_nearest_2km_annual_mean', 'no2_nearest_site_distance_km_mean', 'no2_address_months', 'pm2_5_annual_mean', 'pm2_5_nearest_2km_annual_mean', 'pm2_5_nearest_site_distance_km_mean', 'pm2_5_address_months', 'pm10_annual_mean', 'pm10_nearest_2km_annual_mean', 'pm10_nearest_site_distance_km_mean', 'pm10_address_months', 'o3_annual_mean', 'o3_nearest_2km_annual_mean', 'o3_nearest_site_distance_km_mean', 'o3_address_months', 'min_data_capture_pct']))
+
+
+@materialized_view(
+    name=_n("journey_reference.person_air_quality_annual"),
+    comment=("Annual air-quality means per person and calendar year, from the monthly DAR059 address estimates in "
+             "person_address_air_quality (NO2, PM2.5, PM10, O3). Derived values only: no address, site or area code "
+             "(J15 ruling 2026-10-29)."),
+    column_comments=PERSON_AIR_QUALITY_ANNUAL_COLUMN_COMMENTS,
+    # INSR_W7 review: "auto", the estate policy since EIR_20261021. "incremental" is not strict (it never fails a
+    # refresh); it skips the cost model, so a full rewrite of the 14.65bn-row monthly source would run ROW_BASED
+    # instead of recomputing (the 10-19/10-20 release-day cascade).
+    refresh_policy="auto",
+)
+def person_air_quality_annual():
+    """INSR_W7 W7.07b: the browser's air-quality criteria read this table, not the monthly product."""
+    return aq_annual(spark.read.table(_n("journey_reference.person_address_air_quality")))
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -5894,10 +6284,12 @@ PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS = {
     "death_date_estimate_source": "RECORDED_DEATH, LAST_ENCOUNTER, LAST_CLINICAL_EVENT or NONE.",
     "cause_of_death": "Raw free-text cause of death.",
     "autopsy_desc": "Resolved autopsy code description/display.",
-    "age_at_death": "Raw reported age at death; source zero values are retained.",
+    "age_at_death": "Whole years from birth_date to the death date (deceased_datetime, else calculated_death_date); NULL outside 0-120 or when either date is missing. INSR_W2 W2.06.",
+    "age_at_death_raw": "Source AGE_AT_DEATH exactly as supplied (constant 0 at source, P7_L5145).",
     "last_encounter_datetime": "It represents the timestamp of the last encounter associated with a deceased individual.",
     "last_clinical_event_datetime": "Latest EVENT_END_DT_TM across selected latest source versions, without result-status filtering.",
-    "last_known_activity_datetime": "Greatest of LAST_ENCNTR_DT_TM and LAST_NON_ERROR_CLINICAL_EVENT_DT_TM. This is activity, not a confirmed death timestamp.",
+    "last_known_activity_datetime": "Greatest of LAST_ENCNTR_DT_TM and LAST_NON_ERROR_CLINICAL_EVENT_DT_TM; when bronze has none, the latest event date across the event feeds (reference_person_scope.last_activity_date, at midnight); see last_known_activity_basis. This is activity, not a confirmed death timestamp. BBR_FOLDIN_V1 BBR-15.",
+    'last_known_activity_basis': 'Which value last_known_activity_datetime holds: bronze_last_known_activity (map_death LAST_KNOWN_ACTIVITY_DT_TM) or person_scope_last_activity_date (the latest event date across the event feeds, reference_person_scope, when bronze has none). BBR_FOLDIN_V1 BBR-15.',  # BBR_FOLDIN_V1
     "clinical_event_count": "Count of selected latest logical clinical-event source states for the person.",
     "_source_system": "Value describing source system for the person death evidence record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "_source_table": "Value describing source table for the person death evidence record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
@@ -5918,6 +6310,18 @@ def _lifecycle_source_person_death_evidence():
     # Assemble person death evidence rows with lifecycle and source evidence for the public
     # product and its internal metadata.
     s = read_source(SRC_DEATH)
+    # INSR_W2 W2.06 (L5145): the source AGE_AT_DEATH is constant 0; age is derived from birth and death dates.
+    birth = read_source(SRC_PERSON).select(F.col("person_id").cast("bigint").alias("_d_pid"),
+                                           F.col("birth_date").alias("_d_birth"))
+    s = s.join(birth, s.PERSON_ID.cast("bigint") == F.col("_d_pid"), "left")
+    # INSR_W2 W2.09 (L5145): bronze LAST_CLINICAL_EVENT_DT_TM counts administrative and bulk events (38.5% fall
+    # after death outside the bulk windows); the derived value takes clinical-category feed events only.
+    scope = spark.read.table(_n("journey_reference.person_scope")).select(
+        F.col("person_id").alias("_s_pid"), F.col("last_clinical_event_datetime").alias("_s_last_clin"),
+        F.col("last_activity_date").alias("_s_last_act"))  # BBR_FOLDIN_V1 BBR-15
+    s = s.join(scope, s.PERSON_ID.cast("bigint") == F.col("_s_pid"), "left")
+    age = F.floor(F.months_between(F.coalesce(_clamped_ts(s.DECEASED_DT_TM), s.CALC_DEATH_DATE.cast("timestamp")),
+                                   F.col("_d_birth").cast("timestamp")) / 12).cast("int")
     # contract v2: rename the deterministic death-evidence identity as a key and publish native person_id
     return s.select(
         stable_id("person_death_evidence:mill", s.PERSON_ID).alias("person_death_evidence_key"),
@@ -5931,9 +6335,19 @@ def _lifecycle_source_person_death_evidence():
         s.DECEASED_METHOD_DESC.alias("method_desc"),
         s.DEATH_DATE_ESTIMATE_SOURCE.alias("death_date_estimate_source"),
         s.CAUSE_OF_DEATH.alias("cause_of_death"), s.AUTOPSY_DESC.alias("autopsy_desc"),
-        s.AGE_AT_DEATH.alias("age_at_death"), s.LAST_ENCNTR_DT_TM.alias("last_encounter_datetime"),
+        F.when(age.between(0, 120), age).alias("age_at_death"),  # INSR_W2 W2.06: derived, NULL if invalid
+        s.AGE_AT_DEATH.alias("age_at_death_raw"), s.LAST_ENCNTR_DT_TM.alias("last_encounter_datetime"),
         s.LAST_CLINICAL_EVENT_DT_TM.alias("last_clinical_event_datetime"),
-        s.LAST_KNOWN_ACTIVITY_DT_TM.alias("last_known_activity_datetime"),
+        F.col("_s_last_clin").alias("last_clinical_event_datetime_derived"),  # INSR_W2 W2.09
+        F.coalesce(F.col("_s_last_clin") > F.date_add(F.coalesce(_clamped_ts(s.DECEASED_DT_TM),
+                   s.CALC_DEATH_DATE.cast("timestamp")), 1), F.lit(False)).alias("post_death_clinical_activity_ind"),
+        # BBR_FOLDIN_V1 (BBR-15): bronze has no last activity for most persons; the person-scope last event date
+        # fills it (the censor date for living persons), and the basis says which one it is.
+        F.coalesce(s.LAST_KNOWN_ACTIVITY_DT_TM, F.col("_s_last_act").cast("timestamp"))
+         .alias("last_known_activity_datetime"),
+        F.when(s.LAST_KNOWN_ACTIVITY_DT_TM.isNotNull(), F.lit("bronze_last_known_activity"))
+         .when(F.col("_s_last_act").isNotNull(), F.lit("person_scope_last_activity_date"))
+         .alias("last_known_activity_basis"),
         s.CLINICAL_EVENT_COUNT.alias("clinical_event_count"),
         F.lit("active").alias("record_status"), s.ADC_UPDT.alias("loaded_at"), F.lit("millennium").alias("_source_system"),
         F.lit(SRC_DEATH).alias("_source_table"), s.PERSON_ID.cast("string").alias("_source_row_id"),
@@ -6165,6 +6579,7 @@ def _lifecycle_source_encounter_bounds():
         a.WARD_MOVE_COUNT.alias("ward_move_count"),
         a.WARD_OCCUPANCY_MINUTES.alias("ward_occupancy_minutes"),
         a.LAST_WARD_IN_DT_TM.alias("last_ward_in_datetime"),
+        a.BOUNDS_BIRTH_FLOOR_APPLIED_IND.alias("bounds_birth_floor_applied_ind"),  # INSR_W2 W2.20
         a.LAST_WARD_OUT_DT_TM.alias("last_ward_out_datetime"),
         a.LAST_WARD_STILL_OPEN_IND.alias("last_ward_still_open_ind"),
         b.FIRST_EVENT_DT_TM.alias("event_first_datetime"),
@@ -6599,6 +7014,8 @@ GP_COMMENTS = {
     "free_text_ind": "Practice was recorded as free text, not a coded organisation.",
     "loaded_at": "map_person_gp_registration.ADC_UPDT carried unchanged.",
     "_source_system": "Always millennium.", "_source_table": "Bronze source table.", "_source_row_id": "PERSON_ORG_RELTN_ID as string.",
+    "registration_end_derived": "registration_end, else the start of the same person's next registration (an open-ended row followed by a later registration has ended). INSR_W2 W2.06.",
+    "registration_end_basis": "source_end or next_registration_start; NULL when the registration is still open. INSR_W2 W2.06.",
 }
 
 @materialized_view(
@@ -6609,5 +7026,20 @@ GP_COMMENTS = {
 )
 def person_gp_registration():
     # Build the declared dataset: registered GP practice history per person.
-    return gp_registration_body(read_source(SRC_GP_REGISTRATION)).withColumn(
+    # INSR_W2 W2.06 (L5172): starts before 1900 or before birth - 1 day are not registration dates (NULL);
+    # registration_end_derived = the next registration's start for the same person (partitioned window).
+    df = gp_registration_body(read_source(SRC_GP_REGISTRATION)).withColumn(
         "person_gp_registration_key", stable_id("person_gp_registration:mill", F.col("person_org_reltn_id")))
+    birth = read_source(SRC_PERSON).select(F.col("person_id").cast("bigint").alias("_gp_pid"),
+                                           F.col("birth_date").alias("_gp_birth"))
+    df = df.join(birth, F.col("person_id") == F.col("_gp_pid"), "left")
+    implausible = (F.col("registration_start") < F.lit("1900-01-01").cast("timestamp")) | (
+        F.col("registration_start") < F.date_sub(F.col("_gp_birth"), 1).cast("timestamp"))
+    df = df.withColumn("registration_start", F.when(~F.coalesce(implausible, F.lit(False)), F.col("registration_start")))
+    nxt = F.lead("registration_start").over(Window.partitionBy("person_id").orderBy(
+        F.col("registration_start").asc_nulls_last(), F.col("person_gp_registration_key").asc()))
+    df = (df.withColumn("registration_end_derived", F.coalesce(F.col("registration_end"), nxt))
+            .withColumn("registration_end_basis",
+                        F.when(F.col("registration_end").isNotNull(), F.lit("source_end"))
+                         .when(nxt.isNotNull(), F.lit("next_registration_start"))))
+    return df.drop("_gp_pid", "_gp_birth")

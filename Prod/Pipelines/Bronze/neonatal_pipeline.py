@@ -353,9 +353,17 @@ for _anon_spec in _ANON_REATTACH_SPECS:
         _anon_join_sql = " AND ".join(
             f"t.`{column}` <=> s.`{column}`" for column in _anon_spec["keys"]
         )
+        # BRONZE_PERF_20261101_ANON_REATTACH_NOOP_V1: update only the rows whose anon values differ from the state.
+        # The unconditional update rewrote every state row on every run (map_pacs_report: the same 1,116,654 rows
+        # each week, none changed), and each rewrite reached silver as a change. The check below still proves
+        # that every matched row equals the state afterwards.
+        _anon_changed_sql = " OR ".join(
+            f"NOT (t.`{column}` <=> s.`{column}`)"
+            for column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES)
+        )
         spark.sql(
             f"MERGE INTO {_anon_qtable(_anon_target)} t USING {_anon_qtable(_anon_state)} s "
-            f"ON {_anon_join_sql} WHEN MATCHED THEN UPDATE SET "
+            f"ON {_anon_join_sql} WHEN MATCHED AND ({_anon_changed_sql}) THEN UPDATE SET "
             + ", ".join(
                 f"t.`{column}` = s.`{column}`"
                 for column in _anon_spec["outputs"] + list(_ANON_STATE_TYPES)
@@ -384,5 +392,4 @@ for _anon_spec in _ANON_REATTACH_SPECS:
 
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET_SCHEMA, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-
 

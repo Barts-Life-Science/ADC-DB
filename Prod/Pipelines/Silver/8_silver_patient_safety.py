@@ -59,10 +59,22 @@ def subject_key_with_system(person_id, source_table, source_row_id):
     )
 
 def _with_comments(frame, product):
-    # Attach the product and source description to every output column's schema metadata.
+    # INSR_W8_COMMENTS_V1 (W8.04): every column's comment comes from the canonical dictionary in silver_tdx_comments.py.
+    # A column missing from it raises KeyError while the graph is built, so a template comment cannot be
+    # published again; assert_not_boilerplate rejects template text that reached the dictionary.
+    from silver_tdx_comments import SILVER_TDX_COLUMN_COMMENTS, assert_not_boilerplate
+    comments = SILVER_TDX_COLUMN_COMMENTS[product]
     for column in frame.columns:
-        frame = frame.withMetadata(column, {"comment": f"{product} field {column}; derived from the admitted TDX bronze source."})
+        text = comments[column]
+        assert_not_boilerplate(text, f"{product}.{column}")
+        frame = frame.withMetadata(column, {"comment": text})
     return frame
+
+
+def _tdx_table_comment(target_name):
+    # INSR_W8_COMMENTS_V1 (W8.04): the grain statement used as the product's MV table comment.
+    from silver_tdx_comments import SILVER_TDX_TABLE_COMMENTS
+    return SILVER_TDX_TABLE_COMMENTS[target_name]
 
 def canonical(source_name, target_name, keys, key_name, namespace):
     # Normalize a configured patient-safety bronze feed: standardize names, construct stable
@@ -153,7 +165,7 @@ def declare_product(source_name, target_name, keys, key_name, namespace):
         return canonical(source_name, target_name, list(keys), key_name, namespace)
     build.__name__ = f"build_{target_name}"
     globals()[build.__name__] = dp.materialized_view(
-        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=f"TDX v2.1 Silver research product {target_name}.", refresh_policy="auto"
+        name=f"{PUBLIC_SCHEMA}.{target_name}", comment=_tdx_table_comment(target_name), refresh_policy="auto"
     )(build)
 
     def metadata():

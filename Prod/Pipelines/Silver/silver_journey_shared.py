@@ -16,6 +16,12 @@ from pyspark.sql import Column
 
 from pyspark.sql.window import Window
 
+# INSR R1 (mapping into bronze): lane registry and contract shared with bronze. The chain is not imported.
+import sys as _r1_sys
+_r1_sys.path.append(spark.conf.get("journey.r1_shared_path", "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"))
+import mapping_contract as R1C  # noqa: E402
+import mapping_lanes as R1L  # noqa: E402
+
 def _make_strip_rtf_text():
     """Send a pure parser closure to workers, without importing this Spark module."""
     try:
@@ -85,8 +91,18 @@ def materialized_view(column_comments=None, **options):
             for axis, source_only, subject in axes:
                 column_comments.update(axis_comments(axis, subject, source_only))
     declare = dp.materialized_view(**options)
-    if not column_comments:
+    # INSR_W2_VALUE_POLICY_V1: public tables listed in silver_value_policy get their derived columns and the
+    # Millennium zero / system-user policy applied to the builder's rows (keys were minted before, so they still
+    # hash the source text), and the comments of the columns the policy adds.
+    import silver_value_policy as insr_value_policy
+    policy_applies = insr_value_policy.applies_to(table_leaf)
+    if policy_applies:
+        column_comments = {**insr_value_policy.column_comments(table_leaf), **(column_comments or {})}
+    # A listed table always goes through the wrapper, even when neither it nor the policy brings a comment
+    # (a zero-only table); otherwise the policy would be skipped silently.
+    if not column_comments and not policy_applies:
         return declare
+    column_comments = column_comments or {}
 
     def decorate(build):
         # Wrap the dataset builder so column descriptions are attached before Lakeflow records
@@ -95,6 +111,8 @@ def materialized_view(column_comments=None, **options):
             # Run the dataset builder and attach the supplied descriptions to its output
             # columns.
             df = build()
+            if policy_applies:
+                df = insr_value_policy.finish_public(df, table_leaf)
             for column in df.columns:
                 if column in column_comments:
                     df = df.withMetadata(column, {"comment": column_comments[column]})
@@ -279,71 +297,47 @@ S3B_INFERIOR_RULE_PATTERNS = (
     "embedding:presenting_complaint_picklist", "rollup:presenting_complaint_picklist",
 )
 
-def s3c_strength_key(value):
-    # Normalize medicine-strength text for matching, removing packaging and infusion wording
-    # handled by the existing rules.
-    x = F.lower(F.trim(F.regexp_replace(value, r"\s+", " ")))
-    x = F.regexp_replace(x, r"\b(?:intravenous\s+(?:infusion\s+)?solution|infusion)\b", " ")
-    x = F.regexp_replace(x, r"\s+\d+(?:,\d{3})*(?:\.\d+)?\s*(?:ml\(s\)|mls|ml|l|litre|bag\(s\)|unit\(s\))\s*$", "")
-    return F.trim(F.regexp_replace(x, r"\s+", " "))
+# SCT_TRUD_V1 (Ben ruling 2026-11-03, "clear TRUD maps supersede OMOP maps"): a lookup head carrying one of these
+# rules is an exact + assured NHS England TRUD map with a single target. It replaces any earlier non-native pick
+# (bronze string similarity, bronze ARIA staging, OMOP Maps-to) on the lanes that call the lookup with
+# replace_inferior=True; the replaced pick is kept in <axis>_legacy_snomed_code.
+S3_TRUD_CLEAR_RULES = ("trud:icdsctmap:single", "trud:opcssctmap:single")
+
 
 OMOP_URI = "urn:omop:concept_id"
 
-SRC_S3_NICIP_MAP = "3_lookup.trud.nicip_snomed_map"
 
-SRC_S3_ICD10_MAP = "3_lookup.omop.icd10_snomed_map"
 
-SRC_S3_OPCS4_MAP = "3_lookup.omop.opcs4_snomed_map"
 
-SRC_S3_STAGE_MAP = "3_lookup.omop.stage_group_snomed_map"
 
-SRC_S3_VALUE_TEXT_MAP = "3_lookup.omop.value_text_snomed_map"
 
-SRC_S3_ALLERGY_MAP = "3_lookup.omop.allergy_substance_snomed_map"
 
-SRC_S3_ENDOBASE_EXAM_MAP = "3_lookup.omop.endobase_exam_type_snomed_map"
 
-SRC_S3_PATHOLOGY_TEST_ADDITIONS = "3_lookup.omop.pathology_test_snomed_additions"
 
 # STM_SPECIMEN_TYPE_V1/silver-specimen: specimen-type keys in the adapter shape; source_code = "<bronze namespace>|<code>".
-SRC_S3_SPECIMEN_MAP_V2 = "3_lookup.omop.specimen_type_snomed_map"
 
 # Measured cosines for the legacy pathology and device tier lanes. Promoted from
 # 8_dev.lookup.tier_lane_rescore on 2026-09-26; a prod pipeline must never read 8_dev.
 # TIER_RESCORE_PROD_SOURCE_PATCH_APPLIED v1
-SRC_S3B_TIER_LANE_RESCORE = "3_lookup.omop.tier_lane_rescore"
 
-SRC_S3B_MED_TEXT_MAP = "3_lookup.omop.med_text_snomed_map"
 
-SRC_S3B_IMAGING_LOCAL_MAP_V2 = "3_lookup.omop.imaging_local_code_map"
 
-SRC_S3B_COMPLAINT_TEXT_MAP = "3_lookup.omop.complaint_text_snomed_map"
 
-SRC_S3B_PROCEDURE_TEXT_MAP = "3_lookup.omop.procedure_text_snomed_map"
 
-SRC_S3B_VITAL_UNIT_MAP = "3_lookup.omop.vital_unit_ucum_map"
 
-SRC_S3B_MEASUREMENT_CONTEXT_MAP = "3_lookup.omop.measurement_context_snomed_map"
 
-SRC_S3C_IMAGING_NAME_MAP = "3_lookup.omop.imaging_exam_name_nicip_map"
 
 SRC_S3C_RXNORM_MULTUM_MAP = "3_lookup.omop.rxnorm_multum_snomed_map"
 
-SRC_S3C_ECDS_COMPLAINT_MAP = "3_lookup.omop.ecds_chief_complaint_map"
 
-SRC_S3C_DMD_NAME_MAP = "3_lookup.omop.dmd_name_map"
 
-SRC_S3C_RXNORM_CLASS_MAP = "3_lookup.omop.rxnorm_class_residue"
 
-SRC_S3C_DMD_ID_MAP = "3_lookup.omop.dmd_id_map"
 
 # FINDING_AXIS_EVENTCD_V1: Cerner EVENT_CD -> finding (question/observable) concept, built by
 # CC/FindingAxis_20261025 from the curated Barts catalogues, OMOP exact names and Opus-verified S5 proposals.
-SRC_S3_FINDING_EVENT_CODE_MAP = "3_lookup.omop.finding_event_code_snomed_map"
+# INSR_W2 W2.03: OMOP Maps-to per (vocabulary, code), built from 3_lookup.omop.concept / concept_relationship.
 
-S3B_BRONZE_MED_EMBED_MODEL = "bronze_med_admin_vector:unversioned"
 
-S3B_HIERARCHY_VERSION = spark.conf.get("journey.s3b_hierarchy_version", "")
 
 def canonical_coding_system(value):
     """Return a stable URI for the measured source vocabulary spellings."""
@@ -419,6 +413,17 @@ def _s3_flatten_codeable_json(df, json_name, axis, source_only=False, model_name
     omop = F.element_at(F.filter(arr, lambda x: canonical_coding_system(x["coding_system"]) == F.lit(OMOP_URI)), 1)
     source_system = canonical_coding_system(source["coding_system"])
     source_native = source_system == F.lit(SNOMED_URI)
+    # SCT_TRUD_V1: SNOMED columns hold concept IDs only. A native SNOMED source code is Cerner's description ID, so
+    # the concept comes from the bridge's own SNOMED coding (bronze SNOMED_CODE = the CKI concept) when present;
+    # the source code is only a fallback, and the resolver's concept guard checks it (rf2 TUI -> CUI or NULL).
+    bridge_snomed = F.element_at(F.filter(arr, lambda x: ~F.coalesce(x["is_source"], F.lit(False)) &
+                                          (canonical_coding_system(x["coding_system"]) == F.lit(SNOMED_URI))), 1)
+    has_cki = bridge_snomed["coding_code"].isNotNull()
+    native_code = F.when(has_cki, bridge_snomed["coding_code"]).otherwise(source["coding_code"])
+    native_display = F.when(has_cki, F.coalesce(bridge_snomed["coding_display"], source["coding_display"])) \
+                      .otherwise(source["coding_display"])
+    native_rule = F.when(has_cki, F.lit("source:canonical_snomed:cki")) \
+                   .otherwise(F.lit("source:canonical_snomed:source_code"))
     mapped = source_native | snomed["coding_code"].isNotNull() | omop["coding_code"].isNotNull()
     df = (df.withColumn(f"{axis}_source_system", source_system)
             .withColumn(f"{axis}_source_code", source["coding_code"])
@@ -445,23 +450,23 @@ def _s3_flatten_codeable_json(df, json_name, axis, source_only=False, model_name
     embedding = embedding_lane.isNotNull()
     deterministic_method = (F.when(method_lower.rlike("exact|synonym"), F.lit("exact_synonym"))
                               .otherwise(F.lit("rule")))
-    return (df.withColumn(f"{axis}_snomed_code", F.when(source_native, source["coding_code"]).otherwise(snomed["coding_code"]))
-              .withColumn(f"{axis}_snomed_display", F.when(source_native, source["coding_display"]).otherwise(snomed["coding_display"]))
+    return (df.withColumn(f"{axis}_snomed_code", F.when(source_native, native_code).otherwise(snomed["coding_code"]))
+              .withColumn(f"{axis}_snomed_display", F.when(source_native, native_display).otherwise(snomed["coding_display"]))
               .withColumn(f"{axis}_omop_concept_id", F.expr(f"try_cast(element_at(filter(from_json(`{json_name}`, '{_S3_CODING_SCHEMA}'), x -> lower(x.coding_system) = '{OMOP_URI}'), 1).coding_code as bigint)"))
               .withColumn(f"{axis}_map_method", F.when(source_native, F.lit("source_native"))
                           .when(mapped & embedding, F.lit("embedding_proposed"))
                           .when(mapped, deterministic_method))
               .withColumn(f"{axis}_map_version", F.coalesce(snomed["map_version"], omop["map_version"]))
               .withColumn(f"{axis}_map_confidence", F.when(source_native, F.lit(1.0)).cast("double"))
-              .withColumn(f"{axis}_map_rule_id", F.when(source_native, F.lit("source:canonical_snomed"))
+              .withColumn(f"{axis}_map_rule_id", F.when(source_native, native_rule)
                           .when(mapped & embedding, F.concat(F.lit("embedding:"), embedding_lane, F.lit(":tier")))
                           .when(mapped, F.concat(F.lit("source:"), F.coalesce(method_source, F.lit("governed_mapping")))))
               .withColumn(f"{axis}_map_candidate_count", F.when(mapped, F.lit(1)).otherwise(F.lit(0)).cast("int"))
               .withColumn(f"{axis}_target_system", F.when(source_native | snomed["coding_code"].isNotNull(), F.lit(SNOMED_URI))
                           .when(omop["coding_code"].isNotNull(), F.lit(OMOP_URI)))
-              .withColumn(f"{axis}_target_code", F.when(source_native, source["coding_code"])
+              .withColumn(f"{axis}_target_code", F.when(source_native, native_code)
                           .otherwise(F.coalesce(snomed["coding_code"], omop["coding_code"])))
-              .withColumn(f"{axis}_target_display", F.when(source_native, source["coding_display"])
+              .withColumn(f"{axis}_target_display", F.when(source_native, native_display)
                           .otherwise(F.coalesce(snomed["coding_display"], omop["coding_display"])))
               .withColumn(f"{axis}_omop_source_concept_id", F.lit(None).cast("bigint"))
               .withColumn(f"{axis}_map_cosine", F.lit(None).cast("double"))
@@ -528,7 +533,7 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
     lookup = lookup.withColumn("_s3_rn", F.row_number().over(rank)).where("_s3_rn = 1").drop("_s3_rn")
     heads = lookup.where("component_index = 1").select(
         F.col("source_code").alias("_s3_key"), F.col("component_count").alias("_s3_head_count"),
-        F.col("status").alias("_s3_head_status"),
+        F.col("status").alias("_s3_head_status"), F.col("mapping_rule_id").alias("_s3_head_rule"),
     )
     source_row_key = "source_" + row_key
     # S3_DOMAIN_STAGES_V1: a domain stage (one row per distinct mapping input) has no event key.
@@ -540,8 +545,13 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
     inferior = F.lit(False)
     for pattern in S3B_INFERIOR_RULE_PATTERNS:
         inferior = inferior | existing_rule.contains(pattern)
+    # SCT_TRUD_V1: a TRUD-clear head (exact, assured, one target) also replaces any non-native pick.
+    trud_clear = (F.coalesce(F.col("_s3_head_rule").isin(*S3_TRUD_CLEAR_RULES), F.lit(False)) &
+                  F.col(f"{axis}_map_method").isNotNull() &
+                  (F.coalesce(F.col(f"{axis}_map_method"), F.lit("")) != "source_native"))
+    replaced = inferior | trud_clear
     eligible = F.col("_s3_key").isNotNull() & (
-        F.col(f"{axis}_map_method").isNull() | (F.lit(replace_inferior) & inferior)
+        F.col(f"{axis}_map_method").isNull() | (F.lit(replace_inferior) & replaced)
     )
     df = df.withColumn("_s3_attempt", eligible)
     if allow_split:
@@ -571,7 +581,7 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
         legacy_column = (F.col(f"{axis}_legacy_snomed_code") if f"{axis}_legacy_snomed_code" in df.columns
                          else F.lit(None).cast("string"))
         df = (df.withColumn(f"{axis}_legacy_snomed_code",
-                            F.when(use_target & inferior, F.col(f"{axis}_snomed_code")).otherwise(legacy_column))
+                            F.when(use_target & replaced, F.col(f"{axis}_snomed_code")).otherwise(legacy_column))
               .withColumn(f"{axis}_map_confidence",
                           F.when(use_target & inferior, F.col(f"{axis}_map_confidence"))
                            .otherwise(F.coalesce(F.col("_s3_legacy_confidence"), F.col(f"{axis}_map_confidence")))))
@@ -632,187 +642,15 @@ def _s3_lookup_axis(df, axis, lookup_src, source_system, key_col, allow_split=Fa
                 ).otherwise(F.col(quantity)))
     return df.drop(*[column for column in df.columns if column.startswith("_s3_")])
 
-def _s3_snomed_from_omop(df, axis):
-    """Recover SNOMED code/display when a bronze row carried only its OMOP concept id."""
-    xw=(spark.read.table(_n("journey_reference._snomed_concept_crosswalk"))
-        .select(F.col("concept_id").alias("_s3_xw_id"),
-                F.col("concept_code").alias("_s3_xw_code"),
-                F.col("concept_name").alias("_s3_xw_display")))
-    df=df.join(xw,F.col(f"{axis}_omop_concept_id")==F.col("_s3_xw_id"),"left")
-    use=F.col(f"{axis}_snomed_code").isNull() & F.col("_s3_xw_code").isNotNull()
-    return (df.withColumn(f"{axis}_snomed_code",F.when(use,F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_snomed_code")))
-              .withColumn(f"{axis}_snomed_display",F.when(use,F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_snomed_display")))
-              .withColumn(f"{axis}_target_system",F.when(use,F.lit(SNOMED_URI)).otherwise(F.col(f"{axis}_target_system")))
-              .withColumn(f"{axis}_target_code",F.when(use,F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_target_code")))
-              .withColumn(f"{axis}_target_display",F.when(use,F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_target_display")))
-              .withColumn(f"{axis}_map_method",F.when(use,F.coalesce(F.col(f"{axis}_map_method"),F.lit("rule"))).otherwise(F.col(f"{axis}_map_method")))
-              .withColumn(f"{axis}_map_rule_id",F.when(use,F.coalesce(F.col(f"{axis}_map_rule_id"),F.lit("omop:snomed_concept_crosswalk"))).otherwise(F.col(f"{axis}_map_rule_id")))
-              .withColumn(f"{axis}_map_candidate_count",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_candidate_count")))
-              .withColumn(f"{axis}_map_status",F.when(use,F.lit("mapped")).otherwise(F.col(f"{axis}_map_status")))
-              .withColumn(f"{axis}_map_competing_count",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_competing_count")))
-              .withColumn(f"{axis}_map_component_index",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_component_index")))
-              .withColumn(f"{axis}_map_component_count",F.when(use,F.lit(1)).otherwise(F.col(f"{axis}_map_component_count")))
-              .drop("_s3_xw_id","_s3_xw_code","_s3_xw_display"))
 
 # SILVER_RELEASE_20261025 item 1: the axes whose models use the fixed crosswalk step below, and their model.
 # These axis names occur in no other model (S3_PUBLIC_CODED_AXES / S3_TABLE_AXIS_SPECS), so choosing the step by
 # axis changes exactly these three models' plans and leaves every other clinical table's plan as it was.
-S3_SNOMED_FROM_OMOP_V2_AXES = {
-    "vital": "vital_sign",
-    "score": "clinical_score",
-    "stage_diagnosis": "condition_stage",
-    "stage_group": "condition_stage",
-}
 
 
-def _s3_snomed_from_omop_v2(df, axis):
-    """Recover SNOMED code/display when a bronze row carried only its OMOP concept id (fixed copy).
 
-    The original step builds its predicate from `{axis}_snomed_code` and then overwrites that column first, so
-    every later withColumn re-resolves the predicate against the new value and sees false: only the code was
-    filled, never the display, target or provenance. Here the predicate is materialised as `_s3_xw_use` before
-    any column it reads is written, and dropped at the end.
-    """
-    xw = (spark.read.table(_n("journey_reference._snomed_concept_crosswalk"))
-          .select(F.col("concept_id").alias("_s3_xw_id"),
-                  F.col("concept_code").alias("_s3_xw_code"),
-                  F.col("concept_name").alias("_s3_xw_display")))
-    df = df.join(xw, F.col(f"{axis}_omop_concept_id") == F.col("_s3_xw_id"), "left")
-    df = df.withColumn("_s3_xw_use", F.col(f"{axis}_snomed_code").isNull() & F.col("_s3_xw_code").isNotNull())
-    use = F.col("_s3_xw_use")
-    return (df.withColumn(f"{axis}_snomed_code", F.when(use, F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_snomed_code")))
-              .withColumn(f"{axis}_snomed_display", F.when(use, F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_snomed_display")))
-              .withColumn(f"{axis}_target_system", F.when(use, F.lit(SNOMED_URI)).otherwise(F.col(f"{axis}_target_system")))
-              .withColumn(f"{axis}_target_code", F.when(use, F.col("_s3_xw_code")).otherwise(F.col(f"{axis}_target_code")))
-              .withColumn(f"{axis}_target_display", F.when(use, F.col("_s3_xw_display")).otherwise(F.col(f"{axis}_target_display")))
-              .withColumn(f"{axis}_map_method", F.when(use, F.coalesce(F.col(f"{axis}_map_method"), F.lit("rule"))).otherwise(F.col(f"{axis}_map_method")))
-              .withColumn(f"{axis}_map_rule_id", F.when(use, F.coalesce(F.col(f"{axis}_map_rule_id"), F.lit("omop:snomed_concept_crosswalk"))).otherwise(F.col(f"{axis}_map_rule_id")))
-              .withColumn(f"{axis}_map_candidate_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_candidate_count")))
-              .withColumn(f"{axis}_map_status", F.when(use, F.lit("mapped")).otherwise(F.col(f"{axis}_map_status")))
-              .withColumn(f"{axis}_map_competing_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_competing_count")))
-              .withColumn(f"{axis}_map_component_index", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_component_index")))
-              .withColumn(f"{axis}_map_component_count", F.when(use, F.lit(1)).otherwise(F.col(f"{axis}_map_component_count")))
-              .drop("_s3_xw_id", "_s3_xw_code", "_s3_xw_display", "_s3_xw_use"))
 
-def _s3_enforce_omop_standard_target(df, axis):
-    """A12: a non-standard OMOP id is source provenance, never a target."""
-    concept = (read_source("3_lookup.omop.concept")
-               .select(F.col("concept_id").cast("bigint").alias("_s3_omop_id"),
-                       F.col("standard_concept").alias("_s3_omop_standard")))
-    df = df.join(concept, F.col(f"{axis}_omop_concept_id") == F.col("_s3_omop_id"), "left")
-    nonstandard = F.col(f"{axis}_omop_concept_id").isNotNull() & (F.coalesce(F.col("_s3_omop_standard"), F.lit("")) != "S")
-    only_nonstandard = nonstandard & F.col(f"{axis}_snomed_code").isNull()
-    return (df.withColumn(f"{axis}_omop_source_concept_id",
-                          F.when(nonstandard, F.col(f"{axis}_omop_concept_id"))
-                           .otherwise(F.col(f"{axis}_omop_source_concept_id")))
-              .withColumn(f"{axis}_omop_concept_id", F.when(nonstandard, F.lit(None).cast("bigint"))
-                          .otherwise(F.col(f"{axis}_omop_concept_id")))
-              .withColumn(f"{axis}_target_system", F.when(only_nonstandard, F.lit(None).cast("string"))
-                          .otherwise(F.col(f"{axis}_target_system")))
-              .withColumn(f"{axis}_target_code", F.when(only_nonstandard, F.lit(None).cast("string"))
-                          .otherwise(F.col(f"{axis}_target_code")))
-              .withColumn(f"{axis}_target_display", F.when(only_nonstandard, F.lit(None).cast("string"))
-                          .otherwise(F.col(f"{axis}_target_display")))
-              .withColumn(f"{axis}_map_status", F.when(only_nonstandard, F.lit("no_candidate"))
-                          .otherwise(F.col(f"{axis}_map_status")))
-              .withColumn(f"{axis}_map_status_reason",
-                          F.when(only_nonstandard, F.lit("non-standard OMOP source concept retained separately"))
-                           .otherwise(F.col(f"{axis}_map_status_reason")))
-              .drop("_s3_omop_id", "_s3_omop_standard"))
 
-def _s3_apply_tier_rescore(df, axis, lane, source_display):
-    """Attach measured cosine to a legacy tier lane; polarity vetoes also clear its target."""
-    target = F.coalesce(F.col(f"{axis}_snomed_code"), F.col(f"{axis}_omop_concept_id").cast("string"))
-    scored = (read_source(SRC_S3B_TIER_LANE_RESCORE).where(F.col("lane") == lane)
-              .select(F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))).alias("_s3_tier_source"),
-                      F.col("target_code").alias("_s3_tier_target"),
-                      F.col("mapping_cosine").alias("_s3_tier_cosine"),
-                      F.col("mapping_status").alias("_s3_tier_status"),
-                      F.col("mapping_rule_id").alias("_s3_tier_rule"),
-                      F.col("scoring_model").alias("_s3_tier_model"),
-                      F.col("polarity_verdict").alias("_s3_tier_polarity"),
-                      F.col("rescored_at").alias("_s3_tier_rescored_at"))
-              .withColumn("_s3_tier_rn", F.row_number().over(Window.partitionBy(
-                  "_s3_tier_source", "_s3_tier_target").orderBy(
-                      F.desc("_s3_tier_cosine"), F.desc("_s3_tier_rescored_at"))))
-              .where("_s3_tier_rn=1").drop("_s3_tier_rn"))
-    source = F.lower(F.trim(F.regexp_replace(source_display.cast("string"), r"\s+", " ")))
-    df = df.join(scored, (source == F.col("_s3_tier_source")) & (target == F.col("_s3_tier_target")), "left")
-    matched = F.col("_s3_tier_rule").isNotNull()
-    vetoed = F.col("_s3_tier_status") == "vetoed_polarity"
-    df = (df.withColumn(f"{axis}_map_cosine", F.when(matched, F.col("_s3_tier_cosine")).otherwise(F.col(f"{axis}_map_cosine")))
-          .withColumn(f"{axis}_map_scoring_model", F.when(matched, F.col("_s3_tier_model")).otherwise(F.col(f"{axis}_map_scoring_model")))
-          .withColumn(f"{axis}_map_status", F.when(matched, F.col("_s3_tier_status")).otherwise(F.col(f"{axis}_map_status")))
-          .withColumn(f"{axis}_map_rule_id", F.when(matched, F.col("_s3_tier_rule")).otherwise(F.col(f"{axis}_map_rule_id")))
-          .withColumn(f"{axis}_map_version", F.when(matched,
-                      F.concat_ws("|", F.col("_s3_tier_model"), F.lit(S3B_HIERARCHY_VERSION)))
-                      .otherwise(F.col(f"{axis}_map_version"))))
-    for suffix in ("snomed_code", "snomed_display", "omop_concept_id", "target_system", "target_code", "target_display"):
-        df = df.withColumn(f"{axis}_{suffix}", F.when(vetoed, F.lit(None).cast(df.schema[f"{axis}_{suffix}"].dataType))
-                           .otherwise(F.col(f"{axis}_{suffix}")))
-    return df.drop(*[c for c in df.columns if c.startswith("_s3_tier_")])
-
-def _s3_apply_bronze_snomed_provenance(df, model_name):
-    """Restore the measured SNOMED method, similarity and ambiguity beside flat axes."""
-    if model_name == "family_history":
-        meta = (read_source(SRC_FAMILY_HISTORY_PRODUCT)
-                .select(F.col("FHX_ACTIVITY_ID").cast("bigint").alias("_s3_meta_id"),
-                        F.col("SNOMED_TYPE").alias("_s3_meta_type"),
-                        F.col("SNOMED_SIMILARITY").cast("double").alias("_s3_meta_similarity"),
-                        F.col("SNOMED_MATCH_NUMBER").cast("int").alias("_s3_meta_candidates")))
-        df = df.join(meta, F.col("fhx_activity_id") == F.col("_s3_meta_id"), "left")
-        axis, source = "condition", "bronze.map_family_history"
-    elif model_name == "condition":
-        diagnosis = (read_source(SRC_DIAGNOSIS)
-                     .select(F.col("DIAGNOSIS_ID").cast("bigint").alias("_s3_diag_id"),
-                             F.col("SNOMED_TYPE").alias("_s3_diag_type"),
-                             F.col("SNOMED_SIMILARITY").cast("double").alias("_s3_diag_similarity"),
-                             F.col("SNOMED_MATCH_NUMBER").cast("int").alias("_s3_diag_candidates")))
-        problem = (read_source(SRC_PROBLEM)
-                   .select(F.col("PROBLEM_ID").cast("bigint").alias("_s3_problem_id"),
-                           F.col("SNOMED_TYPE").alias("_s3_problem_type"),
-                           F.col("SNOMED_SIMILARITY").cast("double").alias("_s3_problem_similarity"),
-                           F.col("SNOMED_MATCH_NUMBER").cast("int").alias("_s3_problem_candidates")))
-        df = (df.join(diagnosis, F.col("diagnosis_id") == F.col("_s3_diag_id"), "left")
-                .join(problem, F.col("problem_id") == F.col("_s3_problem_id"), "left")
-                .withColumn("_s3_meta_type", F.when(F.col("source_object") == "diagnosis", F.col("_s3_diag_type"))
-                            .when(F.col("source_object") == "problem", F.col("_s3_problem_type")))
-                .withColumn("_s3_meta_similarity", F.when(F.col("source_object") == "diagnosis", F.col("_s3_diag_similarity"))
-                            .when(F.col("source_object") == "problem", F.col("_s3_problem_similarity")))
-                .withColumn("_s3_meta_candidates", F.when(F.col("source_object") == "diagnosis", F.col("_s3_diag_candidates"))
-                            .when(F.col("source_object") == "problem", F.col("_s3_problem_candidates"))))
-        axis, source = "condition", "bronze.map_condition"
-    elif model_name == "procedure":
-        meta = (read_source(SRC_PROCEDURE)
-                .select(F.col("PROCEDURE_ID").cast("bigint").alias("_s3_meta_id"),
-                        F.col("SNOMED_TYPE").alias("_s3_meta_type"),
-                        F.col("SNOMED_SIMILARITY").cast("double").alias("_s3_meta_similarity"),
-                        F.col("SNOMED_MATCH_NUMBER").cast("int").alias("_s3_meta_candidates")))
-        df = df.join(meta, F.col("procedure_id") == F.col("_s3_meta_id"), "left")
-        axis, source = "procedure", "bronze.map_procedure"
-    else:
-        return df
-    mapped = F.col(f"{axis}_snomed_code").isNotNull()
-    native = F.col(f"{axis}_map_method") == "source_native"
-    exact = F.lower(F.coalesce(F.col("_s3_meta_type"), F.lit(""))).contains("exact")
-    return (df.withColumn(f"{axis}_map_method",
-                         F.when(native, F.lit("source_native"))
-                          .when(mapped & exact, F.lit("exact_synonym"))
-                          .when(mapped & F.col("_s3_meta_type").isNotNull(), F.lit("rule"))
-                          .otherwise(F.col(f"{axis}_map_method")))
-              .withColumn(f"{axis}_map_confidence",
-                          F.when(native, F.lit(1.0)).when(mapped, F.coalesce(F.col("_s3_meta_similarity"), F.col(f"{axis}_map_confidence")))
-                           .otherwise(F.col(f"{axis}_map_confidence")))
-              .withColumn(f"{axis}_map_candidate_count",
-                          F.when(native, F.lit(1)).when(mapped, F.coalesce(F.col("_s3_meta_candidates"), F.col(f"{axis}_map_candidate_count"), F.lit(1)))
-                           .otherwise(F.col(f"{axis}_map_candidate_count")))
-              .withColumn(f"{axis}_map_rule_id",
-                          F.when(native, F.col(f"{axis}_map_rule_id"))
-                           .when(mapped & exact, F.lit(source + ":EXACT_string_similarity"))
-                           .when(mapped & F.col("_s3_meta_type").isNotNull(), F.concat(F.lit(source + ":"), F.col("_s3_meta_type")))
-                           .otherwise(F.col(f"{axis}_map_rule_id")))
-              .drop(*[name for name in df.columns if name.startswith("_s3_diag_") or name.startswith("_s3_problem_")])
-              .drop("_s3_meta_id", "_s3_meta_type", "_s3_meta_similarity", "_s3_meta_candidates"))
 
 S3_PUBLIC_CODED_AXES = {
     "presenting_complaint": {},
@@ -1123,8 +961,6 @@ SDI_DICOM_MODALITIES = [
         "SRF", "STAIN", "TEXTUREMAP", "TG", "US", "VA", "XA", "XAPROTOCOL", "XC",
     ]
 SDI_PACS_NON_ACQUISITION = ["OT", "SR", "PR", "KO", "DOC"]
-SDI_BODY_SITE_RELATIONSHIPS = [("Has dir proc site", "omop_has_dir_proc_site"), ("Has proc site", "omop_has_proc_site"),
-                               ("Has indir proc site", "omop_has_indir_proc_site")]
 
 
 def _sdi_pacs_modality_dicom(s):
@@ -1149,35 +985,74 @@ def _sdi_imaging_modality(df):
               .drop("_sdi_px_id", "_sdi_px_modality"))
 
 
-def _sdi_imaging_body_site(df):
-    """SDI_IMAGING_BODY_SITE_V1: SNOMED body structure of the mapped examination concept via the OMOP procedure-site
-    relationships, best relationship rank first, lowest site concept id on ties; _multiple marks a tie."""
-    rank = F.when(F.col("relationship_id") == SDI_BODY_SITE_RELATIONSHIPS[0][0], F.lit(1))
-    for i, (rel, _) in enumerate(SDI_BODY_SITE_RELATIONSHIPS[1:], start=2):
-        rank = rank.when(F.col("relationship_id") == rel, F.lit(i))
-    site = (read_source("3_lookup.omop.concept")
-            .where((F.col("vocabulary_id") == "SNOMED") & F.col("invalid_reason").isNull())
-            .select(F.col("concept_id").cast("bigint").alias("_sdi_site_id"), F.col("concept_code").alias("_sdi_site_code"),
-                    F.col("concept_name").alias("_sdi_site_name")))
-    rel = (read_source("3_lookup.omop.concept_relationship")
-           .where(F.col("relationship_id").isin(*[r for r, _ in SDI_BODY_SITE_RELATIONSHIPS]) & F.col("invalid_reason").isNull())
-           .select(F.col("concept_id_1").cast("bigint").alias("_sdi_exam_id"), F.col("concept_id_2").cast("bigint").alias("_sdi_site_id"),
-                   rank.alias("_sdi_rank"))
-           .join(site, "_sdi_site_id"))
-    best = rel.groupBy("_sdi_exam_id").agg(F.min("_sdi_rank").alias("_sdi_rank"))
-    pick = (rel.join(best, ["_sdi_exam_id", "_sdi_rank"])
-            .groupBy("_sdi_exam_id", "_sdi_rank")
-            .agg(F.min(F.struct("_sdi_site_id", "_sdi_site_code", "_sdi_site_name")).alias("_sdi_site"),
-                 F.countDistinct("_sdi_site_id").alias("_sdi_sites")))
-    method = F.when(F.col("_sdi_rank") == 1, F.lit(SDI_BODY_SITE_RELATIONSHIPS[0][1]))
-    for i, (_, name) in enumerate(SDI_BODY_SITE_RELATIONSHIPS[1:], start=2):
-        method = method.when(F.col("_sdi_rank") == i, F.lit(name))
-    df = df.join(pick, F.col("exam_omop_concept_id") == F.col("_sdi_exam_id"), "left")
-    return (df.withColumn("body_site_snomed_code", F.col("_sdi_site._sdi_site_code"))
-              .withColumn("body_site_snomed_display", F.col("_sdi_site._sdi_site_name"))
-              .withColumn("body_site_snomed_method",
-                          F.when(F.col("_sdi_sites") > 1, F.concat(method, F.lit("_multiple"))).otherwise(method))
-              .drop("_sdi_exam_id", "_sdi_rank", "_sdi_site", "_sdi_sites"))
+
+
+def _r1_expand_lane(df, model_name, lane_id):
+    """INSR R1: one lane's bronze STRUCT (_r1_<lane>_mapping, carried from the pregate) -> the flat 24-column axis
+    contract, plus the lane's extra columns (W2.03 omop provenance, imaging body site) parsed once from extras_json.
+
+    A row whose key is not resolved yet (NULL STRUCT: a silver-derived key new in this release, design D4) keeps the
+    source fields the source-only flatten / direct-axis block gave it, carries map_status 'pending_resolution', and
+    has every mapped field NULL; the next bronze run resolves the key."""
+    lane = R1L.LANES[lane_id]
+    mapping = f"_r1_{lane_id}_mapping"
+    resolved = F.col(mapping).isNotNull()
+    source_fields = ("source_system", "source_code", "source_display")
+    for field_name, typ in R1C.AXIS_FIELDS:
+        column = f"{lane.axis}_{field_name}"
+        if field_name in source_fields and column in df.columns:
+            fallback = F.col(column)
+        elif field_name == "map_status":
+            has_source = F.lit(False)
+            for field in source_fields:
+                if f"{lane.axis}_{field}" in df.columns:
+                    has_source = has_source | F.col(f"{lane.axis}_{field}").isNotNull()
+            fallback = F.when(has_source, F.lit("pending_resolution"))
+        else:
+            fallback = F.lit(None).cast(typ)
+        df = df.withColumn(column, F.when(resolved, F.col(f"{mapping}.{field_name}")).otherwise(fallback))
+    # Ben's 2026-11-01 ruling (R4 D4 reverted): the key this row was resolved by, so gold's materialised tables can
+    # join the per-key _mapping_admission MV. Set for unresolved rows too (their key resolves on the next bronze run).
+    df = df.withColumn(f"{lane.axis}_map_key", F.col(f"_r1_{lane_id}_map_key"))
+    if lane.extras:
+        schema = "struct<" + ",".join(f"{c}:string" for c in lane.extras) + ">"
+        df = df.withColumn("_r1_extras", F.from_json(F.col(f"{mapping}.extras_json"), schema))
+        for column in lane.extras:
+            df = df.withColumn(column, F.col(f"_r1_extras.{column}"))
+        df = df.drop("_r1_extras")
+    return df
+
+
+def _r1_explode_components(df, model_name, lane_id):
+    """INSR R1: a source code the resolver split into several concepts becomes one row per component, exactly as
+    the S3 lookup did: component 1 keeps the event key; components 2+ get stable_id('s3b_component', source key,
+    axis, component identity) and their shared quantities cleared."""
+    lane = R1L.LANES[lane_id]
+    if not lane.allow_split:
+        return df
+    comps = f"_r1_{lane_id}_components_json"
+    if "source_patient_event_key" not in df.columns:
+        df = df.withColumn("source_patient_event_key", F.col("patient_event_key"))
+    schema = "array<" + R1C.axis_struct_ddl() + ">"
+    df = df.withColumn("_r1_comp", F.explode_outer(F.from_json(F.col(comps), schema)))
+    split = F.coalesce(F.col("_r1_comp.map_component_index"), F.lit(1)) > 1
+    for name, _ in R1C.AXIS_FIELDS:
+        df = df.withColumn(f"{lane.axis}_{name}", F.when(F.col("_r1_comp").isNotNull(), F.col(f"_r1_comp.{name}"))
+                           .otherwise(F.col(f"{lane.axis}_{name}")))
+    df = df.withColumn("patient_event_key", F.when(split, stable_id(
+        "s3b_component", F.col("source_patient_event_key"), F.lit(lane.axis), F.col("_r1_comp.component_identity")))
+        .otherwise(F.col("patient_event_key")))
+    for quantity in S3B_SHARED_QUANTITIES.get(model_name, ()):
+        if quantity in df.columns:
+            df = df.withColumn(quantity, F.when(split, F.lit(None).cast(df.schema[quantity].dataType))
+                               .otherwise(F.col(quantity)))
+    return df.drop("_r1_comp")
+
+
+def _r1_attach_silver_arm(df, source, model):
+    """INSR R1 (deviation D4): a silver-derived arm takes its lane columns from mapping_resolution by the shared key."""
+    import mapping_attach as R1A
+    return R1A.attach_silver_arm(df, source, model, read_source)   # dev source_overrides apply
 
 
 def _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
@@ -1195,10 +1070,13 @@ def _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, life
     if "source_coding_system" in df.columns:
         df = df.withColumn("source_coding_system", canonical_coding_system(F.col("source_coding_system")))
     retired = S3_PUBLIC_CODED_AXES.get(model_name, {})
+    # INSR R1 (mapping into bronze): a lane axis is flattened source-only here (its source fields are the fallback
+    # for rows whose key is not resolved yet); its mapped fields come from the lane STRUCT in _r1_expand_lane.
+    lane_axes = {R1L.LANES[lane_id].axis for lane_id in R1L.lanes_of_model(model_name)}
     for public_name, json_name in variant_json_columns.items():
         if public_name in retired:
             axis, source_only = retired[public_name]
-            df = _s3_flatten_codeable_json(df, json_name, axis, source_only, model_name)
+            df = _s3_flatten_codeable_json(df, json_name, axis, source_only or axis in lane_axes, model_name)
         else:
             df = df.withColumn(public_name, F.expr(f"parse_json(`{json_name}`)"))
     if model_name == "pathology_result":
@@ -1249,266 +1127,168 @@ def _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, life
                   .when(present, F.concat(F.lit("bronze.map_implant_details:"),
                                          F.coalesce(F.col("_device_mapping_layer"), F.lit("mapped")))),
             candidates=F.when(present, F.lit(1)).otherwise(F.lit(0)))
-    elif model_name == "device":
-        # The MediConnect fields named *_SNOMED_CONCEPT_ID are likewise OMOP
-        # concept_ids. The JSON bridge historically labelled them as SNOMED codes.
-        # Correct the slot before the shared OMOP-to-SNOMED crosswalk runs.
-        df = (df.withColumn("device_omop_concept_id", F.expr("try_cast(device_snomed_code as bigint)"))
-                .withColumn("device_snomed_code", F.lit(None).cast("string"))
-                .withColumn("device_snomed_display", F.lit(None).cast("string")))
-    # Freeze bronze provenance before authoritative lookups decide whether a row is replaceable.
-    df = _s3_apply_bronze_snomed_provenance(df, model_name)
-    if model_name == "medication_order":
-        b=(read_source("4_prod.bronze.map_medication_order").select(
-            F.col("ORDER_ID").cast("bigint").alias("_s3_order_id"),
-            F.col("MULTUM_CODE").cast("string").alias("_s3c_multum"),
-            F.col("SNOMED_CODE").cast("string").alias("_s3_med_snomed"),
-            F.coalesce("OMOP_STANDARD_CONCEPT_NAME", "OMOP_CONCEPT_NAME").alias("_s3_med_snomed_display"),
-            F.col("OMOP_STANDARD_CONCEPT_ID").cast("bigint").alias("_s3_med_omop"),
-            F.coalesce("OMOP_STANDARD_MAPPING_METHOD","OMOP_MAPPING_METHOD").alias("_s3_med_bronze_method"),
-            F.col("OMOP_MAPPING_CONFIDENCE").cast("double").alias("_s3_med_confidence"),
-            F.col("OMOP_STANDARD_CANDIDATE_COUNT").cast("int").alias("_s3_med_candidates")))
-        df=df.join(b,F.col("order_id")==F.col("_s3_order_id"),"left")
-        mapped=F.col("_s3_med_snomed").isNotNull()|F.col("_s3_med_omop").isNotNull()
-        order_embedding = F.upper(F.coalesce(F.col("_s3_med_bronze_method"), F.lit(""))).contains("VECTOR")
-        df=(df.withColumn("medication_snomed_code",F.col("_s3_med_snomed"))
-              .withColumn("medication_snomed_display",F.col("_s3_med_snomed_display"))
-              .withColumn("medication_omop_concept_id",F.col("_s3_med_omop"))
-              .withColumn("medication_map_method",F.when(mapped & order_embedding,F.lit("embedding_proposed"))
-                          .when(mapped,F.lit("rule")))
-              .withColumn("medication_map_confidence",F.col("_s3_med_confidence"))
-              .withColumn("medication_map_rule_id",F.when(mapped & order_embedding,
-                          F.lit("embedding:bronze_medication_order_embedding:tier"))
-                          .when(mapped,F.concat(F.lit("bronze.map_medication_order:"),
-                                              F.coalesce(F.col("_s3_med_bronze_method"),F.lit("mapped")))))
-              .withColumn("medication_map_candidate_count",F.when(mapped,F.coalesce(F.col("_s3_med_candidates"),F.lit(1))))
-              .drop(*[c for c in df.columns if c.startswith("_s3_med_")]))
-    elif model_name == "medication_admin":
-        b=(read_source("4_prod.bronze.map_med_admin").select(
-            F.col("EVENT_ID").cast("bigint").alias("_s3_admin_id"),
-            F.col("MULTUM").cast("string").alias("_s3c_multum"),
-            F.coalesce("SNOMED_VALIDATED_CODE","SNOMED_CODE","LOOKUP_SNOMED_CODE").cast("string").alias("_s3_med_snomed"),
-            F.coalesce("SNOMED_VALIDATED_STR","SNOMED_STR","LOOKUP_SNOMED_FROM_OMOP").alias("_s3_med_snomed_display"),
-            F.coalesce("OMOP_STANDARD_CONCEPT_ID","OMOP_CONCEPT_ID").cast("bigint").alias("_s3_med_omop"),
-            F.col("OMOP_MAPPING_METHOD").alias("_s3_med_bronze_method"),
-            F.col("OMOP_MAPPING_CONFIDENCE").cast("double").alias("_s3_med_confidence"),
-            F.col("SNOMED_CANDIDATE_COUNT").cast("int").alias("_s3_med_candidates")))
-        df=df.join(b,F.col("event_id")==F.col("_s3_admin_id"),"left")
-        mapped=F.col("_s3_med_snomed").isNotNull()|F.col("_s3_med_omop").isNotNull()
-        method=(F.when(F.col("_s3_med_bronze_method")=="LOOKUP_VECTOR_SIMILARITY",F.lit("embedding_proposed"))
-                .when(F.col("_s3_med_bronze_method")=="EXACT_UNIQUE_STANDARD_NAME",F.lit("exact_synonym"))
-                .when(mapped,F.lit("rule")))
-        rule=F.when(F.col("_s3_med_bronze_method")=="LOOKUP_VECTOR_SIMILARITY",F.lit("embedding:bronze_med_admin_embedding:tier")) \
-              .otherwise(F.concat(F.lit("bronze.map_med_admin:"),F.coalesce(F.col("_s3_med_bronze_method"),F.lit("mapped"))))
-        df=(df.withColumn("medication_snomed_code",F.col("_s3_med_snomed"))
-              .withColumn("medication_snomed_display",F.col("_s3_med_snomed_display"))
-              .withColumn("medication_omop_concept_id",F.col("_s3_med_omop"))
-              .withColumn("medication_map_method",method)
-              .withColumn("medication_map_confidence",F.col("_s3_med_confidence"))
-              .withColumn("medication_map_rule_id",F.when(mapped,rule))
-              .withColumn("medication_map_candidate_count",F.when(mapped,F.coalesce(F.col("_s3_med_candidates"),F.lit(1))))
-              .drop(*[c for c in df.columns if c.startswith("_s3_med_") or c=="_s3_admin_id"]))
-    if model_name in ("medication_admin", "medication_order", "medication_dispense"):
-        med_target = F.col("medication_snomed_code").isNotNull() | F.col("medication_omop_concept_id").isNotNull()
-        bronze_embedding = F.col("medication_map_method") == "embedding_proposed"
-        med_source = F.col("medication_source_code").isNotNull() | F.col("medication_source_display").isNotNull()
-        df = (df.withColumn("medication_target_system", F.when(F.col("medication_snomed_code").isNotNull(), F.lit(SNOMED_URI))
-                            .when(F.col("medication_omop_concept_id").isNotNull(), F.lit(OMOP_URI)))
-                .withColumn("medication_target_code", F.coalesce("medication_snomed_code", F.col("medication_omop_concept_id").cast("string")))
-                .withColumn("medication_target_display", F.col("medication_snomed_display"))
-                .withColumn("medication_map_cosine", F.when(bronze_embedding, F.col("medication_map_confidence")))
-                .withColumn("medication_map_scoring_model", F.when(bronze_embedding, F.lit(S3B_BRONZE_MED_EMBED_MODEL)))
-                .withColumn("medication_map_version", F.when(bronze_embedding,
-                            F.concat_ws("|", F.lit(S3B_BRONZE_MED_EMBED_MODEL), F.lit(S3B_HIERARCHY_VERSION)))
-                            .otherwise(F.col("medication_map_version")))
-                .withColumn("medication_map_status", F.when(med_target, F.lit("mapped")).otherwise(F.lit("no_candidate")))
-                .withColumn("medication_map_competing_count", F.col("medication_map_candidate_count"))
-                .withColumn("medication_map_component_index", F.when(med_source, F.lit(1)).cast("int"))
-                .withColumn("medication_map_component_count", F.when(med_source, F.lit(1)).cast("int")))
+    # INSR R1: the device model's OMOP-slot correction runs in the resolver (device lane, mapping_inputs
+    # prepare__device); its mapped slots arrive in the lane STRUCT.
+    # INSR R1 (mapping into bronze): no bronze provenance re-join and no medication re-joins (the resolver read
+    # those fields from the bronze row); mapped axes arrive as one STRUCT per lane from bronze (or, for silver-derived
+    # arms, from mapping_resolution by the same key) and are expanded here. The direct-axis block above is kept: it
+    # gives direct lanes their source fields, which _r1_expand_lane keeps for unresolved rows.
+    for lane_id in R1L.lanes_of_model(model_name):
+        df = _r1_expand_lane(df, model_name, lane_id)
     return df
 
 
-class _S3Step:
-    """One step of the S3 mapping chain: the axis it maps, the joins it adds to a plan and the function applying it."""
-
-    def __init__(self, axis, joins, apply, allow_split=False):
-        self.axis, self.joins, self.apply, self.allow_split = axis, joins, apply, allow_split
 
 
-def _s3_lookup_step(axis, *args, allow_split=False, **kwargs):
-    """A _s3_lookup_axis call as a step: two joins, three when it can split a row into components."""
-    return _S3Step(axis, 3 if allow_split else 2,
-                   lambda df: _s3_lookup_axis(df, axis, *args, allow_split=allow_split, **kwargs), allow_split)
 
 
-def _s3_crosswalk_steps(axis):
-    """SNOMED recovery from the OMOP id, then the OMOP standard-target check, for one axis.
-
-    SILVER_RELEASE_20261025 item 1: the axes of vital_sign, clinical_score and condition_stage take the fixed
-    recovery step; every other axis keeps the original one (Ben's decision: no plan change elsewhere).
-    """
-    recover = _s3_snomed_from_omop_v2 if axis in S3_SNOMED_FROM_OMOP_V2_AXES else _s3_snomed_from_omop
-    return [_S3Step(axis, 1, lambda df: recover(df, axis)),
-            _S3Step(axis, 1, lambda df: _s3_enforce_omop_standard_target(df, axis))]
 
 
-def _s3_mapping_steps(model_name):
-    """The S3 mapping chain of a public clinical table, in the order _cross_qc_public applies it: deterministic
-    lookups (they fill only an otherwise unmapped axis; each lookup is reduced to one explicitly ranked row before
-    the left join), tier rescores, the OMOP crosswalk and standard-target checks, and imaging body site."""
-    steps = []
-    if model_name == "family_history":
-        steps.append(_s3_lookup_step(
-            "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True))
-    elif model_name == "imaging_exam":
-        steps.append(_s3_lookup_step("exam", SRC_S3_NICIP_MAP, "urn:nhs:nicip", F.upper(F.trim(F.col("source_code"))), model_name=model_name))
-        norm_display = F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " ")))
-        steps.append(_s3_lookup_step("exam", SRC_S3C_IMAGING_NAME_MAP, "urn:cerner:radiology-exam",
-                                     F.when(F.col("source_coding_system") == "urn:cerner:radiology-exam", norm_display), model_name=model_name, replace_inferior=True))
-        steps.append(_s3_lookup_step("exam", SRC_S3C_IMAGING_NAME_MAP, "urn:sectra:examination-code",
-                                     F.when(F.col("source_coding_system") == "urn:sectra:examination-code", norm_display), model_name=model_name, replace_inferior=True))
-        steps.append(_s3_lookup_step("exam", SRC_S3B_IMAGING_LOCAL_MAP_V2, "urn:barts:imaging-local-exam",
-                                     F.concat_ws("|", F.col("exam_source_system"), F.col("exam_source_code")), model_name=model_name))
-    elif model_name == "allergy_intolerance":
-        steps.append(_s3_lookup_step("substance", SRC_S3_ALLERGY_MAP, "urn:cerner:allergy-substance-text",
-                                     F.lower(F.trim(F.regexp_replace(F.col("source_display"), r"\s+", " "))), model_name=model_name))
-    elif model_name == "clinical_finding":
-        # FINDING_AXIS_EVENTCD_V1: the finding axis is the Cerner EVENT_CD; mapped per distinct input (S3 domain).
-        steps.append(_s3_lookup_step("finding", SRC_S3_FINDING_EVENT_CODE_MAP, "urn:cerner:code_value",
-                                     F.when(F.col("finding_source_system") == "urn:cerner:code_value",
-                                            F.col("finding_source_code")), model_name=model_name))
-        steps.append(_s3_lookup_step("value", SRC_S3_VALUE_TEXT_MAP, "urn:cerner:nomenclature:answer-text",
-                                     F.lower(F.trim(F.regexp_replace(F.coalesce(F.col("value_display"), F.col("value_text")), r"\s+", " "))), model_name=model_name))
-    elif model_name == "condition_stage":
-        steps.append(_s3_lookup_step("stage_group", SRC_S3_STAGE_MAP, "urn:barts:aria:stage-of-disease",
-                                     F.lower(F.trim(F.regexp_replace(F.col("stage_of_disease"), r"\s+", " "))), model_name=model_name))
-        steps.append(_s3_lookup_step(
-            "stage_diagnosis", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("stage_diagnosis_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("stage_diagnosis_source_code")), r"[^A-Z0-9]", "")),
-            model_name=model_name, replace_inferior=True))
-    elif model_name == "condition":
-        steps.append(_s3_lookup_step(
-            "condition", SRC_S3_ICD10_MAP, "http://hl7.org/fhir/sid/icd-10",
-            F.when(F.col("condition_source_system") == "http://hl7.org/fhir/sid/icd-10",
-                   F.regexp_replace(F.upper(F.col("condition_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True))
-    elif model_name == "procedure":
-        steps.append(_s3_lookup_step(
-            "procedure", SRC_S3_OPCS4_MAP, "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
-            F.when(F.col("procedure_source_system") == "http://fhir.hl7.org.uk/CodeSystem/OPCS-4",
-                   F.regexp_replace(F.upper(F.col("procedure_source_code")), r"[^A-Z0-9]", "")),
-            allow_split=True, model_name=model_name, replace_inferior=True))
-        steps.append(_s3_lookup_step(
-            "procedure", SRC_S3_ENDOBASE_EXAM_MAP, "urn:barts:endobase:exam-type",
-            F.when(F.col("source_object") == "endobase_exam",
-                   F.lower(F.trim(F.regexp_replace(F.col("procedure_source_code"), r"\s+", " ")))), model_name=model_name))
-        steps.append(_s3_lookup_step(
-            "procedure", SRC_S3B_PROCEDURE_TEXT_MAP, "urn:barts:procedure-text",
-            F.sha2(F.concat_ws("|",
-                F.when(F.col("source_object") == "endobase_exam", F.lit("urn:barts:endobase-exam-type"))
-                 .when(F.col("source_object").contains("implant"), F.lit("urn:barts:implant-primary-procedure"))
-                 .otherwise(F.lit("urn:barts:surginet-procedure")),
-                F.lower(F.trim(F.regexp_replace(F.col("procedure_source_display"), r"\s+", " ")))), 256),
-            allow_split=True, model_name=model_name))
-    elif model_name == "pathology_result":
-        steps.append(_s3_lookup_step(
-            "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:cerner_testcode",
-            F.when(F.lower(F.col("test_source_system")).contains("cerner-testcode"), F.col("test_source_code")), model_name=model_name))
-        steps.append(_s3_lookup_step(
-            "test", SRC_S3_PATHOLOGY_TEST_ADDITIONS, "urn:barts:pathology:test:tfc",
-            F.when(F.lower(F.col("test_source_system")).contains("tfc"), F.col("test_source_code")), model_name=model_name))
-    elif model_name == "specimen":
-        # STM_SPECIMEN_TYPE_V1/silver-specimen: the only specimen-type mapping; keyed on the bronze namespace|code carried on the row.
-        steps.append(_s3_lookup_step("specimen_type", SRC_S3_SPECIMEN_MAP_V2, "urn:barts:pathology:specimen-type",
-                                     F.col("_specimen_type_lookup_key"), model_name=model_name))
-    elif model_name == "presenting_complaint":
-        steps.append(_S3Step("complaint", 0, lambda df: _s3_direct_axis(
-            df, "complaint", F.col("source_coding_system"), F.col("source_code"), F.col("source_display"))))
-        steps.append(_s3_lookup_step(
-            "complaint", SRC_S3C_ECDS_COMPLAINT_MAP,
-            "urn:cerner:nomenclature:ed-presenting-complaint",
-            F.when(F.col("source_object").isin("ed_presenting_complaint", "ed_presenting_complaint_text"),
-                   F.col("source_code")), model_name=model_name))
-        steps.append(_s3_lookup_step(
-            "complaint", SRC_S3B_COMPLAINT_TEXT_MAP, "urn:barts:complaint-text",
-            F.when(F.col("source_object").isin("registration_reason_for_visit", "ed_presenting_complaint_text"),
-                   F.col("complaint_text_normalised")), allow_split=True, model_name=model_name))
-    elif model_name == "vital_sign":
-        steps.append(_s3_lookup_step(
-            "unit", SRC_S3B_VITAL_UNIT_MAP, "urn:barts:vital:unit",
-            F.lower(F.trim(F.regexp_replace(F.col("unit_source_value"), r"\s+", " "))),
-            model_name=model_name,
-        ))
-        for _axis, _value in (
-            ("method", F.col("method_display")),
-            ("body_site", F.col("body_site_display")),
-            ("interpretation", F.col("interpretation_display")),
-        ):
-            steps.append(_s3_lookup_step(
-                _axis, SRC_S3B_MEASUREMENT_CONTEXT_MAP, f"urn:barts:vital:{_axis}",
-                F.lower(F.trim(F.regexp_replace(_value, r"\s+", " "))),
-                model_name=model_name,
-            ))
-    if model_name in ("medication_admin", "medication_order", "medication_dispense"):
-        if model_name in ("medication_admin", "medication_order"):
-            steps.append(_s3_lookup_step("medication", SRC_S3C_RXNORM_MULTUM_MAP, "urn:cerner:multum",
-                                         F.col("_s3c_multum"), allow_split=False, model_name=model_name, replace_inferior=True))
-            steps.append(_s3_lookup_step("medication", SRC_S3C_RXNORM_CLASS_MAP, "urn:cerner:multum:class",
-                                         F.col("_s3c_multum"), allow_split=True, model_name=model_name, replace_inferior=True))
-        if model_name == "medication_dispense":
-            steps.append(_s3_lookup_step("medication", SRC_S3C_DMD_ID_MAP, "urn:nhs:dmd",
-                                         F.col("_dmd_code"), model_name=model_name, replace_inferior=True))
-        steps.append(_s3_lookup_step("medication", SRC_S3C_DMD_NAME_MAP, "urn:cerner:medication-text:strength",
-                                     s3c_strength_key(F.col("medication_source_display")), allow_split=True, model_name=model_name))
-        steps.append(_S3Step("medication", 0, lambda df: df.drop("_s3c_multum") if "_s3c_multum" in df.columns else df))
-        steps.append(_s3_lookup_step(
-            "medication", SRC_S3B_MED_TEXT_MAP, "urn:cerner:medication-text",
-            F.lower(F.trim(F.regexp_replace(F.col("medication_source_display"), r"\s+", " "))),
-            allow_split=True, model_name=model_name))
-    if model_name == "pathology_result":
-        steps.append(_S3Step("test", 1, lambda df: _s3_apply_tier_rescore(
-            df, "test", "bronze_pathology_test_auto_high",
-            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_high"), F.col("test_source_display")))))
-        steps.append(_S3Step("test", 1, lambda df: _s3_apply_tier_rescore(
-            df, "test", "bronze_pathology_test_auto_low",
-            F.when(F.col("test_map_rule_id").contains("bronze_pathology_test_auto_low"), F.col("test_source_display")))))
-        steps.append(_S3Step("result", 1, lambda df: _s3_apply_tier_rescore(df, "result", "bronze_pathology_result_auto", F.col("result_source_display"))))
-    elif model_name == "procedure":
-        steps.append(_S3Step("device", 1, lambda df: _s3_apply_tier_rescore(df, "device", "bronze_implant_layer5", F.col("implant_description"))))
-    elif model_name == "device":
-        steps.append(_S3Step("device", 1, lambda df: _s3_apply_tier_rescore(df, "device", "bronze_mediconnect_device", F.col("device_source_display"))))
+# INSR_W2 W2.03: OMOP vocabulary 'Maps to' lanes. 3_lookup.omop.s3_vocab_maps_to holds one ranked row per
+# (vocabulary, code) in the governed v2 lookup schema (standard target first, lowest concept_id; method rule;
+# rule id omop:maps_to:<vocabulary>; version = vocabulary release). A lane is one join to it, so the S3 stage
+# budget is respected. fill='target' maps an otherwise unmapped axis (the _s3_lookup_axis rule); 'omop' fills
+# only {axis}_omop_concept_id / _omop_source_concept_id when NULL; 'source_concept' fills only the source concept.
 
-        def unscorable_device(df):
-            # A governed device-type mapping with a blank source display has no text to score: keep it as a rule.
-            unscorable = ((F.col("device_map_method") == "embedding_proposed") &
-                          (F.length(F.trim(F.coalesce(F.col("device_source_display"), F.lit("")))) == 0) &
-                          F.col("device_target_code").isNotNull())
-            return (df.withColumn("device_map_method", F.when(unscorable, F.lit("rule")).otherwise(F.col("device_map_method")))
-                  .withColumn("device_map_rule_id", F.when(unscorable, F.lit("lookup.mediconnect_device_type_map:approved_without_text_score"))
-                              .otherwise(F.col("device_map_rule_id")))
-                  .withColumn("device_map_status_reason", F.when(unscorable, F.lit("blank source display; governed source-code mapping retained"))
-                              .otherwise(F.col("device_map_status_reason"))))
-        steps.append(_S3Step("device", 0, unscorable_device))
-    for _old_name, (_axis, _source_only) in S3_PUBLIC_CODED_AXES.get(model_name, {}).items():
-        if not _source_only:
-            steps += _s3_crosswalk_steps(_axis)
-    if model_name in ("pathology_result", "clinical_finding", "condition_stage"):
-        _extra_axis = {"pathology_result":"result", "clinical_finding":"value", "condition_stage":"stage_group"}[model_name]
-        steps += _s3_crosswalk_steps(_extra_axis)
-    if model_name == "imaging_exam":  # SDI_IMAGING_BODY_SITE_V1: keyed on the mapped examination concept
-        steps.append(_S3Step("exam", 2, _sdi_imaging_body_site))
-    return steps
+
+
+
+
+
+# BBR_FOLDIN_V1 (design BBR-3): anthropometric synonyms on the vital axis. A vital row no lookup mapped whose
+# normalised display (lower case, collapsed whitespace, leading 'zzz' stripped) names body weight, height or BMI takes
+# that SNOMED observable. The rule id records whether the display says measured or estimated; the OMOP lane
+# (f_vital_omop) then fills the OMOP id only where it is NULL. No pattern uses '.', so the Photon/JVM divergence on
+# line breaks cannot apply.
+# The LOINC (incl. LOINC "Estimated") OMOP ids of each anthropometric SNOMED concept: a governed row on one of these has
+# no SNOMED crosswalk, so the synonym gives it the shared SNOMED concept. A row whose governed OMOP id is any other
+# concept keeps its own mapping (the SNOMED-standard ids get their SNOMED code from the crosswalk under the governed
+# rule; review fix 11-03: the step had relabelled governed rows as synonym-mapped before the crosswalk ran).
+
+
+
+
+# BBR_FOLDIN_V1 (design BBR-11 / BBR-12): pathology test keys on code|display, and QC / non-blood variants.
+# 3_lookup.omop.pathology_test_snomed_additions rows of system BBR_PATH_TEST_CODE_DISPLAY_SYSTEM are keyed
+# concat_ws('|', test code, normalised display): the code alone is ambiguous (TFC EPI is both 'EPI-estimated GFR' and
+# 'Epithelial cells'). Such a row codes a test the bronze map left without a code, or (rule
+# BBR_PATH_TEST_DIMENSION_RULE) re-maps a test whose rows carry a rate or per-WBC unit onto its dimension-specific
+# concept (or no_candidate). It runs after the tier rescores, which can clear a vetoed target.
+# '[\s\S]' instead of '.' (estate rule for regexes that decide a mapping).
+
+
+
+
+
+
+
+
+
+
+# BBR_FOLDIN_V1 (design BBR-4): vital units and a canonical value for the three anthropometric concepts. A NULL
+# unit_concept_id with no source unit (or one whose UCUM is that unit) takes the concept's default unit (rule vital:concept_default_unit on unit_map_rule_id); heights
+# recorded in metres (<= 3, unit NULL or metres) become cm, weights in grams kg. Every other vital passes its value
+# with conversion 'identity' when its unit axis reached a UCUM code.
+BBR_VITAL_DEFAULT_UNITS = {'27113001': ('9529', 'kg'), '50373000': ('8582', 'cm'), '60621009': ('9531', 'kg/m2')}
+BBR_VITAL_DEFAULT_UNIT_RULE = 'vital:concept_default_unit'
+BBR_UCUM_URI = "http://unitsofmeasure.org"
+
+
+def _bbr_vital_canonical(df):
+    """BBR-4: fill the anthropometric default unit concept and add value_canonical / canonical_ucum_code /
+    canonical_conversion (the pure-Python twin is bbr_review/build/bbr_rules.vital_canonical_python)."""
+    snomed, value = F.col("vital_snomed_code"), F.col("value_number")
+    unit = F.lower(F.trim(F.coalesce(F.col("unit_source_value"), F.lit(""))))
+    default_concept, default_ucum = F.lit(None).cast("string"), F.lit(None).cast("string")
+    for code, (concept, ucum) in BBR_VITAL_DEFAULT_UNITS.items():
+        default_concept = F.when(snomed == code, F.lit(concept)).otherwise(default_concept)
+        default_ucum = F.when(snomed == code, F.lit(ucum)).otherwise(default_ucum)
+    # Inputs are materialised before unit_concept_id / unit_map_rule_id change (a predicate over unit_concept_id
+    # would re-resolve to the filled value after its withColumn and lose the concept_default_unit label).
+    df = (df.withColumn("_bbr_default_concept", default_concept).withColumn("_bbr_default_ucum", default_ucum)
+            .withColumn("_bbr_unit_ucum", F.when(F.col("unit_target_system") == BBR_UCUM_URI, F.col("unit_target_code"))))
+    # The default fills only a row whose unit is absent or already means that unit (a weight in lb keeps NULL).
+    df = df.withColumn("_bbr_filled", F.col("unit_concept_id").isNull() & F.col("_bbr_default_concept").isNotNull()
+                       & ((unit == "") | F.coalesce(F.col("_bbr_unit_ucum") == F.col("_bbr_default_ucum"), F.lit(False))))
+    filled = F.col("_bbr_filled")
+    # A height with no unit recorded at <= 3 is in metres (it becomes cm below): its filled unit is the metre, so
+    # unit_concept_id keeps describing value_number (review fix 11-03).
+    metres_no_unit = (snomed == "50373000") & (value <= 3) & (unit == "")
+    fill_concept = F.when(metres_no_unit, F.lit('9546')).otherwise(F.col("_bbr_default_concept"))
+    conversion = (F.when(value.isNull(), F.lit(None).cast("string"))
+                  .when((snomed == "50373000") & (value <= 3) & unit.isin("", "m", "metres", "metre"), F.lit("m->cm"))
+                  .when((snomed == "27113001") & (unit == "g"), F.lit("g->kg"))
+                  .when(filled & (unit == ""), F.lit("concept_default_unit"))
+                  # identity only when the row's unit is the concept's own (or, for other vitals, any UCUM unit);
+                  # an anthropometric value in another unit (lb, stone, inches) gets no canonical value.
+                  .when(F.col("_bbr_default_concept").isNotNull()
+                        & (F.coalesce(F.col("_bbr_unit_ucum") == F.col("_bbr_default_ucum"), F.lit(False))
+                           | F.coalesce(F.col("unit_concept_id") == F.col("_bbr_default_concept"), F.lit(False))),
+                        F.lit("identity"))
+                  .when(F.col("_bbr_default_concept").isNull() & F.col("_bbr_unit_ucum").isNotNull(), F.lit("identity")))
+    df = df.withColumn("canonical_conversion", conversion)
+    conversion = F.col("canonical_conversion")
+    canonical = (F.when(conversion == "m->cm", value * 100).when(conversion == "g->kg", value / 1000)
+                 .when(conversion.isNotNull(), value))
+    canonical_ucum = (F.when(conversion == "m->cm", F.lit("cm")).when(conversion == "g->kg", F.lit("kg"))
+                      .when(conversion.isNotNull(), F.coalesce(F.col("_bbr_default_ucum"), F.col("_bbr_unit_ucum"))))
+    return (df.withColumn("value_canonical", canonical.cast("decimal(38,10)"))
+              .withColumn("canonical_ucum_code", canonical_ucum)
+              .withColumn("unit_map_rule_id",
+                          F.when(filled, F.lit(BBR_VITAL_DEFAULT_UNIT_RULE)).otherwise(F.col("unit_map_rule_id")))
+              .withColumn("unit_concept_id", F.when(filled, fill_concept).otherwise(F.col("unit_concept_id")))
+              .drop("_bbr_default_concept", "_bbr_default_ucum", "_bbr_filled", "_bbr_unit_ucum"))
+
+
+def _bbr_inherit_template_mapping(df):
+    """BBR-13 (Ben ruling 2026-11-03, option a): a continuous-order instance whose medication axis carries no code
+    takes its parent's (template order's) mapped medication fields through an equi-join on template_order_id; the
+    rule id gains ':inherited_from_template'. Today this fills 0 rows (instances are mapped as their parents): it is a
+    deterministic backstop. Only the parent's first component is read, so a row never multiplies."""
+    # The instance keeps its own component index/count: it receives one component, not the parent's set (review
+    # fix 11-03: a copied count of 2 on a single row would claim a sibling row that does not exist).
+    mapped = [c for c in axis_columns("medication")[3:]
+              if c not in ("medication_map_component_index", "medication_map_component_count")]
+    parents = (df.where(F.coalesce(F.col("medication_map_component_index"), F.lit(1)) == 1)
+               .where(F.col("medication_snomed_code").isNotNull() | F.col("medication_omop_concept_id").isNotNull())
+               .select(F.col("order_id").alias("_bbr_parent_id"), *[F.col(c).alias("_bbr_p_" + c) for c in mapped]))
+    df = df.join(parents, (F.col("order_role") == "instance") & (F.col("template_order_id") == F.col("_bbr_parent_id")),
+                 "left")
+    # Materialised: the writes below fill medication_snomed_code, which the decision reads.
+    df = df.withColumn("_bbr_inherit", F.col("_bbr_parent_id").isNotNull() & F.col("medication_snomed_code").isNull()
+                       & F.col("medication_omop_concept_id").isNull())
+    inherit = F.col("_bbr_inherit")
+    for column in mapped:
+        value = F.col("_bbr_p_" + column)
+        if column == "medication_map_rule_id":
+            value = F.concat(F.coalesce(value, F.lit("")), F.lit(":inherited_from_template"))
+        df = df.withColumn(column, F.when(inherit, value).otherwise(F.col(column)))
+    return df.drop("_bbr_parent_id", "_bbr_inherit", *["_bbr_p_" + c for c in mapped])
 
 
 def _cross_qc_finish(df, model_name, public_columns):
     """The per-row steps after the mapping chain, and the public column list."""
     if model_name == "imaging_exam":  # SDI_DICOM_MODALITY_V1: keyed on the row's linked PACS examination
         df = _sdi_imaging_modality(df)
-    return df.select(*public_columns)
+    if model_name == "condition":
+        # INSR_W2 W2.04 (L2380): the diagnosis arm carried ACTIVE_STATUS_CD (code set 48) with no display. Code values
+        # are unique across code sets, so the problem arm's LIFE_CYCLE_STATUS_CD values never match set 48.
+        df = _decode_display(df, "clinical_status_code", "clinical_status_display", 48)
+    if model_name == "allergy_intolerance":
+        # INSR_W2 W2.04 (L2411): severity code set 12022 decoded where bronze carried no SEVERITY_DESC.
+        df = _decode_display(df, "severity_code", "severity_display", 12022)
+    if model_name == "clinical_finding":
+        # INSR_W2 W2.04 (F14d, L2433): a cosine measured against no accepted target describes nothing published.
+        for axis in ("finding", "value"):
+            df = df.withColumn(f"{axis}_map_cosine",
+                               F.when(F.col(f"{axis}_target_code").isNotNull(), F.col(f"{axis}_map_cosine")))
+    if model_name == "vital_sign":  # BBR_FOLDIN_V1 (BBR-4): anthropometric default unit and canonical value
+        df = _bbr_vital_canonical(df)
+    if model_name == "medication_order":  # BBR_FOLDIN_V1 (BBR-13): uncoded instances inherit the parent mapping
+        df = _bbr_inherit_template_mapping(df)
+    # INSR_W2: canonical columns added by later releases are published through silver_value_policy.
+    import silver_value_policy as insr_value_policy
+    return df.select(*insr_value_policy.public_columns_for(model_name, public_columns, df.columns))
 
 
 # S3_DOMAIN_STAGES_V1
@@ -1518,139 +1298,34 @@ def _cross_qc_finish(df, model_name, public_columns):
 # the public MV joins its rows to the last stage. `inputs` are the non-axis columns the chain reads; an omission fails
 # at graph build, because a stage holds only the declared columns. pathology_result maps only its test axis this way:
 # its result axis keys on free-text values, so it stays per row.
-S3_DOMAIN_MODELS = {
-    "imaging_exam": {"axes": ("exam",), "inputs": ("source_code", "source_display", "source_coding_system")},
-    "medication_admin": {"axes": ("medication",), "inputs": ("_s3c_multum",)},
-    "medication_order": {"axes": ("medication",), "inputs": ("_s3c_multum",)},
-    "medication_dispense": {"axes": ("medication",), "inputs": ("_dmd_code",)},
-    "procedure": {"axes": ("procedure", "device"), "inputs": ("source_object", "implant_description")},
-    "vital_sign": {"axes": ("unit", "method", "body_site", "interpretation", "vital"),
-                   "inputs": ("unit_source_value", "method_display", "body_site_display", "interpretation_display")},
-    "pathology_result": {"axes": ("test",), "inputs": ()},
-    # FINDING_AXIS_EVENTCD_V1: ~27k distinct finding inputs over ~1.6bn rows; the value axis keys on answer text,
-    # so it stays per row.
-    "clinical_finding": {"axes": ("finding",), "inputs": ()},
-}
 
-S3_STAGE_JOIN_BUDGET = 3
 
 # variant_json_columns each domain was declared with; the public MV must pass the same.
-S3_DOMAIN_DECLARED = {}
 
 
-def _s3_domain_inputs(df, model_name):
-    """The columns a model's domain chain reads, sorted: every column of its axes, its declared inputs, and the
-    legacy SNOMED column of an axis when the rows already carry one."""
-    spec = S3_DOMAIN_MODELS[model_name]
-    columns = [c for axis in spec["axes"] for c in axis_columns(axis)] + list(spec["inputs"])
-    columns += [f"{axis}_legacy_snomed_code" for axis in spec["axes"] if f"{axis}_legacy_snomed_code" in df.columns]
-    missing = [c for c in columns if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"{model_name}: S3 domain inputs missing from the rows: {missing}")
-    return sorted(set(columns))
 
 
-def _s3_domain_key(columns):
-    """SHA-256 of the input values, nulls included, so equal inputs share one domain row."""
-    return F.sha2(F.to_json(F.struct(*[F.col(c) for c in columns]), {"ignoreNullFields": "false"}), 256)
 
 
-def _s3_domain_stages(model_name):
-    """The domain steps of a model, in chain order, packed into stages of at most S3_STAGE_JOIN_BUDGET joins."""
-    axes = S3_DOMAIN_MODELS[model_name]["axes"]
-    stages, current, joins = [], [], 0
-    for step in _s3_mapping_steps(model_name):
-        if step.axis not in axes:
-            continue
-        if current and joins + step.joins > S3_STAGE_JOIN_BUDGET:
-            stages.append(current)
-            current, joins = [], 0
-        current.append(step)
-        joins += step.joins
-    if current:
-        stages.append(current)
-    return stages
 
 
-def _s3_domain_stage_name(model_name, index):
-    """Published name of domain stage `index` (0 = the distinct inputs)."""
-    return _n(f"journey_clinical._s3_dom_{model_name}_{index}")
 
 
-def declare_s3_domain_stages(model_name, twin_name, variant_json_columns, public_columns, lifecycle_columns):
-    """S3_DOMAIN_STAGES_V1: declare the private domain stages a public clinical table joins to. Call once at
-    notebook level, with the arguments its public MV passes to _cross_qc_public."""
-    S3_DOMAIN_DECLARED[model_name] = dict(variant_json_columns)
-    stages = _s3_domain_stages(model_name)
-    names = [_s3_domain_stage_name(model_name, i) for i in range(len(stages) + 1)]
-
-    def distinct_inputs():
-        # One row per distinct mapping input of the prepared rows, with the split markers the chain fills in.
-        rows = _cross_qc_prepare(spark.read.table(_n(twin_name)), model_name, variant_json_columns,
-                                 public_columns, lifecycle_columns)
-        columns = _s3_domain_inputs(rows, model_name)
-        return (rows.select(*columns).distinct()
-                .withColumn("_s3d_key", _s3_domain_key(columns))
-                .withColumn("_s3d_split_axis", F.lit(None).cast("string"))
-                .withColumn("_s3d_split_identity", F.lit(None).cast("string"))
-                .withColumn("_s3d_split_quantities", F.lit(False)))
-
-    distinct_inputs.__name__ = f"_s3_dom_{model_name}_0"
-    materialized_view(name=names[0], refresh_policy="auto",
-                      comment=f"S3 mapping inputs of {model_name}: one row per distinct input, keyed by _s3d_key.")(distinct_inputs)
-    for index, stage in enumerate(stages, start=1):
-        def apply_stage(previous=names[index - 1], stage=stage):
-            # The next steps of the mapping chain, applied to the previous stage.
-            df = spark.read.table(previous)
-            for step in stage:
-                df = step.apply(df)
-            return df
-
-        apply_stage.__name__ = f"_s3_dom_{model_name}_{index}"
-        materialized_view(name=names[index], refresh_policy="auto",
-                          comment=f"S3 mapping chain of {model_name}, stage {index} of {len(stages)}.")(apply_stage)
 
 
-def _s3_domain_join(df, model_name):
-    """Give each row its mapped domain axes from the last domain stage, then apply the component splits the chain
-    recorded: a new event key from the source event key, and shared quantities cleared, as _s3_lookup_axis does."""
-    columns = _s3_domain_inputs(df, model_name)
-    domain = spark.read.table(_s3_domain_stage_name(model_name, len(_s3_domain_stages(model_name))))
-    rows = df.withColumn("_s3d_key", _s3_domain_key(columns))
-    rows = rows.drop(*[c for c in domain.columns if c != "_s3d_key" and c in rows.columns])
-    axes = S3_DOMAIN_MODELS[model_name]["axes"]
-    splits = any(s.allow_split for s in _s3_mapping_steps(model_name) if s.axis in axes)
-    if splits and "source_patient_event_key" not in rows.columns:
-        rows = rows.withColumn("source_patient_event_key", F.col("patient_event_key"))
-    df = rows.join(domain, "_s3d_key")
-    if splits:
-        split = F.col("_s3d_split_axis").isNotNull()
-        df = df.withColumn("patient_event_key", F.when(split, stable_id(
-            "s3b_component", F.col("source_patient_event_key"), F.col("_s3d_split_axis"), F.col("_s3d_split_identity")))
-            .otherwise(F.col("patient_event_key")))
-        for quantity in S3B_SHARED_QUANTITIES.get(model_name, ()):
-            if quantity in df.columns:
-                df = df.withColumn(quantity, F.when(
-                    F.col("_s3d_split_quantities"), F.lit(None).cast(df.schema[quantity].dataType),
-                ).otherwise(F.col(quantity)))
-    return df.drop("_s3d_key", "_s3d_split_axis", "_s3d_split_identity", "_s3d_split_quantities")
 
 
 def _cross_qc_public(df, model_name, variant_json_columns, public_columns, lifecycle_columns):
     # contract v2: lifecycle columns are validated here but never appended to the public parent.
-    # Read the internal stage and reconstruct the public schema: per-row preparation, the S3 mapping chain, then
-    # the per-row finish. S3_DOMAIN_STAGES_V1: models in S3_DOMAIN_MODELS take their domain axes from the domain
-    # stages and run only their remaining steps here.
+    # INSR R1 (mapping into bronze): no mapping chain in silver. Per-row preparation (lane STRUCT expansion), the
+    # component split the resolver recorded, then the per-row finish.
     df = _cross_qc_prepare(df, model_name, variant_json_columns, public_columns, lifecycle_columns)
-    steps = _s3_mapping_steps(model_name)
-    if model_name in S3_DOMAIN_MODELS:
-        assert S3_DOMAIN_DECLARED.get(model_name) == dict(variant_json_columns), \
-            f"{model_name}: declare_s3_domain_stages was not called with these variant_json_columns"
-        df = _s3_domain_join(df, model_name)
-        steps = [step for step in steps if step.axis not in S3_DOMAIN_MODELS[model_name]["axes"]]
-    for step in steps:
-        df = step.apply(df)
-    return _cross_qc_finish(df, model_name, public_columns)
+    for lane_id in R1L.lanes_of_model(model_name):
+        df = _r1_explode_components(df, model_name, lane_id)
+    # Each lane axis also publishes the key it was resolved by (Ben's 2026-11-01 ruling: gold's materialised tables
+    # join the per-key _mapping_admission MV on it). Additive; OMOP ignores it.
+    _r1_map_keys = [f"{R1L.LANES[l].axis}_map_key" for l in R1L.lanes_of_model(model_name)]
+    return _cross_qc_finish(df, model_name, list(public_columns) + [k for k in _r1_map_keys if k not in public_columns])
 
 
 
@@ -1770,7 +1445,7 @@ def _family_history_canonical_pregate():
                        "bronze.map_family_history", None),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_CONCEPT_ID, s.OMOP_CONCEPT_NAME, False,
                        "bronze.map_family_history", None),
-        ).alias("condition_code"),
+        ).alias("condition_code"), s["FHX_CONDITION_MAPPING"].alias("_r1_fhx_condition_mapping"), s["FHX_CONDITION_MAP_KEY"].alias("_r1_fhx_condition_map_key"), s["FHX_CONDITION_MAP_COMPONENTS_JSON"].alias("_r1_fhx_condition_components_json"),
         s.RELATION_CD.cast("string").alias("relationship_code"),
         s.RELATION_DESC.alias("relationship_display"),
         s.RELATION_TYPE_CD.cast("string").alias("relationship_type_code"),
@@ -1830,7 +1505,7 @@ def _presenting_complaint_canonical():
         F.lit("active").alias("record_status"), enc.REG_DT_TM.alias("record_status_effective_from"),
         F.lit(None).cast("timestamp").alias("record_status_effective_to"), F.date_format(enc.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"),
         enc.UPDT_DT_TM.alias("source_update_timestamp"), enc.ADC_UPDT.alias("loaded_at"),
-        F.lit(SRC_ENCOUNTER).alias("_source_table"), enc.ENCNTR_ID.cast("string").alias("_source_row_id"))
+        F.lit(SRC_ENCOUNTER).alias("_source_table"), enc.ENCNTR_ID.cast("string").alias("_source_row_id"), enc["COMPLAINT_MAPPING"].alias("_r1_complaint_mapping"), enc["COMPLAINT_MAP_KEY"].alias("_r1_complaint_map_key"), enc["COMPLAINT_MAP_COMPONENTS_JSON"].alias("_r1_complaint_components_json"))
 
     nom = read_source(SRC_NOMEN_EVENTS).where("EVENT_CD=3844529 AND SOURCE_STRING IS NOT NULL")
     grp = (read_source(SRC_NOMEN_EVENTS).where("EVENT_CD=467136611")
@@ -1854,7 +1529,7 @@ def _presenting_complaint_canonical():
         F.when(F.coalesce(nom.SOURCE_DELETED_IND, F.lit(False)), nom.ADC_UPDT).alias("record_status_effective_to"),
         F.date_format(nom.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"), nom.CE_UPDT_DT_TM.alias("source_update_timestamp"),
         nom.ADC_UPDT.alias("loaded_at"), F.lit(SRC_NOMEN_EVENTS).alias("_source_table"),
-        F.concat_ws(":", nom.EVENT_ID, nom.SEQUENCE_NBR).alias("_source_row_id"))
+        F.concat_ws(":", nom.EVENT_ID, nom.SEQUENCE_NBR).alias("_source_row_id"), nom["COMPLAINT_MAPPING"].alias("_r1_complaint_mapping"), nom["COMPLAINT_MAP_KEY"].alias("_r1_complaint_map_key"), nom["COMPLAINT_MAP_COMPONENTS_JSON"].alias("_r1_complaint_components_json"))
 
     txt = read_source(SRC_TEXT_EVENTS).where("EVENT_CD=3844529")
     ttext = txt.TEXT_RESULT
@@ -1874,10 +1549,15 @@ def _presenting_complaint_canonical():
         txt.RESULT_DT_TM.alias("record_status_effective_from"),
         F.when(F.coalesce(txt.SOURCE_DELETED_IND, F.lit(False)), txt.ADC_UPDT).alias("record_status_effective_to"),
         F.date_format(txt.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"), txt.ADC_UPDT.alias("source_update_timestamp"),
-        txt.ADC_UPDT.alias("loaded_at"), F.lit(SRC_TEXT_EVENTS).alias("_source_table"), txt.EVENT_ID.cast("string").alias("_source_row_id"))
+        txt.ADC_UPDT.alias("loaded_at"), F.lit(SRC_TEXT_EVENTS).alias("_source_table"), txt.EVENT_ID.cast("string").alias("_source_row_id"), txt["COMPLAINT_MAPPING"].alias("_r1_complaint_mapping"), txt["COMPLAINT_MAP_KEY"].alias("_r1_complaint_map_key"), txt["COMPLAINT_MAP_COMPONENTS_JSON"].alias("_r1_complaint_components_json"))
     return (rfv.unionByName(pick).unionByName(text)
             .withColumn("source_patient_event_key", F.col("patient_event_key"))
             .withColumn("complaint_text_normalised", F.col("source_code"))
+            # INSR_W2 W2.04 (L2982): free-text arms move their text to source_text; source_code stays a code.
+            .withColumn("source_text", F.when(F.col("source_object").isin(
+                "registration_reason_for_visit", "ed_presenting_complaint_text"), F.col("source_display")))
+            .withColumn("source_code", F.when(~F.col("source_object").isin(
+                "registration_reason_for_visit", "ed_presenting_complaint_text"), F.col("source_code")))
             .withColumn("event_end_datetime", F.lit(None).cast("timestamp"))
             .withColumn("event_end_datetime_local", F.lit(None).cast("timestamp"))
             .withColumn("_source_system", F.lit("millennium"))
@@ -1936,7 +1616,7 @@ def _condition_diagnosis_canonical_pregate():
                        "bronze.map_diagnosis", None),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_CONCEPT_ID, s.OMOP_CONCEPT_NAME, False,
                        "bronze.map_diagnosis", None),
-        ).alias("_condition_code_json"),
+        ).alias("_condition_code_json"), s["CONDITION_MAPPING"].alias("_r1_condition_mapping"), s["CONDITION_MAP_KEY"].alias("_r1_condition_map_key"), s["CONDITION_MAP_COMPONENTS_JSON"].alias("_r1_condition_components_json"),
         s.DIAG_TYPE_CD.cast("string").alias("category_code"),
         s.diag_type_desc.alias("category_display"),
         # DIAG_PRIORITY_V1: Millennium's ranking of the diagnosis, carried verbatim (0 = not ranked).
@@ -1976,6 +1656,33 @@ def _condition_diagnosis_canonical_pregate():
         s.ICD10_CODE.cast("string").alias("_icd10_code"), s.ICD10_TERM.alias("_icd10_display"),
         s.OMOP_CONCEPT_ID.cast("string").alias("_omop_code"), s.OMOP_CONCEPT_NAME.alias("_omop_display"),
     )
+
+# INSR_W2 W2.04: Millennium code values decoded through 3_lookup.mill.mill_code_value (unique per CODE_VALUE,
+# row tracking + CDF + DV). Each decoder is one code set, small enough to broadcast.
+SRC_MILL_CODE_VALUE = "3_lookup.mill.mill_code_value"
+
+
+def _code_value_decoder(code_set, prefix):
+    """CODE_VALUE -> DISPLAY for one Millennium code set, as columns <prefix>_code / <prefix>_display.
+
+    Read directly, not through read_source: its active-row rule drops ACTIVE_IND 0 code values, but a retired code
+    still names what historical facts recorded (W9.05 smoke: allergy severity 53323300 'Medium' is inactive)."""
+    return (spark.read.table(SOURCE_OVERRIDES.get(SRC_MILL_CODE_VALUE, SRC_MILL_CODE_VALUE))
+            .where(F.col("CODE_SET") == F.lit(code_set))
+            .select(F.col("CODE_VALUE").cast("bigint").alias(f"{prefix}_code"),
+                    F.col("DISPLAY").alias(f"{prefix}_display")))
+
+
+def _decode_display(df, code_column, display_column, code_set):
+    """Fill display_column from the code set when the source carried only the code (existing text wins)."""
+    prefix = f"_cv{code_set}"
+    cv = F.broadcast(_code_value_decoder(code_set, prefix))
+    # The code columns carry bronze DOUBLE codes rendered as strings ('3294.0', '5.33233E7'): a direct bigint cast
+    # misses the exponent form, so read the text as DOUBLE first (Java's double text round-trips exactly).
+    joined = df.join(cv, F.col(code_column).cast("double").cast("bigint") == F.col(f"{prefix}_code"), "left")
+    return (joined.withColumn(display_column, F.coalesce(F.col(display_column), F.col(f"{prefix}_display")))
+                  .drop(f"{prefix}_code", f"{prefix}_display"))
+
 
 def _condition_diagnosis_canonical():
     # Keep the normalized condition diagnosis rows that pass the existing source-code admission
@@ -2031,7 +1738,7 @@ def _condition_problem_canonical_pregate():
                        "bronze.map_problem", None),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_CONCEPT_ID, s.OMOP_CONCEPT_NAME, False,
                        "bronze.map_problem", None),
-        ).alias("_condition_code_json"),
+        ).alias("_condition_code_json"), s["CONDITION_MAPPING"].alias("_r1_condition_mapping"), s["CONDITION_MAP_KEY"].alias("_r1_condition_map_key"), s["CONDITION_MAP_COMPONENTS_JSON"].alias("_r1_condition_components_json"),
         s.CLASSIFICATION_CD.cast("string").alias("category_code"),
         s.classification_desc.alias("category_display"),
         # DIAG_PRIORITY_V1: problems have no diagnosis priorities; their RANKING_CD uses the same
@@ -2044,6 +1751,12 @@ def _condition_problem_canonical_pregate():
         s.CONFIRMATION_STATUS_CD.cast("string").alias("verification_status_code"),
         s.confirmation_status_desc.alias("verification_status_display"),
         s.ONSET_DT_TM.alias("onset_datetime"),
+        # INSR_W2 W2.19(b) (L931) and L4261: the life-cycle status date and the onset precision Millennium
+        # recorded (bronze already carries both; W2_19 probe: ONSET_DT_FLAG 100% filled on dated onsets).
+        s.LIFE_CYCLE_DT_TM.alias("clinical_status_effective_datetime"),
+        s.ONSET_DT_FLAG.cast("string").alias("onset_precision_flag"),
+        # ONSET_DT_CD 0 is the Millennium "no code" value (J5), published as NULL.
+        F.when(s.ONSET_DT_CD != 0, s.ONSET_DT_CD.cast("string")).alias("onset_precision_code"),
         F.when(ended, s.END_EFFECTIVE_DT_TM).alias("abatement_datetime"),
         F.lit(None).cast("string").alias("body_site_code"),
         F.lit(None).cast("string").alias("body_site_display"),
@@ -2136,7 +1849,7 @@ def _endobase_procedure_canonical_pregate():
         codeable_concept_json(
             coding_obj(F.lit("urn:barts:endobase:exam-type"), source_code,
                        source_display, True)
-        ).alias("_procedure_code_json"),
+        ).alias("_procedure_code_json"), s["PROCEDURE_MAPPING"].alias("_r1_procedure_mapping"), s["PROCEDURE_MAP_KEY"].alias("_r1_procedure_map_key"), s["PROCEDURE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_components_json"), s["PROCEDURE_DEVICE_MAPPING"].alias("_r1_procedure_device_mapping"), s["PROCEDURE_DEVICE_MAP_KEY"].alias("_r1_procedure_device_map_key"), s["PROCEDURE_DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_device_components_json"),
         status.alias("status_code"), status.alias("status_display"),
         performed.alias("performed_start"), performed_end.alias("performed_end"),
         F.lit(None).cast("string").alias("body_site_code"),
@@ -2227,7 +1940,7 @@ def _cc_procedure_canonical_pregate():
                 F.lit("http://fhir.hl7.org.uk/CodeSystem/OPCS-4"),
                 s.OPCS_Proc_Code.cast("string"), F.lit(None).cast("string"), True,
             )
-        ).alias("_procedure_code_json"),
+        ).alias("_procedure_code_json"), s["PROCEDURE_MAPPING"].alias("_r1_procedure_mapping"), s["PROCEDURE_MAP_KEY"].alias("_r1_procedure_map_key"), s["PROCEDURE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_components_json"), s["PROCEDURE_DEVICE_MAPPING"].alias("_r1_procedure_device_mapping"), s["PROCEDURE_DEVICE_MAP_KEY"].alias("_r1_procedure_device_map_key"), s["PROCEDURE_DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_device_components_json"),
         F.lit("completed").alias("status_code"),
         s.CC_TYPE_DESC.alias("status_display"),
         s.OPCS_Proc_Dt_CLEAN.alias("performed_start"),
@@ -2314,7 +2027,7 @@ def _maternity_diagnosis_canonical_pregate():
         codeable_concept_json(
             coding_obj(F.lit("http://snomed.info/sct"), F.col("s.DIAG"),
                        F.col("s.DIAG_SNOMED_DESC"), True)
-        ).alias("_condition_code_json"),
+        ).alias("_condition_code_json"), F.col("s.CONDITION_MAPPING").alias("_r1_condition_mapping"), F.col("s.CONDITION_MAP_KEY").alias("_r1_condition_map_key"), F.col("s.CONDITION_MAP_COMPONENTS_JSON").alias("_r1_condition_components_json"),
         F.col("s.DIAGSCHEME").alias("category_code"), F.lit("maternity diagnosis").alias("category_display"),
         # DIAG_PRIORITY_V1: the maternity feed carries no diagnosis ranking.
         F.lit(None).cast("bigint").alias("diag_priority"),
@@ -2360,10 +2073,27 @@ def _maternity_diagnosis_canonical():
     # rule.
     return _maternity_diagnosis_canonical_pregate().where(_usable_code(F.col("source_code")))
 
+def _mill_radiology_exam_grain(s, drop_doc):
+    """One Millennium radiology exam row per ORDER_ID among the mdoc (231) / Radiology (234) rows: Radiology first,
+    then mdoc, then lowest EVENT_ID. Rows of other classes and rows without an ORDER_ID are kept as they are.
+    drop_doc removes the DOC (224) report-document rows (off unless W2_08_probe shows they are the same exams)."""
+    event_class = F.col("EVENT_CLASS_CD").cast("bigint")
+    if drop_doc:
+        s = s.where(F.coalesce(event_class, F.lit(0)) != 224)
+    in_collapse = F.col("ORDER_ID").isNotNull() & event_class.isin(231, 234)
+    rank = Window.partitionBy("ORDER_ID").orderBy(
+        F.when(event_class == 234, 0).otherwise(1).asc(), F.col("EVENT_ID").asc_nulls_last())
+    kept = (s.where(in_collapse).withColumn("_exam_rn", F.row_number().over(rank))
+            .where("_exam_rn = 1").drop("_exam_rn"))
+    return kept.unionByName(s.where(~F.coalesce(in_collapse, F.lit(False))))
+
+
 def _mill_radiology_exam_canonical_pregate(integration=False):
     # Normalize mill radiology exam source rows before the downstream admission filter so
     # excluded evidence remains countable.
-    s = read_source(SRC_RADIOLOGY_EVENT)
+    # INSR_W2 W2.08 (L4500): one exam row per order. mdoc (231) and Radiology (234) are two representations of one
+    # exam: Radiology preferred. DOC-class (224) rows are dropped only when drop_doc (P7_L4500 / W2_08_arms).
+    s = _mill_radiology_exam_grain(read_source(SRC_RADIOLOGY_EVENT), drop_doc=False)
     event_id = stable_id("imaging_exam:mill", s.EVENT_ID)
     skey, ssys = subject_key_with_system(
         [("urn:cerner:person_id", s.PERSON_ID)], SRC_RADIOLOGY_EVENT, s.EVENT_ID
@@ -2394,7 +2124,7 @@ def _mill_radiology_exam_canonical_pregate(integration=False):
         codeable_concept(
             coding_obj(F.lit("urn:cerner:radiology-exam"), source_code,
                        s.EVENT_TITLE_TEXT, True)
-        ).alias("exam_code"),
+        ).alias("exam_code"), s["EXAM_MAPPING"].alias("_r1_exam_mapping"), s["EXAM_MAP_KEY"].alias("_r1_exam_map_key"), s["EXAM_MAP_COMPONENTS_JSON"].alias("_r1_exam_components_json"),
         status.alias("status_code"), s.REFERENCE_NBR.alias("accession_identifier"),
         F.lit(None).cast("string").alias("study_instance_uid"),
         s.NHSI_MODALITY_CATEGORY.alias("modality_code"),
@@ -2969,7 +2699,7 @@ CONDITION_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "condition_code",
+    "condition_code", '_r1_condition_mapping', '_r1_condition_map_key', '_r1_condition_components_json',
     "category_code",
     "category_display",
     # DIAG_PRIORITY_V1: diagnosis ranking.
@@ -3039,7 +2769,7 @@ PROCEDURE_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "procedure_code",
+    "procedure_code", '_r1_procedure_mapping', '_r1_procedure_map_key', '_r1_procedure_components_json', '_r1_procedure_device_mapping', '_r1_procedure_device_map_key', '_r1_procedure_device_components_json',
     "status_code",
     "status_display",
     "performed_start",
@@ -3104,6 +2834,7 @@ def _procedure_canonical_pregate():
         # contract v2: publish the Millennium procedure arm, PROCEDURE_ID, and native relationship ids
         F.lit("millennium_procedure").alias("source_object"),
         s.PROCEDURE_ID.cast("bigint").alias("procedure_id"),
+        s.PROCEDURE_DATE_BASIS.alias("procedure_date_basis"),  # INSR_W2 W2.20
         F.lit(None).cast("bigint").alias("endobase_exam_id"),
         F.lit(None).cast("bigint").alias("implant_event_id"),
         F.lit(None).cast("bigint").alias("implant_sequence"),
@@ -3130,7 +2861,7 @@ def _procedure_canonical_pregate():
                        "bronze.map_procedure", None),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_CONCEPT_ID, s.OMOP_CONCEPT_NAME, False,
                        "bronze.map_procedure", None),
-        ).alias("_procedure_code_json"),
+        ).alias("_procedure_code_json"), s["PROCEDURE_MAPPING"].alias("_r1_procedure_mapping"), s["PROCEDURE_MAP_KEY"].alias("_r1_procedure_map_key"), s["PROCEDURE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_components_json"), s["PROCEDURE_DEVICE_MAPPING"].alias("_r1_procedure_device_mapping"), s["PROCEDURE_DEVICE_MAP_KEY"].alias("_r1_procedure_device_map_key"), s["PROCEDURE_DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_device_components_json"),
         F.when(inactive, F.lit("stopped")).otherwise(F.lit("completed")).alias("status_code"),
         s.active_status_desc.alias("status_display"),
         F.coalesce(s.PROC_START_DT_TM, s.PROCEDURE_DT_TM_EFFECTIVE).alias("performed_start"),
@@ -3205,7 +2936,7 @@ def _implant_procedure_canonical_pregate():
         codeable_concept_json(
             coding_obj(F.lit("urn:barts:implant:primary-procedure"),
                        s.PRIMARY_PROCEDURE, s.PRIMARY_PROCEDURE, True)
-        ).alias("_procedure_code_json"),
+        ).alias("_procedure_code_json"), s["PROCEDURE_MAPPING"].alias("_r1_procedure_mapping"), s["PROCEDURE_MAP_KEY"].alias("_r1_procedure_map_key"), s["PROCEDURE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_components_json"), s["PROCEDURE_DEVICE_MAPPING"].alias("_r1_procedure_device_mapping"), s["PROCEDURE_DEVICE_MAP_KEY"].alias("_r1_procedure_device_map_key"), s["PROCEDURE_DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_device_components_json"),
         F.lit("completed").alias("status_code"), F.lit(None).cast("string").alias("status_display"),
         F.coalesce(s.IMPLANT_DT_TM, s.EVENT_START_DT_TM).alias("performed_start"),
         s.EVENT_END_DT_TM.alias("performed_end"),
@@ -3224,6 +2955,8 @@ def _implant_procedure_canonical_pregate():
         s.MANUFACTURER.alias("manufacturer"), F.coalesce(s.GS1_SERIAL_NUMBER, s.SERIAL_NUMBER).alias("serial_number"),
         s.GS1_BATCH_NUMBER.alias("batch_number"), s.UDI_DI.alias("udi_di"), s.UDI_STANDARD.alias("udi_standard"),
         s.QUANTITY_NUMERIC.cast("decimal(38,6)").alias("quantity"),
+        s.QUANTITY_PARSE_RULE.alias("quantity_parse_rule"),  # INSR_W2 W2.20
+        s.QUANTITY_PARSE_STATUS.alias("quantity_parse_status"),  # INSR_W2 W2.20
         F.lit("active").alias("record_status"),
         s.VALID_FROM_DT_TM.alias("record_status_effective_from"),
         F.lit(None).cast("timestamp").alias("record_status_effective_to"),
@@ -3308,7 +3041,7 @@ def _theatre_procedure_canonical_pregate():
         codeable_concept_json(
             coding_obj(F.lit("urn:cerner:surginet:procedure"), source_code,
                        source_display, True)
-        ).alias("_procedure_code_json"),
+        ).alias("_procedure_code_json"), s["PROCEDURE_MAPPING"].alias("_r1_procedure_mapping"), s["PROCEDURE_MAP_KEY"].alias("_r1_procedure_map_key"), s["PROCEDURE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_components_json"), s["PROCEDURE_DEVICE_MAPPING"].alias("_r1_procedure_device_mapping"), s["PROCEDURE_DEVICE_MAP_KEY"].alias("_r1_procedure_device_map_key"), s["PROCEDURE_DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_procedure_device_components_json"),
         status.alias("status_code"), c.CASE_STATUS.alias("status_display"),
         performed_start.alias("performed_start"), p.PROC_END_DT_TM.alias("performed_end"),
         F.lit(None).cast("string").alias("body_site_code"),
@@ -3469,6 +3202,7 @@ def _pathology_specimen_canonical():
     # Assemble normalized pathology specimen rows for downstream dataset builders, preserving
     # the existing source and identity rules.
     i = spark.read.table(_n("journey_events._pathology_accession_identity"))
+    i = _r1_attach_silver_arm(i, "_events_pathology_accession_identity", "specimen")
     event_id = stable_id("specimen:accession", F.col("pathology_accession_id"))
     skey, ssys = subject_key_with_system(
         [("urn:cerner:person_id", F.col("canonical_person_id")),
@@ -3487,7 +3221,10 @@ def _pathology_specimen_canonical():
         *_pathology_encounter(F.col("accession_encounter_id"), F.col("accession_encounter_conflict")),
         _clamped_ts(F.coalesce("sample_dt", "request_dt", "report_dt")).alias("event_datetime"),
         F.lit(None).cast("timestamp").alias("event_end_datetime"),
-        _clamped_ts(F.coalesce("sample_dt_local", "request_dt_local", "report_dt_local")).alias("event_datetime_local"),
+        # INSR_W2 W2.07 (L3636, P5f): the discipline=other branch arrives with no *_local values; derive them.
+        _clamped_ts(F.coalesce(F.coalesce("sample_dt_local", "request_dt_local", "report_dt_local"),
+                               F.from_utc_timestamp(F.coalesce("sample_dt", "request_dt", "report_dt"),
+                                                    "Europe/London"))).alias("event_datetime_local"),
         F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
         F.lit("urn:barts:pathology:specimen-type").alias("source_coding_system"),
         F.col("specimen_type_code").cast("string").alias("source_code"),
@@ -3498,7 +3235,7 @@ def _pathology_specimen_canonical():
             coding_obj(F.coalesce(F.col("specimen_type_source_system"), F.lit("urn:barts:pathology:specimen-type")),
                        F.col("specimen_type_code"),
                        F.coalesce(F.col("specimen_type_display"), F.col("specimen_type_code")), True),
-        ).alias("specimen_type"),
+        ).alias("specimen_type"), i["_r1_specimen_type_mapping"].alias("_r1_specimen_type_mapping"), i["_r1_specimen_type_map_key"].alias("_r1_specimen_type_map_key"), i["_r1_specimen_type_components_json"].alias("_r1_specimen_type_components_json"),
         F.when(F.col("specimen_type_code").isNotNull(),
                F.concat_ws("|", F.col("specimen_type_source_system"), F.upper(F.trim(F.col("specimen_type_code")))))
          .alias("_specimen_type_lookup_key"),
@@ -3668,7 +3405,7 @@ RESULT_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "result_code",
+    "result_code", '_r1_path_test_mapping', '_r1_path_test_map_key', '_r1_path_test_components_json', '_r1_path_result_mapping', '_r1_path_result_map_key', '_r1_path_result_components_json',
     "pathology_report_key",
     "specimen_key",
     "equivalence_group_key",
@@ -3689,6 +3426,7 @@ RESULT_SOURCE_COLUMNS = [
     "canonical_ucum_code",  # SDI_PATH_V1
     "value_canonical",  # SDI_PATH_V1
     "canonical_conversion",  # SDI_PATH_V1
+    "non_clinical_test_ind",  # BBR_FOLDIN_V1 BBR-9b
     "reference_range_low",
     "reference_range_high",
     "interpretation_code",
@@ -3712,6 +3450,23 @@ RESULT_SOURCE_COLUMNS = [
     "_result_omop_code",
     "_result_confidence_tier",
 ]
+
+# BBR_FOLDIN_V1 (design BBR-9b): LIMS housekeeping rows are not clinical tests: the SDI_PATH_PLACEHOLDER_V1
+# placeholder codes, internal / unused-code results, analyser and report bookkeeping, and eGFR input/factor rows
+# (pinned from the n1000 no-unit aggregate, bbr_review/evidence). Gold drops them (rows of no clinical use, ruling
+# 2026-10-29). Serum indices (lipaemia / haemolysis / icterus) are kept: they qualify other results (BBR-D1).
+BBR_NON_CLINICAL_TEST_CODES = ('INTERC', 'INTERCP', 'INTERM', 'INTERV', 'UNUC', 'UNUH', 'UNUM', 'UNUB', 'TARE', 'SFLG', 'P3', 'EPIA', 'ECRF', 'EPIC', 'AGE', 'GFR4', 'A2RT', 'RACK', 'FINN', 'REN1', 'REN3', 'RECA', 'RCPC', 'BC')
+BBR_NON_CLINICAL_DISPLAY_RE = '(?i)^zzz'
+
+
+def _bbr_non_clinical_test(s):
+    """BBR-9b: non_clinical_test_ind of one map_pathology row (pure twin: bbr_rules.non_clinical_python)."""
+    code = F.coalesce(s.code, s.EVENT_CD.cast("string"))
+    display = F.coalesce(s.description, s.EVENT_CD_DISPLAY)
+    return (F.coalesce(s.test_mapping_match_type == "placeholder_code", F.lit(False))
+            | F.coalesce(code.isin(*BBR_NON_CLINICAL_TEST_CODES), F.lit(False))
+            | F.coalesce(display.rlike(BBR_NON_CLINICAL_DISPLAY_RE), F.lit(False)))
+
 
 def _pathology_result_canonical_pregate(source_df=None, include_parent_links=False,
                                         include_accession_encounter=False):
@@ -3767,7 +3522,7 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
                        s.measurement_concept_name, False,
                        F.concat(F.lit("bronze.map_pathology:"),
                                 F.coalesce(s.test_confidence_tier, F.lit("unknown"))), None),
-        ).alias("_result_code_json"),
+        ).alias("_result_code_json"), s["PATH_TEST_MAPPING"].alias("_r1_path_test_mapping"), s["PATH_TEST_MAP_KEY"].alias("_r1_path_test_map_key"), s["PATH_TEST_MAP_COMPONENTS_JSON"].alias("_r1_path_test_components_json"), s["PATH_RESULT_MAPPING"].alias("_r1_path_result_mapping"), s["PATH_RESULT_MAP_KEY"].alias("_r1_path_result_map_key"), s["PATH_RESULT_MAP_COMPONENTS_JSON"].alias("_r1_path_result_components_json"),
         *(
             [
                 F.when(
@@ -3793,6 +3548,7 @@ def _pathology_result_canonical_pregate(source_df=None, include_parent_links=Fal
         s.unit_source_value, s.ucum_code, s.unit_concept_id.cast("string").alias("unit_concept_id"),
         s.test_mapping_match_type, s.test_mapping_rule_id, s.canonical_ucum_code,  # SDI_PATH_V1
         s.value_canonical.cast("decimal(38,10)").alias("value_canonical"), s.canonical_conversion,  # SDI_PATH_V1
+        _bbr_non_clinical_test(s).alias("non_clinical_test_ind"),  # BBR_FOLDIN_V1 BBR-9b
         s.range_low.cast("decimal(38,10)").alias("reference_range_low"),
         s.range_high.cast("decimal(38,10)").alias("reference_range_high"),
         s.normalcy.alias("interpretation_code"), s.result_growth_grade.alias("polarity"),
@@ -3868,6 +3624,21 @@ def _pathology_requested_test_canonical_pregate():
         F.when(F.col("source_system") == "TFC_LIMS", F.lit("urn:barts:pathology:wkg-tlc"))
         .otherwise(F.lit("urn:cerner:order-mnemonic"))
     )
+    # BBR_FOLDIN_V1 (SCT follow-up F-iv): test_snomed_code holds SNOMED concept IDs only. The NLMC codes and Barts
+    # panel ids TFC put in the same source field move to their own coded column (test_local_code, test_code_system)
+    # instead of being NULLed at gold. A panel id is '1' + the work-group code + a panel suffix.
+    raw_test = F.trim(F.col("test_snomed_code").cast("string"))
+    raw_test = F.when(raw_test != "", raw_test)
+    partition = F.substring(raw_test, -3, 2)
+    is_concept = (F.coalesce(raw_test.rlike("^[1-9][0-9]{5,17}$"), F.lit(False)) & partition.isin("00", "10")
+                  & ~((partition == "10") & (F.length(raw_test) < 11)))
+    local_system = (F.when(raw_test.rlike("^NLMC[0-9]+$"), F.lit('urn:nhs:nlmc'))
+                    .when(F.coalesce(raw_test.startswith(F.concat(F.lit("1"), F.col("wkg_code"))), F.lit(False)),
+                          F.lit('urn:barts:pathology:panel-id'))
+                    .otherwise(F.lit('urn:barts:pathology:test-code')))
+    test_snomed = F.when(is_concept, raw_test)
+    test_local = F.when(~is_concept, raw_test)
+    test_local_system = F.when(~is_concept & raw_test.isNotNull(), local_system)
     # contract v2: publish source_object, CERNER order_id when present, BIGINT identity columns, and key-named hashes
     return j.select(
         event_id.alias("patient_event_key"),
@@ -3888,7 +3659,8 @@ def _pathology_requested_test_canonical_pregate():
         F.col("wkg_code"), F.col("tlc_code"),
         F.col("order_id").cast("bigint").alias("order_id"), F.col("order_mnemonic"),
         F.col("raw_request_text"), F.col("test_description"),
-        F.col("test_snomed_code").cast("string").alias("test_snomed_code"),
+        test_snomed.alias("test_snomed_code"),  # BBR_FOLDIN_V1 F-iv: concept IDs only
+        test_local.alias("test_local_code"), test_local_system.alias("test_code_system"),  # BBR_FOLDIN_V1 F-iv
         F.col("test_omop_concept_id").cast("string").alias("test_omop_concept_id"),
         F.col("mapping_status"), F.col("request_ordinal").cast("long").alias("request_ordinal"),
         stable_id("specimen:accession", F.col("_resolved_accession_id")).alias("specimen_key"),
@@ -3904,7 +3676,7 @@ def _pathology_requested_test_canonical_pregate():
         F.lit("laboratory").alias("_source_system"),
         F.lit(SRC_PATHOLOGY_REQUESTED_TEST).alias("_source_table"),
         F.col("requested_test_occurrence_id").alias("_source_row_id"),
-        F.col("test_snomed_code").cast("string").alias("_test_snomed_code"),
+        test_snomed.alias("_test_snomed_code"),  # BBR_FOLDIN_V1 F-iv
         F.coalesce(F.col("test_description"), source_code).alias("_test_snomed_display"),
         F.col("test_omop_concept_id").cast("string").alias("_test_omop_code"),
         F.coalesce(F.col("test_description"), source_code).alias("_test_omop_display"),
@@ -4587,6 +4359,7 @@ def _registry_vital_canonical():
     # Assemble normalized registry vital rows for downstream dataset builders, preserving the
     # existing source and identity rules.
     s = spark.read.table(_n("journey_clinical._registry_observations")).where("route='measurement'")
+    s = _r1_attach_silver_arm(s, "_clinical_registry_observations", "vital_sign")
     return s.select(
         "patient_event_key", F.lit(None).cast("bigint").alias("event_id"),
         F.lit(None).cast("string").alias("doc_response_key"), F.lit(None).cast("bigint").alias("source_dcp_forms_activity_id"),
@@ -4596,7 +4369,7 @@ def _registry_vital_canonical():
         "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         F.lit("urn:barts:registry-field").alias("source_coding_system"), F.col("registry_field_id").alias("source_code"),
         F.col("question_display").alias("source_display"),
-        codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("vital_code"),
+        codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("vital_code"), s["_r1_vital_mapping"].alias("_r1_vital_mapping"), s["_r1_vital_map_key"].alias("_r1_vital_map_key"), s["_r1_vital_components_json"].alias("_r1_vital_components_json"), s["_r1_vital_unit_mapping"].alias("_r1_vital_unit_mapping"), s["_r1_vital_unit_map_key"].alias("_r1_vital_unit_map_key"), s["_r1_vital_unit_components_json"].alias("_r1_vital_unit_components_json"), s["_r1_vital_method_mapping"].alias("_r1_vital_method_mapping"), s["_r1_vital_method_map_key"].alias("_r1_vital_method_map_key"), s["_r1_vital_method_components_json"].alias("_r1_vital_method_components_json"), s["_r1_vital_body_site_mapping"].alias("_r1_vital_body_site_mapping"), s["_r1_vital_body_site_map_key"].alias("_r1_vital_body_site_map_key"), s["_r1_vital_body_site_components_json"].alias("_r1_vital_body_site_components_json"), s["_r1_vital_interpretation_mapping"].alias("_r1_vital_interpretation_mapping"), s["_r1_vital_interpretation_map_key"].alias("_r1_vital_interpretation_map_key"), s["_r1_vital_interpretation_components_json"].alias("_r1_vital_interpretation_components_json"),
         "value_number", F.col("answer_text").alias("value_text"), F.col("unit").alias("unit_source_value"),
         F.lit(None).cast("string").alias("unit_concept_id"), F.lit(None).cast("decimal(38,10)").alias("reference_range_low"),
         F.lit(None).cast("decimal(38,10)").alias("reference_range_high"), F.lit(None).cast("string").alias("method_code"),
@@ -4634,7 +4407,7 @@ VITAL_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "vital_code",
+    "vital_code", '_r1_vital_mapping', '_r1_vital_map_key', '_r1_vital_components_json', '_r1_vital_unit_mapping', '_r1_vital_unit_map_key', '_r1_vital_unit_components_json', '_r1_vital_method_mapping', '_r1_vital_method_map_key', '_r1_vital_method_components_json', '_r1_vital_body_site_mapping', '_r1_vital_body_site_map_key', '_r1_vital_body_site_components_json', '_r1_vital_interpretation_mapping', '_r1_vital_interpretation_map_key', '_r1_vital_interpretation_components_json',
     "value_number",
     "value_text",
     "unit_source_value",
@@ -4708,7 +4481,7 @@ def _numeric_vital_canonical():
                        F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY), True),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_MANUAL_CONCEPT_ID,
                        s.OMOP_MANUAL_CONCEPT_NAME, False, "bronze.map_numeric_events", None),
-        ).alias("vital_code"),
+        ).alias("vital_code"), s["VITAL_MAPPING"].alias("_r1_vital_mapping"), s["VITAL_MAP_KEY"].alias("_r1_vital_map_key"), s["VITAL_MAP_COMPONENTS_JSON"].alias("_r1_vital_components_json"), s["VITAL_UNIT_MAPPING"].alias("_r1_vital_unit_mapping"), s["VITAL_UNIT_MAP_KEY"].alias("_r1_vital_unit_map_key"), s["VITAL_UNIT_MAP_COMPONENTS_JSON"].alias("_r1_vital_unit_components_json"), s["VITAL_METHOD_MAPPING"].alias("_r1_vital_method_mapping"), s["VITAL_METHOD_MAP_KEY"].alias("_r1_vital_method_map_key"), s["VITAL_METHOD_MAP_COMPONENTS_JSON"].alias("_r1_vital_method_components_json"), s["VITAL_BODY_SITE_MAPPING"].alias("_r1_vital_body_site_mapping"), s["VITAL_BODY_SITE_MAP_KEY"].alias("_r1_vital_body_site_map_key"), s["VITAL_BODY_SITE_MAP_COMPONENTS_JSON"].alias("_r1_vital_body_site_components_json"), s["VITAL_INTERPRETATION_MAPPING"].alias("_r1_vital_interpretation_mapping"), s["VITAL_INTERPRETATION_MAP_KEY"].alias("_r1_vital_interpretation_map_key"), s["VITAL_INTERPRETATION_MAP_COMPONENTS_JSON"].alias("_r1_vital_interpretation_components_json"),
         s.NUMERIC_RESULT.cast("decimal(38,10)").alias("value_number"),
         s.RESULT_TEXT_EFFECTIVE.alias("value_text"),
         F.coalesce(s.UNIT_OF_MEASURE_DISPLAY, s.RESULT_UNITS_DISPLAY).alias("unit_source_value"),
@@ -4743,7 +4516,8 @@ def _numeric_vital_canonical():
     )
 
 
-PROMOTED_VITAL_STAGE_COLUMNS = [c for c in VITAL_STAGE_COLUMNS if c != "vital_code"]
+# INSR R1: the producer has no lane columns; _r1_attach_silver_arm adds them when _promoted_vital_from_stage reads.
+PROMOTED_VITAL_STAGE_COLUMNS = [c for c in VITAL_STAGE_COLUMNS if c != "vital_code" and not c.startswith("_r1_")]
 
 
 
@@ -4752,6 +4526,7 @@ def _promoted_vital_from_stage():
     # Read promoted vital-sign rows and restore their source coding struct for the common vital-
     # sign projection.
     s = spark.read.table(_n("journey_clinical._promoted_vital_sign_primitive"))
+    s = _r1_attach_silver_arm(s, "_clinical_promoted_vital_sign_primitive", "vital_sign")
     return s.withColumn(
         "vital_code",
         codeable_concept(
@@ -4798,7 +4573,7 @@ SCORE_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "score_code",
+    "score_code", '_r1_score_mapping', '_r1_score_map_key', '_r1_score_components_json',
     "score_name",
     "value_number",
     "value_text",
@@ -4878,7 +4653,7 @@ def _numeric_score_canonical():
                        F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY), True),
             coding_obj(F.lit("urn:omop:concept_id"), s.OMOP_MANUAL_CONCEPT_ID,
                        s.OMOP_MANUAL_CONCEPT_NAME, False, "bronze.map_numeric_events", None),
-        ).alias("score_code"),
+        ).alias("score_code"), s["SCORE_MAPPING"].alias("_r1_score_mapping"), s["SCORE_MAP_KEY"].alias("_r1_score_map_key"), s["SCORE_MAP_COMPONENTS_JSON"].alias("_r1_score_components_json"),
         F.coalesce(s.OMOP_MANUAL_CONCEPT_NAME, s.EVENT_LABEL, s.EVENT_CD_DISPLAY).alias("score_name"),
         s.NUMERIC_RESULT.cast("decimal(38,10)").alias("value_number"),
         s.RESULT_TEXT_EFFECTIVE.alias("value_text"),
@@ -4911,7 +4686,7 @@ def _numeric_score_canonical():
 
 
 PROMOTED_SCORE_STAGE_COLUMNS = [
-    c for c in SCORE_STAGE_COLUMNS if c != "score_code"
+    c for c in SCORE_STAGE_COLUMNS if c != "score_code" and not c.startswith("_r1_")  # INSR R1: see vital
 ]
 
 
@@ -4921,6 +4696,7 @@ def _promoted_score_from_stage():
     # Read promoted score rows and restore their source coding struct for the common score
     # projection.
     s = spark.read.table(_n("journey_clinical._promoted_clinical_score_primitive"))
+    s = _r1_attach_silver_arm(s, "_clinical_promoted_clinical_score_primitive", "clinical_score")
     return (
         s.withColumn(
             "score_code",
@@ -5028,7 +4804,7 @@ def _medication_dispense_canonical_pregate():
             coding_obj(F.lit("urn:jac:drug-id"), source_code, source_display, True),
             coding_obj(F.lit("http://snomed.info/sct"), s.DMD_VTM_CODE, s.DMD_VTM_NAME,
                        False, "bronze.map_pharmacy_issue", None),
-        ).alias("medication_code"),
+        ).alias("medication_code"), s["MED_DISPENSE_MAPPING"].alias("_r1_med_dispense_mapping"), s["MED_DISPENSE_MAP_KEY"].alias("_r1_med_dispense_map_key"), s["MED_DISPENSE_MAP_COMPONENTS_JSON"].alias("_r1_med_dispense_components_json"),
         F.when(retracted, F.lit("stopped")).otherwise(F.lit("completed"))
         .alias("status_code"),
         s.ISSUE_TYPE.alias("issue_type"), s.ISSUE_CATEGORY.alias("issue_category"),
@@ -5108,7 +4884,7 @@ def _coded_finding_canonical():
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
             coding_obj(F.lit("urn:cerner:code_value"), s.EVENT_CD, event_display, True)
-        ).alias("finding_code"),
+        ).alias("finding_code"), s["FINDING_MAPPING"].alias("_r1_finding_mapping"), s["FINDING_MAP_KEY"].alias("_r1_finding_map_key"), s["FINDING_MAP_COMPONENTS_JSON"].alias("_r1_finding_components_json"), s["FINDING_VALUE_MAPPING"].alias("_r1_finding_value_mapping"), s["FINDING_VALUE_MAP_KEY"].alias("_r1_finding_value_map_key"), s["FINDING_VALUE_MAP_COMPONENTS_JSON"].alias("_r1_finding_value_components_json"),
         F.lit("coded").alias("finding_kind"),
         F.coalesce(s.DESCRIPTOR, s.RESULT_VAL).alias("value_text"),
         F.lit(None).cast("timestamp").alias("value_datetime"),
@@ -5185,7 +4961,7 @@ def _nomen_finding_canonical():
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
             coding_obj(F.lit("urn:cerner:code_value"), s.EVENT_CD, event_display, True)
-        ).alias("finding_code"),
+        ).alias("finding_code"), s["FINDING_MAPPING"].alias("_r1_finding_mapping"), s["FINDING_MAP_KEY"].alias("_r1_finding_map_key"), s["FINDING_MAP_COMPONENTS_JSON"].alias("_r1_finding_components_json"), s["FINDING_VALUE_MAPPING"].alias("_r1_finding_value_mapping"), s["FINDING_VALUE_MAP_KEY"].alias("_r1_finding_value_map_key"), s["FINDING_VALUE_MAP_COMPONENTS_JSON"].alias("_r1_finding_value_components_json"),
         F.lit("nomenclature").alias("finding_kind"),
         s.SOURCE_STRING.alias("value_text"), F.lit(None).cast("timestamp").alias("value_datetime"),
         value_code.alias("value_code"), value_display.alias("value_display"),
@@ -5229,7 +5005,10 @@ def _date_finding_canonical():
     skey, ssys = subject_key_with_system(
         [("urn:cerner:person_id", s.PERSON_ID)], SRC_DATE_EVENTS, natural
     )
-    event_time = F.coalesce(s.RESULT_DT_TM, s.PERFORMED_DT_TM,
+    # INSR_W2 W2.07 (J4, L2051): a time-only result (placeholder date 2000-01-01) is not the event time; the
+    # performed/end/start clocks follow. The journey-link members derived from these events move with it.
+    from silver_value_policy import drop_time_only
+    event_time = F.coalesce(drop_time_only(s.RESULT_DT_TM), s.PERFORMED_DT_TM,
                             s.EVENT_END_DT_TM, s.EVENT_START_DT_TM)
     event_display = F.coalesce(s.EVENT_LABEL, s.EVENT_CD_DISPLAY, s.EVENT_TITLE_TEXT, s.EVENT_TAG)
     ended_at = F.least(s.DATE_RESULT_VALID_UNTIL_DT_TM, s.CLINICAL_EVENT_VALID_UNTIL_DT_TM)
@@ -5248,13 +5027,14 @@ def _date_finding_canonical():
          .alias("identity_status"),
         s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"), s.EVENT_END_DT_TM.alias("event_end_datetime"),
-        F.coalesce(s.RESULT_DT_TM_LOCAL, s.PERFORMED_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL, s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),
+        F.coalesce(drop_time_only(s.RESULT_DT_TM_LOCAL), s.PERFORMED_DT_TM_LOCAL, s.EVENT_END_DT_TM_LOCAL,
+                   s.EVENT_START_DT_TM_LOCAL).alias("event_datetime_local"),  # INSR_W2 W2.07
         s.EVENT_END_DT_TM_LOCAL.alias("event_end_datetime_local"),
         F.lit("urn:cerner:code_value").alias("source_coding_system"),
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
             coding_obj(F.lit("urn:cerner:code_value"), s.EVENT_CD, event_display, True)
-        ).alias("finding_code"),
+        ).alias("finding_code"), s["FINDING_MAPPING"].alias("_r1_finding_mapping"), s["FINDING_MAP_KEY"].alias("_r1_finding_map_key"), s["FINDING_MAP_COMPONENTS_JSON"].alias("_r1_finding_components_json"), s["FINDING_VALUE_MAPPING"].alias("_r1_finding_value_mapping"), s["FINDING_VALUE_MAP_KEY"].alias("_r1_finding_value_map_key"), s["FINDING_VALUE_MAP_COMPONENTS_JSON"].alias("_r1_finding_value_components_json"),
         F.lit("date").alias("finding_kind"), F.lit(None).cast("string").alias("value_text"),
         s.RESULT_DT_TM.alias("value_datetime"), F.lit(None).cast("string").alias("value_code"),
         F.lit(None).cast("string").alias("value_display"),
@@ -5324,7 +5104,7 @@ def _text_finding_canonical():
         s.EVENT_CD.cast("string").alias("source_code"), event_display.alias("source_display"),
         codeable_concept(
             coding_obj(F.lit("urn:cerner:code_value"), s.EVENT_CD, event_display, True)
-        ).alias("finding_code"),
+        ).alias("finding_code"), s["FINDING_MAPPING"].alias("_r1_finding_mapping"), s["FINDING_MAP_KEY"].alias("_r1_finding_map_key"), s["FINDING_MAP_COMPONENTS_JSON"].alias("_r1_finding_components_json"), s["FINDING_VALUE_MAPPING"].alias("_r1_finding_value_mapping"), s["FINDING_VALUE_MAP_KEY"].alias("_r1_finding_value_map_key"), s["FINDING_VALUE_MAP_COMPONENTS_JSON"].alias("_r1_finding_value_components_json"),
         F.lit("text").alias("finding_kind"), s.TEXT_RESULT.alias("value_text"),
         F.lit(None).cast("timestamp").alias("value_datetime"),
         F.lit(None).cast("string").alias("value_code"),
@@ -5469,7 +5249,7 @@ def _imaging_exam_canonical_pregate(integration=False):
         codeable_concept(
             coding_obj(F.lit("urn:sectra:examination-code"), source_code,
                        source_display, True)
-        ).alias("exam_code"),
+        ).alias("exam_code"), s["EXAM_MAPPING"].alias("_r1_exam_mapping"), s["EXAM_MAP_KEY"].alias("_r1_exam_map_key"), s["EXAM_MAP_COMPONENTS_JSON"].alias("_r1_exam_components_json"),
         F.when(retracted, F.lit("cancelled")).otherwise(F.lit("available"))
         .alias("status_code"),
         s.MILL_LINK_REF.alias("accession_identifier"),
@@ -5929,6 +5709,8 @@ DOCUMENT_SOURCE_COLUMNS = [
     "author_role",
     "service_id",
     "status_code",
+    "result_status_code",  # BBR_FOLDIN_V1 BBR-17
+    "result_status_display",  # BBR_FOLDIN_V1 BBR-17
     "version_id",
     "document_thread_key",
     "supersedes_document_key",
@@ -6368,6 +6150,8 @@ def _document_lane(df):
         "pacs_report_id": "bigint",
         "endobase_exam_id": "bigint",
         "report_version_id": "string",
+        "result_status_code": "string",  # BBR_FOLDIN_V1 BBR-17: arms with no result status
+        "result_status_display": "string",
     }.items():
         if name not in out.columns:
             out = out.withColumn(name, F.lit(None).cast(data_type))
@@ -6375,7 +6159,9 @@ def _document_lane(df):
     for name, data_type in private_types.items():
         if name not in out.columns:
             out = out.withColumn(name, F.lit(None).cast(data_type))
-    return out
+    # BBR_FOLDIN_V1 (BBR-17): a result status that arrived as a code only is decoded (code set 8); existing
+    # displays (mill_blob carries EVENT_RESULT_STATUS_DISPLAY) win.
+    return _decode_display(out, "result_status_code", "result_status_display", 8)
 
 def _hygiene_text(text, strip_controls):
     # Remove the configured control characters only when the caller enables cleaning for that
@@ -6554,6 +6340,8 @@ def _text_document_canonical():
         F.lit("performer").alias("author_role"),
         F.lit(None).cast("string").alias("service_id"),
         F.col("result_status_code").alias("status_code"),
+        F.col("result_status_code").cast("string").alias("result_status_code"),  # BBR_FOLDIN_V1 BBR-17
+        F.col("result_status_display").alias("result_status_display"),  # BBR_FOLDIN_V1 BBR-17
         F.col("_source_row_id").alias("version_id"),
         F.col("value_text").alias("document_text"),
         F.lit("[]").alias("_sections_json"),
@@ -6650,6 +6438,21 @@ def _mill_blob_document_canonical():
         F.col("PERSON_ID").alias("_context_person_id"),
     ).alias("e")
     s = b.join(e, b.ENCNTR_ID == e._context_encounter_id, "left")
+    # BLOB_IDENTITY_V1: the blob row's ENCNTR_ID is copied from raw mill_ce_blob and is sometimes NULL, stale,
+    # or an encounter that is no longer active. Blob 5:Labels carries the clinical event's own encounter and
+    # person (EVENT_ENCNTR_ID / EVENT_PERSON_ID). Resolution order, first match wins:
+    #   1. blob encounter in active map_encounter   (unchanged: every row that linked before links the same way)
+    #   2. clinical event's encounter in active map_encounter
+    #   3. clinical event's person directly (encounter kept as supplied, may be inactive; 0 = no encounter)
+    ev_enc = read_source(SRC_ENCOUNTER).select(
+        F.col("ENCNTR_ID").alias("_event_context_encounter_id"),
+        F.col("PERSON_ID").alias("_event_context_person_id"),
+    ).alias("ev_enc")
+    s = s.join(ev_enc, b.EVENT_ENCNTR_ID == ev_enc._event_context_encounter_id, "left")
+    resolved_person = F.coalesce(e._context_person_id, ev_enc._event_context_person_id, b.EVENT_PERSON_ID)
+    encounter_ref = (F.when(e._context_person_id.isNotNull(), b.ENCNTR_ID)
+                     .when(ev_enc._event_context_person_id.isNotNull(), b.EVENT_ENCNTR_ID)
+                     .otherwise(F.coalesce(F.when(b.ENCNTR_ID != 0, b.ENCNTR_ID), b.EVENT_ENCNTR_ID)))
     natural = F.concat_ws(
         ":", b.EVENT_ID.cast("string"), b.UPDT_CNT.cast("string"),
         F.date_format(b.VALID_FROM_DT_TM, "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
@@ -6658,7 +6461,7 @@ def _mill_blob_document_canonical():
         "document:mill_blob", b.EVENT_ID, b.UPDT_CNT, b.VALID_FROM_DT_TM
     )
     skey, ssys = subject_key_with_system(
-        [("urn:cerner:person_id", e._context_person_id)], SRC_MILL_BLOB_TEXT, natural
+        [("urn:cerner:person_id", resolved_person)], SRC_MILL_BLOB_TEXT, natural
     )
     text_value = b.BLOB_TEXT
     anon_fallback = F.lit(False)
@@ -6692,10 +6495,10 @@ def _mill_blob_document_canonical():
     return s.select(
         event_id.alias("patient_event_id"), event_id.alias("fact_row_id"),
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
-        e._context_person_id.cast("string").alias("person_id"),
-        F.when(e._context_person_id.isNotNull(), F.lit("resolved"))
+        resolved_person.cast("string").alias("person_id"),
+        F.when(resolved_person.isNotNull(), F.lit("resolved"))
          .otherwise(F.lit("unresolved")).alias("identity_status"),
-        b.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        encounter_ref.cast("bigint").alias("encounter_id"),
         event_time.alias("event_datetime"),
         F.when(ended, b.VALID_UNTIL_DT_TM).alias("event_end_datetime"),
         F.coalesce(b.CLINSIG_DT_TM_LOCAL, F.coalesce(b.VALID_FROM_DT_TM_LOCAL, b.UPDT_DT_TM_LOCAL, b.ADC_UPDT_LOCAL)).alias("event_datetime_local"),
@@ -6719,6 +6522,8 @@ def _mill_blob_document_canonical():
         F.when(performed_id.isNotNull(), F.lit("performer"))
          .when(updater_id.isNotNull(), F.lit("updater")).alias("author_role"),
         F.lit(None).cast("string").alias("service_id"), b.STATUS.alias("status_code"),
+        b.EVENT_RESULT_STATUS_CD.cast("string").alias("result_status_code"),  # BBR_FOLDIN_V1 BBR-17
+        b.EVENT_RESULT_STATUS_DISPLAY.alias("result_status_display"),  # BBR_FOLDIN_V1 BBR-17
         natural.alias("version_id"),
         b.EVENT_ID.cast("bigint").alias("event_id"),
         b.UPDT_CNT.cast("bigint").alias("update_count"),
@@ -6769,7 +6574,9 @@ def _mill_blob_document_canonical():
          .alias("_verified_datetime"),
         organization_native_id.alias("_source_organization_native_id"),
         F.when(e._context_person_id.isNotNull(), F.lit("encounter_join"))
-         .when(b.ENCNTR_ID.isNotNull(), F.lit("direct"))
+         .when(ev_enc._event_context_person_id.isNotNull(), F.lit("event_encounter_join"))
+         .when(b.EVENT_PERSON_ID.isNotNull(), F.lit("event_person"))
+         .when(encounter_ref.isNotNull(), F.lit("direct"))
          .otherwise(F.lit("none")).alias("_linkage_route"),
         stable_id("document_thread:mill_blob", blob_thread_key)
          .alias("_document_thread_id"),
@@ -7175,6 +6982,26 @@ def _referral_canonical():
         s.REFERRING_FACILITY_CD.alias("referring_facility_code"),
         s.REFERRING_FACILITY_DESC.alias("referring_facility_display"),
         s.REFERRED_BY_ORG_ID.cast("long").alias("referred_by_org_id"),
+        s.REFERRED_BY_PRID.alias("referred_by_prid"),  # INSR_W2 W2.20
+        s.LOCAL_PATIENT_ID.alias("local_patient_id"),  # INSR_W2 W2.20
+        s.NHS_NUMBER.alias("nhs_number"),  # INSR_W2 W2.20
+        s.REFERRAL_REASON.alias("referral_reason"),  # INSR_W2 W2.20
+        s.REFERRAL_COMMENTS.alias("referral_comments"),  # INSR_W2 W2.20
+        s.REFERRED_BY_ORGANISATION.alias("referred_by_organisation"),  # INSR_W2 W2.20
+        s.ERS_LOCAL_PATIENT_ID.alias("ers_local_patient_id"),  # INSR_W2 W2.20
+        s.ERS_NHS_NUMBER.alias("ers_nhs_number"),  # INSR_W2 W2.20
+        s.ERS_PATIENT_NAME.alias("ers_patient_name"),  # INSR_W2 W2.20
+        s.ERS_REFERRAL_REASON.alias("ers_referral_reason"),  # INSR_W2 W2.20
+        s.ERS_REFERRAL_COMMENTS.alias("ers_referral_comments"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_BY_ORGANISATION.alias("ers_referred_by_organisation"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_BY_TEAM_NAME.alias("ers_referred_by_team_name"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_TO_TEAM_NAME.alias("ers_referred_to_team_name"),  # INSR_W2 W2.20
+        s.ERS_LEAD_CLINICIAN_FORENAME.alias("ers_lead_clinician_forename"),  # INSR_W2 W2.20
+        s.ERS_LEAD_CLINICIAN_SURNAME.alias("ers_lead_clinician_surname"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_BY_CARE_PROVIDER_FORENAME.alias("ers_referred_by_care_provider_forename"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_BY_CARE_PROVIDER_SURNAME.alias("ers_referred_by_care_provider_surname"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_TO_CARE_PROVIDER_FORENAME.alias("ers_referred_to_care_provider_forename"),  # INSR_W2 W2.20
+        s.ERS_REFERRED_TO_CARE_PROVIDER_SURNAME.alias("ers_referred_to_care_provider_surname"),  # INSR_W2 W2.20
         s.BOOKING_TYPE_CD.alias("booking_type_code"),
         s.BOOKING_TYPE_DESC.alias("booking_type_display"),
         s.ADMIN_CATEGORY_CD.alias("admin_category_code"),
@@ -7512,7 +7339,7 @@ def _allergy_canonical_pregate():
             coding_obj(source_system, source_code, source_display, True),
             coding_obj(F.lit("http://snomed.info/sct"), s.SUBSTANCE_SNOMED_CODE,
                        source_display, False, "bronze.map_allergy", None),
-        ).alias("substance_code"),
+        ).alias("substance_code"), s["ALLERGY_SUBSTANCE_MAPPING"].alias("_r1_allergy_substance_mapping"), s["ALLERGY_SUBSTANCE_MAP_KEY"].alias("_r1_allergy_substance_map_key"), s["ALLERGY_SUBSTANCE_MAP_COMPONENTS_JSON"].alias("_r1_allergy_substance_components_json"),
         s.SUBSTANCE_TYPE_CD.cast("string").alias("substance_type_code"),
         s.SUBSTANCE_TYPE_DESC.alias("substance_type_display"),
         s.REACTION_CLASS_CD.cast("string").alias("reaction_class_code"),
@@ -7589,6 +7416,23 @@ def _transfusion_canonical_pregate():
         s.BLOOD_UNIT_GROUP.alias("blood_unit_group"),
         s.PATIENT_BLOOD_GROUP.alias("patient_blood_group"),
         s.END_QUANTITY_VALUE.cast("decimal(38,6)").alias("quantity_value"),
+        s.END_QUANTITY_UNIT_INFERRED.alias("end_quantity_unit_inferred"),  # INSR_W2 W2.20
+        s.END_QUANTITY_ML.alias("end_quantity_ml"),  # INSR_W2 W2.20
+        s.QUANTITY_UNIT_RULE.alias("quantity_unit_rule"),  # INSR_W2 W2.20
+        s.ISBT_PRODUCT_CONCEPT_ID.alias("isbt_product_concept_id"),  # INSR_W2 W2.20
+        s.ISBT_PRODUCT_CONCEPT_NAME.alias("isbt_product_concept_name"),  # INSR_W2 W2.20
+        s.ISBT_MAPPING_METHOD.alias("isbt_mapping_method"),  # INSR_W2 W2.20
+        s.ISBT_MAPPING_RULE_ID.alias("isbt_mapping_rule_id"),  # INSR_W2 W2.20
+        s.ISBT_MAPPING_MODEL.alias("isbt_mapping_model"),  # INSR_W2 W2.20
+        s.ISBT_MAPPING_SCORE.alias("isbt_mapping_score"),  # INSR_W2 W2.20
+        s.PRODUCT_MAPPING_METHOD.alias("product_mapping_method"),  # INSR_W2 W2.20
+        s.PRODUCT_MAPPING_RULE_ID.alias("product_mapping_rule_id"),  # INSR_W2 W2.20
+        s.UNIT_GROUP_MAPPING_METHOD.alias("unit_group_mapping_method"),  # INSR_W2 W2.20
+        s.UNIT_GROUP_MAPPING_RULE_ID.alias("unit_group_mapping_rule_id"),  # INSR_W2 W2.20
+        s.PATIENT_GROUP_MAPPING_METHOD.alias("patient_group_mapping_method"),  # INSR_W2 W2.20
+        s.PATIENT_GROUP_MAPPING_RULE_ID.alias("patient_group_mapping_rule_id"),  # INSR_W2 W2.20
+        s.PRODUCT_MAPPING_SOURCE.alias("product_mapping_source"),  # INSR_W2 W2.20
+        s.SOURCE_MRN_NORM.alias("source_mrn_norm"),  # INSR_W2 W2.20
         s.END_QUANTITY_RAW.alias("quantity_raw"),
         s.BEGIN_LOCATION_NAME.alias("begin_location"),
         s.END_LOCATION_NAME.alias("end_location"),
@@ -7671,7 +7515,7 @@ def _cancer_treatment_canonical_pregate():
             coding_obj(F.lit("urn:omop:concept_id"), s.drug_concept_id,
                        s.drug_concept_name, False,
                        "lookup.cancer_treatment_term_map:applied", None),
-        ).alias("drug_code"),
+        ).alias("drug_code"), s["CANCER_DRUG_MAPPING"].alias("_r1_cancer_drug_mapping"), s["CANCER_DRUG_MAP_KEY"].alias("_r1_cancer_drug_map_key"), s["CANCER_DRUG_MAP_COMPONENTS_JSON"].alias("_r1_cancer_drug_components_json"),
         s.TreatmentPlan.alias("treatment_plan"), s.RegimenName.alias("regimen_name"),
         s.Indication.alias("indication"), normalized_record_type.alias("record_type"),
         s.RxDose.cast("decimal(38,6)").alias("dose_value"),
@@ -7725,7 +7569,8 @@ SRC_CANCER_TREATMENT = "4_prod.bronze.map_cancer_treatment"
 
 
 
-def _condition_stage_canonical_pregate():
+def _condition_stage_aria_pregate():
+    # INSR_W2 W2.20: the ARIA arm of condition stage (unchanged body; was _condition_stage_canonical_pregate).
     # Normalize condition stage source rows before the downstream admission filter so excluded
     # evidence remains countable.
     s = read_source(SRC_ARIA_STAGING)
@@ -7764,7 +7609,7 @@ def _condition_stage_canonical_pregate():
             coding_obj(F.lit("urn:omop:concept_id"), s.DIAGNOSIS_CONCEPT_ID,
                        s.DIAGNOSIS_CONCEPT_NAME, False,
                        "bronze.map_aria_diagnosis_staging", None),
-        ).alias("stage_code"),
+        ).alias("stage_code"), s["STAGE_DIAGNOSIS_MAPPING"].alias("_r1_stage_diagnosis_mapping"), s["STAGE_DIAGNOSIS_MAP_KEY"].alias("_r1_stage_diagnosis_map_key"), s["STAGE_DIAGNOSIS_MAP_COMPONENTS_JSON"].alias("_r1_stage_diagnosis_components_json"), s["STAGE_GROUP_MAPPING"].alias("_r1_stage_group_mapping"), s["STAGE_GROUP_MAP_KEY"].alias("_r1_stage_group_map_key"), s["STAGE_GROUP_MAP_COMPONENTS_JSON"].alias("_r1_stage_group_components_json"),
         s.STAGE_OF_DISEASE.alias("stage_of_disease"), s.STG_CRIT_DESC.alias("stage_criteria"),
         s.DX_TYP.alias("dx_type"), s.CONFIRM_DX.alias("dx_confirmed"),
         s.MTHD_OF_DX.alias("dx_method"),
@@ -7791,6 +7636,59 @@ def _condition_stage_canonical_pregate():
         s.DIAGNOSIS_CONCEPT_ID.cast("string").alias("_omop_code"),
         s.DIAGNOSIS_CONCEPT_NAME.alias("_omop_display"),
     )
+
+SRC_CANCER_STAGE_MILL = "4_prod.bronze.map_cancer_stage_mill"   # INSR_W2 W2.20 (W1.14 INSR_W1_TNM_MILL_V1)
+TNM_AS_RECORDED_SYSTEM = "urn:barts:tnm-as-recorded"
+
+
+def _blank_to_null(col):
+    """A trimmed string, or NULL when it is empty (regexp_extract returns '' for an optional group that is absent)."""
+    return F.when(F.trim(col) != "", F.trim(col))
+
+
+def _condition_stage_mill_pregate():
+    # INSR_W2 W2.20: TNM staging recorded in Millennium (W1.14 bronze map_cancer_stage_mill: the Uro TNM event codes,
+    # one T, N or M per event, and pTNM statements in current pathology report text). No SCR/COSD/CDS input (J19).
+    # source_code is the stated categories joined in T N M order with the prefix on T (e.g. "pT2a N0 M0"); a row
+    # with no category has no usable code and is counted as excluded downstream, like an ARIA row without a code.
+    s = read_source(SRC_CANCER_STAGE_MILL)
+    prefix, t_stage = _blank_to_null(s.STAGE_PREFIX), _blank_to_null(s.T_STAGE)
+    n_stage, m_stage = _blank_to_null(s.N_STAGE), _blank_to_null(s.M_STAGE)
+    tnm = _blank_to_null(F.concat_ws(" ", F.concat(F.coalesce(prefix, F.lit("")), t_stage), n_stage, m_stage))
+    skey, ssys = subject_key_with_system(
+        [("urn:cerner:person_id", s.PERSON_ID)], SRC_CANCER_STAGE_MILL, s.STAGE_KEY,
+    )
+    inactive = F.coalesce(s.SOURCE_PRESENT_IND.cast("int"), F.lit(1)) == 0
+    stage_time = s.STAGE_DT_TM.cast("timestamp")   # Millennium event end / LIMS issue time, a UTC instant
+    return s.select(
+        stable_id("condition_stage:mill", s.SOURCE_KIND, s.SOURCE_ID).alias("patient_event_key"),
+        skey.alias("subject_key"), ssys.alias("subject_id_system"),
+        s.PERSON_ID.cast("bigint").alias("person_id"),
+        F.when(s.PERSON_ID.isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved")).alias("identity_status"),
+        s.ENCNTR_ID.cast("bigint").alias("encounter_id"),
+        stage_time.alias("event_datetime"), F.lit(None).cast("timestamp").alias("event_end_datetime"),
+        F.from_utc_timestamp(stage_time, "Europe/London").alias("event_datetime_local"),
+        F.lit(None).cast("timestamp").alias("event_end_datetime_local"),
+        F.lit(TNM_AS_RECORDED_SYSTEM).alias("source_coding_system"),
+        tnm.alias("source_code"), tnm.alias("source_display"),
+        codeable_concept(coding_obj(F.lit(TNM_AS_RECORDED_SYSTEM), tnm, tnm, True)).alias("stage_code"), s["STAGE_DIAGNOSIS_MAPPING"].alias("_r1_stage_diagnosis_mapping"), s["STAGE_DIAGNOSIS_MAP_KEY"].alias("_r1_stage_diagnosis_map_key"), s["STAGE_DIAGNOSIS_MAP_COMPONENTS_JSON"].alias("_r1_stage_diagnosis_components_json"), s["STAGE_GROUP_MAPPING"].alias("_r1_stage_group_mapping"), s["STAGE_GROUP_MAP_KEY"].alias("_r1_stage_group_map_key"), s["STAGE_GROUP_MAP_COMPONENTS_JSON"].alias("_r1_stage_group_components_json"),
+        s.SOURCE_KIND.alias("stage_source_kind"), s.SOURCE_ID.cast("string").alias("stage_source_id"),
+        prefix.alias("stage_prefix"), t_stage.alias("t_stage"), n_stage.alias("n_stage"), m_stage.alias("m_stage"),
+        s.STAGE_TEXT.alias("stage_text"), s.RULE_ID.alias("stage_rule_id"), s.ROW_HASH.alias("source_row_hash"),
+        F.when(inactive, F.lit("superseded")).otherwise(F.lit("active")).alias("record_status"),
+        F.when(inactive, s.ADC_UPDT).alias("record_status_effective_to"),
+        F.date_format(s.ADC_UPDT, "yyyyMMddHHmmss").alias("load_batch_id"),
+        s.ADC_UPDT.alias("source_update_timestamp"), s.ADC_UPDT.alias("loaded_at"),
+        F.lit("millennium").alias("_source_system"), F.lit(SRC_CANCER_STAGE_MILL).alias("_source_table"),
+        s.STAGE_KEY.alias("_source_row_id"),
+    )
+
+
+def _condition_stage_canonical_pregate():
+    # INSR_W2 W2.20: both condition stage arms. Columns one arm lacks are NULL on its rows (ARIA identifiers and
+    # flags on Millennium rows; the TNM columns on ARIA rows).
+    return _condition_stage_aria_pregate().unionByName(_condition_stage_mill_pregate(), allowMissingColumns=True)
+
 
 def _condition_stage_canonical():
     # Keep the normalized condition stage rows that pass the existing source-code admission
@@ -7957,7 +7855,7 @@ def _device_canonical_pregate():
             coding_obj(F.lit("http://snomed.info/sct"), snomed_code,
                        snomed_display, False,
                        "lookup.mediconnect_device_type_map:applied", None),
-        ).alias("_device_code_json"),
+        ).alias("_device_code_json"), s["DEVICE_MAPPING"].alias("_r1_device_mapping"), s["DEVICE_MAP_KEY"].alias("_r1_device_map_key"), s["DEVICE_MAP_COMPONENTS_JSON"].alias("_r1_device_components_json"),
         F.coalesce(s.DEVICE_ROLE, s._m_device_role).alias("device_role"),
         s.MODEL_NAME.alias("model_name"),
         s.MODEL_CODE.alias("model_code"),
@@ -7969,6 +7867,8 @@ def _device_canonical_pregate():
         s.LEAD_LOCATION.alias("lead_location"), s.POCKET_SITE.alias("pocket_site"),
         s.STATUS.alias("status_display"),
         F.coalesce(s.DEVICE_MAPPING_STATUS, s._m_mapping_status).alias("device_mapping_status"),
+        s.DEVICE_MAPPING_RULE_ID.alias("device_mapping_rule_id"),  # INSR_W2 W2.20
+        s.DEVICE_MAPPING_LLM_DECISION.alias("device_mapping_llm_decision"),  # INSR_W2 W2.20
         s.COMMENT.alias("comment_text"),
         F.when(inactive, F.lit("superseded")).otherwise(F.lit("active"))
         .alias("record_status"),
@@ -8653,6 +8553,16 @@ def _medication_supply_canonical_pregate():
     return s.select(
         event_id.alias("patient_event_key"),
         s.HOMECARE_REQUEST_ITEM_ID.cast("string").alias("homecare_request_item_id"),
+        s.DRUG_MAPPING_RULE_ID.alias("drug_mapping_rule_id"),  # INSR_W2 W2.20
+        s.DRUG_MAPPING_MODEL.alias("drug_mapping_model"),  # INSR_W2 W2.20
+        s.DRUG_MAPPING_SCORE.alias("drug_mapping_score"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_NAME.alias("homecare_contact_name"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_ADDR1.alias("homecare_contact_addr1"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_ADDR2.alias("homecare_contact_addr2"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_ADDR3.alias("homecare_contact_addr3"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_ADDR4.alias("homecare_contact_addr4"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_POSTCODE.alias("homecare_contact_postcode"),  # INSR_W2 W2.20
+        s.HOMECARE_CONTACT_TELEPHONE.alias("homecare_contact_telephone"),  # INSR_W2 W2.20
         skey.alias("subject_key"), ssys.alias("subject_id_system"),
         person_id.alias("person_id"),
         F.when(person_id.isNotNull(), F.lit("resolved"))
@@ -8730,8 +8640,11 @@ def _elective_access_entry_canonical():
         & (F.col("PROCEDURE_TYPE_SEQ") == 1)
         & (F.col("PROCEDURE_SEQ") == 1)
     ).select("WAITING_LIST_OID", "PROCEDURE_CODE", "PROCEDURE_DESC", "PROCEDURE_CATALOG")
+    # INSR_W2 W2.22: the priority comes from field 118 only; other attribute fields (1198 from 2026-10-24)
+    # would duplicate the entry.
     prio = read_source(SRC_EAL_ATTRIBUTE).where(
         F.coalesce(F.col("SOURCE_PRESENT_IND"), F.lit(True))
+        & (F.col("FIELD_OID") == 118)
     ).select(
         "WAITING_LIST_OID",
         F.col("FIELD_VALUE_VAR").alias("_p_code"),
@@ -9471,7 +9384,7 @@ def _baby_delivery_canonical():
         F.lit("urn:nhs:msds:delivery-method").alias("source_coding_system"),
         F.col("s.DELIVERYMETHODCODE").alias("source_code"),
         F.col("s.DELIVERYMETHODCODE").alias("source_display"),
-        F.col("s.BABY_PERSON_ID").cast("string").alias("baby_person_id"),
+        F.when(F.col("s.BABY_PERSON_ID").cast("bigint") != 0, F.col("s.BABY_PERSON_ID").cast("bigint")).alias("baby_person_id"),  # INSR_W2 W2.11
         F.col("s.BIRTHORDERMATERNITYSUS").alias("birth_order"),
         F.col("s.PREGOUTCOME").alias("pregnancy_outcome"),
         F.col("s.DELIVERYMETHODCODE").alias("delivery_method_code"),

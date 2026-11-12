@@ -17,6 +17,7 @@
 # ==== Imports ====
 
 import pyspark.sql.functions as F
+from silver_value_policy import time_only, time_part  # INSR_W2 W2.07
 from pyspark.sql import Column, Window
 
 # COMMAND ----------
@@ -6647,7 +6648,9 @@ FORM_RESPONSE_BASE_COLUMNS = [
     "response_value_text",
     "response_value_number",
     "response_value_datetime",
+    "response_value_time",
     "response_coding_system",
+    "unit_source",
     "response_coding_code",
     "response_coding_display",
     "question_concept_id",
@@ -6704,6 +6707,12 @@ FORM_RESPONSE_BASE_COLUMN_COMMENTS = {
     "loaded_at": "Bronze material-change timestamp for the source response.",
 }
 
+FORM_RESPONSE_BASE_COLUMN_COMMENTS["response_value_time"] = (
+    "Time of day (HH:mm:ss) for an answer recorded as a time only (Millennium placeholder date 2000-01-01); "
+    "response_value_datetime is then NULL. INSR_W2 W2.07.")
+FORM_RESPONSE_BASE_COLUMN_COMMENTS["unit_source"] = (
+    "Where unit_concept_id came from: the item unit mapping source, canonical_unit, or "
+    "powerform_dta_default (the PowerForm DTA default unit); NULL when no unit. INSR_W2 W2.04.")
 FORM_RESPONSE_COLUMN_COMMENTS = {
     "dcp_forms_activity_id": "Millennium DCP_FORMS_ACTIVITY_ID; native parent key joining clinical_form.",
     "patient_event_key": "Deterministic SHA-256 key of the parent PowerForm instance.",
@@ -6750,6 +6759,8 @@ FORM_RESPONSE_COLUMN_COMMENTS.update({
     "promoted_to_table": "Dedicated instrument product carrying this configured response, when applicable.",
     "promoted_to_row_id": "Patient-event key of the dedicated instrument row; null for residual responses.",
 })
+FORM_RESPONSE_COLUMN_COMMENTS["unit_source"] = FORM_RESPONSE_BASE_COLUMN_COMMENTS["unit_source"]  # INSR_W2 W2.04
+FORM_RESPONSE_COLUMN_COMMENTS["response_value_time"] = FORM_RESPONSE_BASE_COLUMN_COMMENTS["response_value_time"]  # INSR_W2 W2.07
 
 
 def _configured_column_expr(slug_col, label_col, section_col):
@@ -6887,10 +6898,10 @@ def _form_response_primitive():
             i.CANONICAL_NUMERIC_RESULT,
             a.NUMERIC_RESPONSE_NBR,
         ).cast("decimal(38,10)").alias("response_value_number"),
-        F.coalesce(
-            i.CANONICAL_DATE_RESULT,
-            i.RESPONSE_DT_TM,
-        ).alias("response_value_datetime"),
+        # INSR_W2 W2.07 (J4, L2051): a time-only answer keeps its time in response_value_time.
+        F.when(~time_only(F.coalesce(i.CANONICAL_DATE_RESULT, i.RESPONSE_DT_TM)),
+               F.coalesce(i.CANONICAL_DATE_RESULT, i.RESPONSE_DT_TM)).alias("response_value_datetime"),
+        time_part(F.coalesce(i.CANONICAL_DATE_RESULT, i.RESPONSE_DT_TM)).alias("response_value_time"),
         F.when(
             i.RESPONSE_NOMENCLATURE_ID.isNotNull(),
             F.lit("urn:cerner:nomenclature"),
@@ -6905,7 +6916,13 @@ def _form_response_primitive():
         i.RESPONSE_TEXT_TXT.alias("response_coding_display"),
         i.QUESTION_CONCEPT_ID.cast("string").alias("question_concept_id"),
         i.VALUE_CONCEPT_ID.cast("string").alias("value_concept_id"),
-        i.UNIT_CONCEPT_ID.cast("string").alias("unit_concept_id"),
+        # INSR_W2 W2.04 (L2763): canonical unit, else the PowerForm (DTA) default unit; unit_source says which.
+        F.coalesce(i.UNIT_CONCEPT_ID, i.CANONICAL_UNIT_CONCEPT_ID, i.POWERFORM_UNIT_CONCEPT_ID)
+        .cast("string").alias("unit_concept_id"),
+        F.when(i.UNIT_CONCEPT_ID.isNotNull(), F.coalesce(i.UNIT_MAPPING_SOURCE, F.lit("item_unit")))
+         .when(i.CANONICAL_UNIT_CONCEPT_ID.isNotNull(), F.lit("canonical_unit"))
+         .when(i.POWERFORM_UNIT_CONCEPT_ID.isNotNull(), F.lit("powerform_dta_default"))
+         .alias("unit_source"),
         i.VALUE_MAPPING_SOURCE.alias("value_mapping_source"),
         i.POWERFORM_MAPPING_RULE_ID.cast("string").alias(
             "powerform_mapping_rule_id"
@@ -6954,6 +6971,7 @@ def _form_response_selection():
         F.col("response_value_number").isNotNull()
         | F.col("response_value_text").isNotNull()
         | F.col("response_value_datetime").isNotNull()
+        | F.col("response_value_time").isNotNull()  # INSR_W2 W2.07
         | F.col("value_concept_id").isNotNull()
     )
     order = Window.partitionBy(

@@ -10,8 +10,9 @@
 # MAGIC - `mill_order_action` is a LIVE lane (ORDER_ACTION_LIVE_V1, 2026-10-08). It stopped landing on 2024-09-17; the DAR064
 # MAGIC   raw recovery backfilled it to 2026-09-19 and it is now an IncrUpdtV2 feed (UPDT_DT_TM watermark).
 # MAGIC   `HISTORICAL_FEED_IND` marks the rows the old feed landed (raw ADC_UPDT on or before 2024-09-17).
-# MAGIC - `map_medication_order_detail` is latest-`ACTION_SEQUENCE` long format. Historical action-level
-# MAGIC   order detail is an explicit bronze-contract exclusion, not an implicit downstream raw read.
+# MAGIC - `map_medication_order_detail` holds each OE field's effective value at the order's latest action: the
+# MAGIC   rows of the latest action (<= LAST_ACTION_SEQUENCE) that wrote that field (INSR_W1_MED_DETAIL_EFFECTIVE_V1).
+# MAGIC   Superseded values of a field from earlier actions remain an explicit bronze-contract exclusion.
 # MAGIC - Exact scale profile: 363,043,691 pharmacy orders; 457,718,185 pharmacy actions;
 # MAGIC   29,944,771 pharmacy ingredients; 6,815,038,919 all-action pharmacy detail rows versus
 # MAGIC   2,822,380,791 latest-action source rows before natural-key deduplication. The 2.82B-row
@@ -139,7 +140,8 @@ SOURCE_SLA = {
 }
 LOOKUP_SOURCES = {CODE_VALUE, S4_MED_LOOKUP_TABLE}
 EXPECTED_COLUMNS = {
-    SRC_ORDER: {"ORDER_ID", "PERSON_ID", "ENCNTR_ID", "ACTIVITY_TYPE_CD", "LAST_ACTION_SEQUENCE", "ORDER_STATUS_CD", "ADC_UPDT"},
+    SRC_ORDER: {"ORDER_ID", "PERSON_ID", "ENCNTR_ID", "ACTIVITY_TYPE_CD", "LAST_ACTION_SEQUENCE", "ORDER_STATUS_CD", "ADC_UPDT",
+                "TEMPLATE_ORDER_ID", "TEMPLATE_ORDER_FLAG", "ORIG_ORD_AS_FLAG"},  # BBR_FOLDIN_V1 (BBR-13/14)
     SRC_ACTION: {"ORDER_ID", "ACTION_SEQUENCE", "ACTION_TYPE_CD", "ACTION_DT_TM", "ORDER_STATUS_CD", "ADC_UPDT"},
     SRC_INGREDIENT: {"ORDER_ID", "ACTION_SEQUENCE", "COMP_SEQUENCE", "STRENGTH", "VOLUME", "DOSE_QUANTITY", "ADC_UPDT"},
     SRC_DETAIL: {"ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE", "OE_FIELD_ID", "OE_FIELD_MEANING", "ADC_UPDT"},
@@ -579,6 +581,8 @@ def replace_target_full(df: DataFrame, target: str, keys: list[str]) -> dict:
         .withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp"))
         .withColumn("ADC_UPDT", F.current_timestamp())
     )
+    # R1FIX_20261109: the R1 lane columns are carried as typed NULLs (the R1 attach re-fills them).
+    replacement = bronze_keep_r1_columns(replacement, target)
     target_columns = spark.table(target).columns
     missing = sorted(set(target_columns) - set(replacement.columns))
     extra = sorted(set(replacement.columns) - set(target_columns))
@@ -1052,6 +1056,12 @@ def build_order(order_ids: DataFrame | None, decode_lookup: DataFrame) -> DataFr
         F.col("CATALOG_CD").cast("long").alias("CATALOG_CD"),
         F.col("CATALOG_TYPE_CD").cast("long").alias("CATALOG_TYPE_CD"),
         F.col("SYNONYM_ID").cast("long").alias("SYNONYM_ID"),
+        # BBR_FOLDIN_V1 (BBR-13/14): continuous-order role and order category, carried verbatim. A zero template
+        # id is Cerner's "no template" value. Backfilled once by INSR_Apply P2.BBR.med_order_template; the logic
+        # version is not bumped (a bump would force FULL on all four medication tables).
+        F.when(F.col("TEMPLATE_ORDER_ID").cast("long") != 0, F.col("TEMPLATE_ORDER_ID").cast("long")).alias("TEMPLATE_ORDER_ID"),
+        F.col("TEMPLATE_ORDER_FLAG").cast("int").alias("TEMPLATE_ORDER_FLAG"),
+        F.col("ORIG_ORD_AS_FLAG").cast("int").alias("ORIG_ORD_AS_FLAG"),
         "ORDER_MNEMONIC", "ORDERED_AS_MNEMONIC", "HNA_ORDER_MNEMONIC",
         "ORDER_DETAIL_DISPLAY_LINE", "CLINICAL_DISPLAY_LINE", "SIMPLIFIED_DISPLAY_LINE",
         F.col("ORDER_STATUS_CD").cast("long").alias("ORDER_STATUS_CD"),
@@ -1210,8 +1220,19 @@ def build_detail(affected_orders: DataFrame | None = None) -> DataFrame:
         .join(parent.alias("parent"), F.col("source.ORDER_ID") == F.col("parent.ORDER_ID_RAW"), "inner")
         .drop(F.col("parent.ORDER_ID"), F.col("parent.ORDER_ID_RAW"))
     )
-    detail = detail.where(F.col("ACTION_SEQUENCE").cast("long") == F.col("LAST_ACTION_SEQUENCE"))
+    # INSR_W1_MED_DETAIL_EFFECTIVE_V1: Millennium writes a detail row only for the fields an action changed, so the
+    # latest action usually carries none (2026-05 PMS orders: 88 of 952 had detail at their latest action, 952 at
+    # some action). Each OE field takes the rows of the latest action <= LAST_ACTION_SEQUENCE that wrote it, i.e.
+    # its effective value at the latest action. This lands REQSTARTDTTM, FREQ and every other field on orders whose
+    # latest action wrote nothing (P6g, P6g2, P_W112 L856).
+    detail = detail.where(F.col("ACTION_SEQUENCE").cast("long") <= F.col("LAST_ACTION_SEQUENCE"))
     detail = deduplicate_source_rows(detail, ["ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE"])
+    field_window = Window.partitionBy(F.col("ORDER_ID").cast("long"), F.col("OE_FIELD_ID").cast("long"))
+    detail = (
+        detail.withColumn("_FIELD_LATEST_ACTION", F.max(F.col("ACTION_SEQUENCE").cast("long")).over(field_window))
+        .where(F.col("ACTION_SEQUENCE").cast("long") == F.col("_FIELD_LATEST_ACTION"))
+        .drop("_FIELD_LATEST_ACTION")
+    )
     return detail.select(
         F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
         F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
@@ -1226,7 +1247,9 @@ def build_detail(affected_orders: DataFrame | None = None) -> DataFrame:
         F.col("OE_FIELD_MEANING_ID").cast("long").alias("OE_FIELD_MEANING_ID"),
         F.col("PARENT_ACTION_SEQUENCE").cast("long").alias("PARENT_ACTION_SEQUENCE"),
         "LAST_ACTION_SEQUENCE",
-        F.lit("LATEST_ACTION_LONG_FORMAT").alias("DETAIL_HISTORY_CONTRACT"),
+        F.lit("EFFECTIVE_AT_LATEST_ACTION").alias("DETAIL_HISTORY_CONTRACT"),  # INSR_W1_MED_DETAIL_EFFECTIVE_V1
+        F.when(F.col("ACTION_SEQUENCE").cast("long") == F.col("LAST_ACTION_SEQUENCE"), F.lit("LATEST_ACTION"))
+        .otherwise(F.lit("CARRIED_FORWARD")).alias("DETAIL_ACTION_BASIS"),
         # S3-A11 BEGIN: child and parent source provenance fill forward.
         F.col("UPDT_CNT").cast("long").alias("SOURCE_UPDT_CNT"),
         F.col("ORDER_SOURCE_ADC_UPDT").alias("ORDER_SOURCE_ADC_UPDT"),
@@ -1568,16 +1591,32 @@ def run_full_parity_suite(modes: dict[str, str]) -> dict:
         }
 
     if modes[DETAIL] in FULL_MODES:
-        expected_detail = (
+        # INSR_W1_MED_DETAIL_EFFECTIVE_V1: the expected row set, stated independently of build_detail so the check can
+        # still catch a defect in it. For each (ORDER_ID, OE_FIELD_ID) of the source detail, keep the rows of the highest
+        # ACTION_SEQUENCE at or below the order's LAST_ACTION_SEQUENCE (NULL OE_FIELD_ID groups with NULL, as the window does).
+        source_detail = (
             spark.table(SRC_DETAIL)
             .select(
                 F.col("ORDER_ID").cast("long").alias("ORDER_ID"),
                 F.col("ACTION_SEQUENCE").cast("long").alias("ACTION_SEQUENCE"),
                 F.col("DETAIL_SEQUENCE").cast("long").alias("DETAIL_SEQUENCE"),
+                F.col("OE_FIELD_ID").cast("long").alias("OE_FIELD_ID"),
             )
             .join(parent_ids, "ORDER_ID", "inner")
-            .where(F.col("ACTION_SEQUENCE") == F.col("LAST_ACTION_SEQUENCE"))
-            .select("ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE")
+            .where(F.col("ACTION_SEQUENCE") <= F.col("LAST_ACTION_SEQUENCE"))
+        )
+        field_latest = source_detail.groupBy("ORDER_ID", "OE_FIELD_ID").agg(
+            F.max("ACTION_SEQUENCE").alias("_FIELD_LATEST_ACTION")
+        )
+        expected_detail = (
+            source_detail.alias("d")
+            .join(
+                field_latest.alias("f"),
+                (F.col("d.ORDER_ID") == F.col("f.ORDER_ID")) & F.col("d.OE_FIELD_ID").eqNullSafe(F.col("f.OE_FIELD_ID")),
+                "inner",
+            )
+            .where(F.col("d.ACTION_SEQUENCE") == F.col("f._FIELD_LATEST_ACTION"))
+            .select("d.ORDER_ID", "d.ACTION_SEQUENCE", "d.DETAIL_SEQUENCE")
             .dropDuplicates(["ORDER_ID", "ACTION_SEQUENCE", "DETAIL_SEQUENCE"])
             .count()
         )
@@ -1588,7 +1627,7 @@ def run_full_parity_suite(modes: dict[str, str]) -> dict:
         result["targets"][DETAIL] = {
             "present_rows": int(present_detail),
             "expected_rows": int(expected_detail),
-            "detail_history_contract": "LATEST_ACTION_LONG_FORMAT",
+            "detail_history_contract": "EFFECTIVE_AT_LATEST_ACTION",
         }
 
     return result
@@ -1607,6 +1646,10 @@ def apply_output_comments() -> None:
             "MODIFIED_START_DT_TM": "S10 lifecycle timestamp retained despite sparse population.",
             "VALID_DOSE_DT_TM": "S10 planned-dose lifecycle timestamp.",
             "SOURCE_ADC_UPDT": "Journey standard block input: raw order ADC timestamp.",
+            # BBR_FOLDIN_V1 (BBR-13/14)
+            "TEMPLATE_ORDER_ID": "Cerner TEMPLATE_ORDER_ID: on a continuous-order instance (TEMPLATE_ORDER_FLAG 4) the parent order whose attribute, detail and ingredient rows describe it; NULL when 0 (no template).",
+            "TEMPLATE_ORDER_FLAG": "Cerner TEMPLATE_ORDER_FLAG as recorded: 0 one-off order, 1 continuous-order parent (template), 4 instance (one scheduled dose of the parent).",
+            "ORIG_ORD_AS_FLAG": "Cerner ORIG_ORD_AS_FLAG as recorded: 0 normal order, 1 prescription/discharge order, 2 recorded/home medication, 3 patient's own medication, 4 pharmacy charge only, 5 satellite.",
         },
         "S10 medication_order",
     )
@@ -1627,8 +1670,9 @@ def apply_output_comments() -> None:
     )
     apply_comments(
         DETAIL,
-        "S10 latest-action order-detail feeder in long form. Natural-key duplicates are collapsed; historical detail remains excluded while S3-A11 retains parent stamps/counters.",
-        {"DETAIL_HISTORY_CONTRACT": "S10 contract: LATEST_ACTION_LONG_FORMAT; historical detail requires a separate bronze product."},
+        "S10 order-detail feeder in long form: each OE field at its effective value at the latest action (INSR_W1_MED_DETAIL_EFFECTIVE_V1). Natural-key duplicates are collapsed; superseded values remain excluded while S3-A11 retains parent stamps/counters.",
+        {"DETAIL_HISTORY_CONTRACT": "S10 contract: EFFECTIVE_AT_LATEST_ACTION; superseded field values require a separate bronze product.",
+         "DETAIL_ACTION_BASIS": "LATEST_ACTION when the row was written by the order latest action; CARRIED_FORWARD when an earlier action last wrote this field."},
         "S10 medication_order dosage and route detail",
     )
 

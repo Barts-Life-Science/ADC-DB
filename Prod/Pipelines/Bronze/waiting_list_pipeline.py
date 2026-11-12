@@ -327,6 +327,26 @@ EXPECTED_SNAPSHOT_SCHEMA.update({
     "SNAPSHOT_DATE": "date",
     "SNAPSHOT_CUTOFF_TS": "timestamp",
 })
+# INSR_W1_WL_PLAUSIBLY_OPEN_V1: last, because ADD COLUMNS appends it after SNAPSHOT_CUTOFF_TS.
+EXPECTED_SNAPSHOT_SCHEMA["PLAUSIBLY_OPEN_IND"] = "boolean"
+WL_PLAUSIBLY_OPEN_DAYS = 1095
+
+
+def plausibly_open_expr(cutoff_column):
+    """
+    INSR_W1_WL_PLAUSIBLY_OPEN_V1: True when a census row still looks like a live wait at the cut-off.
+
+    The census keeps every active, non-removed entry, including entries abandoned years ago (2026-10-25: 1.60M
+    rows, about 149k plausibly open). A row is plausibly open when its waiting end is absent or after the cut-off
+    AND it has a start (adjusted start, start, referral, decision, request, original request) or a status change
+    within WL_PLAUSIBLY_OPEN_DAYS before the cut-off. A flag, never a filter (J26).
+    """
+    start = F.coalesce(F.col("ADJ_WAITING_START_DT_TM"), F.col("WAITING_START_DT_TM"), F.col("REFERRAL_DT_TM"),
+                       F.col("ADMIT_DECISION_DT_TM"), F.col("REQUESTED_DT_TM"), F.col("ORIG_REQUEST_RECEIVED_DT_TM"))
+    horizon = cutoff_column - F.expr(f"INTERVAL {WL_PLAUSIBLY_OPEN_DAYS} DAYS")
+    not_ended = F.col("WAITING_END_DT_TM").isNull() | (F.col("WAITING_END_DT_TM") > cutoff_column)
+    recent = (start >= horizon) | (F.col("STATUS_DT_TM") >= horizon)
+    return F.coalesce(not_ended & recent, F.lit(False))
 
 HASH_EXCLUDE = {
     "ROW_HASH", "IS_CURRENT", "PIPELINE_RUN_ID", "PIPELINE_ATTEMPT_ID",
@@ -1021,6 +1041,7 @@ COLUMN_COMMENTS = {
         "PM_WAIT_LIST_ID": "Millennium waiting-list identifier; unique within SNAPSHOT_DATE.",
         "SNAPSHOT_DATE": "UTC business date of the immutable snapshot.",
         "SNAPSHOT_CUTOFF_TS": "Single immutable UTC cutoff timestamp shared by every row for SNAPSHOT_DATE.",
+        "PLAUSIBLY_OPEN_IND": "INSR_W1_WL_PLAUSIBLY_OPEN_V1: waiting end absent or after the cut-off AND a start or status change within 1095 days before it. A flag, never a filter; the census keeps every active entry.",
     },
 }
 
@@ -2480,6 +2501,30 @@ def snapshot_date_state(snapshot_date_value, label: str) -> dict:
     }
 
 
+# INSR_W1_WL_ISO_WEEK_DUE_V1: a census is due once per ISO week, decided from the census dates already committed.
+# Never reconstruct a past census: a week with no census is only ever filled by a run inside that week.
+
+
+def iso_week_key(day):
+    """ISO (year, week) of a date as one sortable integer, e.g. 2026-10-25 -> 202643."""
+    iso = day.isocalendar()
+    return iso[0] * 100 + iso[1]
+
+
+def iso_week_census_state(committed_dates, pinned_date):
+    """Return (week_has_census, same_week_dates) for the pinned census date against the committed census dates."""
+    week = iso_week_key(pinned_date)
+    same_week = sorted(d for d in committed_dates if iso_week_key(d) == week)
+    return bool(same_week), same_week
+
+
+def committed_census_dates() -> list:
+    """Every SNAPSHOT_DATE already committed in map_waiting_list_snapshot (a few dozen dates at most)."""
+    if not bronze_table_exists(SNAPSHOT_TARGET):
+        return []
+    return [row["SNAPSHOT_DATE"] for row in spark.table(SNAPSHOT_TARGET).select("SNAPSHOT_DATE").distinct().collect()]
+
+
 def determine_snapshot_due(weekly_status: dict) -> dict:
     if (
         SNAPSHOT_CUTOFF_TS_VALUE is None
@@ -2498,16 +2543,22 @@ def determine_snapshot_due(weekly_status: dict) -> dict:
         reasons.append("MANUAL_RUN_SNAPSHOTS")
     if weekly_status["week_pending"]:
         reasons.append("WEEKLY_RECONCILIATION_PENDING")
+    # INSR_W1_WL_ISO_WEEK_DUE_V1: the census cadence is one per ISO week, judged from the census table itself.
+    week_has_census, same_week_census_dates = iso_week_census_state(committed_census_dates(), SNAPSHOT_DATE_UTC)
+    if not week_has_census and not target_absent:
+        reasons.append("ISO_WEEK_HAS_NO_SNAPSHOT")
     requested = bool(reasons)
     heartbeat_run_lock("snapshot due ownership and existence check")
     existing_state = snapshot_date_state(
         SNAPSHOT_DATE_UTC, "snapshot due determination"
     )
-    due = SNAPSHOT_ENABLED and requested and not existing_state["exists"]
+    due = SNAPSHOT_ENABLED and requested and not existing_state["exists"] and not week_has_census
     if not SNAPSHOT_ENABLED:
         status_reason = "DISABLED"
     elif existing_state["exists"]:
         status_reason = "SNAPSHOT_EXISTS_FOR_PINNED_UTC_DATE"
+    elif week_has_census:
+        status_reason = "SNAPSHOT_EXISTS_FOR_ISO_WEEK:" + ",".join(str(d) for d in same_week_census_dates)
     elif requested:
         status_reason = "REQUESTED:" + ",".join(reasons)
     else:
@@ -2596,6 +2647,7 @@ def take_snapshot(snapshot_due: dict) -> dict:
         .select(*SNAPSHOT_COLUMNS, *DECODE_COLUMNS)
         .withColumn("SNAPSHOT_DATE", F.lit(snapshot_date_value).cast("date"))
         .withColumn("SNAPSHOT_CUTOFF_TS", F.lit(snapshot_cutoff_value).cast("timestamp"))
+        .withColumn("PLAUSIBLY_OPEN_IND", plausibly_open_expr(F.col("SNAPSHOT_CUTOFF_TS")))  # INSR_W1_WL_PLAUSIBLY_OPEN_V1
         .select(*EXPECTED_SNAPSHOT_SCHEMA.keys())
     )
     validate_schema_contract(snapshot, SNAPSHOT_TARGET, "pre-stage snapshot")

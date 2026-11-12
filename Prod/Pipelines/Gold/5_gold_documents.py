@@ -10,6 +10,7 @@
 
 # COMMAND ----------
 
+# INSR_W4_ROWRULES_V1: W4 row rules (insr-v1); see gold_journey_shared.py
 from gold_journey_shared import (
     INTERNAL_SCHEMA,
     PUBLIC_SCHEMA,
@@ -21,6 +22,7 @@ from gold_journey_shared import (
     _tdx_qc,
     _with_comments,
     _with_parent_status,
+    _with_row_key,  # INSR_W3 W3.09
     dp,
 )
 
@@ -52,7 +54,8 @@ TEXT_DOCUMENT_SELECT = [
     '`source_display` AS `source_display`',
     '`document_type` AS `document_type`',
     '`title` AS `title`',
-    '`author_practitioner_id` AS `author_practitioner_id`',
+    # INSR_W3 W3.06: Gold: NULL where the Cerner system user id 1 (J5; silver publishes the flag).
+    "CASE WHEN CAST(`author_practitioner_id` AS BIGINT) = 1 THEN NULL ELSE `author_practitioner_id` END AS `author_practitioner_id`",
     '`author_role` AS `author_role`',
     '`service_id` AS `service_id`',
     "CASE WHEN UPPER(TRIM(CAST(`status_code` AS STRING))) = '0' OR UPPER(TRIM(CAST(`status_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `status_code` END AS `status_code`",
@@ -112,10 +115,16 @@ TEXT_DOCUMENT_SELECT = [
     '`prsb_map_version` AS `prsb_map_version`',
     '`source_feed` AS `source_feed`',
     '`record_status` AS `record_status`',
-    '`record_status_effective_from` AS `record_status_effective_from`',
-    '`record_status_effective_to` AS `record_status_effective_to`',
-    '`source_update_timestamp` AS `source_update_timestamp`',
+    # INSR_W3 W3.05: Gold: NULL where the OLE zero date or a post-2100 year below 9999.
+    "CASE WHEN CAST(`record_status_effective_from` AS DATE) = DATE'1899-12-30' OR (CAST(`record_status_effective_from` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`record_status_effective_from` AS DATE)) < 9999) THEN NULL ELSE `record_status_effective_from` END AS `record_status_effective_from`",
+    # INSR_W3 W3.05: Gold: NULL where the OLE zero date or an open-end marker in [2099-12-31, 9999).
+    "CASE WHEN CAST(`record_status_effective_to` AS DATE) = DATE'1899-12-30' OR (CAST(`record_status_effective_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`record_status_effective_to` AS DATE)) < 9999) THEN NULL ELSE `record_status_effective_to` END AS `record_status_effective_to`",
+    # INSR_W3 W3.05: Gold: NULL where the OLE zero date or a post-2100 year below 9999.
+    "CASE WHEN CAST(`source_update_timestamp` AS DATE) = DATE'1899-12-30' OR (CAST(`source_update_timestamp` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`source_update_timestamp` AS DATE)) < 9999) THEN NULL ELSE `source_update_timestamp` END AS `source_update_timestamp`",
     '`loaded_at` AS `loaded_at`',
+]
+TEXT_DOCUMENT_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`author_system_ind` AS `author_system_ind`',
 ]
 
 # contract v2: QC/batch inputs come from internal _text_document_metadata; source history stays on the main research table.
@@ -130,6 +139,12 @@ TEXT_DOCUMENT_MANDATORY_RULES = {
 }
 
 TEXT_DOCUMENT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.text.document.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
+    # INSR_W4 BBR cross_field (design BBR-17): A Millennium result status code that did not decode through mill_code_value (BBR-17): consumers filter on result_status_display (Auth/Modified/In Error), so an undecoded code is invisible to them.
+    'gold.text.document.table.insr_bbr_status_undecoded':
+        "NOT COALESCE((`result_status_code` RLIKE '^[0-9]+$' AND `result_status_display` IS NULL), FALSE)",
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 337,496,145 of 656,894,348 at the profile.
@@ -155,10 +170,7 @@ TEXT_DOCUMENT_ADVISORY_RULES = {
     "gold.text.document.record_status_effective_to.future_owner":
         "NOT COALESCE((CAST(`record_status_effective_to` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS), FALSE)",
 
-    # Counts published documents that are not completed (interim, preliminary, unknown or
-    # blank succession status). They are kept; filter on succession_status to exclude them.
-    "gold.text.document.succession_status.default_view_completed":
-        "source_feed IN ('ancil_long_blob', 'elective_access_comment', 'endobase_exam', 'neonatal_episode_narrative', 'order_comment', 'pathology_report', 'text_event') OR LOWER(TRIM(succession_status)) IN ('final', 'addendum')",
+    # INSR_W3 W3.05: succession_status.default_view_completed retired (J9: is_latest_version only).
 
     # Left as a warning because the comparison has no trustworthy side: 2,051 people in the
     # spine carry a death recorded before their own birth, 14,720 died before 1990 and
@@ -268,6 +280,16 @@ TEXT_DOCUMENT_COLUMN_COMMENTS = {
     "source_update_timestamp": "Source-arm-specific timestamp; interpret with source_feed. text_event takes the greatest STRING_RESULT_EFFECTIVE_UPDT_DT_TM, CLINICAL_EVENT_ADC_UPDT, LONG_TEXT_ADC_UPDT, LOOKUP_ADC_UPDT and ADC_UPDT from map_text_events. mill_blob_text uses UPDT_DT_TM; pacs_report uses REPORT_MODIFIED_UTC. endobase_exam takes the greatest contributing term ADC_UPDT and parent-exam PIPELINE_UPDT_DT_TM. order_comment uses TEXT_UPDT_DT_TM_CLEAN, falling back to COMMENT_UPDT_DT_TM_CLEAN. elective_access_comment uses MODIFIED_DT_TM; neonatal_episode_narrative uses ADC_UPDT; pathology_report uses valid_from. This mixes source, version and processing clocks; it is not a uniform clinical event time or native-system update time.",
     "loaded_at": "Per-arm contributing load clock: text events use own map_text_events.ADC_UPDT; deduplicated blob versions use the selected mill_blob_text.ADC_UPDT; PACS reports use own report ADC_UPDT, excluding bridge, examination and linkage clocks; neonatal narratives and pathology versions use own ADC_UPDT, excluding joined episode, accession, identity and alias clocks. EndoBase takes greatest of maximum ADC_UPDT across retained nonblank source-present terms, joined exam ADC_UPDT and joined encounter ADC_UPDT. Order comments take greatest of SOURCE_COMMENT_ADC_UPDT, SOURCE_TEXT_ADC_UPDT, PIPELINE_UPDT_DT_TM and joined order SOURCE_ADC_UPDT. Elective-access comments use own ADC_UPDT. Text hygiene, PRSB/organization enrichment, corpus frequency, thread-head selection and QC/public projections add no clock; current and historical pathology versions retain their own clocks. Null inputs follow the arm expression, and no current Silver refresh time is substituted.",
 }
+TEXT_DOCUMENT_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "author_system_ind": "True when the source author_practitioner_id was 1, the Cerner system user (J5); the id is then published as NULL. NULL when the source id was NULL. INSR_W2."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+TEXT_DOCUMENT_PERSON_SCOPE_RULES = {
+    "gold.text.document.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._text_document"),
@@ -276,6 +298,7 @@ TEXT_DOCUMENT_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(TEXT_DOCUMENT_MANDATORY_RULES)
 @dp.expect_all(TEXT_DOCUMENT_ADVISORY_RULES)
+@dp.expect_all_or_drop(TEXT_DOCUMENT_PERSON_SCOPE_RULES)
 def _gold_qc_text_document():
     """Quality-controlled twin of journey_text.document."""
     df = _qc("text_document", TEXT_DOCUMENT_SELECT)
@@ -383,6 +406,7 @@ def gold_text_document():
         '`record_status_effective_to` AS `record_status_effective_to`',
         '`source_update_timestamp` AS `source_update_timestamp`',
         '`loaded_at` AS `loaded_at`',
+        '`author_system_ind` AS `author_system_ind`',  # INSR_W3 W3.12
     )
     return _s3_flatten_gold_public(_with_comments(df, TEXT_DOCUMENT_COLUMN_COMMENTS), "text_document")
 
@@ -434,7 +458,7 @@ def _gold_qc_text_document_sensitivity_label():
 )
 def gold_text_document_sensitivity_label():
     """Publish text_document_sensitivity_label without exposing the internal parent-admission marker."""
-    return spark.read.table(_n("gold_qc._text_document_sensitivity_label")).drop("__gold_parent_present")
+    return _with_row_key(spark.read.table(_n("gold_qc._text_document_sensitivity_label")).drop("__gold_parent_present"), "text_document_sensitivity_label")  # INSR_W3 W3.09
 
 # COMMAND ----------
 
@@ -445,6 +469,9 @@ TEXT_SAFETY_DOCUMENT_MANDATORY_RULES = {
     "gold.text_safety_document.active_record": "COALESCE(record_status = 'active', FALSE)",
 }
 TEXT_SAFETY_DOCUMENT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.text.safety_document.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.text_safety_document.key_present": "safety_document_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -453,7 +480,11 @@ TEXT_SAFETY_DOCUMENT_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.text_safety_document",
-    comment="TDX v2.1 Gold QC twin for text_safety_document.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per Datix incident narrative fragment (description, action, outcome and similar free "
+        "text), with the released anonymised text. Gold QC twin of silver text_safety_document: mandatory "
+        "rules drop rows, advisory rules are reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(TEXT_SAFETY_DOCUMENT_MANDATORY_RULES)

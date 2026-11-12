@@ -10,7 +10,9 @@
 
 # COMMAND ----------
 
+# INSR_W4_ROWRULES_V1: W4 row rules (insr-v1); see gold_journey_shared.py
 from gold_journey_shared import (
+    insr_w4_apply_value_rules,  # INSR_W4
     F,
     _n,
     _qc,
@@ -77,6 +79,9 @@ CLINICAL_FORM_MANDATORY_RULES = {
 }
 
 CLINICAL_FORM_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.form.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 6,212 of 55,393,916 at the profile.
@@ -146,6 +151,12 @@ CLINICAL_FORM_COLUMN_COMMENTS = {
     "loaded_at": "Greatest of the form-level maximum ADC_UPDT values from mill_form_activity, map_powerform_assessment_item and map_powerform_assessment, and maximum Source_ADC_UPDT from map_mat_vte_assessment. This is the contributing-source ingestion/provenance clock, not the Silver refresh time or form event time; null only when every contributing clock is null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_FORM_PERSON_SCOPE_RULES = {
+    "gold.clinical.form.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_form"),
     comment="Internal quality-controlled twin of clinical_form: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -153,6 +164,7 @@ CLINICAL_FORM_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_FORM_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_FORM_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_FORM_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_form():
     """Quality-controlled twin of journey_clinical.form."""
     df = _qc("clinical_form", CLINICAL_FORM_SELECT)
@@ -249,7 +261,9 @@ def _s3b_form_qc(table_name, axes):
 @dp.expect_all_or_drop(CLINICAL_FORM_RESPONSE_MANDATORY_RULES)
 def _gold_qc_clinical_form_response():
     """Prepare internal QC data for clinical_form_response; native rules run on the returned rows."""
-    return _s3b_form_qc("clinical_form_response", ("question", "answer", "unit"))
+    df = _s3b_form_qc("clinical_form_response", ("question", "answer", "unit"))
+    df = insr_w4_apply_value_rules('clinical_form_response', df)  # INSR_W4
+    return df
 
 @dp.materialized_view(
     name=_n("gold_clinical.form_response"), table_properties={"quality": "gold"},
@@ -271,10 +285,12 @@ def gold_clinical_form_response():
 @dp.expect_all_or_drop(CLINICAL_FORM_SMOKING_STATUS_MANDATORY_RULES)
 def _gold_qc_clinical_form_smoking_status():
     """Prepare internal QC data for clinical_form_smoking_status; native rules run on the returned rows."""
-    return _s3b_form_qc(
+    df = _s3b_form_qc(
         "clinical_form_smoking_status",
         ("smoking_status", "cessation_advice", "cessation_referral", "nicotine_treatment", "dependence_level"),
     )
+    df = insr_w4_apply_value_rules('clinical_form_smoking_status', df)  # INSR_W4
+    return df
 
 @dp.materialized_view(
     name=_n("gold_clinical.form_smoking_status"), table_properties={"quality": "gold"},

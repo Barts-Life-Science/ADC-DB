@@ -57,6 +57,77 @@ for code, display in [("SCH_ACTION_CD","SCH_ACTION_DISPLAY"),("SCH_REASON_CD","S
     out = decode(out, code, display)
 out = (out.withColumn("SOURCE_TABLE", F.lit(SOURCE)).withColumn("SOURCE_ROW_ID", F.col("SCH_ACTION_ID").cast("string"))
     .withColumn("PIPELINE_RUN_ID", F.lit(RUN_ID)).withColumn("SOURCE_PRESENT_IND", F.lit(True)).withColumn("SOURCE_ABSENT_DETECTED_TS", F.lit(None).cast("timestamp")))
+# INSR_W8_COMMENTS_V1 (W8.04): canonical bronze comments, generated from the INSR W8.02 dictionary. Edit the dictionary,
+# never this literal. Column names are the bronze (upper-case) names.
+INSR_W8_BRONZE_COMMENTS = {
+ "map_appointment_action": {
+  "ACTION_DT_TM": "Date and time the scheduling action was taken.",
+  "ACTION_MEANING": "Meaning string corresponding to the scheduling action code.",
+  "ACTION_PRSNL_ID": "Identifier of the personnel member who performed the scheduling action.",
+  "ACTION_SOURCE_CD": "Code value identifying the source from which the scheduling action originated.",
+  "ACTION_SOURCE_DISPLAY": "Display text describing the source of the appointment action, resolved from a Millennium code value.",
+  "ACTIVE_IND": "Indicator showing whether the scheduling event action record is active.",
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "APPT_SYNONYM_CD": "Code value identifying the appointment synonym associated with the scheduling action.",
+  "APPT_SYNONYM_DISPLAY": "Display text of the appointment type synonym associated with the appointment action, resolved from a Millennium code value.",
+  "BREACH_OFFSET_DAYS": "Number of days of breach offset recorded for this scheduling event action.",
+  "CONTACT_FOLLOW_UP_DT_TM": "Date and time recorded for a follow-up of a patient contact associated with the scheduling action.",
+  "CONTACT_OUTCOME_CD": "Code value identifying the recorded outcome of a patient contact associated with the scheduling action.",
+  "CONTACT_OUTCOME_DISPLAY": "Display text of the contact outcome recorded for the appointment action, resolved from a Millennium code value.",
+  "ENCNTR_ID": "Internal surrogate identifier of the encounter linked to the scheduling event action, resolved during ingestion.",
+  "LINKAGE_ROUTE": "How the row was linked to its person or encounter.",
+  "ORGANIZATION_ID": "Identifier of the organization associated with this scheduling event action, populated with a resolved organization during trust mapping.",
+  "ORIG_ACTION_ID": "Identifier of the original scheduling action from which this action was derived.",
+  "PATIENT_DECEASED_IND": "Indicator flagging whether the patient associated with the scheduling event was recorded as deceased at the time of the action.",
+  "PERFORM_DT_TM": "Date and time the scheduling action was performed.",
+  "PERSON_ID": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "REASON_MEANING": "Meaning string corresponding to the scheduling action reason code.",
+  "REQ_ACTION_ID": "Identifier of the request action linked to this scheduling event action.",
+  "REQ_ACTION_MEANING": "Cerner code meaning text corresponding to REQ_ACTION_CD for the requested action.",
+  "RESOURCE_CD": "Code value identifying the scheduling resource associated with this scheduling event action.",
+  "RESOURCE_DISPLAY": "Display text of the scheduling resource associated with the appointment action, resolved from a Millennium code value.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SCHEDULE_ID": "Identifier of the schedule associated with the scheduling event action.",
+  "SCH_ACTION_CD": "Code value identifying the type of scheduling action performed on the event.",
+  "SCH_ACTION_DISPLAY": "Display text of the scheduling action performed on the appointment, resolved from a Millennium code value.",
+  "SCH_ACTION_ID": "Internal surrogate identifier uniquely identifying a scheduling event action record.",
+  "SCH_EVENT_ID": "Identifier of the scheduling event (appointment) to which this action applies.",
+  "SCH_REASON_CD": "Code value identifying the reason recorded for the scheduling action.",
+  "SCH_REASON_DISPLAY": "Display text of the scheduling reason recorded for the appointment action, resolved from a Millennium code value.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "TRUST": "Name of the NHS trust to which the record has been attributed by the ingestion trust-resolution process.",
+  "VER_STATUS_MEANING": "Cerner code meaning text corresponding to VER_STATUS_CD for the verification status."
+ }
+}
+INSR_W8_BRONZE_TABLE_COMMENTS = {
+ "map_appointment_action": "One row per Millennium scheduling action on an appointment (book, confirm, check in, cancel, undo), keyed by SCH_ACTION_ID. Curated bronze input to silver clinical_appointment_action; source-faithful columns, decodes in silver."
+}
+
+
+def _insr_w8_sql(text):
+    """Escape a comment for a single-quoted SQL literal."""
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _insr_w8_comment(table, column):
+    """Dictionary comment for one bronze column; KeyError for a column the dictionary does not know."""
+    return INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]][column]
+
+
+def _insr_w8_assert_covered(table, columns):
+    """Refuse to publish a table with a column the comment dictionary does not cover (checked before any write)."""
+    known = INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]]
+    missing = [c for c in columns if c not in known]
+    if missing:
+        raise KeyError(f"INSR_W8_COMMENTS_V1: {table} columns missing from the comment dictionary: {missing}")
+
+
+_insr_w8_assert_covered(TARGET, out.columns + ["ROW_HASH", "ADC_UPDT"])  # INSR_W8_COMMENTS_V1: before any write
 payload = sorted(c for c in out.columns if c not in {"PIPELINE_RUN_ID","SOURCE_ABSENT_DETECTED_TS"})
 out = out.withColumn("ROW_HASH", F.sha2(F.to_json(F.struct(*[F.col(c) for c in payload])),256)).withColumn("ADC_UPDT",F.current_timestamp())
 if SAMPLE_MODE:
@@ -81,11 +152,10 @@ else:
       .whenNotMatchedBySourceUpdate(condition="t.SOURCE_PRESENT_IND=true",set={"SOURCE_PRESENT_IND":"false","SOURCE_ABSENT_DETECTED_TS":"current_timestamp()","ADC_UPDT":"current_timestamp()"}).execute())
     operation = "FULL_MERGE"
 spark.sql(f"ALTER TABLE {qname(TARGET)} SET TBLPROPERTIES ('delta.enableChangeDataFeed'='true','delta.enableRowTracking'='true','delta.enableDeletionVectors'='true')")
-spark.sql(f"COMMENT ON TABLE {qname(TARGET)} IS 'One row per admitted Millennium scheduling action. VIEW and interface/session machinery are excluded; undo and restoration actions remain explicit.'")
+spark.sql(f"COMMENT ON TABLE {qname(TARGET)} IS '{_insr_w8_sql(INSR_W8_BRONZE_TABLE_COMMENTS[TARGET.split('.')[-1]])}'")  # INSR_W8_COMMENTS_V1
 for col in spark.table(TARGET).columns:
-    spark.sql(f"ALTER TABLE {qname(TARGET)} ALTER COLUMN `{col}` COMMENT 'TDX appointment-action bronze field {col}.'")
-    risk, severity = (("4","2") if any(x in col.upper() for x in ("PERSON","ENCNTR","PRSNL","_ID")) else ("1","1"))
-    spark.sql(f"ALTER TABLE {qname(TARGET)} ALTER COLUMN `{col}` SET TAGS ('ig_risk'='{risk}','ig_severity'='{severity}')")
+    spark.sql(f"ALTER TABLE {qname(TARGET)} ALTER COLUMN `{col}` COMMENT '{_insr_w8_sql(_insr_w8_comment(TARGET, col))}'")
+    # INSR_W1_TAG_HEURISTIC_RETIRED_V1: ig_risk/ig_severity come from Table Metadata Compliance (estate-copied), never from column names.
 spark.sql(f"ALTER TABLE {qname(TARGET)} CLUSTER BY (SCH_EVENT_ID, ACTION_DT_TM)")
 result = {"target":TARGET,"operation":operation,"rows":spark.table(TARGET).count(),"sample_mode":SAMPLE_MODE,"sample_rows":SAMPLE_ROWS}
 spark.createDataFrame([(RUN_ID,json.dumps(result,sort_keys=True),datetime.now(timezone.utc).replace(tzinfo=None))],"run_id string, result_json string, recorded_at timestamp").write.mode("append").saveAsTable("6_mgmt.bronze.appointment_action_pipeline_runs")  # OGR_NO_DEV_V1/appointment_action

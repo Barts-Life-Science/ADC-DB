@@ -258,6 +258,35 @@ def _table_exists(table_name: str) -> bool:
     return spark.catalog.tableExists(table_name)
 
 
+def _stage_once(df: Optional[DataFrame], name: str, config: "DeviceMappingConfig", run_token: str,
+                staged_tables: List[str]) -> Optional[DataFrame]:
+    """
+    BRONZE_PERF_20261101_DEVICE_STAGE_V1: write a frame once to a run scratch table and return a reader of it.
+
+    The mapping outputs are long lazy plans over ten inputs, and validate_device_mapping_outputs alone runs twelve
+    counts on them; each count re-ran the whole plan, as did each write after it (11-01: the plan was evaluated
+    about every 4 minutes from 07:19 to 08:11, roughly 50 of the task's 78 minutes, for 860 output rows). Staging
+    evaluates it once, and the validation and the writes then see exactly the same rows. The scratch table sits
+    next to the candidate table and is dropped when the run ends (_drop_staged).
+    """
+    if df is None:
+        return None
+    schema_name = config.candidate_table.rsplit(".", 1)[0]
+    table_name = f"{schema_name}.map_device_mapping__stage_{name}_{run_token}"
+    df.write.format("delta").mode("overwrite").saveAsTable(table_name)
+    staged_tables.append(table_name)
+    return spark.table(table_name)
+
+
+def _drop_staged(staged_tables: List[str]) -> None:
+    """Best-effort cleanup of the run scratch tables made by _stage_once."""
+    for table_name in staged_tables:
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {_sql_name(table_name)}")
+        except Exception as exc:
+            print(f"[DEVICE_STAGE] could not drop {table_name}: {exc}")
+
+
 def _is_empty(df: Optional[DataFrame]) -> bool:
     return df is None or df.limit(1).count() == 0
 
@@ -756,6 +785,25 @@ def read_cdf_versions(
             f"to {ending_version}. Run deploy_map_device_mapping_improvements() "
             "to take a new validated snapshot."
         ) from exc
+
+
+def _device_rewritten_sources(changed_ranges, config: DeviceMappingConfig) -> Dict[str, List[int]]:
+    """R1FIX_20261109: {event source: versions} for the implant/procedure sources whose change window contains a
+    whole-table rewrite (delta_rewrites, shared with the R1 attach and pathology_incremental)."""
+    import sys
+    shared = "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import delta_rewrites
+
+    rewritten = {}
+    for table_name in (config.implant_source, config.procedures_source):
+        if table_name in changed_ranges:
+            start_version, end_version = changed_ranges[table_name]
+            versions = delta_rewrites.rewrite_versions(spark, table_name, start_version, end_version)
+            if versions:
+                rewritten[table_name] = versions
+    return rewritten
 
 
 def configure_device_mapping_source_cdf(
@@ -3259,6 +3307,8 @@ def rebuild_map_device_mapping_v2(
         configure_device_mapping_source_cdf(config)
     ensure_device_mapping_auxiliary_tables(config)
     versions = current_device_mapping_versions(config)
+    run_token = uuid4().hex[:12]  # BRONZE_PERF_20261101_DEVICE_STAGE_V1: scratch table suffix for this run
+    staged_tables: List[str] = []
 
     try:
         source = build_implant_source_base(
@@ -3278,8 +3328,10 @@ def rebuild_map_device_mapping_v2(
             versions,
             references=references,
         )
-        final = final
-        candidates = candidates
+        # BRONZE_PERF_20261101_DEVICE_STAGE_V1: evaluate the mapping once (see _stage_once).
+        source = _stage_once(source, "source", config, run_token, staged_tables)
+        final = _stage_once(final, "final", config, run_token, staged_tables)
+        candidates = _stage_once(candidates, "candidates", config, run_token, staged_tables)
         validation = validate_device_mapping_outputs(
             source,
             final,
@@ -3335,6 +3387,7 @@ def rebuild_map_device_mapping_v2(
             if dataframe is not None:
                 None
         release_mapping_references(references)
+        _drop_staged(staged_tables)  # BRONZE_PERF_20261101_DEVICE_STAGE_V1
 
 
 def deploy_map_device_mapping_improvements(
@@ -3546,6 +3599,19 @@ def process_device_mapping_incremental_v2(
             refresh_implant_details=refresh_implant_details,
         )
 
+    # R1FIX_20261109: a source table that was rewritten in full inside its change window (a map_procedure or
+    # map_implant_details full rebuild, or the INSR R1 heal) changed every row, and a change-feed read across a rewrite
+    # that narrowed the schema fails. Remap in full, as a reference-table change already does.
+    rewritten_sources = _device_rewritten_sources(changed_ranges, config)
+    if rewritten_sources:
+        print(f"[device_pipeline] source rewritten in full {rewritten_sources}; running the validated rebuild")
+        return rebuild_map_device_mapping_v2(
+            config,
+            create_backup=False,
+            configure_source_retention=False,
+            refresh_implant_details=refresh_implant_details,
+        )
+
     source_change_ids = None
     procedure_event_ids = None
     if config.implant_source in changed_ranges:
@@ -3580,6 +3646,8 @@ def process_device_mapping_incremental_v2(
     source = None
     final = None
     candidates = None
+    run_token = uuid4().hex[:12]  # BRONZE_PERF_20261101_DEVICE_STAGE_V1: scratch table suffix for this run
+    staged_tables: List[str] = []
     try:
         old_anchors = spark.table(config.anchor_lookup_table)
         initial_source = build_implant_source_base(initial_event_ids, config)
@@ -3617,8 +3685,12 @@ def process_device_mapping_incremental_v2(
             current_versions,
             references=references,
         )
-        final = final
-        candidates = candidates
+        # BRONZE_PERF_20261101_DEVICE_STAGE_V1: evaluate the mapping once (see _stage_once). The affected ids are
+        # staged at the same point, so the deletes and the candidate replacement use the ids the mapping was built for.
+        affected_event_ids = _stage_once(affected_event_ids, "affected_ids", config, run_token, staged_tables)
+        source = _stage_once(source, "source", config, run_token, staged_tables)
+        final = _stage_once(final, "final", config, run_token, staged_tables)
+        candidates = _stage_once(candidates, "candidates", config, run_token, staged_tables)
         validation = validate_device_mapping_outputs(
             source,
             final,
@@ -3663,6 +3735,7 @@ def process_device_mapping_incremental_v2(
             if dataframe is not None:
                 None
         release_mapping_references(references)
+        _drop_staged(staged_tables)  # BRONZE_PERF_20261101_DEVICE_STAGE_V1
 
 
 def process_device_mapping_incremental(

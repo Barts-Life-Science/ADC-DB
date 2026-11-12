@@ -306,13 +306,18 @@ def publish(build_fn, target, schema, comment, key_cols, sources,
         spark.sql(f"TRUNCATE TABLE {target}")
 
     protect = f" AND NOT ({protect_condition})" if protect_condition else ""
+    # R1FIX_20261109: assign this builder's own columns only. UPDATE SET * / INSERT * also name the INSR R1 lane
+    # columns the attach task owns, which the source lacks (DELTA_MERGE_UNRESOLVED_EXPRESSION CANCER_DRUG_MAPPING,
+    # bronze run 178236917345566). Behaviour for every builder column is unchanged.
+    own_columns = {name: f"s.`{name}`" for name in df.columns}
     (
         DeltaTable.forName(spark, target).alias("t")
         .merge(df.alias("s"), f"t.{key_name} = s.{key_name}")
-        .whenMatchedUpdateAll(
-            condition=f"(t.ROW_HASH <> s.ROW_HASH OR t.SOURCE_PRESENT_IND = 0){protect}"
+        .whenMatchedUpdate(
+            condition=f"(t.ROW_HASH <> s.ROW_HASH OR t.SOURCE_PRESENT_IND = 0){protect}",
+            set=own_columns,
         )
-        .whenNotMatchedInsertAll()
+        .whenNotMatchedInsert(values=own_columns)
         .whenNotMatchedBySourceUpdate(
             condition=f"t.SOURCE_PRESENT_IND = 1{protect}",
             set={"SOURCE_PRESENT_IND": "0", "ADC_UPDT": "current_timestamp()"},
@@ -1037,6 +1042,77 @@ results.append(publish(
     key_name="TREATMENT_KEY",
 ))
 
+from functools import reduce
+
+# INSR_W1_TNM_MILL_V1: TNM stage from Millennium sources only (J19: SCR/COSD are banned for staging, TNM included).
+# Two arms: (1) the three "Uro TNM Stagging" clinical-event codes (T, N, M as separate events); (2) a pTNM/cTNM statement
+# in current pathology report text (rule PTNM_REGEX_V1). One row per source item; provenance in RULE_ID and SOURCE_KIND.
+T_STAGE_MILL = f"{TARGET_SCHEMA}.map_cancer_stage_mill"
+URO_TNM_EVENT_CDS = {478061273: "T", 478061303: "N", 478061333: "M"}
+PTNM_PATTERN = r"(?i)\b(y?[pc])?(T[0-4][a-c]?|Tis|Tx)[\s\S]{0,20}?(N[0-3][a-c]?|Nx)[\s\S]{0,20}?(M[01][a-c]?|Mx)"
+SCHEMA_CANCER_STAGE_MILL = StructType([
+    StructField("STAGE_KEY", StringType(), False, {"comment": "SHA-256 of SOURCE_KIND and SOURCE_ID."}),
+    StructField("SOURCE_KIND", StringType(), True, {"comment": "URO_TNM_EVENT or PATH_REPORT_PTNM."}),
+    StructField("SOURCE_ID", StringType(), True, {"comment": "Clinical EVENT_ID, or pathology report_version_id."}),
+    StructField("PERSON_ID", LongType(), True, {"comment": "Cerner PERSON_ID (event person, or eligible accession person)."}),
+    StructField("ENCNTR_ID", LongType(), True, {"comment": "Encounter of the clinical event; NULL for report text."}),
+    StructField("STAGE_DT_TM", TimestampType(), True, {"comment": "Event end time, or report issue time."}),
+    StructField("STAGE_PREFIX", StringType(), True, {"comment": "p, c, yp or yc when stated; NULL otherwise."}),
+    StructField("T_STAGE", StringType(), True, {"comment": "T category as recorded (e.g. T2a, Tis, Tx)."}),
+    StructField("N_STAGE", StringType(), True, {"comment": "N category as recorded."}),
+    StructField("M_STAGE", StringType(), True, {"comment": "M category as recorded."}),
+    StructField("STAGE_TEXT", StringType(), True, {"comment": "The matched statement or the event result text."}),
+    StructField("RULE_ID", StringType(), True, {"comment": "URO_TNM_EVENTCD_V1 or PTNM_REGEX_V1."}),
+    StructField("SOURCE_PRESENT_IND", IntegerType(), True, {"comment": "1 while the source item is present."}),
+    StructField("ROW_HASH", StringType(), True, {"comment": "Payload hash."}),
+    StructField("ADC_UPDT", TimestampType(), True, {"comment": "Last write by cancer_pipeline."}),
+])
+CANCER_STAGE_MILL_COMMENT = ("TNM staging recorded in Millennium (Uro TNM event codes) and stated in pathology reports (pTNM regex). "
+                             "Not a complete staging source: ARIA/registry staging is not used (J19). INSR_W1_TNM_MILL_V1.")
+
+
+def build_mill_stage_arm():
+    """Union of the Uro TNM events (current versions) and the pTNM statements in current pathology report versions."""
+    events = []
+    for table, result_col, valid_col in (("map_coded_events", "RESULT_DISPLAY", "CE_VALID_UNTIL_DT_TM"),
+                                         ("map_text_events", "RESULT_VAL", "CLINICAL_EVENT_VALID_UNTIL_DT_TM")):
+        axis = F.create_map(*[x for cd, ax in URO_TNM_EVENT_CDS.items() for x in (F.lit(cd), F.lit(ax))])
+        frame = (spark.table(f"4_prod.bronze.{table}")
+                 .where(F.col("EVENT_CD").cast("long").isin(*URO_TNM_EVENT_CDS))
+                 .where(F.col(valid_col).isNull() | (F.col(valid_col) >= F.lit("2099-01-01").cast("timestamp")))
+                 .withColumn("_axis", F.element_at(axis, F.col("EVENT_CD").cast("long")))
+                 .select(F.lit("URO_TNM_EVENT").alias("SOURCE_KIND"), F.col("EVENT_ID").cast("string").alias("SOURCE_ID"),
+                         F.col("PERSON_ID").cast("long").alias("PERSON_ID"), F.col("ENCNTR_ID").cast("long").alias("ENCNTR_ID"),
+                         F.col("EVENT_END_DT_TM").alias("STAGE_DT_TM"), F.lit(None).cast("string").alias("STAGE_PREFIX"),
+                         F.when(F.col("_axis") == "T", F.col(result_col)).alias("T_STAGE"),
+                         F.when(F.col("_axis") == "N", F.col(result_col)).alias("N_STAGE"),
+                         F.when(F.col("_axis") == "M", F.col(result_col)).alias("M_STAGE"),
+                         F.col(result_col).alias("STAGE_TEXT"), F.lit("URO_TNM_EVENTCD_V1").alias("RULE_ID")))
+        events.append(frame)
+    persons = (spark.table("4_prod.bronze.map_pathology_accession").where("lower(trim(person_resolution_status)) = 'eligible'")
+               .select("pathology_accession_id", F.col("canonical_person_id").cast("long").alias("PERSON_ID")))
+    reports = (spark.table("4_prod.bronze.map_pathology_report").where("is_current").where(F.col("report_text").rlike(PTNM_PATTERN))
+               .join(persons, "pathology_accession_id", "left")
+               .select(F.lit("PATH_REPORT_PTNM").alias("SOURCE_KIND"), F.col("report_version_id").alias("SOURCE_ID"), "PERSON_ID",
+                       F.lit(None).cast("long").alias("ENCNTR_ID"), F.col("issued_dt").alias("STAGE_DT_TM"),
+                       F.when(F.length(F.regexp_extract("report_text", PTNM_PATTERN, 1)) > 0,
+                              F.lower(F.regexp_extract("report_text", PTNM_PATTERN, 1))).alias("STAGE_PREFIX"),
+                       F.regexp_extract("report_text", PTNM_PATTERN, 2).alias("T_STAGE"),
+                       F.regexp_extract("report_text", PTNM_PATTERN, 3).alias("N_STAGE"),
+                       F.regexp_extract("report_text", PTNM_PATTERN, 4).alias("M_STAGE"),
+                       F.regexp_extract("report_text", PTNM_PATTERN, 0).alias("STAGE_TEXT"), F.lit("PTNM_REGEX_V1").alias("RULE_ID")))
+    return reduce(lambda a, b: a.unionByName(b), events + [reports])
+
+
+assert_target_schema_compatible(T_STAGE_MILL, SCHEMA_CANCER_STAGE_MILL)
+results.append(publish(
+    build_mill_stage_arm, T_STAGE_MILL, SCHEMA_CANCER_STAGE_MILL, CANCER_STAGE_MILL_COMMENT,
+    ["SOURCE_KIND", "SOURCE_ID"],
+    sources=["4_prod.bronze.map_coded_events", "4_prod.bronze.map_text_events", "4_prod.bronze.map_pathology_report",
+             "4_prod.bronze.map_pathology_accession"],
+    key_name="STAGE_KEY",
+))
+
 record_counts = {}
 if bronze_table_exists(T_TREATMENT):
     record_counts = {
@@ -1067,4 +1143,3 @@ summary = {
 }
 print(bronze_json(summary))
 dbutils.notebook.exit(bronze_json(summary))
-

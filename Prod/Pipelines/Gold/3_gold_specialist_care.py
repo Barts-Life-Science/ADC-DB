@@ -10,13 +10,16 @@
 
 # COMMAND ----------
 
+# INSR_W4_ROWRULES_V1: W4 row rules (insr-v1); see gold_journey_shared.py
 from gold_journey_shared import (
+    insr_w4_apply_value_rules,  # INSR_W4
     _n,
     _qc,
     _s3_flatten_gold_public,
     _src,
     _with_comments,
     _with_parent_status,
+    _with_row_key,  # INSR_W3 W3.09
     dp,
 )
 
@@ -37,12 +40,14 @@ CLINICAL_BABY_DELIVERY_SELECT = [
     '`event_datetime_local` AS `event_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     'CASE WHEN `event_end_datetime` IS NOT NULL AND (CASE WHEN `event_datetime` IS NOT NULL AND `event_end_datetime` IS NOT NULL AND `event_datetime` > `event_end_datetime` THEN NULL ELSE `event_end_datetime` END) IS NULL THEN NULL ELSE `event_end_datetime_local` END AS `event_end_datetime_local`',  # GOLD_COLUMN_PARITY_V1
     '`source_coding_system` AS `source_coding_system`',
-    "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
+    # INSR_W3 W3.05: passthrough: literal_0 retired; MSDS code 0 is a valid value (owner exception).
+    "`source_code` AS `source_code`",
     '`source_display` AS `source_display`',
     '`baby_person_id` AS `baby_person_id`',
     '`birth_order` AS `birth_order`',
     '`pregnancy_outcome` AS `pregnancy_outcome`',
-    "CASE WHEN UPPER(TRIM(CAST(`delivery_method_code` AS STRING))) = '0' THEN NULL ELSE `delivery_method_code` END AS `delivery_method_code`",
+    # INSR_W3 W3.05: passthrough: literal_0 retired; MSDS code 0 is a valid value (owner exception).
+    "`delivery_method_code` AS `delivery_method_code`",
     '`phenotypic_sex` AS `phenotypic_sex`',
     '`gestation_length_birth` AS `gestation_length_birth`',
     '`birthweight` AS `birthweight`',
@@ -87,6 +92,9 @@ CLINICAL_BABY_DELIVERY_MANDATORY_RULES = {
 }
 
 CLINICAL_BABY_DELIVERY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.baby_delivery.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 387 of 99,299 at the profile.
@@ -152,6 +160,12 @@ CLINICAL_BABY_DELIVERY_COLUMN_COMMENTS = {
     "loaded_at": "map_maternity_baby_delivery.ADC_UPDT carried unchanged from the deduplicated delivery source row. Identity fan-out is collapsed without aggregating this clock; the joined pregnancy spine does not contribute a load timestamp. This is not the Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_BABY_DELIVERY_PERSON_SCOPE_RULES = {
+    "gold.clinical.baby_delivery.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_baby_delivery"),
     comment="Internal quality-controlled twin of clinical_baby_delivery: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -159,6 +173,7 @@ CLINICAL_BABY_DELIVERY_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_BABY_DELIVERY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_BABY_DELIVERY_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_BABY_DELIVERY_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_baby_delivery():
     """Quality-controlled twin of journey_clinical.baby_delivery."""
     df = _qc("clinical_baby_delivery", CLINICAL_BABY_DELIVERY_SELECT)
@@ -166,12 +181,14 @@ def _gold_qc_clinical_baby_delivery():
 
 @dp.materialized_view(
     name=_n("gold_clinical.baby_delivery"),
-    comment=(
-        "One MSDS baby-delivery row with mother identity recovered through the pregnancy "
-        "spine. Gold QC twin of the silver product: 3 columns are repaired or nulled, 1 "
-        "rule(s) drop rows, 2 check(s) are advisory. Each rule states its reason in the "
-        "pipeline notebook, and Lakeflow expectation metrics report what every rule matched "
-        "on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One MSDS baby-delivery row with mother identity recovered through the pregnancy spine. Gold QC "
+        "twin of the silver product: 3 columns are repaired or nulled, 1 rule(s) drop rows, 2 check(s) "
+        "are advisory. Each rule states its reason in the pipeline notebook, and Lakeflow expectation "
+        "metrics report what every rule matched on each update. Coverage: The baby's person id is empty "
+        "on 23.5% of baby-delivery rows, where the baby's NHS number does not resolve to exactly one "
+        "Millennium person; every filled id is a published person; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -292,6 +309,9 @@ CLINICAL_CANCER_TREATMENT_MANDATORY_RULES = {
 }
 
 CLINICAL_CANCER_TREATMENT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.cancer_treatment.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counted rather than nulled because a treatment course that is still running has a
     # planned end date, which is in the future by construction. Seen on 5,115 of 2,789,249
     # rows (0.183%) when profiled on 2026-08-24.
@@ -391,6 +411,12 @@ CLINICAL_CANCER_TREATMENT_COLUMN_COMMENTS = {
     "loaded_at": "map_cancer_treatment.ADC_UPDT carried unchanged through usable-code filtering and QC/public projections. No joined parent or QC clock is added. This differs from SRC_ADC_UPDT used for source_update_timestamp and from the current Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_CANCER_TREATMENT_PERSON_SCOPE_RULES = {
+    "gold.clinical.cancer_treatment.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_cancer_treatment"),
     comment="Internal quality-controlled twin of clinical_cancer_treatment: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -398,6 +424,7 @@ CLINICAL_CANCER_TREATMENT_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_CANCER_TREATMENT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CANCER_TREATMENT_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_CANCER_TREATMENT_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_cancer_treatment():
     """Quality-controlled twin of journey_clinical.cancer_treatment."""
     df = _qc("clinical_cancer_treatment", CLINICAL_CANCER_TREATMENT_SELECT)
@@ -405,12 +432,15 @@ def _gold_qc_clinical_cancer_treatment():
 
 @dp.materialized_view(
     name=_n("gold_clinical.cancer_treatment"),
-    comment=(
-        "One SACT constituent-drug treatment fact, kept separate from encounter-bound "
-        "Millennium medication administration. Gold QC twin of the silver product: 8 columns "
-        "are repaired or nulled, 1 rule(s) drop rows, 8 check(s) are advisory. Each rule "
-        "states its reason in the pipeline notebook, and Lakeflow expectation metrics report "
-        "what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One SACT constituent-drug treatment fact, kept separate from encounter-bound Millennium "
+        "medication administration. Gold QC twin of the silver product: 8 columns are repaired or nulled, "
+        "1 rule(s) drop rows, 8 check(s) are advisory. Each rule states its reason in the pipeline "
+        "notebook, and Lakeflow expectation metrics report what every rule matched on each update. "
+        "Coverage: iQemo holds regimens, courses and cycles but no per-drug rows at source (its only drug "
+        "column is a G-CSF regimen drug id), so chemotherapy is published at cycle grain without "
+        "individual agents; complete-through month per release: 6_mgmt.data_quality.release_finding "
+        "(finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -546,11 +576,14 @@ def _gold_qc_clinical_cancer_treatment_cycle():
 
 @dp.materialized_view(
     name=_n("gold_clinical.cancer_treatment_cycle"),
-    comment=(
-        "One iQemo chemotherapy cycle child reference at composite course/cycle grain. Gold "
-        "QC twin of the silver product: 1 columns are repaired or nulled, 1 rule(s) drop "
-        "rows, 1 check(s) are advisory. Each rule states its reason in the pipeline notebook, "
-        "and Lakeflow expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One iQemo chemotherapy cycle child reference at composite course/cycle grain. Gold QC twin of "
+        "the silver product: 1 columns are repaired or nulled, 1 rule(s) drop rows, 1 check(s) are "
+        "advisory. Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics "
+        "report what every rule matched on each update. Coverage: iQemo holds regimens, courses and "
+        "cycles but no per-drug rows at source (its only drug column is a G-CSF regimen drug id), so "
+        "chemotherapy is published at cycle grain without individual agents; complete-through month per "
+        "release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -629,6 +662,9 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_MANDATORY_RULES = {
 }
 
 CLINICAL_CRITICAL_CARE_ACTIVITY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.critical_care_activity.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 9,847 of 341,038 at the profile.
@@ -682,6 +718,12 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_COLUMN_COMMENTS = {
     "loaded_at": "map_critical_care_activity.ADC_UPDT carried unchanged through code filtering and source/public projections. No parent-period timestamp is joined or added. It is the contributing bronze load clock, distinct from PIPELINE_UPDT_DT_TM published as source_update_timestamp, not Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_CRITICAL_CARE_ACTIVITY_PERSON_SCOPE_RULES = {
+    "gold.clinical.critical_care_activity.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_activity"),
     comment="Internal quality-controlled twin of clinical_critical_care_activity: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -689,6 +731,7 @@ CLINICAL_CRITICAL_CARE_ACTIVITY_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ACTIVITY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_ACTIVITY_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ACTIVITY_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_critical_care_activity():
     """Quality-controlled twin of journey_clinical.critical_care_activity."""
     df = _qc(
@@ -700,11 +743,14 @@ def _gold_qc_clinical_critical_care_activity():
 
 @dp.materialized_view(
     name=_n("gold_clinical.critical_care_activity"),
-    comment=(
-        "One admitted CCMDS critical-care activity with parent-link evidence. Gold QC twin of "
-        "the silver product: 1 columns are repaired or nulled, 1 rule(s) drop rows, 3 "
-        "check(s) are advisory. Each rule states its reason in the pipeline notebook, and "
-        "Lakeflow expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One admitted CCMDS critical-care activity with parent-link evidence. Gold QC twin of the silver "
+        "product: 1 columns are repaired or nulled, 1 rule(s) drop rows, 3 check(s) are advisory. Each "
+        "rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report what "
+        "every rule matched on each update. Coverage: Critical-care activity rows step up about 5-fold "
+        "from August 2025 after a CCMDS coding change (periods unchanged); 22% of rows have no parent "
+        "period; complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -799,6 +845,9 @@ CLINICAL_CRITICAL_CARE_ADMISSION_MANDATORY_RULES = {
 }
 
 CLINICAL_CRITICAL_CARE_ADMISSION_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.critical_care_admission.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 5,454 of 141,391 at the profile.
@@ -868,6 +917,12 @@ CLINICAL_CRITICAL_CARE_ADMISSION_COLUMN_COMMENTS = {
     "loaded_at": "map_critical_care_admission.ADC_UPDT carried unchanged for the contributing Medicus admission row. This is bronze ingestion provenance, distinct from updated_at/source_update_timestamp and the admission/discharge dates; it is not Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_CRITICAL_CARE_ADMISSION_PERSON_SCOPE_RULES = {
+    "gold.clinical.critical_care_admission.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_admission"),
     comment="Internal quality-controlled twin of clinical_critical_care_admission: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -875,6 +930,7 @@ CLINICAL_CRITICAL_CARE_ADMISSION_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ADMISSION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_ADMISSION_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_ADMISSION_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_critical_care_admission():
     """Quality-controlled twin of journey_clinical.critical_care_admission."""
     df = _qc(
@@ -992,6 +1048,9 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_MANDATORY_RULES = {
 }
 
 CLINICAL_CRITICAL_CARE_DAILY_SCORE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.critical_care_daily_score.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 191,490 of 3,989,576 at the profile.
@@ -1051,6 +1110,12 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_COLUMN_COMMENTS = {
     "loaded_at": "map_critical_care_daily_score.ADC_UPDT carried unchanged through code filtering and source/public projections. The parent admission key is derived without joining a parent clock; this is row-level bronze ingestion provenance, distinct from UPDATED_AT and Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_CRITICAL_CARE_DAILY_SCORE_PERSON_SCOPE_RULES = {
+    "gold.clinical.critical_care_daily_score.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_daily_score"),
     comment="Internal quality-controlled twin of clinical_critical_care_daily_score: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1058,6 +1123,7 @@ CLINICAL_CRITICAL_CARE_DAILY_SCORE_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_DAILY_SCORE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_DAILY_SCORE_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_DAILY_SCORE_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_critical_care_daily_score():
     """Quality-controlled twin of journey_clinical.critical_care_daily_score."""
     df = _qc(
@@ -1069,11 +1135,14 @@ def _gold_qc_clinical_critical_care_daily_score():
 
 @dp.materialized_view(
     name=_n("gold_clinical.critical_care_daily_score"),
-    comment=(
-        "One admitted Medicus daily critical-care score row. Gold QC twin of the silver "
-        "product: 1 columns are repaired or nulled, 1 rule(s) drop rows, 3 check(s) are "
-        "advisory. Each rule states its reason in the pipeline notebook, and Lakeflow "
-        "expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One admitted Medicus daily critical-care score row. Gold QC twin of the silver product: 1 "
+        "columns are repaired or nulled, 1 rule(s) drop rows, 3 check(s) are advisory. Each rule states "
+        "its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule "
+        "matched on each update. Coverage: Medicus critical-care daily scores are mostly not calculated "
+        "from 2022 (SOFA filled on 96% of patient-days before, 12% after) while patient-days are "
+        "unchanged; complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -1179,6 +1248,9 @@ CLINICAL_CRITICAL_CARE_PERIOD_MANDATORY_RULES = {
 }
 
 CLINICAL_CRITICAL_CARE_PERIOD_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.critical_care_period.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 7,181 of 176,886 at the profile.
@@ -1253,6 +1325,12 @@ CLINICAL_CRITICAL_CARE_PERIOD_COLUMN_COMMENTS = {
     "loaded_at": "ADC_UPDT of the selected map_critical_care_period revision, not the maximum load time across the business-period group. Selection maximizes the struct of CURRENT_IND cast to INT (null 0), Record_Updated_Dt cast to TIMESTAMP (null 1900-01-01), then Crit_Care_Period_Id (null -1), within PERIOD_BUSINESS_KEY. The chosen row's clock is carried unchanged; it is distinct from PIPELINE_UPDT_DT_TM and Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_CRITICAL_CARE_PERIOD_PERSON_SCOPE_RULES = {
+    "gold.clinical.critical_care_period.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_critical_care_period"),
     comment="Internal quality-controlled twin of clinical_critical_care_period: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1260,6 +1338,7 @@ CLINICAL_CRITICAL_CARE_PERIOD_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_PERIOD_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_CRITICAL_CARE_PERIOD_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_CRITICAL_CARE_PERIOD_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_critical_care_period():
     """Quality-controlled twin of journey_clinical.critical_care_period."""
     df = _qc(
@@ -1393,6 +1472,9 @@ CLINICAL_LABOUR_DELIVERY_MANDATORY_RULES = {
 }
 
 CLINICAL_LABOUR_DELIVERY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.labour_delivery.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 379 of 101,238 at the profile.
@@ -1463,6 +1545,17 @@ CLINICAL_LABOUR_DELIVERY_COLUMN_COMMENTS = {
     "loaded_at": "map_maternity_labour_delivery.ADC_UPDT carried unchanged from the deduplicated labour source row. Identity fan-out is collapsed without aggregating this clock; the joined pregnancy spine does not contribute a load timestamp. This is not the Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_LABOUR_DELIVERY_PERSON_SCOPE_RULES = {
+    "gold.clinical.labour_delivery.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+CLINICAL_LABOUR_DELIVERY_ORPHAN_RULES = {
+    "gold.clinical.labour_delivery.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_labour_delivery"),
     comment="Internal quality-controlled twin of clinical_labour_delivery: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1470,6 +1563,8 @@ CLINICAL_LABOUR_DELIVERY_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_LABOUR_DELIVERY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_LABOUR_DELIVERY_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_LABOUR_DELIVERY_PERSON_SCOPE_RULES)
+@dp.expect_all(CLINICAL_LABOUR_DELIVERY_ORPHAN_RULES)
 def _gold_qc_clinical_labour_delivery():
     """Quality-controlled twin of journey_clinical.labour_delivery."""
     # 1 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -1485,11 +1580,15 @@ def _gold_qc_clinical_labour_delivery():
 
 @dp.materialized_view(
     name=_n("gold_clinical.labour_delivery"),
-    comment=(
-        "One MSDS labour-delivery row with pregnancy-spine identity evidence. Gold QC twin of "
-        "the silver product: 2 columns are repaired or nulled, 1 rule(s) drop rows, 3 "
-        "check(s) are advisory. Each rule states its reason in the pipeline notebook, and "
-        "Lakeflow expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One MSDS labour-delivery row with pregnancy-spine identity evidence. Gold QC twin of the silver "
+        "product: 2 columns are repaired or nulled, 1 rule(s) drop rows, 3 check(s) are advisory. Each "
+        "rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report what "
+        "every rule matched on each update. Coverage: Still built from the maternity services dataset "
+        "(MSDS): Millennium matches 99% of MSDS deliveries from April 2019 but records the delivery "
+        "method on 73% as many and labour onset on 31% as many, so the table was not moved onto "
+        "Millennium in this release; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -1607,6 +1706,9 @@ CLINICAL_MATERNITY_CARE_CONTACT_MANDATORY_RULES = {
 }
 
 CLINICAL_MATERNITY_CARE_CONTACT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.maternity_care_contact.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 240 of 1,052,832 at the profile.
@@ -1681,6 +1783,12 @@ CLINICAL_MATERNITY_CARE_CONTACT_COLUMN_COMMENTS = {
     "loaded_at": "map_maternity_care_contact.ADC_UPDT carried unchanged from the deduplicated contact source row. Identity fan-out is collapsed without aggregating this clock; the joined pregnancy spine does not contribute a load timestamp. This is not the Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_MATERNITY_CARE_CONTACT_PERSON_SCOPE_RULES = {
+    "gold.clinical.maternity_care_contact.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_maternity_care_contact"),
     comment="Internal quality-controlled twin of clinical_maternity_care_contact: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1688,6 +1796,7 @@ CLINICAL_MATERNITY_CARE_CONTACT_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_MATERNITY_CARE_CONTACT_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_MATERNITY_CARE_CONTACT_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_MATERNITY_CARE_CONTACT_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_maternity_care_contact():
     """Quality-controlled twin of journey_clinical.maternity_care_contact."""
     df = _qc(
@@ -1699,11 +1808,14 @@ def _gold_qc_clinical_maternity_care_contact():
 
 @dp.materialized_view(
     name=_n("gold_clinical.maternity_care_contact"),
-    comment=(
-        "One MSDS maternity care contact with pregnancy-spine identity evidence. Gold QC twin "
-        "of the silver product: 0 columns are repaired or nulled, 1 rule(s) drop rows, 4 "
-        "check(s) are advisory. Each rule states its reason in the pipeline notebook, and "
-        "Lakeflow expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One MSDS maternity care contact with pregnancy-spine identity evidence. Gold QC twin of the "
+        "silver product: 0 columns are repaired or nulled, 1 rule(s) drop rows, 4 check(s) are advisory. "
+        "Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report "
+        "what every rule matched on each update. Coverage: Still built from the maternity services "
+        "dataset (MSDS): Millennium appointments cover 93% of MSDS contact person-days from April 2019 "
+        "(95% required), so the table was not moved onto Millennium in this release; complete-through "
+        "month per release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -1804,6 +1916,9 @@ CLINICAL_NEONATAL_CARE_DAY_MANDATORY_RULES = {
 }
 
 CLINICAL_NEONATAL_CARE_DAY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.neonatal_care_day.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 5,848 of 507,781 at the profile.
@@ -1873,6 +1988,12 @@ CLINICAL_NEONATAL_CARE_DAY_COLUMN_COMMENTS = {
     "loaded_at": "map_neonatal_critical_care.ADC_UPDT carried unchanged through the care-day stage and public projection. This is bronze ingestion provenance, not ActivityDate, critical-care start/discharge or Silver refresh time; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_NEONATAL_CARE_DAY_PERSON_SCOPE_RULES = {
+    "gold.clinical.neonatal_care_day.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_care_day"),
     comment="Internal quality-controlled twin of clinical_neonatal_care_day: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1880,6 +2001,7 @@ CLINICAL_NEONATAL_CARE_DAY_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_CARE_DAY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_CARE_DAY_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_NEONATAL_CARE_DAY_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_neonatal_care_day():
     """Quality-controlled twin of journey_clinical.neonatal_care_day."""
     df = _qc(
@@ -1983,6 +2105,9 @@ CLINICAL_NEONATAL_EPISODE_SELECT = [
     '`source_update_timestamp` AS `source_update_timestamp`',
     '`loaded_at` AS `loaded_at`',
 ]
+CLINICAL_NEONATAL_EPISODE_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`unit_level_derived` AS `unit_level_derived`',
+]
 
 # contract v2: QC/batch inputs come from internal _clinical_neonatal_episode_metadata; source history stays on the main research table.
 CLINICAL_NEONATAL_EPISODE_MANDATORY_RULES = {
@@ -1994,6 +2119,9 @@ CLINICAL_NEONATAL_EPISODE_MANDATORY_RULES = {
 }
 
 CLINICAL_NEONATAL_EPISODE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.neonatal_episode.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 557 of 36,718 at the profile.
@@ -2057,6 +2185,16 @@ CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS = {
     "source_update_timestamp": "Timestamp of the last update to this record.",
     "loaded_at": "map_neonatal_episode.ADC_UPDT carried unchanged for the contributing BadgerNet episode row. It is bronze ingestion provenance, distinct from LastUpdate published as source_update_timestamp and from RecordTimestamp; it is not admission/birth/discharge time or Silver refresh time.",
 }
+CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "unit_level_derived": "Neonatal unit level 1, 2 or 3 parsed from unit_level (first digit 1-3); NULL when absent. INSR_W2 W2.11."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_NEONATAL_EPISODE_PERSON_SCOPE_RULES = {
+    "gold.clinical.neonatal_episode.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_episode"),
@@ -2065,6 +2203,7 @@ CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_EPISODE_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_EPISODE_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_NEONATAL_EPISODE_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_neonatal_episode():
     """Quality-controlled twin of journey_clinical.neonatal_episode."""
     df = _qc(
@@ -2128,6 +2267,7 @@ def gold_clinical_neonatal_episode():
         '`record_status_effective_to` AS `record_status_effective_to`',
         '`source_update_timestamp` AS `source_update_timestamp`',
         '`loaded_at` AS `loaded_at`',
+        '`unit_level_derived` AS `unit_level_derived`',  # INSR_W3 W3.12
     )
     return _with_comments(df, CLINICAL_NEONATAL_EPISODE_COLUMN_COMMENTS)
 
@@ -2188,6 +2328,9 @@ CLINICAL_NEONATAL_EXAMINATION_MANDATORY_RULES = {
 }
 
 CLINICAL_NEONATAL_EXAMINATION_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.neonatal_examination.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 112 of 7,528 at the profile.
@@ -2259,6 +2402,12 @@ CLINICAL_NEONATAL_EXAMINATION_COLUMN_COMMENTS = {
     "loaded_at": "map_neonatal_examination.ADC_UPDT carried unchanged through code filtering and source/public projections. The neonatal-episode key is derived without joining an episode clock. This is bronze ingestion provenance, identical to source_update_timestamp, not examination time or Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_NEONATAL_EXAMINATION_PERSON_SCOPE_RULES = {
+    "gold.clinical.neonatal_examination.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_neonatal_examination"),
     comment="Internal quality-controlled twin of clinical_neonatal_examination: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -2266,6 +2415,7 @@ CLINICAL_NEONATAL_EXAMINATION_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_NEONATAL_EXAMINATION_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_NEONATAL_EXAMINATION_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_NEONATAL_EXAMINATION_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_neonatal_examination():
     """Quality-controlled twin of journey_clinical.neonatal_examination."""
     df = _qc(
@@ -2277,11 +2427,12 @@ def _gold_qc_clinical_neonatal_examination():
 
 @dp.materialized_view(
     name=_n("gold_clinical.neonatal_examination"),
-    comment=(
-        "One populated BadgerNet neonatal examination. Gold QC twin of the silver product: 0 "
-        "columns are repaired or nulled, 1 rule(s) drop rows, 4 check(s) are advisory. Each "
-        "rule states its reason in the pipeline notebook, and Lakeflow expectation metrics "
-        "report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One populated BadgerNet neonatal examination. Gold QC twin of the silver product: 0 columns are "
+        "repaired or nulled, 1 rule(s) drop rows, 4 check(s) are advisory. Each rule states its reason in "
+        "the pipeline notebook, and Lakeflow expectation metrics report what every rule matched on each "
+        "update. Examinations whose form had no examination content are not published; 27 of 29,670 gated "
+        "rows carried any finding and none was dated."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -2375,6 +2526,9 @@ CLINICAL_REGISTRY_ENTRY_MANDATORY_RULES = {
 }
 
 CLINICAL_REGISTRY_ENTRY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.registry_entry.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Counts what the research surface removed: rows failing identity_status = 'resolved'.
     # The mandatory rule above has already dropped them, so this is how many went, not how
     # many survive. 37 of 236,690 at the profile.
@@ -2429,6 +2583,12 @@ CLINICAL_REGISTRY_ENTRY_COLUMN_COMMENTS = {
     "loaded_at": "ADC_UPDT of the contributing iWeb row, carried unchanged per family. Surgery-procedure and coronary-lesion parent joins select parent identity and clinical event time, not a parent load clock. The family union takes no cross-family maximum; device rows are excluded before registry QC/public projections.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+CLINICAL_REGISTRY_ENTRY_PERSON_SCOPE_RULES = {
+    "gold.clinical.registry_entry.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._clinical_registry_entry"),
     comment="Internal quality-controlled twin of clinical_registry_entry: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -2436,6 +2596,7 @@ CLINICAL_REGISTRY_ENTRY_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_ENTRY_MANDATORY_RULES)
 @dp.expect_all(CLINICAL_REGISTRY_ENTRY_ADVISORY_RULES)
+@dp.expect_all_or_drop(CLINICAL_REGISTRY_ENTRY_PERSON_SCOPE_RULES)
 def _gold_qc_clinical_registry_entry():
     """Quality-controlled twin of journey_clinical.registry_entry."""
     df = _qc("clinical_registry_entry", CLINICAL_REGISTRY_ENTRY_SELECT)
@@ -2651,7 +2812,7 @@ def _gold_qc_clinical_neonatal_care_day_activity():
 )
 def gold_clinical_neonatal_care_day_activity():
     """Publish clinical_neonatal_care_day_activity without exposing the internal parent-admission marker."""
-    return spark.read.table(_n("gold_qc._clinical_neonatal_care_day_activity")).drop("__gold_parent_present")
+    return _with_row_key(spark.read.table(_n("gold_qc._clinical_neonatal_care_day_activity")).drop("__gold_parent_present"), "clinical_neonatal_care_day_activity")  # INSR_W3 W3.09
 
 # COMMAND ----------
 
@@ -2705,7 +2866,7 @@ def _gold_qc_clinical_neonatal_care_day_high_cost_drug():
 )
 def gold_clinical_neonatal_care_day_high_cost_drug():
     """Publish clinical_neonatal_care_day_high_cost_drug without exposing the internal parent-admission marker."""
-    return spark.read.table(_n("gold_qc._clinical_neonatal_care_day_high_cost_drug")).drop("__gold_parent_present")
+    return _with_row_key(spark.read.table(_n("gold_qc._clinical_neonatal_care_day_high_cost_drug")).drop("__gold_parent_present"), "clinical_neonatal_care_day_high_cost_drug")  # INSR_W3 W3.09
 
 # COMMAND ----------
 
@@ -2907,6 +3068,10 @@ CLINICAL_REGISTRY_ACS_TRANSFER_SELECT = [
     '`date_of_birth` AS `date_of_birth`',
     '`hospital_identifier` AS `hospital_identifier`',
 ]
+CLINICAL_REGISTRY_ACS_TRANSFER_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`peak_troponin_ng_l` AS `peak_troponin_ng_l`',
+    '`unit_method` AS `unit_method`',
+]
 
 CLINICAL_REGISTRY_ACS_TRANSFER_COLUMN_COMMENTS = {
     "patient_event_key": "Deterministic SHA-256 key matching clinical_registry_entry.patient_event_key for the acs_transfer source family and native entry_id.",
@@ -3103,6 +3268,11 @@ CLINICAL_REGISTRY_ACS_TRANSFER_COLUMN_COMMENTS = {
     "date_of_birth": "Patient date of birth as recorded in the source ACS transfer registry record.",
     "hospital_identifier": "Hospital identifier recorded against the patient in the source registry record.",
 }
+CLINICAL_REGISTRY_ACS_TRANSFER_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "peak_troponin_ng_l": "Peak troponin in ng/L, unit decided per assay: High sensitivity Troponin I is recorded in ng/L and kept; High sensitivity Troponin T, Troponin T and Troponin I are recorded in ug/L, so values below 5 are x1000 (values >= 5 were already ng/L). NULL when the assay is unknown or missing. INSR_W2 W2.11 (L3029).",
+    "unit_method": "How peak_troponin_ng_l was derived: assay_ng_l, assay_ug_l_x1000, assay_ug_l_value_already_ng_l, or undetermined (unknown/missing assay; peak_troponin_ng_l NULL). INSR_W2 W2.11."
+})
 
 CLINICAL_REGISTRY_ACS_TRANSFER_MANDATORY_RULES = {
     # The child belongs in Gold only when its parent was admitted to Gold.
@@ -3127,7 +3297,16 @@ def _gold_qc_clinical_registry_acs_transfer():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_acs_transfer"),
-    comment='Typed child of clinical_registry_entry for the acs_transfer family. MINAP-style ACS transfer pathway: symptom, transfer and reperfusion timestamps, GRACE/Killip, drugs, laboratory results and Takotsubo fields. Diagnoses remain source labels. ADMISSION_DATE_QUALITY identifies the known 2000-01-01 placeholder range. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the acs_transfer family. MINAP-style ACS transfer "
+        "pathway: symptom, transfer and reperfusion timestamps, GRACE/Killip, drugs, laboratory results "
+        "and Takotsubo fields. Diagnoses remain source labels. ADMISSION_DATE_QUALITY identifies the "
+        "known 2000-01-01 placeholder range. Every governed bronze column is retained under its "
+        "lower-case name. Coverage: iWeb registries start at different years: coronary 2013, non-coronary "
+        "2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), mortality review 2018, ERACS 2025, ACS "
+        "transfer 2000; complete-through month per release: 6_mgmt.data_quality.release_finding "
+        "(finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -3427,7 +3606,16 @@ def _gold_qc_clinical_registry_cardiac_mdt():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_cardiac_mdt"),
-    comment='Typed child of clinical_registry_entry for the cardiac_mdt family. Harmonised iWeb cardiac MDT record. REGISTRY_TYPE=CORONARY_REVASC identifies the coronary revascularisation workflow; REGISTRY_TYPE=CT_AORTIC identifies CT/aortic surveillance. Workflow-specific columns are null for the other registry. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the cardiac_mdt family. Harmonised iWeb cardiac MDT "
+        "record. REGISTRY_TYPE=CORONARY_REVASC identifies the coronary revascularisation workflow; "
+        "REGISTRY_TYPE=CT_AORTIC identifies CT/aortic surveillance. Workflow-specific columns are null "
+        "for the other registry. Every governed bronze column is retained under its lower-case name. "
+        "Coverage: iWeb registries start at different years: coronary 2013, non-coronary 2016, surgery "
+        "2017, cardiac MDT 2018 (CT aortic 2021), mortality review 2018, ERACS 2025, ACS transfer 2000; "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -3625,7 +3813,13 @@ def _gold_qc_clinical_registry_coronary_lesion():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_coronary_lesion"),
-    comment='Typed child of clinical_registry_entry for the coronary_lesion family. Per-lesion/per-vessel PCI and angiography detail from the iWeb coronary registry. The parent coronary procedure registry is not landed, so PARENT_ENTRY_ID is retained for future linkage but currently has no bronze parent and there is no reliable procedure date. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per coronary lesion recorded in the iWeb coronary registry; it links to its procedure "
+        "through the registry entry, not to an encounter. Coverage: iWeb registries start at different "
+        "years: coronary 2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), "
+        "mortality review 2018, ERACS 2025, ACS transfer 2000; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -4195,7 +4389,22 @@ def _gold_qc_clinical_registry_coronary_procedure():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_coronary_procedure"),
-    comment='Typed child of clinical_registry_entry for the coronary_procedure family. One row per unioned Reg_CORONARY_Pre/Reg_CORONARY_PostProcedure EntryId, with PRE_ and POST_ source fields kept separate. NHS number and MRN are deliberately published and column-tagged ig_risk=4/ig_severity=2 under the 2026-08-13 identifier doctrine. Person linkage copies the live iWeb current-alias plus consensus-safe historical fallback. DateOfDischarge raw text is retained beside parsed future/sentinel/clean fields; known source maximum 2026-12-10 is a future typo, never silently accepted. DATE_LAST_CHANGED is an edit timestamp, not the procedure date. LESION_CHILD_COUNT counts current iweb_coronary_lesion children; parent procedures with zero lesions are legitimate and retained. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the coronary_procedure family. One row per unioned "
+        "Reg_CORONARY_Pre/Reg_CORONARY_PostProcedure EntryId, with PRE_ and POST_ source fields kept "
+        "separate. NHS number and MRN are deliberately published and column-tagged "
+        "ig_risk=4/ig_severity=2 under the 2026-08-13 identifier doctrine. Person linkage copies the live "
+        "iWeb current-alias plus consensus-safe historical fallback. DateOfDischarge raw text is retained "
+        "beside parsed future/sentinel/clean fields; known source maximum 2026-12-10 is a future typo, "
+        "never silently accepted. DATE_LAST_CHANGED is an edit timestamp, not the procedure date. "
+        "LESION_CHILD_COUNT counts current iweb_coronary_lesion children; parent procedures with zero "
+        "lesions are legitimate and retained. Every governed bronze column is retained under its "
+        "lower-case name. Coverage: iWeb registries start at different years: coronary 2013, non-coronary "
+        "2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), mortality review 2018, ERACS 2025, ACS "
+        "transfer 2000; The iWeb pre-procedure embolic-protection and GP IIb/IIIa fields are empty at "
+        "source; their post_* twins carry the data; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -4367,6 +4576,20 @@ CLINICAL_REGISTRY_ERACS_EPISODE_SELECT = [
     '`nhs_number` AS `nhs_number`',
     '`date_of_birth` AS `date_of_birth`',
 ]
+CLINICAL_REGISTRY_ERACS_EPISODE_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`timing_of1st_time` AS `timing_of1st_time`',
+    '`timing_of1st_parse_status` AS `timing_of1st_parse_status`',
+    '`timing_of2nd_time` AS `timing_of2nd_time`',
+    '`timing_of2nd_parse_status` AS `timing_of2nd_parse_status`',
+    '`timing_of_ondansetron_time` AS `timing_of_ondansetron_time`',
+    '`timing_of_ondansetron_parse_status` AS `timing_of_ondansetron_parse_status`',
+    '`timing_of_paracetamol_administered_time` AS `timing_of_paracetamol_administered_time`',
+    '`timing_of_paracetamol_administered_parse_status` AS `timing_of_paracetamol_administered_parse_status`',
+    '`baseline_act_num` AS `baseline_act_num`',
+    '`baseline_act_parse_status` AS `baseline_act_parse_status`',
+    '`post_protamine_act_num` AS `post_protamine_act_num`',
+    '`post_protamine_act_parse_status` AS `post_protamine_act_parse_status`',
+]
 
 CLINICAL_REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS = {
     "patient_event_key": "Deterministic SHA-256 key matching clinical_registry_entry.patient_event_key for the eracs_episode source family and native entry_id.",
@@ -4527,6 +4750,21 @@ CLINICAL_REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS = {
     "nhs_number": "NHS number recorded for the patient on the source ERACS registry record, used for national person identification and linkage.",
     "date_of_birth": "Patient's date of birth as recorded on the source ERACS registry record.",
 }
+CLINICAL_REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "timing_of1st_time": "'HH:MM' parsed from TIMING_OF1ST (ERACS_TYPED_V1).",
+    "timing_of1st_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF1ST.",
+    "timing_of2nd_time": "'HH:MM' parsed from TIMING_OF2ND (ERACS_TYPED_V1).",
+    "timing_of2nd_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF2ND.",
+    "timing_of_ondansetron_time": "'HH:MM' parsed from TIMING_OF_ONDANSETRON (ERACS_TYPED_V1).",
+    "timing_of_ondansetron_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF_ONDANSETRON.",
+    "timing_of_paracetamol_administered_time": "'HH:MM' parsed from TIMING_OF_PARACETAMOL_ADMINISTERED (ERACS_TYPED_V1).",
+    "timing_of_paracetamol_administered_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF_PARACETAMOL_ADMINISTERED.",
+    "baseline_act_num": "Leading number parsed from BASELINE_ACT (ERACS_TYPED_V1).",
+    "baseline_act_parse_status": "PARSED, BLANK or UNPARSED for BASELINE_ACT.",
+    "post_protamine_act_num": "Leading number parsed from POST_PROTAMINE_ACT (ERACS_TYPED_V1).",
+    "post_protamine_act_parse_status": "PARSED, BLANK or UNPARSED for POST_PROTAMINE_ACT."
+})
 
 CLINICAL_REGISTRY_ERACS_EPISODE_MANDATORY_RULES = {
     # The child belongs in Gold only when its parent was admitted to Gold.
@@ -4547,11 +4785,22 @@ def _gold_qc_clinical_registry_eracs_episode():
     ).dropDuplicates(['patient_event_key'])
     child = spark.read.table(_src("clinical_registry_eracs_episode"))
     df = _with_parent_status(child, parent, ['patient_event_key']).selectExpr(*CLINICAL_REGISTRY_ERACS_EPISODE_SELECT, "__gold_parent_present AS __gold_parent_present")
+    df = insr_w4_apply_value_rules('clinical_registry_eracs_episode', df)  # INSR_W4
     return _with_comments(df, CLINICAL_REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS)
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_eracs_episode"),
-    comment='Typed child of clinical_registry_entry for the eracs_episode family. Enhanced Recovery After Cardiac Surgery pathway registry, live since 2025: pathway timestamps, pacing, TEG/platelet mapping, transfusion, mobilisation and discharge milestones. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the eracs_episode family. Enhanced Recovery After "
+        "Cardiac Surgery pathway registry, live since 2025: pathway timestamps, pacing, TEG/platelet "
+        "mapping, transfusion, mobilisation and discharge milestones. Every governed bronze column is "
+        "retained under its lower-case name. Coverage: iWeb registries start at different years: coronary "
+        "2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), mortality review 2018, "
+        "ERACS 2025, ACS transfer 2000; ERACS episodes carry no encounter id and an admission time on "
+        "only 5 of 1,744 episodes at source, so they are not matched to a hospital stay and admission and "
+        "discharge times are not derived from one; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -4810,6 +5059,12 @@ CLINICAL_REGISTRY_MORTALITY_REVIEW_COLUMN_COMMENTS = {
     "m_commentskin": "Free-text comments relating to the patient's next of kin, such as contact or communication notes recorded at review.",
 }
 
+CLINICAL_REGISTRY_MORTALITY_REVIEW_INSR_W4_ADVISORY_RULES = {  # INSR_W4
+    # INSR_W4 W4.05 date_ordering (estate 2026-10-29): A mortality review cannot precede the death it reviews (L3185).
+    'gold.clinical.registry_mortality_review.table.insr_f6_review_before_death':
+        'NOT COALESCE((CAST(`date_of_mortality_review` AS DATE) < coalesce(`date_of_death_clean`, CAST(`dateof_death` AS DATE))), FALSE)',
+}
+
 CLINICAL_REGISTRY_MORTALITY_REVIEW_MANDATORY_RULES = {
     # The child belongs in Gold only when its parent was admitted to Gold.
     # The left join retains rejected rows long enough for Lakeflow to count them.
@@ -4822,6 +5077,7 @@ CLINICAL_REGISTRY_MORTALITY_REVIEW_MANDATORY_RULES = {
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_MORTALITY_REVIEW_MANDATORY_RULES)
+@dp.expect_all(CLINICAL_REGISTRY_MORTALITY_REVIEW_INSR_W4_ADVISORY_RULES)  # INSR_W4
 def _gold_qc_clinical_registry_mortality_review():
     """Task 3 Gold child of clinical_registry_entry; parent-rejected rows are excluded."""
     parent = spark.read.table(_n("gold_clinical.registry_entry")).select(
@@ -4833,7 +5089,16 @@ def _gold_qc_clinical_registry_mortality_review():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_mortality_review"),
-    comment='Typed child of clinical_registry_entry for the mortality_review family. Cardiac mortality/M&M review registry: source-text cause-of-death chain (not asserted to be ICD-coded), NCEPOD classification, coronial/medical-examiner fields and structured care-problem flags. Patient names, contact details and next-of-kin content are retained and governed with IG tags. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the mortality_review family. Cardiac mortality/M&M "
+        "review registry: source-text cause-of-death chain (not asserted to be ICD-coded), NCEPOD "
+        "classification, coronial/medical-examiner fields and structured care-problem flags. Patient "
+        "names, contact details and next-of-kin content are retained and governed with IG tags. Every "
+        "governed bronze column is retained under its lower-case name. Coverage: iWeb registries start at "
+        "different years: coronary 2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic "
+        "2021), mortality review 2018, ERACS 2025, ACS transfer 2000; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -5029,7 +5294,19 @@ def _gold_qc_clinical_registry_noncoronary_procedure():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_noncoronary_procedure"),
-    comment='Typed child of clinical_registry_entry for the noncoronary_procedure family. iWeb non-coronary/structural cath-lab registry covering interventions such as TAVI, TMVI, ASD/VSD closure and septal ablation. Local N-Label values are retained here and exploded separately in iweb_multiselect_value. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the noncoronary_procedure family. iWeb "
+        "non-coronary/structural cath-lab registry covering interventions such as TAVI, TMVI, ASD/VSD "
+        "closure and septal ablation. Local N-Label values are retained here and exploded separately in "
+        "iweb_multiselect_value. Every governed bronze column is retained under its lower-case name. "
+        "Coverage: iWeb registries start at different years: coronary 2013, non-coronary 2016, surgery "
+        "2017, cardiac MDT 2018 (CT aortic 2021), mortality review 2018, ERACS 2025, ACS transfer 2000; "
+        "Non-coronary iWeb procedures from April 2025 run at 0.37 of the previous two years at source "
+        "(coronary is unchanged); The discharge date is empty on 3,510 of 7,667 non-coronary procedures "
+        "at source; the table has no encounter id and a containing hospital stay would fill only 2.5% "
+        "more, so it is not derived; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -5481,7 +5758,16 @@ def _gold_qc_clinical_registry_surgery_episode():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_surgery_episode"),
-    comment="Typed child of clinical_registry_entry for the surgery_episode family. iWeb CS2010G adult cardiac surgery registry. Complete PRE1 fields remain top-level; PRE2, POST1 and POST2 source fields are retained losslessly in typed module structs. This preserves identifiers and clinical content while remaining within Unity Catalog's 1,000-tag-per-table quota. Every governed bronze column is retained under its lower-case name.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the surgery_episode family. iWeb CS2010G adult "
+        "cardiac surgery registry. Complete PRE1 fields remain top-level; PRE2, POST1 and POST2 source "
+        "fields are retained losslessly in typed module structs. This preserves identifiers and clinical "
+        "content while remaining within Unity Catalog's 1,000-tag-per-table quota. Every governed bronze "
+        "column is retained under its lower-case name. Coverage: iWeb registries start at different "
+        "years: coronary 2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), "
+        "mortality review 2018, ERACS 2025, ACS transfer 2000; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -5653,7 +5939,15 @@ def _gold_qc_clinical_registry_surgery_followup():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_surgery_followup"),
-    comment='Typed child of clinical_registry_entry for the surgery_followup family. CS2010G follow-up module. The source is small and dormant but semantically distinct. Duplicate EntryId rows are reduced deterministically to the latest DateLastChanged/ADC_UPDT row. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the surgery_followup family. CS2010G follow-up "
+        "module. The source is small and dormant but semantically distinct. Duplicate EntryId rows are "
+        "reduced deterministically to the latest DateLastChanged/ADC_UPDT row. Every governed bronze "
+        "column is retained under its lower-case name. Coverage: iWeb registries start at different "
+        "years: coronary 2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), "
+        "mortality review 2018, ERACS 2025, ACS transfer 2000; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -5872,6 +6166,12 @@ CLINICAL_REGISTRY_SURGERY_PROCEDURE_COLUMN_COMMENTS = {
     "date_of_birth": "Patient date of birth as recorded on the iWeb CS2010G subprocedure record.",
 }
 
+CLINICAL_REGISTRY_SURGERY_PROCEDURE_INSR_W4_ADVISORY_RULES = {  # INSR_W4
+    # INSR_W4 W4.06 string_discipline (review L4946 (documented in the procedure description)): Drug-picklist bleed-through into the prosthesis name (L4946): dose and form words are not devices.
+    'gold.clinical.registry_surgery_procedure.implant_prosthesis_nametxt.insr_f19_prosthesis_drug_name':
+        "NOT COALESCE((lower(`implant_prosthesis_nametxt`) RLIKE '(^|[^a-z])(mg|mcg|microgram|tablets?|capsules?|injection|infusion|solution|ampoules?|vials?)([^a-z]|$)'), FALSE)",
+}
+
 CLINICAL_REGISTRY_SURGERY_PROCEDURE_MANDATORY_RULES = {
     # The child belongs in Gold only when its parent was admitted to Gold.
     # The left join retains rejected rows long enough for Lakeflow to count them.
@@ -5884,6 +6184,7 @@ CLINICAL_REGISTRY_SURGERY_PROCEDURE_MANDATORY_RULES = {
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_REGISTRY_SURGERY_PROCEDURE_MANDATORY_RULES)
+@dp.expect_all(CLINICAL_REGISTRY_SURGERY_PROCEDURE_INSR_W4_ADVISORY_RULES)  # INSR_W4
 def _gold_qc_clinical_registry_surgery_procedure():
     """Task 3 Gold child of clinical_registry_entry; parent-rejected rows are excluded."""
     parent = spark.read.table(_n("gold_clinical.registry_entry")).select(
@@ -5895,7 +6196,16 @@ def _gold_qc_clinical_registry_surgery_procedure():
 
 @dp.materialized_view(
     name=_n("gold_clinical.registry_surgery_procedure"),
-    comment='Typed child of clinical_registry_entry for the surgery_procedure family. One row per graft, valve or aortic-implant component of a CS2010G surgery. PARENT_ENTRY_ID joins iweb_cardiac_surgery_episode and is hard-gated to zero orphans. Known source defect: IMPLANT_PROSTHESIS_NAMETXT contains some drug-picklist bleed-through. Every governed bronze column is retained under its lower-case name.',
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the surgery_procedure family. One row per graft, "
+        "valve or aortic-implant component of a CS2010G surgery. PARENT_ENTRY_ID joins "
+        "iweb_cardiac_surgery_episode and is hard-gated to zero orphans. Known source defect: "
+        "IMPLANT_PROSTHESIS_NAMETXT contains some drug-picklist bleed-through. Every governed bronze "
+        "column is retained under its lower-case name. Coverage: iWeb registries start at different "
+        "years: coronary 2013, non-coronary 2016, surgery 2017, cardiac MDT 2018 (CT aortic 2021), "
+        "mortality review 2018, ERACS 2025, ACS transfer 2000; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )

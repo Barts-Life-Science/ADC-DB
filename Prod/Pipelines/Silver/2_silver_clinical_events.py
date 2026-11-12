@@ -11,7 +11,7 @@
 
 # Shared projections also serve the patient event index.
 from silver_journey_shared import (
-    declare_s3_domain_stages,
+    _r1_attach_silver_arm,
     CONDITION_PRIMITIVE_COLUMNS,
     F,
     IMAGING_ACCESSION_MEMBER_COLUMNS,
@@ -74,6 +74,7 @@ from silver_journey_shared import (
     _micro_isolate_canonical,
     _mill_radiology_exam_canonical,
     _n,
+    SRC_CANCER_TREATMENT,  # INSR_W2 W2.08
     _nomen_finding_typed,
     _numeric_score_canonical,
     _numeric_vital_canonical,
@@ -411,10 +412,20 @@ def _problem_revision_grouped_query():
         .withColumn("_revision_history_json", F.lit(None).cast("string"))
         .withColumn("_revision_history_count", F.lit(0).cast("long"))
     )
+    # INSR_W2 W2.19: problem-arm columns, NULL on the diagnosis and maternity arms.
+    carry = ['clinical_status_effective_datetime', 'onset_precision_flag', 'onset_precision_code']
+    cols = list(CONDITION_PRIMITIVE_COLUMNS) + carry
+
+    def with_carry(df):
+        """Add the carried columns as typed NULLs where an arm has none."""
+        for c in carry:
+            if c not in df.columns:
+                df = df.withColumn(c, F.lit(None).cast("timestamp" if c.endswith("datetime") else "string"))
+        return df
     return (
-        diagnosis.select(*CONDITION_PRIMITIVE_COLUMNS)
-        .unionByName(problem.select(*CONDITION_PRIMITIVE_COLUMNS))
-        .unionByName(maternity.select(*CONDITION_PRIMITIVE_COLUMNS))
+        with_carry(diagnosis).select(*cols)
+        .unionByName(with_carry(problem).select(*cols))
+        .unionByName(with_carry(maternity).select(*cols))
     )
 
 @materialized_view(
@@ -626,15 +637,16 @@ def _implant_attribute_grouped_query():
     # evidence.
     e = read_source(SRC_IMPLANT_EVENTS)
     # contract v2: key implant attribute aggregation and joins by patient_event_key
+    # INSR_W2 W2.08 (L3235): a parent-form attribute belongs to the implant with the same sequence on that form,
+    # not to every implant on the form (the OR join fanned out to ~50 rows per implant). Two equi-joins, unioned.
     implants = _implant_procedure_canonical().select(
-        "patient_event_key", "_base_clinical_event_id", "_implant_form_event_id"
+        "patient_event_key", "_base_clinical_event_id", "_implant_form_event_id", "implant_sequence"
     )
-    joined = e.join(
-        implants,
-        (e.CLINICAL_EVENT_ID == implants._base_clinical_event_id)
-        | (e.PARENT_EVENT_ID == implants._implant_form_event_id),
-        "inner",
-    )
+    direct = e.join(implants, e.CLINICAL_EVENT_ID == implants._base_clinical_event_id, "inner")
+    by_form = e.join(implants, (e.PARENT_EVENT_ID == implants._implant_form_event_id)
+                     & (F.expr("try_cast(COLLATING_SEQ AS BIGINT)") == implants.implant_sequence), "inner")
+    joined = direct.unionByName(by_form).dropDuplicates(["patient_event_key", "CLINICAL_EVENT_ID"])
+    e = joined  # the attribute struct and aggregate below read the joined rows
     attribute = F.struct(
         F.coalesce(e.PERFORMED_DT_TM, e.EVENT_START_DT_TM).cast("long").alias("sequence"),
         e.CLINICAL_EVENT_ID.cast("string").alias("clinical_event_id"),
@@ -1036,12 +1048,24 @@ def _procedure_primitive_query():
         .withColumn("_implant_attribute_json", F.lit(None).cast("string"))
         .withColumn("_implant_attribute_count", F.lit(0).cast("long"))
     )
+    # INSR_W2 W2.20: arm-specific W1 carries, typed NULL on the arms that do not have them.
+    carry = ['quantity_parse_rule', 'quantity_parse_status', 'procedure_date_basis']
+
+    def _carry(df):
+        """Add the carried columns as NULL strings where an arm has none."""
+        for c in carry:
+            if c not in df.columns:
+                df = df.withColumn(c, F.lit(None).cast("string"))
+        return df
+    procedure_rows, implant_rows, theatre_rows, cc_rows, endobase_rows = (
+        _carry(procedure_rows), _carry(implant_rows), _carry(theatre_rows), _carry(cc_rows), _carry(endobase_rows))
+    PROCEDURE_PRIMITIVE_COLUMNS_W2 = list(PROCEDURE_PRIMITIVE_COLUMNS) + carry
     return (
-        procedure_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS)
-        .unionByName(implant_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS))
-        .unionByName(theatre_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS))
-        .unionByName(cc_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS))
-        .unionByName(endobase_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS))
+        procedure_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS_W2)
+        .unionByName(implant_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS_W2))
+        .unionByName(theatre_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS_W2))
+        .unionByName(cc_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS_W2))
+        .unionByName(endobase_rows.select(*PROCEDURE_PRIMITIVE_COLUMNS_W2))
     )
 
 @materialized_view(
@@ -2039,6 +2063,7 @@ RESULT_PUBLIC_COLUMNS = [
     'canonical_ucum_code',  # SDI_PATH_V1
     'value_canonical',  # SDI_PATH_V1
     'canonical_conversion',  # SDI_PATH_V1
+    'non_clinical_test_ind',  # BBR_FOLDIN_V1 BBR-9b
     'reference_range_low',
     'reference_range_high',
     'interpretation_code',
@@ -2180,6 +2205,7 @@ PATHOLOGY_RESULT_COLUMN_COMMENTS = {
     "value_canonical": "map_pathology.value_canonical: value_as_number restated in canonical_ucum_code (see canonical_conversion); equal to value_as_number unless converted. NULL when canonical_conversion is NULL or unit_label_conflict.",  # SDI_PATH_V1
     "canonical_conversion": "map_pathology.canonical_conversion: g/dL->g/L (x10) | %->mmol/mol (IFCC = (NGSP - 2.15) x 10.929, 1 dp) | ug/L->ng/L (x1000, troponin T only) | unit_label_conflict (troponin I labelled ug/L: TFC TROI has held ng/L-scale values since 2014, so neither the label nor a conversion is trusted; value_canonical and canonical_ucum_code are NULL) | egfr_unit_implied / inr_unit_implied (unit named by the test concept; value unchanged) | identity (ucum_code kept) | NULL (no numeric value, or no unit).",  # SDI_PATH_V1
     "unit_concept_id": "OMOP unit concept identifier.",
+    "non_clinical_test_ind": 'True for a LIMS housekeeping row, not a clinical test: SDI_PATH_PLACEHOLDER_V1 placeholder codes, internal / unused-code results (INTERC, UNUC ...), analyser and report bookkeeping, eGFR input and factor rows, and ZZZ-prefixed tests. Gold drops these rows. Serum indices are kept. BBR_FOLDIN_V1 BBR-9b.',  # BBR_FOLDIN_V1
     "reference_range_low": "Reference-range lower bound.",
     "reference_range_high": "Reference-range upper bound.",
     "interpretation_code": "Source interpretation or normalcy.",
@@ -2257,7 +2283,9 @@ PATHOLOGY_ORDER_COLUMN_COMMENTS = {
     "order_mnemonic": "CERNER order mnemonic.",
     "raw_request_text": "Native request wording. Identifiable free text; ig_risk 4",
     "test_description": "Native requested-test description.",
-    "test_snomed_code": "Source-provided requested-test SNOMED code.",
+    "test_snomed_code": "Source-provided requested-test SNOMED concept ID; only concept IDs (NLMC codes and panel ids are in test_local_code). BBR_FOLDIN_V1 F-iv.",
+    "test_local_code": "The requested-test code when it is not a SNOMED concept ID: an NLMC code (NLMC0198) or a Barts panel id ('1' + work-group code + panel suffix) that TFC put in the SNOMED source field. BBR_FOLDIN_V1 F-iv.",  # BBR_FOLDIN_V1
+    "test_code_system": 'Coding system of test_local_code: urn:nhs:nlmc (legacy National Laboratory Medicine Catalogue; no published FHIR URI, estate urn: convention), urn:barts:pathology:panel-id, or urn:barts:pathology:test-code; NULL when test_local_code is NULL. BBR_FOLDIN_V1 F-iv.',  # BBR_FOLDIN_V1
     "test_omop_concept_id": "Source-provided requested-test OMOP concept identifier.",
     "mapping_status": "'mapped' means a rule ran, not that codes landed — CERNER arm carries zero baked codes.",
     "request_ordinal": "Source request ordinal within the accession.",
@@ -2299,7 +2327,9 @@ def _lifecycle_source_pathology_order():
         "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local",
         "source_coding_system", "source_code", "source_display",
         "source_object", "wkg_code", "tlc_code", "order_id", "order_mnemonic",
-        "raw_request_text", "test_description", "test_snomed_code", "test_omop_concept_id",
+        "raw_request_text", "test_description", "test_snomed_code",
+        "test_local_code", "test_code_system",  # BBR_FOLDIN_V1 F-iv
+        "test_omop_concept_id",
         "mapping_status", "request_ordinal", "specimen_key",
         "record_status", "record_status_effective_from", "record_status_effective_to",
         "confidentiality_code", "vip_ind", "withheld_identity_ind",
@@ -3671,6 +3701,55 @@ def _pathology_request_thread_canonical():
         F.greatest("loaded_at", "_r_loaded_at").alias("loaded_at"),
     )
 
+# INSR_W2 W2.12 (J32) =============================================================================================
+# Encounter attribution for diagnostic rows that arrive without an encounter: a candidate encounter of the same
+# person whose window contains the event (per arm in INSR_W2_ATTRIBUTION_ARMS: micro/susceptibility use the spell
+# itself), ranked contained first, then nearest start, then lowest encounter_id (NULLS LAST). Only the arms that
+# passed the ambiguity gate (<= 10% of attributed events with >1 candidate) are declared. Published as a companion
+# table so no VARIANT-bearing fact MV gains a join; the fact's own encounter_id is untouched.
+INSR_W2_ATTRIBUTION_ARMS = {'imaging_exam': ('journey_clinical.imaging_exam', 2, 12, 'band_-2h_+12h'), 'specimen': ('journey_clinical.specimen', 2, 12, 'band_-2h_+12h'), 'microbiology_isolate': ('journey_clinical.microbiology_isolate', 0, 0, 'spell_containment'), 'susceptibility_result': ('journey_clinical.susceptibility_result', 0, 0, 'spell_containment')}
+
+
+def _declare_encounter_attribution(arm, fact_table, before_h, after_h, method):
+    """Declare one companion MV: patient_event_key -> encounter_id_derived, method, candidate count."""
+    def attribution():
+        """Rank the same-person encounters whose window holds each unlinked event and keep the best one."""
+        x = (spark.read.table(_n(fact_table)).where(F.col("encounter_id").isNull() & F.col("person_id").isNotNull()
+                                                    & F.col("event_datetime").isNotNull())
+             .select("patient_event_key", F.col("person_id").cast("bigint").alias("person_id"), "event_datetime"))
+        e = spark.read.table(_n("journey_spine.encounter")).where(F.col("period_start").isNotNull()).select(
+            F.col("person_id").cast("bigint").alias("_e_person"), F.col("encounter_id").alias("_e_id"),
+            F.col("period_start").alias("_e_start"), F.coalesce("period_end", "period_start").alias("_e_end"))
+        lo = F.col("_e_start") - F.expr(f"INTERVAL {before_h} HOURS")
+        hi = F.col("_e_end") + F.expr(f"INTERVAL {after_h} HOURS")
+        c = x.join(e, x.person_id == F.col("_e_person"), "inner").where(F.col("event_datetime").between(lo, hi))
+        contained = F.col("event_datetime").between(F.col("_e_start"), F.col("_e_end"))
+        dist = F.abs(F.unix_timestamp("event_datetime") - F.unix_timestamp("_e_start"))
+        w = Window.partitionBy("patient_event_key")
+        ranked = (c.withColumn("_rn", F.row_number().over(w.orderBy(contained.desc(), dist.asc_nulls_last(),
+                                                                    F.col("_e_id").asc_nulls_last())))
+                   .withColumn("_n", F.count(F.lit(1)).over(w)))
+        return ranked.where("_rn = 1").select(
+            "patient_event_key", "person_id", F.col("_e_id").cast("bigint").alias("encounter_id_derived"),
+            F.when(contained, F.lit(method)).otherwise(F.lit(method + ":nearest")).alias("encounter_attribution_method"),
+            F.col("_n").cast("int").alias("encounter_attribution_candidates"))
+    attribution.__name__ = f"{arm}_encounter_attribution"
+    materialized_view(
+        name=_n(f"journey_clinical.{arm}_encounter_attribution"), refresh_policy="auto", cluster_by=["patient_event_key"],
+        comment=f"INSR_W2 W2.12: derived encounter for {arm} rows with no source encounter (J32).",
+        column_comments={
+            "patient_event_key": f"Key of the {arm} row (join to clinical_{arm}).",
+            "person_id": "Native Millennium PERSON_ID of the row and of the encounter.",
+            "encounter_id_derived": "Encounter of the same person whose window holds the event; the fact's own encounter_id is unchanged.",
+            "encounter_attribution_method": f"{method} (event inside the window and the spell) or {method}:nearest (inside the window, outside the spell).",
+            "encounter_attribution_candidates": "Encounters of the person whose window held the event; >1 means the pick was ranked.",
+        })(attribution)
+
+
+for _arm in ['microbiology_isolate', 'susceptibility_result']:
+    _declare_encounter_attribution(_arm, *INSR_W2_ATTRIBUTION_ARMS[_arm])
+
+
 REQUEST_THREAD_COLUMN_COMMENTS = {
     "request_thread_key": "Deterministic request-edge primary key.",
     "source_object": "Request-thread arm: pathology, medication, or waiting_list.",
@@ -4871,11 +4950,24 @@ def _med_admin_ingredient_grouped_query():
         s.FREETEXT_DOSE.alias("freetext_dose"),
         F.lit(True).alias("source_present_ind"),
     )
-    return s.groupBy("EVENT_ID").agg(
-        F.to_json(F.sort_array(F.collect_list(ingredient))).alias("ingredients_json"),
+    # INSR_W2 W2.05 (J24): an administration whose every ingredient dose is 0 recorded no dose. The flag is a
+    # grouped aggregate (no window); when it holds, dose_value is NULLed inside the ingredient JSON.
+    dose = F.coalesce(s.ORDERED_DOSE, s.DOSE_QUANTITY).cast("decimal(38,10)")
+    grouped = s.groupBy("EVENT_ID").agg(
+        F.sort_array(F.collect_list(ingredient)).alias("_ingredients"),
         F.count(F.lit(1)).cast("long").alias("ingredient_count"),
         F.max(F.greatest(s.UPDT_DT_TM, s.ADC_UPDT)).alias("ingredient_source_update_timestamp"),
         F.max(s.ADC_UPDT).alias("ingredient_loaded_at"),
+        (F.max((dose == 0).cast("int")) == 1).alias("_any_zero"),
+        (F.max((dose != 0).cast("int")) == 1).alias("_any_nonzero"),
+    )
+    all_zero = F.col("_any_zero") & ~F.coalesce(F.col("_any_nonzero"), F.lit(False))
+    nulled = F.transform("_ingredients", lambda x: x.withField("dose_value", F.lit(None).cast("decimal(38,10)")))
+    return grouped.select(
+        "EVENT_ID",
+        F.to_json(F.when(all_zero, nulled).otherwise(F.col("_ingredients"))).alias("ingredients_json"),
+        "ingredient_count", "ingredient_source_update_timestamp", "ingredient_loaded_at",
+        F.coalesce(all_zero, F.lit(False)).alias("all_ingredients_zero_ind"),
     )
 
 @materialized_view(
@@ -5008,8 +5100,9 @@ def _med_order_detail_grouped_query():
         F.coalesce(s.DETAIL_SEQUENCE, F.lit(0)).cast("long").alias("detail_sequence"),
         s.OE_FIELD_ID.cast("string").alias("field_id"),
         s.OE_FIELD_MEANING.alias("field_meaning"),
-        F.coalesce(s.OE_FIELD_DISPLAY_VALUE_EXTEND,
-                   s.OE_FIELD_DISPLAY_VALUE).alias("value_text"),
+        # INSR_W2 W2.05 (L856): Millennium pads some detail values with trailing CR/LF.
+        F.regexp_replace(F.coalesce(s.OE_FIELD_DISPLAY_VALUE_EXTEND, s.OE_FIELD_DISPLAY_VALUE),
+                         r"[\r\n]+$", "").alias("value_text"),
         s.OE_FIELD_VALUE.cast("decimal(38,10)").alias("value_number"),
         s.OE_FIELD_DT_TM_VALUE.alias("value_datetime"),
         s.DETAIL_HISTORY_CONTRACT.alias("history_contract"),
@@ -5178,7 +5271,7 @@ def _medication_admin_primitive_query():
                        F.coalesce(F.col("a.OMOP_STANDARD_CONCEPT_ID"), F.col("a.OMOP_CONCEPT_ID")),
                        F.coalesce(F.col("a.OMOP_STANDARD_CONCEPT_NAME"), F.col("a.OMOP_CONCEPT_NAME")),
                        False, "bronze.map_med_admin", None),
-        ).alias("_medication_code_json"),
+        ).alias("_medication_code_json"), F.col("a.MED_ADMIN_MAPPING").alias("_r1_med_admin_mapping"), F.col("a.MED_ADMIN_MAP_KEY").alias("_r1_med_admin_map_key"), F.col("a.MED_ADMIN_MAP_COMPONENTS_JSON").alias("_r1_med_admin_components_json"),
         F.when(F.col("o._linked_order_id").isNotNull(),
                stable_id("medication_order:mill", F.col("a.ORDER_ID"))).alias("medication_order_key"),
         F.col("a.RESULT_STATUS_CD").cast("string").alias("administration_status_code"),
@@ -5206,6 +5299,7 @@ def _medication_admin_primitive_query():
         F.col("a.INFUSION_UNIT_DISPLAY").alias("infusion_rate_unit"),
         F.col("i.ingredients_json").alias("_ingredients_json"),
         F.coalesce(F.col("i.ingredient_count"), F.lit(0)).cast("long").alias("ingredient_count"),
+        F.coalesce(F.col("i.all_ingredients_zero_ind"), F.lit(False)).alias("all_ingredients_zero_ind"),  # INSR_W2 W2.05
         performer.cast("bigint").alias("performer_practitioner_id"),
         verifier.cast("bigint").alias("verifier_practitioner_id"),
         F.col("a.NURSE_UNIT_CD").cast("string").alias("location_code"),
@@ -5322,14 +5416,43 @@ def _medication_order_primitive_query():
             coding_obj(F.lit(OMOP_URI), F.col("o.OMOP_STANDARD_CONCEPT_ID"),
                        F.col("o.OMOP_STANDARD_CONCEPT_NAME"), False,
                        "bronze.map_medication_order", None),
-        ).alias("_medication_code_json"),
+        ).alias("_medication_code_json"), F.col("o.MED_ORDER_MAPPING").alias("_r1_med_order_mapping"), F.col("o.MED_ORDER_MAP_KEY").alias("_r1_med_order_map_key"), F.col("o.MED_ORDER_MAP_COMPONENTS_JSON").alias("_r1_med_order_components_json"),
         F.col("o.ORDER_STATUS_CD").cast("string").alias("order_status_code"),
         F.col("o.ORDER_STATUS_DESCRIPTION").alias("order_status_display"),
         F.col("o.DEPT_STATUS_CD").cast("string").alias("department_status_code"),
         F.col("o.DEPT_STATUS_DESCRIPTION").alias("department_status_display"),
         F.col("o.ACTIVE_STATUS_CD").cast("string").alias("active_status_code"),
         F.col("o.ACTIVE_STATUS_DESCRIPTION").alias("active_status_display"),
-        F.lit("order").alias("intent_code"),
+        # BBR_FOLDIN_V1 (BBR-14): FHIR MedicationRequest.category from ORIG_ORD_AS_FLAG; a recorded home medication is a
+        # statement of what the patient takes (intent 'plan', reported_ind true), Ben decision BBR-D4. NULL flag -> NULL.
+        F.when(F.col("o.ORIG_ORD_AS_FLAG").isNull(), F.lit(None).cast("string"))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 2, F.lit("plan")).otherwise(F.lit("order")).alias("intent_code"),
+        F.when(F.col("o.ORIG_ORD_AS_FLAG") == 0, F.lit('inpatient'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 1, F.lit('discharge'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 2, F.lit('community'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 3, F.lit('inpatient'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 4, F.lit('inpatient'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 5, F.lit('inpatient'))
+         .alias("category_code"),
+        F.when(F.col("o.ORIG_ORD_AS_FLAG") == 0, F.lit('Normal order'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 1, F.lit('Prescription/Discharge order'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 2, F.lit('Recorded/Home medication'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 3, F.lit("Patient's own medication"))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 4, F.lit('Pharmacy charge only'))
+         .when(F.col("o.ORIG_ORD_AS_FLAG") == 5, F.lit('Satellite'))
+         .alias("category_display"),
+        F.concat(F.lit("ORIG_ORD_AS_FLAG="), F.col("o.ORIG_ORD_AS_FLAG").cast("string")).alias("category_basis"),
+        (F.col("o.ORIG_ORD_AS_FLAG") == 2).alias("reported_ind"),
+        # BBR_FOLDIN_V1 (BBR-13): continuous-order role; content_order_id is the order whose attribute, detail and
+        # ingredient rows describe this row (the parent for an instance), the by-reference inheritance of BBR-D2.
+        F.col("o.TEMPLATE_ORDER_ID").cast("bigint").alias("template_order_id"),
+        F.when(F.col("o.TEMPLATE_ORDER_FLAG") == 0, F.lit('order'))
+         .when(F.col("o.TEMPLATE_ORDER_FLAG") == 1, F.lit('continuous_parent'))
+         .when(F.col("o.TEMPLATE_ORDER_FLAG") == 4, F.lit('instance'))
+         .alias("order_role"),
+        F.concat(F.lit("TEMPLATE_ORDER_FLAG="), F.col("o.TEMPLATE_ORDER_FLAG").cast("string")).alias("order_role_basis"),
+        F.coalesce(F.when(F.col("o.TEMPLATE_ORDER_FLAG") == 4, F.col("o.TEMPLATE_ORDER_ID").cast("bigint")),
+                   F.col("o.ORDER_ID").cast("bigint")).alias("content_order_id"),
         F.col("o.MED_ORDER_TYPE_CD").cast("string").alias("medication_order_type_code"),
         F.col("o.MED_ORDER_TYPE_DESCRIPTION").alias("medication_order_type_display"),
         F.col("o.ORIG_ORDER_DT_TM").alias("authored_datetime"),
@@ -5636,6 +5759,14 @@ MEDICATION_ORDER_PUBLIC_COLUMNS = [
     'active_status_code',
     'active_status_display',
     'intent_code',
+    'category_code',  # BBR_FOLDIN_V1
+    'category_display',  # BBR_FOLDIN_V1
+    'category_basis',  # BBR_FOLDIN_V1
+    'reported_ind',  # BBR_FOLDIN_V1
+    'template_order_id',  # BBR_FOLDIN_V1
+    'order_role',  # BBR_FOLDIN_V1
+    'order_role_basis',  # BBR_FOLDIN_V1
+    'content_order_id',  # BBR_FOLDIN_V1
     'medication_order_type_code',
     'medication_order_type_display',
     'authored_datetime',
@@ -5698,7 +5829,15 @@ MEDICATION_ORDER_COLUMN_COMMENTS = {
     "department_status_display": "Department workflow status display.",
     "active_status_code": "Source active-status code.",
     "active_status_display": "Source active-status display.",
-    "intent_code": "Medication request intent.",
+    "intent_code": "Medication request intent (FHIR): plan for a recorded/home medication (ORIG_ORD_AS_FLAG 2, see reported_ind), order for every other order; NULL when the flag is absent. BBR_FOLDIN_V1 BBR-14 (was the constant 'order').",
+    'category_code': "FHIR MedicationRequest.category from Cerner ORIG_ORD_AS_FLAG: inpatient (0 normal, 3 patient's own, 4 pharmacy charge only, 5 satellite), discharge (1 prescription/discharge order), community (2 recorded/home medication); NULL when the flag is absent. BBR_FOLDIN_V1 BBR-14.",  # BBR_FOLDIN_V1
+    'category_display': 'Cerner label of ORIG_ORD_AS_FLAG, verbatim. BBR_FOLDIN_V1 BBR-14.',  # BBR_FOLDIN_V1
+    'category_basis': "Rule basis of category_code: 'ORIG_ORD_AS_FLAG=<flag>'. BBR_FOLDIN_V1 BBR-14.",  # BBR_FOLDIN_V1
+    'reported_ind': 'True for a recorded/home medication (ORIG_ORD_AS_FLAG 2): a statement of what the patient takes, not an order to dispense (FHIR reportedBoolean). BBR_FOLDIN_V1 BBR-14.',  # BBR_FOLDIN_V1
+    'template_order_id': 'Cerner TEMPLATE_ORDER_ID: on an instance row the parent continuous order (order_id of its parent row); NULL when the order has no template. BBR_FOLDIN_V1 BBR-13.',  # BBR_FOLDIN_V1
+    'order_role': "Continuous-order role from TEMPLATE_ORDER_FLAG: order (0, one-off), continuous_parent (1, the prescription), instance (4, one scheduled dose of the parent; administered doses are in medication_admin). Count prescriptions with order_role <> 'instance'. BBR_FOLDIN_V1 BBR-13.",  # BBR_FOLDIN_V1
+    'order_role_basis': "Rule basis of order_role: 'TEMPLATE_ORDER_FLAG=<flag>'. BBR_FOLDIN_V1 BBR-13.",  # BBR_FOLDIN_V1
+    'content_order_id': 'The order whose attribute, detail and ingredient rows describe this row: template_order_id on an instance, else order_id. Join clinical_medication_order_attribute / _detail / _ingredient on it (instances carry none of their own; Ben decision BBR-D2, by reference). BBR_FOLDIN_V1 BBR-13.',  # BBR_FOLDIN_V1
     "medication_order_type_code": "Source medication-order type code.",
     "medication_order_type_display": "Source medication-order type display.",
     "authored_datetime": "Original order time.",
@@ -5942,6 +6081,7 @@ MEDICATION_ORDER_DETAIL_PUBLIC_COLUMNS = [
     "field_meaning", "value_text", "value_number", "value_datetime",
     "history_contract", "parent_action_sequence", "last_action_sequence",
     "source_present_ind", "loaded_at",
+    "detail_action_basis",  # INSR_W2 W2.20
 ]
 
 MEDICATION_ORDER_DETAIL_COLUMN_COMMENTS = {
@@ -5975,13 +6115,15 @@ def medication_order_detail():
         F.coalesce(s.DETAIL_SEQUENCE, F.lit(0)).cast("long").alias("detail_sequence"),
         s.OE_FIELD_ID.cast("string").alias("field_id"),
         s.OE_FIELD_MEANING.alias("field_meaning"),
-        F.coalesce(s.OE_FIELD_DISPLAY_VALUE_EXTEND, s.OE_FIELD_DISPLAY_VALUE)
-         .alias("value_text"),
+        # INSR_W2 W2.05 (L856): trailing CR/LF stripped (also feeds medication_order_attribute FREQ etc.).
+        F.regexp_replace(F.coalesce(s.OE_FIELD_DISPLAY_VALUE_EXTEND, s.OE_FIELD_DISPLAY_VALUE),
+                         r"[\r\n]+$", "").alias("value_text"),
         s.OE_FIELD_VALUE.cast("decimal(38,10)").alias("value_number"),
         s.OE_FIELD_DT_TM_VALUE.alias("value_datetime"),
         s.DETAIL_HISTORY_CONTRACT.alias("history_contract"),
         s.PARENT_ACTION_SEQUENCE.cast("long").alias("parent_action_sequence"),
         s.LAST_ACTION_SEQUENCE.cast("long").alias("last_action_sequence"),
+        s.DETAIL_ACTION_BASIS.alias("detail_action_basis"),  # INSR_W2 W2.20
         s.SOURCE_PRESENT_IND.alias("source_present_ind"),
         s.ADC_UPDT.alias("loaded_at"),
     ).select(*MEDICATION_ORDER_DETAIL_PUBLIC_COLUMNS)
@@ -6055,6 +6197,10 @@ def medication_admin_ingredient():
         .distinct()
     )
     s = read_source(SRC_MED_ADMIN_INGREDIENT).join(admitted, "EVENT_ID", "left_semi")
+    # INSR_W2 W2.05 (J24): the per-administration all-zero flag, equi-joined back on EVENT_ID.
+    j24 = spark.read.table(_n("journey_clinical._med_admin_ingredient_grouped")).select(
+        F.col("EVENT_ID").alias("_j24_event_id"), F.col("all_ingredients_zero_ind").alias("_j24_all_zero"))
+    s = s.join(j24, s.EVENT_ID == F.col("_j24_event_id"), "left")
     df = s.select(
         s.EVENT_ID.cast("bigint").alias("event_id"),
         F.coalesce(s.ACTION_SEQUENCE, F.lit(0)).cast("long").alias("action_sequence"),
@@ -6088,11 +6234,12 @@ def medication_admin_ingredient():
         F.lit(True).alias("source_present_ind"),
         s.ADC_UPDT.alias("loaded_at"),
         s.MULTUM_CODE.cast("string").alias("multum_code"),
+        F.coalesce(F.col("_j24_all_zero"), F.lit(False)).alias("all_ingredients_zero_ind"),  # INSR_W2 W2.05
     )
     df = _s3_direct_axis(df, "ingredient", F.col("coding_system"), F.col("coding_code"), F.col("coding_display"))
     df = _s3_lookup_axis(df, "ingredient", SRC_S3C_RXNORM_MULTUM_MAP, "urn:cerner:multum:ingredient",
                          F.col("multum_code"), model_name="medication_admin_ingredient", row_key="component_id")
-    return df.select(*MEDICATION_ADMIN_INGREDIENT_PUBLIC_COLUMNS)
+    return df.select(*MEDICATION_ADMIN_INGREDIENT_PUBLIC_COLUMNS, "all_ingredients_zero_ind")
 
 # COMMAND ----------
 
@@ -6332,7 +6479,7 @@ CLINICAL_FINDING_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "finding_code",
+    "finding_code", '_r1_finding_mapping', '_r1_finding_map_key', '_r1_finding_components_json', '_r1_finding_value_mapping', '_r1_finding_value_map_key', '_r1_finding_value_components_json',
     "finding_kind",
     "value_text",
     "value_datetime",
@@ -6421,13 +6568,14 @@ def _registry_finding_canonical():
     # Assemble normalized registry finding rows for downstream dataset builders, preserving the
     # existing source and identity rules.
     s = spark.read.table(_n("journey_clinical._registry_observations")).where("route='finding'")
+    s = _r1_attach_silver_arm(s, "_clinical_registry_observations", "clinical_finding")
     return s.select(
         "patient_event_key", F.lit(None).cast("bigint").alias("event_id"), F.lit(1).cast("bigint").alias("sequence_nbr"),
         F.concat(F.lit("registry:"), F.col("registry_product")).alias("source_object"), "subject_key", "subject_id_system", "person_id",
         F.when(F.col("person_id").isNotNull(), F.lit("resolved")).otherwise(F.lit("unresolved")).alias("identity_status"),
         "encounter_id", "event_datetime", "event_end_datetime", "event_datetime_local", "event_end_datetime_local", F.lit("urn:barts:registry-field").alias("source_coding_system"),
         F.col("registry_field_id").alias("source_code"), F.col("question_display").alias("source_display"),
-        codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("finding_code"),
+        codeable_concept(coding_obj(F.lit("urn:barts:registry-field"), F.col("registry_field_id"), F.col("question_display"), True)).alias("finding_code"), s["_r1_finding_mapping"].alias("_r1_finding_mapping"), s["_r1_finding_map_key"].alias("_r1_finding_map_key"), s["_r1_finding_components_json"].alias("_r1_finding_components_json"), s["_r1_finding_value_mapping"].alias("_r1_finding_value_mapping"), s["_r1_finding_value_map_key"].alias("_r1_finding_value_map_key"), s["_r1_finding_value_components_json"].alias("_r1_finding_value_components_json"),
         F.lit("registry_categorical").alias("finding_kind"), F.col("answer_text").alias("value_text"),
         F.lit(None).cast("timestamp").alias("value_datetime"), F.lit(None).cast("string").alias("value_code"),
         F.col("answer_text").alias("value_display"), F.lit(None).cast("string").alias("normalcy_code"),
@@ -6572,7 +6720,7 @@ IMAGING_EXAM_SOURCE_COLUMNS = [
     "source_coding_system",
     "source_code",
     "source_display",
-    "exam_code",
+    "exam_code", '_r1_exam_mapping', '_r1_exam_map_key', '_r1_exam_components_json',
     "status_code",
     "accession_identifier",
     "study_instance_uid",
@@ -7019,6 +7167,23 @@ TRANSFUSION_SOURCE_COLUMNS = [
     "load_batch_id",
     "source_update_timestamp",
     "loaded_at",
+    "end_quantity_unit_inferred",  # INSR_W2 W2.20
+    "end_quantity_ml",  # INSR_W2 W2.20
+    "quantity_unit_rule",  # INSR_W2 W2.20
+    "isbt_product_concept_id",  # INSR_W2 W2.20
+    "isbt_product_concept_name",  # INSR_W2 W2.20
+    "isbt_mapping_method",  # INSR_W2 W2.20
+    "isbt_mapping_rule_id",  # INSR_W2 W2.20
+    "isbt_mapping_model",  # INSR_W2 W2.20
+    "isbt_mapping_score",  # INSR_W2 W2.20
+    "product_mapping_method",  # INSR_W2 W2.20
+    "product_mapping_rule_id",  # INSR_W2 W2.20
+    "unit_group_mapping_method",  # INSR_W2 W2.20
+    "unit_group_mapping_rule_id",  # INSR_W2 W2.20
+    "patient_group_mapping_method",  # INSR_W2 W2.20
+    "patient_group_mapping_rule_id",  # INSR_W2 W2.20
+    "product_mapping_source",  # INSR_W2 W2.20
+    "source_mrn_norm",  # INSR_W2 W2.20
 ]
 
 # contract v2: the researcher-facing parent excludes lifecycle, QC and retired fields.
@@ -7065,6 +7230,23 @@ TRANSFUSION_PUBLIC_COLUMNS = [
     'record_status_effective_to',
     'source_update_timestamp',
     'loaded_at',
+    "end_quantity_unit_inferred",  # INSR_W2 W2.20
+    "end_quantity_ml",  # INSR_W2 W2.20
+    "quantity_unit_rule",  # INSR_W2 W2.20
+    "isbt_product_concept_id",  # INSR_W2 W2.20
+    "isbt_product_concept_name",  # INSR_W2 W2.20
+    "isbt_mapping_method",  # INSR_W2 W2.20
+    "isbt_mapping_rule_id",  # INSR_W2 W2.20
+    "isbt_mapping_model",  # INSR_W2 W2.20
+    "isbt_mapping_score",  # INSR_W2 W2.20
+    "product_mapping_method",  # INSR_W2 W2.20
+    "product_mapping_rule_id",  # INSR_W2 W2.20
+    "unit_group_mapping_method",  # INSR_W2 W2.20
+    "unit_group_mapping_rule_id",  # INSR_W2 W2.20
+    "patient_group_mapping_method",  # INSR_W2 W2.20
+    "patient_group_mapping_rule_id",  # INSR_W2 W2.20
+    "product_mapping_source",  # INSR_W2 W2.20
+    "source_mrn_norm",  # INSR_W2 W2.20
 ]
 
 TRANSFUSION_LIFECYCLE_COLUMNS = [
@@ -7238,6 +7420,27 @@ def _lifecycle_source_transfusion_event():
         s.BLOOD_UNIT_FATE.alias("blood_unit_fate"),
         s.ALERT_PRESENT_IND.alias("alert_present_ind"),
         s.COMMENT_PRESENT_IND.alias("comment_present_ind"),
+        s.PRODUCT_MAPPING_METHOD.alias("product_mapping_method"),  # INSR_W2 W2.20
+        s.PRODUCT_MAPPING_RULE_ID.alias("product_mapping_rule_id"),  # INSR_W2 W2.20
+        s.UNIT_GROUP_MAPPING_METHOD.alias("unit_group_mapping_method"),  # INSR_W2 W2.20
+        s.UNIT_GROUP_MAPPING_RULE_ID.alias("unit_group_mapping_rule_id"),  # INSR_W2 W2.20
+        s.PATIENT_GROUP_MAPPING_METHOD.alias("patient_group_mapping_method"),  # INSR_W2 W2.20
+        s.PATIENT_GROUP_MAPPING_RULE_ID.alias("patient_group_mapping_rule_id"),  # INSR_W2 W2.20
+        s.PRODUCT_MAPPING_SOURCE.alias("product_mapping_source"),  # INSR_W2 W2.20
+        s.FIRST_NAME.alias("first_name"),  # INSR_W2 W2.20
+        s.HEALTH_NUMBER.alias("health_number"),  # INSR_W2 W2.20
+        s.LAST_NAME.alias("last_name"),  # INSR_W2 W2.20
+        s.PATIENT_BIRTH_DATE.alias("patient_birth_date"),  # INSR_W2 W2.20
+        s.PATIENT_GENDER.alias("patient_gender"),  # INSR_W2 W2.20
+        s.PATIENT_ID.alias("patient_id"),  # INSR_W2 W2.20
+        s.PATIENT_NAME.alias("patient_name"),  # INSR_W2 W2.20
+        s.PATIENT_NUMBER.alias("patient_number"),  # INSR_W2 W2.20
+        s.PORTER_USER_NAME.alias("porter_user_name"),  # INSR_W2 W2.20
+        s.SECONDARY_FIRST_NAME.alias("secondary_first_name"),  # INSR_W2 W2.20
+        s.SECONDARY_LAST_NAME.alias("secondary_last_name"),  # INSR_W2 W2.20
+        s.SECONDARY_USER_NAME.alias("secondary_user_name"),  # INSR_W2 W2.20
+        s.USER_NAME.alias("user_name"),  # INSR_W2 W2.20
+        s.SOURCE_MRN_NORM.alias("source_mrn_norm"),  # INSR_W2 W2.20
         F.when(inactive, F.lit("superseded")).otherwise(F.lit("active"))
         .alias("record_status"),
         F.lit(SRC_BLOODTRACK_TRANSACTION).alias("source_table"),
@@ -7456,6 +7659,7 @@ CANCER_TREATMENT_CYCLE_COLUMN_COMMENTS = {
     "source_row_id": "Composite source row identifier.",
     "chemotherapy_course_id": "iQemo CHEMOTHERAPY_COURSE_ID as BIGINT; first component of the primary key.",
     "treatment_cycle_id": "iQemo TREATMENT_CYCLE_ID as BIGINT; second component of the primary key.",
+    "person_id": "Native Millennium PERSON_ID of the parent iQemo course (bronze map_cancer_treatment); NULL when the course has no person or more than one. INSR_W2 W2.08.",
     "record_status": "Always active in the current map_cancer_treatment_cycle projection. CycleStatus and CANCELLATION_DATE_CLEAN remain separate clinical fields and do not change this literal label; no superseded or retracted status is emitted.",
     "loaded_at": "map_cancer_treatment_cycle.PIPELINE_UPDT_DT_TM carried unchanged. No treatment-parent clock is joined, and ADC_UPDT, prescription dates, cancellation time and the current Silver refresh time are not substituted.",
 }
@@ -7480,6 +7684,13 @@ def _lifecycle_source_cancer_treatment_cycle():
     # Assemble cancer treatment cycle rows with lifecycle and source evidence for the public
     # product and its internal metadata.
     s = read_source(SRC_CANCER_TREATMENT_CYCLE)
+    # INSR_W2 W2.08 (L2204): carry person_id natively from the bronze parent course (one person per course; a
+    # course with conflicting persons gets NULL), so a cycle whose parent fails the drug admission is still a
+    # person's data.
+    parent = read_source(SRC_CANCER_TREATMENT).groupBy(
+        F.col("iqemo_chemotherapy_course_id").cast("bigint").alias("_cy_course")).agg(
+        F.min(F.col("PERSON_ID").cast("bigint")).alias("_cy_lo"), F.max(F.col("PERSON_ID").cast("bigint")).alias("_cy_hi"))
+    s = s.join(parent, s.CHEMOTHERAPY_COURSE_ID.cast("bigint") == F.col("_cy_course"), "left")
     row_key = F.concat_ws(":", s.CHEMOTHERAPY_COURSE_ID.cast("string"),
                           s.TREATMENT_CYCLE_ID.cast("string"))
     # contract v2: retain the composite SHA as cancer_treatment_cycle_key and publish the two native iQemo key components
@@ -7488,6 +7699,7 @@ def _lifecycle_source_cancer_treatment_cycle():
                   s.TREATMENT_CYCLE_ID).alias("cancer_treatment_cycle_key"),
         s.CHEMOTHERAPY_COURSE_ID.cast("bigint").alias("chemotherapy_course_id"),
         s.TREATMENT_CYCLE_ID.cast("bigint").alias("treatment_cycle_id"),
+        F.when(F.col("_cy_lo") == F.col("_cy_hi"), F.col("_cy_lo")).alias("person_id"),  # INSR_W2 W2.08
         s.CHEMOTHERAPY_COURSE_ID.cast("string").alias("iqemo_course_id"),
         s.TREATMENT_CYCLE_ID.cast("string").alias("cycle_sequence_id"),
         s.RegimenCycleID.cast("string").alias("regimen_cycle_id"),
@@ -7649,9 +7861,29 @@ CONDITION_STAGE_COLUMN_COMMENTS = {
     "loaded_at": "map_aria_diagnosis_staging.ADC_UPDT carried unchanged through code filtering and quality/public projections. This is the contributing bronze load clock, distinct from PIPELINE_UPDT_DT_TM published as source_update_timestamp; it is not disease onset/resolution or Silver refresh time.",
 }
 
+# INSR_W2 W2.20: comments re-stated for the two arms (ARIA and the W1.14 Millennium TNM arm).
+CONDITION_STAGE_COLUMN_COMMENTS.update({
+    'aria_pt_id': 'ARIA patient identifier; first component of the ARIA-arm primary key. NULL on Millennium TNM rows.',
+    'aria_dx_id': 'ARIA diagnosis identifier; second component of the ARIA-arm primary key. NULL on Millennium TNM rows.',
+    'source_coding_system': 'http://hl7.org/fhir/sid/icd-10 on ARIA rows; urn:barts:tnm-as-recorded on Millennium TNM rows (stage_source_kind set).',
+    'source_code': 'ARIA: ICD diagnosis code with diagnosis-name fallback. Millennium TNM rows: the stated T, N and M categories as recorded, prefix on T (e.g. pT2a N0 M0); a Uro TNM event carries one category.',
+    'source_display': 'ARIA: diagnosis name or description. Millennium TNM rows: same text as source_code.',
+    'stage_code': 'ARIA: source ICD and mapped OMOP diagnosis codings. Millennium TNM rows: the as-recorded TNM coding only (not mapped).',
+    'history_ind': 'ARIA HX_OF_IND = Y. NULL on Millennium TNM rows.',
+    'current_entry_ind': 'ARIA rows: true when CUR_ENTRY_IND is Y after uppercasing; null source values and other values become false. NULL on Millennium TNM rows.',
+    'cause_of_death_ind': 'ARIA rows: true when CS_OF_DTH_IND is Y after uppercasing; null source values and other values become false. NULL on Millennium TNM rows.',
+    'record_status': "ARIA rows: superseded when coalesce(CUR_ENTRY_IND,'Y') differs from the exact value Y or SOURCE_PRESENT_IND is false (null defaults true); otherwise active. Millennium TNM rows: superseded when map_cancer_stage_mill.SOURCE_PRESENT_IND is 0, otherwise active. No retracted status is emitted.",
+    'record_status_effective_from': 'ARIA rows: map_aria_diagnosis_staging.EVLV_TSTAMP_CLEAN carried unchanged; a missing value remains null. NULL on Millennium TNM rows (no history start in the source).',
+    'record_status_effective_to': "The arm's bronze ADC_UPDT only when the row is superseded; otherwise null. An ingestion-time proxy, not an observed status-transition time.",
+    'source_update_timestamp': 'ARIA rows: bronze PIPELINE_UPDT_DT_TM of map_aria_diagnosis_staging. Millennium TNM rows: map_cancer_stage_mill.ADC_UPDT (last write by cancer_pipeline). A processing clock, not a clinical time.',
+    'loaded_at': "The arm's bronze ADC_UPDT (map_aria_diagnosis_staging or map_cancer_stage_mill), carried unchanged.",
+    'event_datetime': 'ARIA rows: sentinel-cleaned diagnosis onset. Millennium TNM rows: STAGE_DT_TM (Uro TNM event end time, or pathology report issue time), a UTC instant.',
+    'event_datetime_local': 'event_datetime in Europe/London wall-clock time (GMT/BST). ARIA is a local-clock source and carries event_datetime unchanged; Millennium TNM rows convert the UTC STAGE_DT_TM.',
+})
+
 @materialized_view(
     name=_n("journey_clinical.condition_stage"),
-    comment="One diagnosis-and-staging assertion from the frozen ARIA source, retaining its composite identifiers and staging details.",
+    comment="One staging assertion: an ARIA diagnosis-and-staging record (frozen source) or a Millennium TNM statement (Uro TNM event or pathology report pTNM, INSR W1.14), with its source identifiers and staging details.",
     cluster_by=["person_id", "event_datetime"],
     refresh_policy="auto",
     column_comments=CONDITION_STAGE_COLUMN_COMMENTS,
@@ -8130,23 +8362,6 @@ for old_name, axes in S3_TABLE_AXIS_SPECS["clinical_endoscopy_finding"].items():
 
 # COMMAND ----------
 
-declare_s3_domain_stages("imaging_exam", "journey_clinical._qc_imaging_exam", {"exam_code": "_qc_exam_code_json"},
-                         IMAGING_EXAM_PUBLIC_COLUMNS, IMAGING_EXAM_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("medication_admin", "journey_clinical._qc_medication_admin", {"medication_code": "_qc_medication_code_json"},
-                         MEDICATION_ADMIN_PUBLIC_COLUMNS, MEDICATION_ADMIN_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("medication_order", "journey_clinical._qc_medication_order", {"medication_code": "_qc_medication_code_json"},
-                         MEDICATION_ORDER_PUBLIC_COLUMNS, MEDICATION_ORDER_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("medication_dispense", "journey_clinical._qc_medication_dispense", {"medication_code": "_qc_medication_code_json"},
-                         MEDICATION_DISPENSE_PUBLIC_COLUMNS, MEDICATION_DISPENSE_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("procedure", "journey_clinical._qc_procedure", {"procedure_code": "_procedure_code_json"},
-                         PROCEDURE_PUBLIC_COLUMNS, PROCEDURE_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("vital_sign", "journey_clinical._qc_vital_sign", {"vital_code": "_qc_vital_code_json"},
-                         VITAL_PUBLIC_COLUMNS, VITAL_LIFECYCLE_COLUMNS)
-declare_s3_domain_stages("pathology_result", "journey_clinical._qc_pathology_result", {"result_code": "_result_code_json"},
-                         RESULT_PUBLIC_COLUMNS, RESULT_LIFECYCLE_COLUMNS)
-# FINDING_AXIS_EVENTCD_V1: the clinical_finding finding axis (EVENT_CD lookup) maps once per distinct input.
-declare_s3_domain_stages("clinical_finding", "journey_clinical._qc_clinical_finding", {"finding_code": "_qc_finding_code_json"},
-                         CLINICAL_FINDING_PUBLIC_COLUMNS, CLINICAL_FINDING_LIFECYCLE_COLUMNS)
 
 # COMMAND ----------
 

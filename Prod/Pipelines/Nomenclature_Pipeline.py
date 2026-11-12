@@ -722,8 +722,15 @@ def run_mapping_section():
     ).select("concept_id_1", "concept_id_2").distinct()
 
     vocab_code = try_cast_column("SOURCE_VOCABULARY_CD", LongType())
+    # SCT_TRUD_V1 (Ben ruling 2026-11-03: SNOMED columns hold concept IDs only). A SNOMED row with no usable CKI
+    # resolves its Cerner SOURCE_IDENTIFIER (a description ID) through RF2 TUI -> CUI; TUI is unique in the table.
+    rf2_descriptions = spark.table("3_lookup.trud.snomed_sct").select(
+        F.col("TUI").cast(StringType()).alias("_RF2_TUI"), F.col("CUI").cast(StringType()).alias("_RF2_CUI")
+    )
     base = (
-        candidates.withColumn("IS_SNOMED", vocab_code.isin(SNOMED_VOCAB_CODES))
+        candidates.join(rf2_descriptions, F.trim(F.col("SOURCE_IDENTIFIER")) == F.col("_RF2_TUI"), "left")
+        .drop("_RF2_TUI")
+        .withColumn("IS_SNOMED", vocab_code.isin(SNOMED_VOCAB_CODES))
         .withColumn("IS_MULTUM", vocab_code.isin(MULTUM_VOCAB_CODES))
         .withColumn("IS_ICD10", vocab_code.isin(ICD10_VOCAB_CODES))
         .withColumn("IS_OPCS4", vocab_code.isin(OPCS4_VOCAB_CODES))
@@ -740,15 +747,16 @@ def run_mapping_section():
             F.when(
                 F.col("IS_SNOMED"),
                 F.when(
-                    F.col("CONCEPT_CKI").rlike("(?i)^SNOMED!"),
-                    F.regexp_extract(F.col("CONCEPT_CKI"), "(?i)^SNOMED!(.*)$", 1),
-                ).otherwise(F.col("SOURCE_IDENTIFIER")),
+                    F.col("CONCEPT_CKI").rlike("(?i)^(SNOMED|SNMUKEMED)![0-9]+$"),
+                    F.regexp_extract(F.col("CONCEPT_CKI"), r"(?i)^(?:SNOMED|SNMUKEMED)!([\s\S]*)$", 1),
+                ).otherwise(F.col("_RF2_CUI")),
             )
             .when(F.col("IS_MULTUM"), normalize_code(F.col("SOURCE_IDENTIFIER"), "MULTUM"))
             .when(F.col("IS_ICD10"), normalize_code(F.col("SOURCE_IDENTIFIER"), "ICD10"))
             .when(F.col("IS_OPCS4"), normalize_code(F.col("SOURCE_IDENTIFIER"), "OPCS4"))
             .otherwise(F.trim(F.col("SOURCE_IDENTIFIER"))),
         )
+        .drop("_RF2_CUI")
     )
 
 
@@ -835,12 +843,12 @@ def run_mapping_section():
     native_snomed = candidate_frame(
         stage_one_current.filter(
             try_cast_column("SOURCE_VOCABULARY_CD", LongType()).isin(SNOMED_VOCAB_CODES)
-            | F.col("CONCEPT_CKI").rlike("(?i)^SNOMED!")
+            | F.col("CONCEPT_CKI").rlike("(?i)^(SNOMED|SNMUKEMED)!")
         ),
         F.coalesce(
             F.when(
-                F.col("CONCEPT_CKI").rlike("(?i)^SNOMED!"),
-                F.regexp_extract(F.col("CONCEPT_CKI"), "(?i)^SNOMED!(.*)$", 1),
+                F.col("CONCEPT_CKI").rlike("(?i)^(SNOMED|SNMUKEMED)![0-9]+$"),
+                F.regexp_extract(F.col("CONCEPT_CKI"), r"(?i)^(?:SNOMED|SNMUKEMED)!([\s\S]*)$", 1),
             ),
             F.col("FOUND_CUI"),
         ),

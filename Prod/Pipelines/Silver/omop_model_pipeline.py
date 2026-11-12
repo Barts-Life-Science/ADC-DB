@@ -33,10 +33,15 @@ except ImportError:  # classic DLT fallback does not accept refresh_policy
 # Vocabulary, governed crosswalks, and the append-only ID registry remain authoritative
 # reference dependencies; embedding or replacing them would change OMOP semantics.
 PIPELINE_VERSION = "0.8.0-ogr-2026-10-01"  # VDB_OMOP_LOCAL_V1  # OGR_METADATA_V1
+# INSR_20261029 (INSR_W5_OMOP_V1): release tag for the W5 metadata rows. PIPELINE_VERSION is deliberately
+# unchanged: it is a literal inside provenance, metrics and map versions, and a bump would recompute them.
+INSR_RELEASE = "insr-20261029"
 STUDY_START = "2012-01-01"
 # Research-cohort floor: no longer a person gate. Published via omop_person_research_flags
 # for the gold layer to apply (HERON-UK: partners may include all persons).
 MIN_BIRTH_YEAR = 1910
+# INSR_W5 W5.11 (L672, J4, F3): the Millennium default birth date (a x160 heap held in raw mill_person, W0.03 P3b).
+BIRTH_PLACEHOLDER_DATE = "1910-01-01"
 # HERON-UK observation-period censoring age (no enrolment dates at source).
 CENSOR_AGE_YEARS = 120
 # HERON-UK IMD convention: observation_concept_id 0, source concept "IMD quintile", unit "quintile".
@@ -116,6 +121,8 @@ SOURCE_TABLES = {
     "lkp_vte_item_map": "3_lookup.omop.omop_maternity_vte_item_map",
     "lkp_stage_map": "3_lookup.omop.omop_stage_group_map",
     "lkp_calendar": "3_lookup.omop.calendar_day",  # INCR_FIX_20261018
+    "lkp_specimen_site": "3_lookup.omop.omop_specimen_site_map",  # INSR_W5 W5.15
+    "src_person_scope": "4_prod.silver.reference_person_scope",  # INSR_W5 W5.03 (W2.09 person_scope)
 }
 
 # Unqualified reads bind to datasets in this pipeline and therefore follow the
@@ -127,6 +134,7 @@ PIPELINE_DATASETS = {
     "src_om_observation_period": "observation_period",
     "src_om_person": "person",  # OMOP_PREG_INFANT_V1
     "src_om_condition_occurrence": "condition_occurrence",  # OMOP_PREG_INFANT_V1
+    "src_om_procedure_occurrence": "procedure_occurrence",  # INSR_W5 W5.10
 }
 
 # Dev sources promoted 2026-09-26: lookups to 3_lookup.omop, the ID registry to 4_prod.omop_meta.
@@ -299,6 +307,15 @@ TABLE_TRANSFORMS = {}
 EVIDENCE_BUILDERS = []
 METRIC_BUILDERS = []
 METADATA_ROWS = []
+METADATA_ROWS.append((67, 0, 0, 'vital_canonical_unit_policy', "BBR_FOLDIN_V1 BBR-4: vital_sign value_as_number is silver value_canonical when canonical_conversion is set (heights in cm incl. m->cm, weights in kg incl. g->kg, BMI kg/m2), else value_number; unit_concept_id is the canonical UCUM unit's concept when it resolves, else the row's unit_concept_id (anthropometric rows with no source unit carry the concept default unit, vital:concept_default_unit)", None, None, None, None))  # INSR_W5 W5.20 BBR_FOLDIN_V1
+METADATA_ROWS.append((68, 0, 0, 'measurement_anthropometric_bounds_policy', 'BBR_FOLDIN_V1 BBR-5: a body weight <= 0 or > 400 kg, height < 20 or > 250 cm, or BMI < 5 or > 150 (on the canonical value, keyed on the SNOMED concept; a value with no canonical conversion, e.g. lb or ft, is not bounded) loses its value_as_number, and the then valueless row is not emitted (BBR-6, row 69); gold invalidates the same values (insr_bbr_anthropometric_range) and keeps the row', None, None, None, None))  # INSR_W5 W5.20 BBR_FOLDIN_V1
+METADATA_ROWS.append((69, 0, 0, 'measurement_valueless_anthropometric_policy', 'BBR_FOLDIN_V1 BBR-6: a vital-sign weight, height or BMI row (OMOP 3025315, 3026600, 3035463, 3036277, 3038553, 4099154, 4177340, 4245997, 36304833) with no value_as_number and value_as_concept_id 0 is not emitted (no clinical use); silver and gold keep the row and its source value', None, None, None, None))  # INSR_W5 W5.20 BBR_FOLDIN_V1
+METADATA_ROWS.append((70, 0, 0, 'drug_exposure_order_role_policy', "BBR_FOLDIN_V1 BBR-13 (Ben decision BBR-D3): continuous-order instances (silver clinical_medication_order order_role = 'instance', one scheduled dose of a parent prescription) never become drug exposures; administered doses come from medication_admin. Medication orders are not an admitted router event type", None, None, None, None))  # INSR_W5 W5.20 BBR_FOLDIN_V1
+# INSR_W5 W5.19 SCT_TRUD_V1: the TRUD-clear S3 rules (= silver S3_TRUD_CLEAR_RULES).
+SCT_TRUD_CLEAR_RULES = ('trud:icdsctmap:single', 'trud:opcssctmap:single')
+METADATA_ROWS.append((66, 0, 0, "trud_precedence_policy", "SCT_TRUD_V1 (Ben 2026-11-03): where silver's condition/procedure SNOMED target came from an exact, assured NHS England TRUD map with one target (rules trud:icdsctmap:single, trud:opcssctmap:single) and reached a standard concept, that standard is the event's concept; other arms' standards for the event stay in staging as trud_precedence_suppressed. OMOP Maps-to fills events whose TRUD target has no standard concept. condition_source_concept_id stays the ICD10/OPCS4 concept, whose OHDSI Maps-to may differ from the published standard (deliberate divergence)", None, None, None, None))  # INSR_W5 W5.19 SCT_TRUD_V1
+METADATA_ROWS.append((65, 0, 0, "area_observation_date_convention", "INSR W5.14 (L391, J38): area observations (IMD quintile, radon class, Census 2021 percentages) are dated from the address effective-from date, else the period start for a sole record; bulk address loads in 2013-03 and 2021-03 make observation spikes in those months (99% of the excess is area rows, P7_L391); they are not clinical activity and never open a period", None, None, None, None))  # INSR_W5 W5.14
+METADATA_ROWS.append((60, 0, 0, "birth_placeholder_policy", "INSR W5.11 (J4): a 1910-01-01 birth date is the Millennium default, not a birth; OMOP treats it as unknown (year/month/day and birth_datetime NULL), so omop_person_research_flags reads missing_birth_date and omop_gold drops the person", None, None, None, None))  # INSR_W5 W5.11
 
 
 def _register_extension(table, builder):
@@ -422,7 +439,16 @@ def _person_base():
     # Every Silver person publishes (HERON-UK: partners may include all persons). The former
     # O1 cohort gates are carried as _research_exclusion_reason for the gold layer; only a
     # person that cannot be keyed is excluded here.
-    person_source = read_source("src_person").alias("p")
+    # INSR_W5 W5.11: a 1910-01-01 birth is unknown. The flag is computed first, so nulling birth_date cannot hide it
+    # from the birth_datetime rule.
+    person_source = (
+        read_source("src_person")
+        .withColumn("_insr_birth_placeholder",
+                    F.coalesce(F.to_date(F.col("birth_date")) == F.lit(BIRTH_PLACEHOLDER_DATE).cast("date"), F.lit(False)))
+        .withColumn("birth_date", F.when(~F.col("_insr_birth_placeholder"), F.col("birth_date")))
+        .withColumn("birth_datetime", F.when(~F.col("_insr_birth_placeholder"), F.col("birth_datetime")))
+        .alias("p")
+    )
     gender = read_source("lkp_gender").select(
         F.col("gender_code").alias("_gender_code"),
         F.col("gender_concept_id").alias("_gender_concept_id"),
@@ -476,11 +502,11 @@ def _person_base():
 person_schema = T.StructType([
     T.StructField('person_id', T.LongType(), False, metadata={'comment': 'Millennium PERSON_ID carried as a natural key.'}),
     T.StructField('gender_concept_id', T.IntegerType(), False, metadata={'comment': 'Standard gender concept via governed gender map.'}),
-    T.StructField('year_of_birth', T.IntegerType(), True, metadata={'comment': 'Year from Journey birth date; NULL when Silver has no birth date (all persons publish; see omop_person_research_flags).'}),
+    T.StructField('year_of_birth', T.IntegerType(), True, metadata={'comment': 'Year from Journey birth date; NULL when Silver has no birth date or holds the 1910-01-01 Millennium default (INSR W5.11) (all persons publish; see omop_person_research_flags).'}),
     T.StructField('month_of_birth', T.IntegerType(), True, metadata={'comment': 'Month from Journey birth date where source precision permits.'}),
     T.StructField('day_of_birth', T.IntegerType(), True, metadata={'comment': 'Day from Journey birth date where source precision permits; no day-15 imputation.'}),
     T.StructField('birth_datetime', T.TimestampType(), True, metadata={'comment': 'Full birth datetime retained by approved D4 ruling.'}),
-    T.StructField('race_concept_id', T.IntegerType(), False, metadata={'comment': 'Standard Race concept via the NHS Ethnic Category Maps-to relationship (HERON-UK); 0 where the source concept is missing or its mapping is absent or ambiguous.'}),
+    T.StructField('race_concept_id', T.IntegerType(), False, metadata={'comment': 'Standard Race concept via the NHS Ethnic Category Maps-to relationship (HERON-UK); 0 where the source concept is missing or its mapping is absent or ambiguous, including letters S (any other) and Z (not stated or refused), which have no vocabulary concept (RACE_XWALK_INSR_V1).'}),
     T.StructField('ethnicity_concept_id', T.IntegerType(), False, metadata={'comment': 'Recorded convention is 0 because the NHS source does not carry the Hispanic axis.'}),
     T.StructField('location_id', T.LongType(), True, metadata={'comment': 'LSOA LOCATION of the current address (natural key); NULL when the address has no E01/W01 LSOA.'}),
     T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Current registered GP (PERSON_PRSNL_RELTN code 1115, active and in effect at refresh; latest start, then lowest id) resolved to a published provider; NULL otherwise.'}),
@@ -529,6 +555,26 @@ def omop_person_research_flags():
             F.col("_record_status").alias("record_status"),
             F.col("_research_exclusion_reason").alias("research_exclusion_reason"),
         )
+    )
+
+
+# INSR_W5 W5.03 (C0 ruling 1): the silver person_scope flags omop_gold applies, one row per published person. Silver
+# OMOP still publishes every person; omop_gold drops persons that are not in_scope (no qualifying encounter and no
+# clinical row) and persons without an observation period (J7).
+@dp.materialized_view(
+    name="omop_person_scope",
+    comment="INSR W5.03: per published person, the silver person_scope flags omop_gold applies (in_scope = a qualifying encounter or any clinical row; C0 ruling 1, 2026-10-29). A person absent from person_scope is not in scope.",
+)
+def omop_person_scope():
+    """Published persons left-joined to silver person_scope; a person absent from person_scope gets false flags."""
+    scope = read_source("src_person_scope").select(
+        F.col("person_id").cast("bigint").alias("_ps_person"), "in_scope", "has_encounter", "has_clinical_data")
+    persons = _person_base().where(F.col("_exclusion_reason").isNull()).select("person_id")
+    return persons.join(scope, F.col("person_id") == F.col("_ps_person"), "left").select(
+        "person_id",
+        F.coalesce(F.col("in_scope"), F.lit(False)).alias("in_scope"),
+        F.coalesce(F.col("has_encounter"), F.lit(False)).alias("has_encounter"),
+        F.coalesce(F.col("has_clinical_data"), F.lit(False)).alias("has_clinical_data"),
     )
 
 
@@ -636,6 +682,15 @@ def _om_constant_rows(rows, schema):
     return result
 
 
+# INSR_W5 W5.09 (L341, F18, J41): 137,919 death rows carried a single whitespace character as cause text.
+def _insr_cause_text(column):
+    """The cause text, or NULL when it holds only whitespace (including no-break spaces)."""
+    return F.when(F.length(F.regexp_replace(column.cast("string"), r"[\s\x{00A0}]", "")) > 0, column)
+
+
+METADATA_ROWS.append((61, 0, 0, "cause_text_policy", "INSR W5.09 (J41): death cause_source_value is NULL when the source cause text is empty or whitespace only; otherwise the first 50 characters", None, None, None, None))
+
+
 def _death_base():
     people = read_source("src_person").select(
         F.col("person_id").alias("_person_source_id"),
@@ -702,7 +757,7 @@ def _death_base():
         F.lit(32817).cast("int").alias("death_type_concept_id"),
         F.coalesce(F.col("_dc_concept_id"), F.lit(0)).cast("int").alias("cause_concept_id"),  # OGR_DEATH_CAUSE_V1
         (
-            F.substring(F.col("_cause_of_death"), 1, 50)
+            F.substring(_insr_cause_text(F.col("_cause_of_death")), 1, 50)  # INSR_W5 W5.09
             if CARRY_CAUSE_TEXT else F.lit(None).cast("string")
         ).alias("cause_source_value"),
         F.coalesce(F.col("_dc_concept_id"), F.lit(0)).cast("int").alias("cause_source_concept_id"),
@@ -722,7 +777,7 @@ death_schema = T.StructType([
     T.StructField('death_datetime', T.TimestampType(), True, metadata={'comment': 'Best available death timestamp consistent with death_date.'}),
     T.StructField('death_type_concept_id', T.IntegerType(), True, metadata={'comment': 'Verified EHR type concept 32817.'}),
     T.StructField('cause_concept_id', T.IntegerType(), True, metadata={'comment': 'Standard SNOMED Condition matched uniquely by exact concept name, then synonym, on normalised cause text; 0 when unmatched or ambiguous.'}),
-    T.StructField('cause_source_value', T.StringType(), True, metadata={'comment': 'Death cause text truncated to 50 characters and governed by omop.carry_cause_text.'}),
+    T.StructField('cause_source_value', T.StringType(), True, metadata={'comment': 'Death cause text truncated to 50 characters and governed by omop.carry_cause_text; NULL when the source text is empty or whitespace only (INSR W5.09).'}),
     T.StructField('cause_source_concept_id', T.IntegerType(), True, metadata={'comment': 'Same concept as cause_concept_id (the text is the source); 0 when unmatched.'}),
 ])
 # === END GENERATED: explicit schema for death ===
@@ -817,15 +872,15 @@ location_schema = T.StructType([
     T.StructField('location_id', T.LongType(), False, metadata={'comment': 'Cerner source_location_code natural key for facilities; 8e15 + rank*1e9 + LSOA digits for LSOA rows (E01 rank 1, W01 rank 2).'}),
     T.StructField('address_1', T.StringType(), True, metadata={'comment': 'Always NULL; street address is outside the approved surface.'}),
     T.StructField('address_2', T.StringType(), True, metadata={'comment': 'Always NULL; street address is outside the approved surface.'}),
-    T.StructField('city', T.StringType(), True, metadata={'comment': 'Facility or building city supplied by Journey.'}),
+    T.StructField('city', T.StringType(), True, metadata={'comment': 'Facility or building city supplied by Journey; NULL on LSOA rows by design (INSR W5.14).'}),
     T.StructField('state', T.StringType(), True, metadata={'comment': 'NULL in O1.'}),
     T.StructField('zip', T.StringType(), True, metadata={'comment': 'Outward postcode only, derived from the Journey location postcode; PID scan rejects full postcode shapes.'}),
     T.StructField('county', T.StringType(), True, metadata={'comment': 'Local authority code (modal across address rows) for LSOA rows; NULL for facilities.'}),
     T.StructField('location_source_value', T.StringType(), True, metadata={'comment': 'Cerner source_location_code as string.'}),
     T.StructField('country_concept_id', T.IntegerType(), True, metadata={'comment': '42035286 United Kingdom.'}),
     T.StructField('country_source_value', T.StringType(), True, metadata={'comment': 'GB source code.'}),
-    T.StructField('latitude', T.DoubleType(), True, metadata={'comment': 'Facility or building latitude where supplied.'}),
-    T.StructField('longitude', T.DoubleType(), True, metadata={'comment': 'Facility or building longitude where supplied.'}),
+    T.StructField('latitude', T.DoubleType(), True, metadata={'comment': 'Facility or building latitude where supplied; NULL on LSOA rows by design: areas are published as derived measures only (J15, INSR W5.14).'}),
+    T.StructField('longitude', T.DoubleType(), True, metadata={'comment': 'Facility or building longitude where supplied; NULL on LSOA rows by design: areas are published as derived measures only (J15, INSR W5.14).'}),
 ])
 # === END GENERATED: explicit schema for location ===
 
@@ -835,7 +890,7 @@ location_schema = T.StructType([
     # during the Delta materialization write, although the inferred data types
     # are identical.  Keep location_schema above as the documented contract,
     # but let Lakeflow infer this one physical schema.
-    comment="OMOP LOCATION: Journey facility/building locations plus one PID-free row per LSOA (natural key 8e15 + rank*1e9 + digits); no street addresses or postcodes.",
+    comment="OMOP LOCATION: Journey facility/building locations plus one PID-free row per LSOA (natural key 8e15 + rank*1e9 + digits); no street addresses or postcodes. LSOA rows carry no city or coordinates by design; the data browser shows derived area measures only (J15, INSR W5.14).",
 )
 def location():
     facility = _location_base().where(F.col("_exclusion_reason").isNull()).drop("_exclusion_reason")
@@ -884,7 +939,7 @@ def _care_site_base():
 care_site_schema = T.StructType([
     T.StructField('care_site_id', T.LongType(), False, metadata={'comment': 'Cerner source_location_code carried as a natural key.'}),
     T.StructField('care_site_name', T.StringType(), True, metadata={'comment': 'Journey nurse-unit display name.'}),
-    T.StructField('place_of_service_concept_id', T.IntegerType(), True, metadata={'comment': 'Dominant published visit concept at the care site mapped 9201→8717, 9202→8756, 9203→8870; 0 otherwise.'}),
+    T.StructField('place_of_service_concept_id', T.IntegerType(), True, metadata={'comment': 'Dominant published visit concept at the care site mapped 9201→8717, 9202→8756, 9203→8870; else the physical location type (wa→8717, CARE_SITE_POS_FALLBACK_V1, INSR W5.15); 0 otherwise.'}),
     T.StructField('location_id', T.LongType(), True, metadata={'comment': 'Nearest published facility or building ancestor.'}),
     T.StructField('care_site_source_value', T.StringType(), True, metadata={'comment': 'Cerner source_location_code as string.'}),
     T.StructField('place_of_service_source_value', T.StringType(), True, metadata={'comment': 'Journey physical_type_code.'}),
@@ -892,6 +947,20 @@ care_site_schema = T.StructType([
 # === END GENERATED: explicit schema for care_site ===
 
 VISIT_TO_PLACE_OF_SERVICE = {9201: 8717, 9202: 8756, 9203: 8870}  # OGR_CARE_SITE_POS_V1
+
+
+# INSR_W5 W5.15 (L562, J33): CARE_SITE_POS_FALLBACK_V1. A nurse unit with no published visit takes its place of
+# service from the Millennium physical location type; every published unit is type "wa" (ward) -> 8717 (Inpatient
+# Hospital). Other types stay 0 until mapped.
+CARE_SITE_POS_FALLBACK = {"wa": 8717}
+
+
+def _insr_pos_fallback(physical_type):
+    """Place-of-service concept for a physical location type, or NULL."""
+    return F.create_map(*[F.lit(x) for kv in CARE_SITE_POS_FALLBACK.items() for x in kv])[F.lower(F.trim(physical_type))]
+
+
+METADATA_ROWS.append((64, 0, 0, "best_effort_map_policy", "INSR W5.15 (J33): provider specialty for position codes absent from omop_position_specialty_map and specimen anatomic site from omop_specimen_site_map are best-effort maps (exact name, embedding dot product, Opus 5.5 gate) with method, model, score, verdict and rule id on each lookup row and in omop_concept_provenance (rules insr_w5:position_codes:*, insr_w5:specimen_body_site:*); care_site place_of_service falls back to the physical location type (wa -> 8717) when no visit is published (CARE_SITE_POS_FALLBACK_V1)", None, None, None, None))
 
 
 def _care_site_pos():
@@ -918,9 +987,19 @@ def care_site():
     return (
         base.join(_care_site_pos(), F.col("care_site_id") == F.col("_pos_care_site_id"), "left")
         .withColumn("place_of_service_concept_id",
-                    F.coalesce(F.col("_pos_concept_id"), F.lit(0)).cast("int"))
+                    F.coalesce(F.col("_pos_concept_id"),
+                               _insr_pos_fallback(F.col("place_of_service_source_value")),  # INSR_W5 W5.15
+                               F.lit(0)).cast("int"))
         .select(*columns)
     )  # OGR_CARE_SITE_POS_V1
+
+
+# INSR_W5 W5.04 (L415, F7, J5; W0.04 P4g, P4_omop_system_id1): personnel id 0 is the "no practitioner"
+# placeholder and id 1 the Millennium system account. Neither is a provider. Excluding them here makes every fact,
+# visit, visit detail, device and person pointer that named them resolve to NULL through _published_provider_keys().
+PLACEHOLDER_PERSONNEL_IDS = (0,)
+SYSTEM_PERSONNEL_IDS = (1,)
+METADATA_ROWS.append((56, 0, 0, "provider_placeholder_policy", "INSR W5.04 (J5): Millennium personnel id 0 (no practitioner) and 1 (system account) are excluded from PROVIDER (reasons placeholder_personnel_id, system_personnel_id), so every provider_id that pointed at them is NULL", None, None, None, None))
 
 
 def _provider_base():
@@ -961,7 +1040,10 @@ def _provider_base():
         F.lit(0).cast("int").alias("specialty_source_concept_id"),
         F.lit(None).cast("string").alias("gender_source_value"),
         F.lit(0).cast("int").alias("gender_source_concept_id"),
-        F.when(natural_key.isNull(), F.lit("unparseable_natural_key")).alias("_exclusion_reason"),
+        F.when(natural_key.isNull(), F.lit("unparseable_natural_key"))
+        .when(natural_key.isin(*PLACEHOLDER_PERSONNEL_IDS), F.lit("placeholder_personnel_id"))  # INSR_W5 W5.04
+        .when(natural_key.isin(*SYSTEM_PERSONNEL_IDS), F.lit("system_personnel_id"))  # INSR_W5 W5.04
+        .alias("_exclusion_reason"),
     )
 
 
@@ -971,7 +1053,7 @@ provider_schema = T.StructType([
     T.StructField('provider_name', T.StringType(), True, metadata={'comment': 'Staff name governed by omop.carry_staff_identifiers.'}),
     T.StructField('npi', T.StringType(), True, metadata={'comment': 'Staff NPI or doctor number governed by omop.carry_staff_identifiers.'}),
     T.StructField('dea', T.StringType(), True, metadata={'comment': 'NULL in O1.'}),
-    T.StructField('specialty_concept_id', T.IntegerType(), True, metadata={'comment': 'Governed best-effort standard Provider concept; 0 when unmapped.'}),
+    T.StructField('specialty_concept_id', T.IntegerType(), True, metadata={'comment': 'Governed best-effort standard Provider concept (position map rows from rule insr_w5:position_codes carry method, model, score and verdict; INSR W5.15); 0 when unmapped.'}),
     T.StructField('care_site_id', T.LongType(), True, metadata={'comment': 'Primary nurse-unit location where it resolves to a published care site.'}),
     T.StructField('year_of_birth', T.IntegerType(), True, metadata={'comment': 'NULL in O1.'}),
     T.StructField('gender_concept_id', T.IntegerType(), True, metadata={'comment': '0 in O1.'}),
@@ -986,7 +1068,7 @@ provider_schema = T.StructType([
 @dp.materialized_view(
     name="provider",
     schema=provider_schema,
-    comment="OMOP PROVIDER from Journey practitioner with governed best-effort specialty.",
+    comment="OMOP PROVIDER from Journey practitioner with governed best-effort specialty; personnel ids 0 (placeholder) and 1 (system account) are not providers (INSR W5.04).",
 )
 def provider():
     return _provider_base().where(F.col("_exclusion_reason").isNull()).drop("_exclusion_reason")
@@ -1146,6 +1228,11 @@ def visit_occurrence():
     )
 
 
+# INSR_W5 W5.05 (L532, F4): an end on or after this date is the Millennium open-end sentinel, not a date.
+OPEN_END_SENTINEL_DATE = "2099-12-31"
+METADATA_ROWS.append((57, 0, 0, "end_date_policy", "INSR W5.05 (F4, F5a): a visit_detail end on or after 2099-12-31 is an open sentinel (end falls back to start); visit_detail rows starting in 2100 or later (start_open_sentinel, the W3.07 begin-class rule), before 2012-01-01 (before_study_window) or before their visit date (detail_before_visit) are excluded; a procedure end after the extraction date is NULL; a drug end after the extraction date becomes the start date with verbatim_end_date NULL, before eras derive", None, None, None, None))
+
+
 def _visit_detail_base():
     registry = (
         read_source("src_id_registry")
@@ -1166,6 +1253,7 @@ def _visit_detail_base():
             F.col("admitted_from_source_value").alias("_v_adm_source"),
             F.col("discharged_to_concept_id").alias("_v_dis_concept"),
             F.col("discharged_to_source_value").alias("_v_dis_source"),
+            F.col("visit_start_date").alias("_v_start_date"),  # INSR_W5 W5.05
         )
     )
     published_care_sites = (
@@ -1227,7 +1315,10 @@ def _visit_detail_base():
     )
     joined = joined.join(attending, F.col("_registry_source_key") == F.col("_ap_key"), "left")
     start = F.col("_start")
-    end_raw = F.coalesce(F.col("_end_raw"), start)
+    # INSR_W5 W5.05: an end on the open sentinel is treated as open, so it falls back to the start.
+    end_raw = F.coalesce(
+        F.when(F.to_date(F.col("_end_raw")) < F.lit(OPEN_END_SENTINEL_DATE).cast("date"), F.col("_end_raw")),
+        start)
     end = F.when(end_raw < start, start).otherwise(end_raw)
     return joined.select(
         F.col("_allocated_id").alias("visit_detail_id"),
@@ -1254,8 +1345,11 @@ def _visit_detail_base():
         .when(F.col("_start_basis") == "PRE_ATTENDANCE", F.lit("pre_attendance_stop"))
         .when(F.col("_start_basis") == "NO_ATTENDANCE_EVIDENCE", F.lit("no_attendance_evidence"))
         .when(F.col("_start").isNull(), F.lit("missing_start_datetime"))
+        .when(F.year(F.col("_start")) >= 2100, F.lit("start_open_sentinel"))  # INSR_W5 W5.05 (W3.07 begin-class rule)
+        .when(F.to_date(F.col("_start")) < F.to_date(F.lit(STUDY_START)), F.lit("before_study_window"))  # INSR_W5 W5.05
         .when(F.col("_encounter_id").isNull(), F.lit("no_encounter_link"))
         .when(F.col("_visit_id").isNull(), F.lit("visit_not_published"))
+        .when(F.to_date(F.col("_start")) < F.col("_v_start_date"), F.lit("detail_before_visit"))  # INSR_W5 W5.05
         .when(F.col("_allocated_id").isNull(), F.lit("id_not_allocated"))
         .alias("_exclusion_reason"),
     )
@@ -1268,7 +1362,7 @@ visit_detail_schema = T.StructType([
     T.StructField('visit_detail_concept_id', T.IntegerType(), False, metadata={'comment': '9201 ward stay or 32037 critical care.'}),
     T.StructField('visit_detail_start_date', T.DateType(), False, metadata={'comment': 'Ward lane: location_stay occupancy_start_local (Europe/London) date (stops ending before the patient arrived are excluded); critical-care lane: CCMDS period start date (source local time).'}),
     T.StructField('visit_detail_start_datetime', T.TimestampType(), True, metadata={'comment': 'Ward lane: location_stay occupancy_start_local (Europe/London wall-clock time); critical-care lane: CCMDS period start.'}),
-    T.StructField('visit_detail_end_date', T.DateType(), False, metadata={'comment': 'Ward lane: location_stay occupancy_end_local (null when the stop end was the encounter administrative close), Europe/London date; critical-care lane: CCMDS period end. Open or inverted intervals fall back to start.'}),
+    T.StructField('visit_detail_end_date', T.DateType(), False, metadata={'comment': 'Ward lane: location_stay occupancy_end_local (null when the stop end was the encounter administrative close), Europe/London date; critical-care lane: CCMDS period end. Open or inverted intervals, and the 2099-12-31+ open sentinel, fall back to start (INSR W5.05).'}),
     T.StructField('visit_detail_end_datetime', T.TimestampType(), True, metadata={'comment': 'Stay or period end in local wall-clock time under the same convention.'}),
     T.StructField('visit_detail_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Verified EHR type concept 32817.'}),
     T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Attending participant whose validity (converted to Europe/London) contains the detail start, resolved to a published provider; latest start, then lowest id; NULL otherwise.'}),
@@ -1351,6 +1445,50 @@ def visit_detail():
     )
 
 
+# INSR_W5 W5.02 (J7 part 1, L315, F22): OMOP_OP_EVIDENCE_V2. Evidence that proves the person was seen although the
+# record is not published (W0.02 P2a; reasons confirmed by W5.01 a):
+#   - routed events excluded only for a mapping reason, dated on or after STUDY_START;
+#   - attended encounters not published as visits (scope or missing source key), from STUDY_START;
+#   - the pregnancy journey start (the only published lane not yet covered: P2a pregnancy/episode, 126 persons).
+# Area observations, eras and death are never evidence (P2c_area 48.50% outside the period; P2a DOCUMENT rows).
+# _om_observation_start keeps the birth - 1 day, death, censoring-age and extraction guards for every arm.
+OP_EVIDENCE_MAPPING_REASONS = ("coding_system_not_governed", "concept_unresolved", "standard_unmapped",
+                               "deferred_adapter")
+OP_EVIDENCE_VISIT_REASONS = ("encounter_level_out_of_scope", "no_source_encounter_key")
+OP_EVIDENCE_EXCLUDED_TYPE_CLASSES = ("Preadmit", "Wait List", "Results Only")
+
+
+def _insr_unpublished_visit_evidence():
+    """Start of every attended 2012+ encounter that _visit_base excluded for scope or a missing source key."""
+    attended = read_source("src_encounter").where(
+        (F.col("attendance_evidence") == "OBSERVED")
+        & ~F.coalesce(F.col("type_class_display"), F.lit("")).isin(*OP_EVIDENCE_EXCLUDED_TYPE_CLASSES)
+    ).select(F.col("encounter_id").alias("_ev_encounter_id"))
+    return (
+        _visit_base()
+        .where(F.col("_exclusion_reason").isin(*OP_EVIDENCE_VISIT_REASONS)
+               & (F.col("visit_start_date") >= F.to_date(F.lit(STUDY_START))))
+        .join(attended, F.col("_encounter_id") == F.col("_ev_encounter_id"), "inner")
+        .select(F.col("person_id").cast("bigint").alias("person_id"),
+                F.col("visit_start_datetime").alias("_evidence_start"))
+    )
+
+
+def _insr_pregnancy_evidence():
+    """Start of every non-superseded top-level pregnancy journey from STUDY_START (the rows EPISODE publishes)."""
+    journeys = read_source("src_journey").where(
+        (F.col("journey_type_code") == "pregnancy") & F.col("parent_journey_key").isNull()
+        & (F.coalesce(F.col("status_code"), F.lit("")) != "superseded")
+        & (F.to_date("period_start") >= F.to_date(F.lit(STUDY_START)))
+    )
+    return journeys.select(F.expr("try_cast(person_id AS bigint)").alias("person_id"),
+                           F.col("period_start").cast("timestamp").alias("_evidence_start"))
+
+
+EVIDENCE_BUILDERS.append(_insr_pregnancy_evidence)
+METADATA_ROWS.append((55, 0, 0, "op_evidence_policy", "OMOP_OP_EVIDENCE_V2 (INSR 2026-10-29, J7): besides published records, from 2012-01-01 the period start also counts routed events excluded only for a mapping reason (coding_system_not_governed, concept_unresolved, standard_unmapped, deferred_adapter), attended encounters not published as visits (scope or missing source key; not pre-admission, wait list or results only) and the pregnancy journey start; area observations, eras and death never open a period", None, None, None, None))
+
+
 @dp.materialized_view(
     name="_om_observation_start",
     comment="Internal: per person, the observation-period start, the death and censoring-age bounds and the gate reason. Carries no run-date literal, so new evidence refreshes it incrementally; observation_period adds the run-date end.",
@@ -1369,7 +1507,9 @@ def _om_observation_start():
     )
     routed_evidence = (
         read_source("src_routed_events")
-        .where(F.col("_exclusion_reason").isNull())
+        .where(F.col("_exclusion_reason").isNull()
+               | (F.col("_exclusion_reason").isin(*OP_EVIDENCE_MAPPING_REASONS)  # INSR_W5 W5.02
+                  & (F.to_date("event_datetime") >= F.to_date(F.lit(STUDY_START)))))
         .select(
             F.col("person_id").cast("bigint").alias("person_id"),
             F.col("event_datetime").alias("_evidence_start"),
@@ -1394,6 +1534,7 @@ def _om_observation_start():
         visit_evidence.unionByName(routed_evidence)
         .unionByName(visit_detail_evidence)
         .unionByName(specimen_evidence)
+        .unionByName(_insr_unpublished_visit_evidence())  # INSR_W5 W5.02
         .unionByName(_evidence_extensions())  # OGR_EXT_V1
         .where(F.col("person_id").isNotNull() & F.col("_evidence_start").isNotNull())
         .join(births, F.col("person_id") == F.col("_birth_person_id"), "left")
@@ -1465,7 +1606,7 @@ def _observation_period_base():
 observation_period_schema = T.StructType([
     T.StructField('observation_period_id', T.LongType(), False, metadata={'comment': 'Equal to person_id because O2 publishes one period per person.'}),
     T.StructField('person_id', T.LongType(), False, metadata={'comment': 'Published PERSON foreign key.'}),
-    T.StructField('observation_period_start_date', T.DateType(), False, metadata={'comment': 'Date of the first published record (visit, visit_detail, routed event or specimen) on or after birth - 1 day; no study-window clamp (HERON-UK).'}),
+    T.StructField('observation_period_start_date', T.DateType(), False, metadata={'comment': 'Date of the first record evidence on or after birth - 1 day (OMOP_OP_EVIDENCE_V2: published visits, visit details, routed events, specimens and adapter rows; from 2012 also mapping-excluded routed events, unpublished attended encounters and the pregnancy journey start); no study-window clamp (HERON-UK).'}),
     T.StructField('observation_period_end_date', T.DateType(), False, metadata={'comment': 'Earliest of death date, the 120th birthday and the source-release (extraction) date (HERON-UK); independent of the last record.'}),
     T.StructField('period_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Verified EHR type concept 32817.'}),
 ])
@@ -1867,6 +2008,18 @@ def _router_standard_rows(fanned=None):
     preferred_window = Window.partitionBy(
         "patient_event_id", "_standard_concept_id"
     )
+    # INSR_W5 W5.19 SCT_TRUD_V1: _trud_event = some arm of the event is a TRUD-clear S3 target that reached a
+    # standard; _trud_standard = this standard is one the TRUD arm reached. The rule id rides in the s3_axis JSON.
+    trud_arm = F.coalesce(
+        F.col("map_source").startswith("s3_axis:")
+        & F.expr("get_json_object(substring(map_source, 9), '$.rule')").isin(*SCT_TRUD_CLEAR_RULES),
+        F.lit(False),
+    )
+    fanned = (
+        fanned.withColumn("_trud_event", F.max(trud_arm).over(Window.partitionBy("patient_event_id")))
+        .withColumn("_trud_standard", F.max(trud_arm).over(preferred_window))
+    )
+    trud_suppressed = F.col("_trud_event") & ~F.col("_trud_standard")
     selected = (
         fanned.withColumn(
             "_preferred",
@@ -1880,6 +2033,7 @@ def _router_standard_rows(fanned=None):
     )
     winner_window = Window.partitionBy("patient_event_id", "_final_table_key")
     winner_key = F.struct(
+        trud_suppressed.cast("int").alias("trud_loser"),  # INSR_W5 W5.19 SCT_TRUD_V1
         F.coalesce(F.col("_priority"), F.lit(999)).alias("priority"),
         F.coalesce(F.col("_normalized_code"), F.lit("")).alias("code"),
         F.col("_standard_concept_id").alias("standard"),
@@ -1888,11 +2042,12 @@ def _router_standard_rows(fanned=None):
         selected.withColumn("_winner", F.min(winner_key).over(winner_window))
         .withColumn(
             "_winner_priority",
-            F.min(F.coalesce(F.col("_priority"), F.lit(999))).over(winner_window),
+            F.min(F.when(~trud_suppressed, F.coalesce(F.col("_priority"), F.lit(999)))).over(winner_window),
         )
         .withColumn(
             "_standard_suppressed",
-            F.when(
+            F.when(trud_suppressed, F.lit(True))  # INSR_W5 W5.19 SCT_TRUD_V1
+            .when(
                 F.col("_final_table") == F.lit(MEASUREMENT_TABLE),
                 F.coalesce(
                     F.col("_standard_concept_id") != F.col("_winner.standard"),
@@ -1906,7 +2061,8 @@ def _router_standard_rows(fanned=None):
         )
         .withColumn(
             "_suppressed_reason",
-            F.when(
+            F.when(trud_suppressed, F.lit("trud_precedence_suppressed"))  # INSR_W5 W5.19 SCT_TRUD_V1
+            .when(
                 F.col("_standard_suppressed")
                 & (F.col("_final_table") == F.lit(DRUG_TABLE)),
                 F.lit("drug_standard_suppressed"),
@@ -1915,7 +2071,7 @@ def _router_standard_rows(fanned=None):
                 F.lit("measurement_standard_suppressed"),
             ),
         )
-        .drop("_winner", "_winner_priority")
+        .drop("_winner", "_winner_priority", "_trud_event", "_trud_standard")
     )
     return (
         selected.withColumn(
@@ -2421,7 +2577,7 @@ condition_occurrence_schema = T.StructType([
     T.StructField('condition_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Governed per-feed type concept via omop_type_concept_map; 32817 default.'}),
     T.StructField('condition_status_concept_id', T.IntegerType(), True, metadata={'comment': 'Governed Condition Status concept from category_display; 0 when unmapped.'}),
     T.StructField('stop_reason', T.StringType(), True, metadata={'comment': 'NULL in O3; no source assertion.'}),
-    T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Asserting practitioner resolved to a published provider; NULL otherwise.'}),
+    T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Asserting practitioner resolved to a published provider; NULL otherwise, including the personnel placeholders 0 and 1 (INSR W5.04).'}),
     T.StructField('visit_occurrence_id', T.LongType(), True, metadata={'comment': "Published parent visit where the event's encounter resolves; NULL otherwise."}),
     T.StructField('visit_detail_id', T.LongType(), True, metadata={'comment': 'Published VISIT_DETAIL of the same visit whose interval contains the event datetime (critical care before ward stay, latest start, lowest id); NULL when none.'}),
     T.StructField('condition_source_value', T.StringType(), True, metadata={'comment': 'Source code, falling back to the selected mapped code; identifier-shaped 10-digit values are prefixed condition: for D4 safety.'}),
@@ -2497,7 +2653,7 @@ procedure_occurrence_schema = T.StructType([
     T.StructField('procedure_concept_id', T.IntegerType(), False, metadata={'comment': 'Resolved standard Procedure concept; never 0 under the mapped-only policy.'}),
     T.StructField('procedure_date', T.DateType(), False, metadata={'comment': 'Event datetime date. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('procedure_datetime', T.TimestampType(), True, metadata={'comment': 'Event datetime. Europe/London wall-clock time (silver *_local).'}),
-    T.StructField('procedure_end_date', T.DateType(), True, metadata={'comment': 'Event end (silver performed_end is the same source column) where supplied; clamped to not precede start. Europe/London wall-clock time (silver *_local).'}),
+    T.StructField('procedure_end_date', T.DateType(), True, metadata={'comment': 'Event end (silver performed_end is the same source column) where supplied; clamped to not precede start; NULL when after the extraction date (INSR W5.05). Europe/London wall-clock time (silver *_local).'}),
     T.StructField('procedure_end_datetime', T.TimestampType(), True, metadata={'comment': 'Event end under the same convention. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('procedure_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Governed per-feed type concept via omop_type_concept_map; 32817 default.'}),
     T.StructField('modifier_concept_id', T.IntegerType(), True, metadata={'comment': '0 in O3; no modifier lane.'}),
@@ -2538,6 +2694,9 @@ def _procedure_occurrence_core():
     start = F.col("event_datetime")
     # silver performed_end is the same source column as event_end_datetime in every procedure lane.
     end = _clamp_end(start, F.col("event_end_datetime"))
+    # INSR_W5 W5.05 (F5a): an end after the extraction date is not known yet: NULL (equi-join on _om_future_day).
+    joined = _after_run_date(joined.withColumn("_insr_end_day", F.to_date(end)), "_insr_end_day", "_insr_end_future")
+    end = F.when(~F.coalesce(F.col("_insr_end_future"), F.lit(False)), end)
     return joined.select(
         F.col("allocated_id").alias("procedure_occurrence_id"),
         "person_id",
@@ -2701,7 +2860,11 @@ def _imd_base():
         F.lit(None).cast("bigint").alias("visit_detail_id"),
         F.col("_area_source_value").alias("observation_source_value"),
         F.col("_area_source_concept").cast("int").alias("observation_source_concept_id"),
-        F.lit(None).cast("string").alias("unit_source_value"),
+        # INSR_W5 W5.14 (J15, L651): the unit of each area measure, as text.
+        F.when(F.col("_area_stem") == "imd", F.lit("quintile"))
+        .when(F.col("_area_stem") == "radon", F.lit("radon_class"))
+        .when(F.col("_area_stem").startswith("census:"), F.lit("%"))
+        .cast("string").alias("unit_source_value"),
         F.lit(None).cast("string").alias("qualifier_source_value"),
         F.when(is_imd, F.col("_area_value").cast("int").cast("string"))
         .otherwise(F.col("_area_value_text")).alias("value_source_value"),
@@ -2737,7 +2900,7 @@ observation_schema = T.StructType([
     T.StructField('visit_detail_id', T.LongType(), True, metadata={'comment': 'Published VISIT_DETAIL of the same visit whose interval contains the event datetime (critical care before ward stay, latest start, lowest id); NULL when none.'}),
     T.StructField('observation_source_value', T.StringType(), True, metadata={'comment': 'Source code, falling back to the selected mapped code; identifier-shaped 10-digit values are prefixed observation: for D4 safety.'}),
     T.StructField('observation_source_concept_id', T.IntegerType(), True, metadata={'comment': 'Best vocabulary-arm source concept for the event; 0 when only the urn arm exists.'}),
-    T.StructField('unit_source_value', T.StringType(), True, metadata={'comment': 'Silver unit source value where carried.'}),
+    T.StructField('unit_source_value', T.StringType(), True, metadata={'comment': 'Silver unit source value where carried; quintile, radon_class or % on area rows (INSR W5.14).'}),
     T.StructField('qualifier_source_value', T.StringType(), True, metadata={'comment': 'Family-history relationship display, or allergy severity display; NULL elsewhere.'}),
     T.StructField('value_source_value', T.StringType(), True, metadata={'comment': 'IMD quintile as text on IMD rows; NULL elsewhere per rider R-O3-6.'}),
     T.StructField('observation_event_id', T.LongType(), True, metadata={'comment': 'NULL in O3; event-modifier mechanics arrive with oncology staging in O4.'}),
@@ -2748,7 +2911,7 @@ observation_schema = T.StructType([
 @dp.materialized_view(
     name="observation",
     schema=observation_schema,
-    comment="OMOP OBSERVATION routed from Journey patient events including registry, family-history, and community lanes (mapped-only), plus HERON-UK IMD quintile rows.",
+    comment="OMOP OBSERVATION routed from Journey patient events including registry, family-history, and community lanes (mapped-only: unmapped events are counted in omop_exclusion_metrics, not published), plus area rows (IMD quintile, radon class, Census 2021 percentages) dated from the address effective-from date, which makes the 2013-03 and 2021-03 spikes; value_as_string is NULL by policy R-O3-6 (INSR W5.14).",
 )
 def observation():
     return _finish("observation", _observation_core())  # OGR_EXT_V1
@@ -2842,7 +3005,7 @@ device_exposure_schema = T.StructType([
     T.StructField('device_exposure_end_date', T.DateType(), True, metadata={'comment': 'Event end where supplied; clamped to not precede start. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('device_exposure_end_datetime', T.TimestampType(), True, metadata={'comment': 'Event end under the same convention. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('device_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Governed per-feed type concept via omop_type_concept_map; 32817 default.'}),
-    T.StructField('unique_device_id', T.StringType(), True, metadata={'comment': 'Namespace-prefixed device identifier: sn: serials (MediConnect/implants), udi: UDI-DI (implants), unit: blood-unit barcode (transfusions); prefixes stop numeric values mimicking NHS numbers.'}),
+    T.StructField('unique_device_id', T.StringType(), True, metadata={'comment': 'Namespace-prefixed device identifier: sn: serials (MediConnect/implants), udi: UDI-DI (implants), unit: blood-unit barcode (transfusions); prefixes stop numeric values mimicking NHS numbers. SurgiNet implant UDI capture is sparse at source (J40), so most device rows carry none (INSR W5.14).'}),
     T.StructField('production_id', T.StringType(), True, metadata={'comment': 'batch:-prefixed implant batch number where carried; NULL elsewhere.'}),
     T.StructField('quantity', T.IntegerType(), True, metadata={'comment': 'Implant quantity or integral transfusion quantity; NULL when the event produces more than one published standard concept in device_exposure or the source value is fractional.'}),
     T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Implant (procedure-kind) rows: performing practitioner resolved to a published provider; NULL for device and transfusion rows (no practitioner in silver) and when unresolved.'}),
@@ -2958,11 +3121,11 @@ measurement_schema = T.StructType([
     T.StructField('measurement_time', T.StringType(), True, metadata={'comment': 'NULL in O4 per rider R-O4-4; derivable from measurement_datetime.'}),
     T.StructField('measurement_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Governed per-feed type concept via omop_type_concept_map; pathology feeds carry 32856.'}),
     T.StructField('operator_concept_id', T.IntegerType(), True, metadata={'comment': 'Standard Meas Value Operator concept resolved from the pathology operator field; 0 when absent or unresolvable.'}),
-    T.StructField('value_as_number', T.DoubleType(), True, metadata={'comment': 'Pathology, vital-sign, or score numeric value; single-standard rule R-O4-2 keeps it populated.'}),
+    T.StructField('value_as_number', T.DoubleType(), True, metadata={'comment': 'Pathology, vital-sign, or score numeric value; pathology values are in the canonical UCUM unit when silver applied a unit conversion (INSR W5.06); single-standard rule R-O4-2 keeps it populated.'}),
     T.StructField('value_as_concept_id', T.IntegerType(), True, metadata={'comment': 'Silver-resolved pathology value concept, else the vocabulary-resolved measurement_value role concept; 0 otherwise.'}),
-    T.StructField('unit_concept_id', T.IntegerType(), True, metadata={'comment': 'Castable silver unit concept, else standard UCUM concept resolved from ucum_code; 0 otherwise.'}),
-    T.StructField('range_low', T.DoubleType(), True, metadata={'comment': 'Pathology reference range low where carried.'}),
-    T.StructField('range_high', T.DoubleType(), True, metadata={'comment': 'Pathology reference range high where carried.'}),
+    T.StructField('unit_concept_id', T.IntegerType(), True, metadata={'comment': 'Standard UCUM concept of the canonical unit when a pathology unit conversion scaled the value (INSR W5.06; 0 when that UCUM code has no concept, never the pre-conversion unit); 0 for a pathology row with no numeric value whose unit is one a conversion rewrites (%, g/dL, ug/L); else the castable silver unit concept, else the UCUM concept of ucum_code; 0 otherwise.'}),
+    T.StructField('range_low', T.DoubleType(), True, metadata={'comment': 'Pathology reference range low where carried, in the same (canonical) unit as value_as_number; NULL on a unit-label conflict (INSR W5.06).'}),
+    T.StructField('range_high', T.DoubleType(), True, metadata={'comment': 'Pathology reference range high where carried, in the same (canonical) unit as value_as_number; NULL on a unit-label conflict (INSR W5.06).'}),
     T.StructField('provider_id', T.LongType(), True, metadata={'comment': 'Vital-sign performer resolved to a published provider; NULL otherwise.'}),
     T.StructField('visit_occurrence_id', T.LongType(), True, metadata={'comment': "Published parent visit where the event's encounter resolves; pathology linkage is sparse at source (19.4%) — tracked ask."}),
     T.StructField('visit_detail_id', T.LongType(), True, metadata={'comment': 'Published VISIT_DETAIL of the same visit whose interval contains the event datetime (critical care before ward stay, latest start, lowest id); NULL when none.'}),
@@ -2986,23 +3149,87 @@ def measurement():
     return _finish("measurement", _measurement_core())  # OGR_EXT_V1
 
 
+# INSR_W5 W5.06 (L439, F10, J33): silver carries each pathology value in a canonical UCUM unit (value_canonical,
+# canonical_ucum_code, canonical_conversion). OMOP publishes the canonical value and unit when a conversion applies
+# (the raw unit stays in unit_source_value) and converts the reference range by the same rule. A unit-label conflict
+# keeps the raw value and unit, and its range is not published.
+CANONICAL_UNCHANGED_CONVERSIONS = ("identity", "egfr_unit_implied", "inr_unit_implied")
+CANONICAL_RANGE_CONVERSIONS = {  # conversion label -> (offset, factor): canonical = (value + offset) * factor
+    "g/dL->g/L": (0.0, 10.0),
+    "ug/L->ng/L": (0.0, 1000.0),
+    "%->mmol/mol": (-2.15, 10.929),
+}
+# INSR_W5 W5.20 BBR_FOLDIN_V1 (BBR-8, SDI_PATH_UNIT_V2): concept-conditional conversions and factor-1 relabels publish the canonical
+# unit; not_convertible_dimension keeps the row's own value and unit (an unchanged conversion).
+CANONICAL_RANGE_CONVERSIONS.update({'iu->u_identity': (0.0, 1.0), 'milli_unit_identity': (0.0, 1.0), 'u_per_ml->ku_per_l': (0.0, 1.0), 'mg/dL->mg/L': (0.0, 10.0)})
+CANONICAL_UNCHANGED_CONVERSIONS = CANONICAL_UNCHANGED_CONVERSIONS + ('not_convertible_dimension',)
+# S5.06b (review 2026-10-31, recommendation (d) accepted): units a conversion rewrites. A pathology row with no
+# numeric value is never converted, so it would keep such a pre-conversion unit next to its test's converted rows
+# (HbA1c 4184637: 21 valueless '%' rows beside mmol/mol on the n1000 slice); it publishes unit_concept_id 0 instead.
+# INSR_W5 W5.20 BBR_FOLDIN_V1: V1 labels name their source unit; the SDI_PATH_UNIT_V2 labels do not, so the unconditional relabel
+# sources are listed instead (concept-conditional sources stay out: they are a canonical unit elsewhere).
+CANONICAL_CONVERSION_SOURCE_UNITS = tuple(sorted({label.split("->")[0] for label in CANONICAL_RANGE_CONVERSIONS
+                                                 if label.split("->")[0] in ("g/dL", "ug/L", "%")} | set(('10*-3.[U]/L', '10*-3.[iU]/L', '10*-3.[iU]/mL', '[iU]/L'))))
+METADATA_ROWS.append((58, 0, 0, "measurement_canonical_unit_policy", "INSR W5.06 (F10, J33): pathology value_as_number uses silver value_canonical when a conversion applies (g/dL->g/L x10, ug/L->ng/L x1000, %->mmol/mol (x-2.15)*10.929, identity and implied eGFR/INR units); unit_concept_id is the canonical_ucum_code concept (0 when it does not resolve) on scaled rows only, 0 on a pathology row with no numeric value whose unit is a conversion source unit (%, g/dL, ug/L), and identity/implied rows keep the existing unit logic; reference ranges convert by the same rule; unit_label_conflict keeps the raw value and unit with no range; the raw unit stays in unit_source_value", None, None, None, None))
+
+
+def _insr_canonical_range(value, conversion):
+    """A reference-range bound in the canonical unit: unchanged without a conversion or for an identity-type one,
+    (value + offset) * factor for a known unit conversion, NULL for unit_label_conflict or an unknown conversion."""
+    result = F.when(conversion.isNull() | conversion.isin(*CANONICAL_UNCHANGED_CONVERSIONS), value)
+    for label, (offset, factor) in CANONICAL_RANGE_CONVERSIONS.items():
+        result = result.when(conversion == label, (value + F.lit(offset)) * F.lit(factor))
+    return result
+
+
+# INSR_W5 W5.20 BBR_FOLDIN_V1 (BBR-5/6, bbr_review/build/bbr_rules.py): anthropometric bounds keyed on the vital SNOMED concept,
+# {concept: (lowest valid, highest valid, lowest is exclusive)} in the canonical unit, and the anthropometric OMOP
+# measurement concepts (SNOMED, LOINC and LOINC-estimated standard of weight, height, BMI).
+ANTHROPOMETRIC_BOUNDS = {'27113001': (0, 400, True), '50373000': (20, 250, False), '60621009': (5, 150, False)}
+ANTHROPOMETRIC_OMOP_IDS = (3025315, 3026600, 3035463, 3036277, 3038553, 4099154, 4177340, 4245997, 36304833)
+
+
+def _insr_anthropometric_out_of_range(code, value):
+    """True where `value` (canonical unit) is outside the bounds of the anthropometric concept `code`; FALSE for any
+    other concept or a NULL value."""
+    out = F.lit(False)
+    for snomed, (low, high, low_exclusive) in sorted(ANTHROPOMETRIC_BOUNDS.items()):
+        below = (value <= F.lit(low)) if low_exclusive else (value < F.lit(low))
+        out = out | F.coalesce((code == F.lit(snomed)) & (below | (value > F.lit(high))), F.lit(False))
+    return out
+
+
 def _measurement_core():
     rows = _staged_rows("measurement")
     pathology = read_source("src_pathology_result").select(
         "patient_event_id",
-        F.col("value_number").cast("double").alias("_path_number"),
+        F.when(F.col("canonical_conversion").isNotNull() & (F.col("canonical_conversion") != "unit_label_conflict"),
+               F.col("value_canonical")).otherwise(F.col("value_number")).cast("double").alias("_path_number"),  # INSR_W5 W5.06
+        F.col("canonical_conversion").alias("_path_conversion"),  # INSR_W5 W5.06
         F.expr("try_cast(value_concept_id AS int)").alias("_path_value_concept"),
         F.col("operator_concept_id").alias("_operator_raw"),
         F.expr("try_cast(unit_concept_id AS int)").alias("_path_unit_concept"),
-        F.col("ucum_code").alias("_path_ucum"),
+        F.when(F.col("canonical_conversion").isNotNull() & ~F.col("canonical_conversion").isin(*CANONICAL_UNCHANGED_CONVERSIONS) & (F.col("canonical_conversion") != "unit_label_conflict"), F.col("canonical_ucum_code"))
+        .otherwise(F.col("ucum_code")).alias("_path_ucum"),  # INSR_W5 W5.06
         F.col("unit_source_value").alias("_path_unit_source"),
-        F.col("reference_range_low").cast("double").alias("_range_low"),
-        F.col("reference_range_high").cast("double").alias("_range_high"),
+        _insr_canonical_range(F.col("reference_range_low").cast("double"),
+                              F.col("canonical_conversion")).alias("_range_low"),  # INSR_W5 W5.06
+        _insr_canonical_range(F.col("reference_range_high").cast("double"),
+                              F.col("canonical_conversion")).alias("_range_high"),  # INSR_W5 W5.06
     )
+    # INSR_W5 W5.20 BBR_FOLDIN_V1 (BBR-4/5): the canonical value and unit when silver set a canonical conversion; an
+    # anthropometric value outside its bounds is not published.
+    vital_canonical = F.col("canonical_conversion").isNotNull()
+    vital_value = F.when(vital_canonical, F.col("value_canonical")).otherwise(F.col("value_number")).cast("double")
     vital = read_source("src_vital_sign").select(
         "patient_event_id",
-        F.col("value_number").cast("double").alias("_vital_number"),
-        F.expr("try_cast(unit_concept_id AS int)").alias("_vital_unit_concept"),
+        # bounds apply to the canonical value only, as gold's insr_bbr_anthropometric_range (review fix 11-03)
+        F.when(~_insr_anthropometric_out_of_range(F.col("vital_snomed_code"),
+                                                  F.when(vital_canonical, F.col("value_canonical").cast("double"))),
+               vital_value)
+        .alias("_vital_number"),
+        F.expr("try_cast(unit_concept_id AS int)").alias("_vital_unit_concept_raw"),
+        F.when(vital_canonical, F.col("canonical_ucum_code")).alias("_vital_ucum"),
         F.col("unit_source_value").alias("_vital_unit_source"),
         F.col("performer_practitioner_id").alias("_vital_performer"),
     )
@@ -3017,6 +3244,10 @@ def _measurement_core():
         .join(vital, "patient_event_id", "left")
         .join(score, "patient_event_id", "left")
         .join(_ucum_units(), F.col("_path_ucum") == F.col("_ucum_code"), "left")
+        .join(_ucum_units().select(F.col("_ucum_code").alias("_vital_ucum_code"),  # INSR_W5 W5.20 BBR_FOLDIN_V1 (BBR-4)
+                                   F.col("_ucum_concept").alias("_vital_ucum_concept")),
+              F.col("_vital_ucum") == F.col("_vital_ucum_code"), "left")
+        .withColumn("_vital_unit_concept", F.coalesce(F.col("_vital_ucum_concept"), F.col("_vital_unit_concept_raw")))
         .join(_value_role_concepts(), "patient_event_id", "left")
         .join(
             _published_provider_keys(),
@@ -3044,6 +3275,13 @@ def _measurement_core():
             F.col("_path_number"), F.col("_vital_number"), F.col("_meas_score_number")
         ),
     )
+    # INSR_W5 W5.20 BBR_FOLDIN_V1 (BBR-6): a vital-sign weight/height/BMI row with no value and no value concept is not emitted.
+    valueless_anthropometric = (
+        (F.col("event_type") == F.lit("vital_sign")) & value_number.isNull()
+        & (F.coalesce(F.col("_path_value_concept"), F.col("_value_concept"), F.lit(0)) == 0)
+        & F.col("standard_concept_id").isin(*ANTHROPOMETRIC_OMOP_IDS)
+    )
+    joined = joined.where(~F.coalesce(valueless_anthropometric, F.lit(False)))
     return joined.select(
         F.col("allocated_id").alias("measurement_id"),
         "person_id",
@@ -3058,10 +3296,20 @@ def _measurement_core():
         F.coalesce(
             F.col("_path_value_concept"), F.col("_value_concept"), F.lit(0)
         ).cast("int").alias("value_as_concept_id"),
-        F.coalesce(
+        # INSR_W5 W5.06: a scaled (converted) value carries only its canonical UCUM unit, or 0 when that code does
+        # not resolve; it never falls back to the pre-conversion unit. Other rows keep the existing fallback.
+        F.when(
+            F.col("_path_conversion").isNotNull()
+            & ~F.col("_path_conversion").isin(*CANONICAL_UNCHANGED_CONVERSIONS)
+            & (F.col("_path_conversion") != "unit_label_conflict"),
+            F.coalesce(F.col("_ucum_concept"), F.lit(0)),
+        ).when(  # INSR_W5 W5.06 (S5.06b): no value, unit a conversion source unit: no pre-conversion unit
+            F.col("_path_number").isNull() & F.col("_path_ucum").isin(*CANONICAL_CONVERSION_SOURCE_UNITS),
+            F.lit(0),
+        ).otherwise(F.coalesce(
             F.col("_path_unit_concept"), F.col("_ucum_concept"),
             F.col("_vital_unit_concept"), F.col("_meas_score_unit"), F.lit(0)
-        ).cast("int").alias("unit_concept_id"),
+        )).cast("int").alias("unit_concept_id"),
         F.col("_range_low").alias("range_low"),
         F.col("_range_high").alias("range_high"),
         F.col("_resolved_provider_id").alias("provider_id"),
@@ -3174,6 +3422,11 @@ def _drug_exposure_frame_core(keep_internals=False):
     start_ts = F.col("event_datetime").cast("timestamp")
     verbatim_end = F.coalesce(F.col("_sact_end"), F.col("event_end_datetime"))
     end_ts = _clamp_end(start_ts, verbatim_end)
+    # INSR_W5 W5.05 (F5a): an end after the extraction date becomes the start (verbatim end NULL), before eras.
+    joined = _after_run_date(joined.withColumn("_insr_end_day", F.to_date(end_ts)), "_insr_end_day", "_insr_end_future")
+    end_future = F.coalesce(F.col("_insr_end_future"), F.lit(False))
+    end_ts = F.when(end_future, start_ts).otherwise(end_ts)
+    verbatim_end = F.when(~end_future, verbatim_end)
     quantity = F.when(
         F.col("mapping_count") <= 1,
         F.when(F.col("event_type") == "medication_admin", F.col("_adm_dose"))
@@ -3219,7 +3472,7 @@ drug_exposure_schema = T.StructType([
     T.StructField('drug_concept_id', T.IntegerType(), False, metadata={'comment': 'Resolved standard Drug concept; never 0 under the mapped-only policy; all standards from the winning arm are retained per R-O5-2.'}),
     T.StructField('drug_exposure_start_date', T.DateType(), False, metadata={'comment': 'Event datetime date. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('drug_exposure_start_datetime', T.TimestampType(), True, metadata={'comment': 'Event datetime. Europe/London wall-clock time (silver *_local).'}),
-    T.StructField('drug_exposure_end_date', T.DateType(), False, metadata={'comment': 'Source stop datetime where stated, else the start date per R-O5-7; clamped never to precede the start. Europe/London wall-clock time (silver *_local).'}),
+    T.StructField('drug_exposure_end_date', T.DateType(), False, metadata={'comment': 'Source stop datetime where stated, else the start date per R-O5-7; clamped never to precede the start; a stop after the extraction date becomes the start date and verbatim_end_date is NULL (INSR W5.05). Europe/London wall-clock time (silver *_local).'}),
     T.StructField('drug_exposure_end_datetime', T.TimestampType(), True, metadata={'comment': 'Same convention as drug_exposure_end_date. Europe/London wall-clock time (silver *_local).'}),
     T.StructField('verbatim_end_date', T.DateType(), True, metadata={'comment': 'Populated only where the source states an explicit stop; NULL where the end was coalesced from the start per R-O5-7.'}),
     T.StructField('drug_type_concept_id', T.IntegerType(), False, metadata={'comment': 'Governed per-feed type concept via omop_type_concept_map per R-O5-4; administrations 32818, pharmacy issues 32825, expenditure and SACT 32817; 32825 on homecare supply rows.'}),
@@ -3337,7 +3590,13 @@ def _eras(frame, group_columns, start_column, end_column):
 
 
 def _drug_era_candidates():
-    return (
+    """Drug exposures as era input, each with the reason it is left out of eras (NULL = eligible).
+
+    INSR_W5_ERA_RUN_DATE_V1 (2026-11-07): an exposure that starts after the run date (= source_release_date) never
+    publishes (omop_gold drops facts starting after the release), so it must not stretch an era either. 261
+    future-dated exposures (to 2082) did, leaving 18 published gold drug eras ending after the release (w5_check
+    no_future_ends, prod P5.4)."""
+    exposures = (
         _drug_exposure_frame(transforms=False)  # OGR_EXT_V1
         .select(
             F.col("drug_exposure_id").alias("_exposure_id"),
@@ -3346,6 +3605,10 @@ def _drug_era_candidates():
             F.col("drug_exposure_start_date").alias("_start"),
             F.col("drug_exposure_end_date").alias("_end"),
         )
+    )
+    exposures = _after_run_date(exposures, "_start", "_era_start_future")  # INSR_W5_ERA_RUN_DATE_V1
+    return (
+        exposures
         .join(_drug_ingredients(), "_drug_concept", "left")
         .withColumn(
             "_era_reason",
@@ -3354,8 +3617,10 @@ def _drug_era_candidates():
                 F.lit("ingredient_unresolved"),
             )
             .when(F.col("_start").isNull(), F.lit("era_start_missing"))
+            .when(F.coalesce(F.col("_era_start_future"), F.lit(False)), F.lit("era_start_after_run_date"))
             .otherwise(F.lit(None).cast("string")),
         )
+        .drop("_era_start_future")
     )
 
 
@@ -3421,6 +3686,7 @@ def _dose_era_candidates():
         .withColumn("_has_any_ingredient", F.lit(True))
     )
     scored = with_ingredient.join(any_ingredient, "_drug_concept", "left")
+    scored = _after_run_date(scored, "_start", "_era_start_future")  # INSR_W5_ERA_RUN_DATE_V1: see _drug_era_candidates
     reason = (
         F.when(
             F.col("_event_type") != F.lit("medication_admin"),
@@ -3437,9 +3703,10 @@ def _dose_era_candidates():
         .when(F.col("_has_any_ingredient").isNull(), F.lit("ingredient_unresolved"))
         .when(F.col("_ingredient_concept").isNull(), F.lit("dose_multi_ingredient"))
         .when(F.col("_start").isNull(), F.lit("era_start_missing"))
+        .when(F.coalesce(F.col("_era_start_future"), F.lit(False)), F.lit("era_start_after_run_date"))  # INSR_W5_ERA_RUN_DATE_V1
         .otherwise(F.lit(None).cast("string"))
     )
-    return scored.withColumn("_dose_reason", reason)
+    return scored.withColumn("_dose_reason", reason).drop("_era_start_future")
 
 
 def _dose_era_frame():
@@ -3719,6 +3986,30 @@ def condition_era():
 
 # O4 specimen and cross-domain relationships.
 
+# INSR_W5 W5.15 (L607, J33): body-site code -> SNOMED Spec Anatomic Site concept from the best-effort site map
+# (exact, embedding, Opus 5.5 gate; rule insr_w5:specimen_body_site:*). One row per code; unmapped codes stay 0.
+def _insr_specimen_site_map():
+    """Accepted body-site mappings with their provenance columns, keyed by the local code."""
+    return read_source("lkp_specimen_site").where(F.col("target_concept_id").isNotNull()).select(
+        F.col("source_code").alias("_ss_code"), F.col("target_concept_id").cast("int").alias("_ss_concept"),
+        F.col("map_method").alias("_ss_method"), F.col("map_rule_id").alias("_ss_rule"),
+        F.col("map_scoring_model").alias("_ss_model"), F.col("map_version").alias("_ss_version"),
+        F.col("map_cosine").cast("double").alias("_ss_score"))
+
+
+def _insr_specimen_site_provenance():
+    """Provenance of every published specimen whose anatomic site came from the site map (F14c)."""
+    rows = (
+        _specimen_base().where(F.col("_exclusion_reason").isNull() & (F.col("anatomic_site_concept_id") > 0))
+        .withColumn("_ss_lookup", F.regexp_replace(F.col("anatomic_site_source_value"), "^specimen:", ""))
+        .join(_insr_specimen_site_map(), F.col("_ss_lookup") == F.col("_ss_code"), "inner")
+    )
+    return _provenance_rows(
+        rows, "specimen", F.col("specimen_id"), "anatomic_site_concept_id", F.col("anatomic_site_concept_id"),
+        F.lit(0), F.lit("LIMS body site"), F.col("_ss_method"), F.col("_ss_score"), F.col("_ss_rule"),
+        F.col("_ss_model"), F.col("_ss_version"))
+
+
 def _specimen_base():
     source = read_source("src_specimen").select(
         F.col("patient_event_id").alias("_source_event"),
@@ -3756,6 +4047,7 @@ def _specimen_base():
         )
         .join(registry, F.col("_registry_source_key") == F.col("_registry_key"), "left")
         .join(F.broadcast(specimen_concepts), F.col("_type_concept_candidate") == F.col("_specimen_concept"), "left")
+        .join(F.broadcast(_insr_specimen_site_map()), F.col("_site_code") == F.col("_ss_code"), "left")  # INSR_W5 W5.15
         .join(
             published_people,
             F.col("_person_candidate") == F.col("_published_person_id"),
@@ -3771,7 +4063,7 @@ def _specimen_base():
         F.col("_specimen_dt").cast("timestamp").alias("specimen_datetime"),
         F.lit(None).cast("double").alias("quantity"),
         F.lit(0).cast("int").alias("unit_concept_id"),
-        F.lit(0).cast("int").alias("anatomic_site_concept_id"),
+        F.coalesce(F.col("_ss_concept"), F.lit(0)).cast("int").alias("anatomic_site_concept_id"),  # INSR_W5 W5.15
         F.lit(0).cast("int").alias("disease_status_concept_id"),
         F.col("_source_event").cast("string").alias("specimen_source_id"),
         _safe_source_code(F.col("_type_code"), "specimen").alias("specimen_source_value"),
@@ -3803,8 +4095,8 @@ specimen_schema = T.StructType([
     T.StructField('specimen_datetime', T.TimestampType(), True, metadata={'comment': 'clinical_specimen event_datetime_local (sample, else request, else report time). Europe/London wall-clock time (silver *_local).'}),
     T.StructField('quantity', T.DoubleType(), True, metadata={'comment': 'NULL in O4; Journey carries no specimen quantity.'}),
     T.StructField('unit_concept_id', T.IntegerType(), True, metadata={'comment': '0 in O4.'}),
-    T.StructField('anatomic_site_concept_id', T.IntegerType(), True, metadata={'comment': '0 in O4 per rider R-O4-5; body-site SNOMED is absent at source.'}),
-    T.StructField('disease_status_concept_id', T.IntegerType(), True, metadata={'comment': '0 in O4; no source assertion.'}),
+    T.StructField('anatomic_site_concept_id', T.IntegerType(), True, metadata={'comment': 'SNOMED Spec Anatomic Site concept from the best-effort body-site map (omop_specimen_site_map, INSR W5.15); 0 when the code is unmapped.'}),
+    T.StructField('disease_status_concept_id', T.IntegerType(), True, metadata={'comment': '0: the laboratory source carries no disease-status assertion (INSR W5.14).'}),
     T.StructField('specimen_source_id', T.StringType(), True, metadata={'comment': 'Journey patient_event_id surrogate for the specimen; never a lab number or accession.'}),
     T.StructField('specimen_source_value', T.StringType(), True, metadata={'comment': 'Local specimen type code; identifier-shaped 10-digit values are prefixed specimen: for D4 safety.'}),
     T.StructField('unit_source_value', T.StringType(), True, metadata={'comment': 'NULL in O4.'}),
@@ -4481,11 +4773,11 @@ def metadata():
         (6, 0, 0, "vocabulary_version", "v5.0 27-FEB-26", None, None, None, None),
         (7, 0, 0, "pipeline_version", PIPELINE_VERSION, None, None, None, None),
         (8, 0, 0, "person_gate", "HERON-UK: every keyed Silver person publishes (superseded, missing birth date, birth year < 1910 and non-binary gender included; year_of_birth NULL when unknown); the former O1 gates are per-person flags in omop_person_research_flags, applied by gold", None, None, None, None),
-        (9, 0, 0, "ethnicity_axis", "HERON-UK: race_source_concept_id = NHS Ethnic Category concept for the NHS letter; race_concept_id = its unambiguous Maps-to Race target, else 0; ethnicity_concept_id = 0", None, None, None, None),
+        (9, 0, 0, "ethnicity_axis", "HERON-UK: race_source_concept_id = NHS Ethnic Category concept for the NHS letter; race_concept_id = its unambiguous Maps-to Race target, else 0; ethnicity_concept_id = 0. RACE_XWALK_INSR_V1 (2026-10-29): Cerner Other - Not Stated and Patient Refused carry letter Z, Other - Any Other Ethnic Group letter S; the vocabulary (v5.0 27-FEB-26) has no NHS Ethnic Category concept for S or Z, so those persons keep 0 in both concept columns; no SUS or GP backfill (J19)", None, None, None, None),
         (10, 0, 0, "visit_scope", "spell, emergency_visit, outpatient_attendance, recurring_contact, results_only, other; waiting_list_placeholder and preadmission excluded (O2 R1)", None, None, None, None),
         (11, 0, 0, "visit_id_policy", "natural ENCNTR_ID via 4_prod.silver.reference_encounter_bounds.source_encounter_id; keyless encounters excluded with accounting (O2 R2)", None, None, None, None),
         (12, 0, 0, "visit_detail_lanes", "ward_stay=9201 from location_stay occupancy bounds (all lifecycle states; pre-attendance and no-attendance stops excluded); critical_care=32037; parent = containing ward stay (OGR)", None, None, None, None),  # OGR_METADATA_V1
-        (13, 0, 0, "observation_period_interpretation", f"HERON-UK no-enrolment convention: one period per person; start = first published record (visit, visit_detail, routed event, specimen, direct-adapter rows) on or after birth - 1 day; end = earliest of death, age {CENSOR_AGE_YEARS} and source release date", None, None, None, None),  # OGR_METADATA_V1
+        (13, 0, 0, "observation_period_interpretation", f"HERON-UK no-enrolment convention: one period per person; start = first record evidence (published visit, visit_detail, routed event, specimen and direct-adapter rows; from 2012-01-01 also mapping-excluded routed events, unpublished attended encounters and the pregnancy journey start: OMOP_OP_EVIDENCE_V2) on or after birth - 1 day; end = earliest of death, age {CENSOR_AGE_YEARS} and source release date", None, None, None, None),  # OGR_METADATA_V1
         (14, 0, 0, "mother_child_linkage", "fact_relationship person-person; domain 56; concepts 4248584/4285883; both directions", None, None, None, None),
         (15, 0, 0, "event_router_scope", "nine governed O3-O5 lanes; qualified fact_table reduced to fact kind; every indication event excluded at event grain; additional observed event families flow event-only", None, None, None, None),
         (16, 0, 0, "mapping_ladder", "all distinct event-standard pairs retained; coding-system priority chooses provenance only for duplicate pairs; invalid or absent source concepts may traverse to valid standard Maps-to targets", None, None, None, None),
@@ -4573,6 +4865,7 @@ def _era_eligibility_metrics():
 # Adapters read Silver, lookups and the registry only, never a CDM MV, so they may feed
 # observation-period evidence without a cycle.
 PROVENANCE_BUILDERS = []
+PROVENANCE_BUILDERS.append(_insr_specimen_site_provenance)  # INSR_W5 W5.15
 
 
 def _clinical_event_registry():
@@ -5232,7 +5525,8 @@ episode_schema = T.StructType([
 @dp.materialized_view(
     name="episode",
     schema=episode_schema,
-    comment="OMOP EPISODE: one pregnancy episode per non-superseded spine_journey pregnancy (32533 / object 4299535).",
+    comment="OMOP EPISODE: pregnancy episodes only, one per non-superseded spine_journey pregnancy (32533 / object 4299535); an episode without a recorded birth stays open (end NULL): closing stale episodes was not adopted (INSR W5.08, 1.2% carry a linked outcome).",
+    # INSR_W5 W5.08: no other episode type is published.
 )
 def episode():
     return _episode_base().where(F.col("_exclusion_reason").isNull()).select(
@@ -5764,6 +6058,71 @@ EVIDENCE_BUILDERS.append(_vte_evidence)
 PROVENANCE_BUILDERS.append(_vte_provenance)
 
 
+# INSR_W5 W5.10 (L715, J32, F6, F22): OMOP_VISIT_DAY_FALLBACK_V1. A date-only (00:00:00) condition or procedure row
+# with no visit takes the person's published visit whose start..end dates contain the fact date, only when exactly one
+# visit does (W5.01 e: 83% of date-only rows with a candidate have exactly one; ambiguous rows stay NULL). Rows that
+# already have a visit are untouched. Registered before the visit-detail attach, so an attached row also gets its stay.
+VISIT_DAY_FALLBACK_TABLES = {
+    "condition_occurrence": ("condition_occurrence_id", "condition_start_date", "condition_start_datetime"),
+    "procedure_occurrence": ("procedure_occurrence_id", "procedure_date", "procedure_datetime"),
+}
+
+
+def _insr_visit_day_candidates(frame, id_column, date_column, datetime_column):
+    """Per date-only, visit-less fact row: how many same-person published visits contain its date, and the lowest."""
+    visits = _visit_base().where(F.col("_exclusion_reason").isNull()).select(
+        F.col("person_id").alias("_vf_person"), F.col("visit_occurrence_id").alias("_vf_visit"),
+        F.col("visit_start_date").alias("_vf_start"), F.col("visit_end_date").alias("_vf_end"))
+    facts = frame.where(F.col("visit_occurrence_id").isNull()
+                        & (F.date_format(F.col(datetime_column), "HH:mm:ss") == "00:00:00")).select(
+        F.col(id_column).alias("_vf_id"), F.col("person_id").alias("_vf_fact_person"),
+        F.col(date_column).alias("_vf_date"))
+    return (
+        facts.join(visits, (F.col("_vf_fact_person") == F.col("_vf_person"))
+                   & F.col("_vf_date").between(F.col("_vf_start"), F.col("_vf_end")), "inner")
+        .groupBy("_vf_id")
+        .agg(F.count(F.lit(1)).alias("_vf_candidates"), F.min("_vf_visit").alias("_vf_visit"))
+    )
+
+
+def _insr_visit_day_fallback(table):
+    """The transform for one table: fill visit_occurrence_id on exactly-one-candidate rows only."""
+    id_column, date_column, datetime_column = VISIT_DAY_FALLBACK_TABLES[table]
+
+    def attach(frame):
+        """Rows with exactly one containing visit take it; every other row is returned unchanged."""
+        candidates = _insr_visit_day_candidates(frame, id_column, date_column, datetime_column)
+        columns = frame.columns
+        return (
+            frame.join(candidates, F.col(id_column) == F.col("_vf_id"), "left")
+            .withColumn("visit_occurrence_id",
+                        F.coalesce(F.col("visit_occurrence_id"),
+                                   F.when(F.col("_vf_candidates") == 1, F.col("_vf_visit"))).cast("bigint"))
+            .select(*columns)
+        )
+
+    return attach
+
+
+def _insr_visit_day_metrics():
+    """Rows still without a visit after the fallback, per table (exclusion-metric lane visit_day_fallback)."""
+    frames = [
+        read_source(f"src_om_{table}").where(F.col("visit_occurrence_id").isNull())
+        .agg(F.count(F.lit(1)).cast("bigint").alias("excluded_rows"))
+        .select(F.lit("visit_day_fallback").alias("captured_model"), F.lit(table).alias("lane"),
+                F.lit("visit_null_after_fallback").alias("reason"), "excluded_rows",
+                F.lit(PIPELINE_VERSION).alias("pipeline_version"))
+        for table in VISIT_DAY_FALLBACK_TABLES
+    ]
+    return frames[0].unionByName(frames[1])
+
+
+for _table in VISIT_DAY_FALLBACK_TABLES:
+    _register_transform(_table, _insr_visit_day_fallback(_table))
+METRIC_BUILDERS.append(_insr_visit_day_metrics)
+METADATA_ROWS.append((59, 0, 0, "visit_day_fallback_policy", "OMOP_VISIT_DAY_FALLBACK_V1 (INSR W5.10, J32): a date-only condition or procedure row with no visit takes the person's published visit whose start and end dates contain the fact date when exactly one does; ambiguous and unmatched rows stay NULL (omop_exclusion_metrics lane visit_day_fallback)", None, None, None, None))
+
+
 # OGR_VD_ATTACH_V1: fact-to-stay interval matching (published visit_detail of the same visit).
 VISIT_DETAIL_ATTACH_TABLES = {
     "condition_occurrence": ("condition_occurrence_id", "condition_start_datetime"),
@@ -5816,6 +6175,7 @@ for _table in VISIT_DETAIL_ATTACH_TABLES:
     _register_transform(_table, _attach_visit_detail(_table))
 
 
+METADATA_ROWS.append((63, 0, 0, "episode_scope", "INSR W5.08: EPISODE and PREGNANCY hold pregnancy episodes only; an episode with no recorded birth stays open (end NULL); open episodes older than 300 days are counted in omop_gold _og_audit_stale_pregnancy (report only); outcome and delivery codes absent from omop_maternity_concept_map are mapped best-effort (rule insr_w5:pregnancy_displays, exact then embedding then Opus 5.5 gate, with provenance)", None, None, None, None))  # INSR_W5 W5.08
 # OGR_METADATA_V1: policy rows for the OGR components (ids 37+).
 METADATA_ROWS.extend([
     (37, 0, 0, "unit_domain_policy", "unit_concept_id is published only when it is a standard, valid Unit-domain concept (IMD 37524288 exempt); others are demoted to 0 with unit_source_value kept; counts in omop_exclusion_metrics lane unit_guard", None, None, None, None),
@@ -5833,6 +6193,18 @@ METADATA_ROWS.extend([
     (49, 0, 0, "infant_birth_policy", "clinical_birth rows: birth weight, Apgar 1/5 and gestation at birth on the baby person when published, delivery method, delivery outcome and pregnancy outcome on the mother, neonatal outcome on the baby; unmapped Cerner codes excluded; implausible weights (bronze flag), Apgar outside 0-10, gestation weeks outside 20-45 / days outside 0-6 or days not recorded excluded with named reasons (silver keeps values as recorded); baby MRN/NHS never carried", None, None, None, None),
     (50, 0, 0, "maternity_vte_policy", "maternity VTE risk assessment form -> procedure 40483208, total score observation 43054879, and items via 3_lookup.omop.omop_maternity_vte_item_map: question concept guarded (standard Obs/Meas, not a hub >5 labels, not a panel/tool, <=2 items per concept, label agreement), routed by domain, numeric items keep value + canonical unit; unguarded items excluded vte_question_unmapped; telephone/completer/system items never published", None, None, None, None),
     (51, 0, 0, "drug_administration_status_policy", "medication administrations with In Error (31) or Not Done (36) result status are excluded as drug_in_error / drug_not_administered before concept resolution", None, None, None, None),
+])
+
+
+# INSR_W5 W5.12 (J2, J12, L281, L692): OMOP coverage, known gaps and expected coding lag, rows 100-149;
+# text from the W8.05 source-coverage register (register:_source_coverage.yml).
+METADATA_ROWS.extend([
+    (100, 0, 0, 'coverage_start:drug_exposure_administration', 'administration-sourced drug_exposure rows start in 2021-08 apart from a small 2015 pilot (source: W0 ledger P7_L1517)', None, None, date.fromisoformat("2021-08-01"), None),
+    (101, 0, 0, 'expected_coding_lag:all', 'recent months fill in as coding completes; omop_gold metadata complete_through:<table> gives the last month considered complete at the release (source: INSR W5.12/W8.05 (J12, L4400))', None, None, None, None),
+    (102, 0, 0, 'feed_ramp:drug_exposure', 'drug_exposure volume rises about 50-fold from 2019 to 2021 as electronic prescribing, dispensing (2019-10) and administration (2021-08) went live; earlier years are sparse by source (source: Insights L281; W0 ledger P7_L1517, P7_L2851)', None, None, None, None),
+    (103, 0, 0, 'known_gap:2026-03..04', 'condition_occurrence and procedure_occurrence rows dated 2026-03 and 2026-04 are about half the January/May volume; gold holds what the Millennium source holds for those months, so the gap is at source and was not re-landed (source: W0 ledger P6a/P6b (DOCUMENT))', None, None, date.fromisoformat("2026-03-01"), None),
+    (104, 0, 0, 'known_gap:family_history_2024-09', 'family-history observations stop on 2024-09-23 because the raw family-history feed stopped landing; reworded with the register entry if W1.11 finds a replacement capture (source: W0 ledger P7_L2686; C0 ruling 5)', None, None, date.fromisoformat("2024-09-23"), None),
+    (105, 0, 0, 'known_gap:hba1c_2021-10..12', 'HbA1c measurements for 2021-10 to 2021-12 are mostly absent because the source LIMS holds those results as pending with no value (source: W0 ledger P7_L1374b (DOCUMENT))', None, None, date.fromisoformat("2021-10-01"), None),
 ])
 
 

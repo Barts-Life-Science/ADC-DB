@@ -10,7 +10,8 @@ requested = dbutils.widgets.get("run_id").strip()
 timeout_seconds = int(dbutils.widgets.get("child_timeout_seconds"))
 ROOT = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Assessment"  # OGR_NO_DEV_V1
 OMOP_PIPELINE_ID = "4bd3f582-0551-4c75-9b99-0031207f3417"
-SILVER_PIPELINE_ID = "061f9450-ec36-4c3d-b8fc-8b6bcbcc397a"
+# INSR R0: silver is eight domain pipelines (S2_clinical keeps 061f9450); the pin is the latest update of any.
+SILVER_PIPELINE_IDS = ("53f239d6-198f-4ab1-8e1c-dd2b78022a17", "061f9450-ec36-4c3d-b8fc-8b6bcbcc397a", "b23a5a34-026f-4db1-a303-da506999b3e9", "169ff06d-7439-490b-ad7e-38eac9d15f80", "896634e6-16de-460c-844a-a6e6105753bc", "a4c27cd9-6177-428d-9bdd-1a15ec7b99eb", "354f7d05-615f-48e8-9f4c-e66f158d738c", "55f800f5-debe-4414-af69-02995b11b9b4",)
 VOCAB = {
     # 4_prod.omop vocab tables are now SELECT * views over 3_lookup.omop; pin the underlying Delta tables.
     "vocab:concept": "3_lookup.omop.concept",
@@ -40,14 +41,16 @@ def iso_millis(value):
         value = value.astimezone(timezone.utc).replace(tzinfo=None)
     return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
 
-def latest_completed_pipeline(pipeline_id):
+def latest_completed_pipeline(pipeline_ids):
     # Prod pipelines' event_log is not readable by the SP; use the system timeline.
+    # INSR R0: a tuple of pipeline ids; returns the latest completed non-validate update of any of them.
+    in_list = ", ".join(f"'{p}'" for p in pipeline_ids)
     rows = spark.sql(f"""
       SELECT update_id,max(period_end_time) timestamp,
              max_by(result_state,period_end_time) state,
              max_by(update_type,period_end_time) update_type
       FROM system.lakeflow.pipeline_update_timeline
-      WHERE pipeline_id='{pipeline_id}' AND period_start_time > current_timestamp() - INTERVAL 30 DAYS
+      WHERE pipeline_id IN ({in_list}) AND period_start_time > current_timestamp() - INTERVAL 30 DAYS
       GROUP BY update_id ORDER BY timestamp DESC
     """).collect()
     active = [r.asDict() for r in rows if r["state"] not in ("COMPLETED","FAILED","CANCELED")]
@@ -64,8 +67,8 @@ def schema_fingerprint(schema):
 
 def collect_pins():
     pins = {
-        "omop_cdm:pipeline_update": latest_completed_pipeline(OMOP_PIPELINE_ID),
-        "silver:pipeline_update": latest_completed_pipeline(SILVER_PIPELINE_ID),
+        "omop_cdm:pipeline_update": latest_completed_pipeline((OMOP_PIPELINE_ID,)),
+        "silver:pipeline_update": latest_completed_pipeline(SILVER_PIPELINE_IDS),
         "omop_silver:schema_last_altered": schema_fingerprint("omop_silver"),
     }
     for key, table in VOCAB.items():

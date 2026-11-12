@@ -6,6 +6,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 import re
 from pyspark.sql import functions as F
 
@@ -21,6 +22,9 @@ SOURCES = {"pms_device_exposure": ["clinical_procedure", "reference_device_mappi
            "pms_followup": [], "pms_registry_device_procedure": [], "pms_dataset": []}
 DERIVED = {
     "exposure_id": "One implanted device: gold clinical_procedure.patient_event_key of the implant row.",
+    # INSR_W6 W6.02 (L1129): implant_sequence is not a key in this dataset; exposure_id is.
+    "implant_sequence": "Millennium IMPLANT_SEQUENCE of the implant row (its ordinal within implant_event_id). Not a key "
+                        "in this dataset: the row key is exposure_id, which equals gold clinical_procedure.patient_event_key.",
     "implant_event_id": "Millennium implant EVENT_ID (map_implant_details) for the device row.",
     "index_datetime": "Implant date-time as recorded (gold performed_start); may be epoch-truncated, see index_date_status.",
     "index_date_status": "recorded | epoch_truncated (1970 raw-load truncation) | missing.",
@@ -98,18 +102,83 @@ DERIVED = {
 for n in ("haemoglobin", "albumin", "creatinine", "egfr", "hba1c", "crp", "wbc"):
     DERIVED[f"preop_{n}"] = f"Latest preferred {n} result (unit-filtered) in the 90 days before the implant time."
     DERIVED[f"preop_{n}_date"] = f"Date of preop_{n}."
+# INSR_W6 W6.05 (L1402)
+DERIVED["preop_haemoglobin"] = ("Latest preferred total haemoglobin (SNOMED 1022431000000105) in the 90 days before the "
+                                "implant time, in g/L (g/dL results x10, see preop_haemoglobin_unit_basis).")
+DERIVED["preop_haemoglobin_unit_basis"] = "g_l (reported in g/L) | g_dl_x10 (reported in g/dL, multiplied by 10)."
 for k in ("diabetes", "obesity", "chronic_kidney_disease", "heart_failure", "ischaemic_heart_disease",
           "cerebrovascular_disease", "peripheral_vascular_disease", "copd", "rheumatoid_arthritis", "osteoporosis",
           "malignancy", "liver_disease", "dementia", "immunodeficiency", "smoking", "anticoagulation_long_term"):
     DERIVED[f"cm_{k}"] = f"ICD-10 rule cm_{k} coded in the 5 years before index (false = no coded record, not absence)."
 OUT_TYPES = ["infection", "mechanical_complication", "other_device_complication", "periprosthetic_fracture",
-             "microbiology_isolate", "revision_procedure", "repeat_same_gmdn_implant", "safety_incident_person",
-             "safety_incident_device_serial", "readmission", "ed_attendance", "icu_admission", "death"]
+             "microbiology_any_isolate", "revision_procedure", "revision_procedure_index_stay", "repeat_same_gmdn_implant",
+             "safety_incident_person", "safety_incident_device_serial", "readmission", "ed_attendance", "icu_admission",
+             "icu_admission_index_stay", "death"]  # INSR_W6 W6.04 (J21)
 for t in OUT_TYPES:
     DERIVED[f"first_{t}_days"] = f"Days from index to the first {t} event (pms_outcome_event)."
     DERIVED[f"n_{t}"] = f"Number of {t} events for the exposure."
     for h in (30, 90, 365):
         DERIVED[f"{t}_{h}d"] = f"{t} within {h} days of index; false if none and follow-up >= {h} days; NULL if follow-up is shorter."
+
+# INSR_W6 W6.04: new and changed columns.
+DERIVED.update({
+    "implanter_practitioner_id": "Native Millennium personnel id recorded as performer on the implant row; NULL when the "
+                                 "source holds 0 (not recorded; the implant log never records the implanter, L1288).",
+    "operator_practitioner_id": "Case surgeon, else the implant performer; 0 (not recorded) is NULL before the choice.",
+    "implant_sterilisation_date": "Parsed device sterilisation date; NULL when it falls after the implant date (rule "
+                                  "attr_sterilisation_not_after_implant), the raw value stays in implant_sterilisation_raw.",
+    "implant_sterilisation_rule": "attr_sterilisation_not_after_implant when the parsed sterilisation date was after the "
+                                  "implant date and was withheld; NULL otherwise.",
+    "implant_sterilisation_swap_suspected_ind": "On withheld sterilisation dates: true when the date is within 31 days of "
+                                                "the expiry date (the two fields were probably swapped at entry).",
+    "quantity_parse_status": "How the implant QUANTITY text parsed in bronze (W1.01 rule set): PARSED, UNPARSED, MISSING, "
+                             "AMBIGUOUS or IMPLAUSIBLE; NULL until the rule set reaches gold.",
+    "quantity_parse_rule": "Rule set that produced quantity and quantity_parse_status (IMPLANT_QTY_V2).",
+    "surgery_duration_minutes_derived": "Surgery duration in minutes within 1-1440: the SurgiNet value, else stop minus "
+                                        "start; NULL otherwise (L1326).",
+    "surgery_duration_source": "bronze_duration or stop_minus_start; NULL iff surgery_duration_minutes_derived is NULL.",
+    "surgery_duration_minutes": "Surgery duration as recorded by SurgiNet (not stop minus start); outliers and NULLs are "
+                                "kept as recorded, see surgery_duration_minutes_derived.",
+    "capture_era": "Theatre capture era of the case's site: sbh_from_2024_08 / sbh_before_2024_08 for St Bartholomew's "
+                   "(SurgiNet case capture there rose about 3x from 2024-08 while other sites stayed flat; rule "
+                   "capture_era_sbh_2024_08), stable for other sites, NULL with no linked case.",
+    "index_stay_ind": "True when the event was recorded in the implant encounter (the index stay).",
+    "staged_procedure_ind": "On revision rows: the description names a planned second stage (rule revision_staged_v1).",
+    "staged_procedure_rule": "revision_staged_v1 when staged_procedure_ind is true.",
+    "outcome_type": "Outcome category; see rule_id for the exact surveillance rule. icu_admission_index_stay and "
+                    "revision_procedure_index_stay are ICU admissions and revisions recorded in the implant encounter "
+                    "(planned peri-operative care or staged surgery), kept apart from post-implant events (J21).",
+    "datix_device_serial_capture_rate": "Share of Datix device-factor rows whose serial has at least 5 letters/digits; the "
+                                        "safety_incident_device_serial columns are NULL below 0.5 (ruling 2026-10-29).",
+    "n_pre_index_device_serial_incidents": "Datix incidents naming this device serial before implant (accepted "
+                                           "attribution); NULL when serial capture is below 0.5 or the serial is short.",
+    "first_pre_index_device_serial_days": "Earliest pre-implant serial incident, days from index (negative); NULL under "
+                                          "the same serial-capture rule.",
+    "procedure_date_basis": "How the revision's procedure time was set (gold clinical_procedure): NULL = recorded "
+                            "PROC_DT_TM; encounter_arrival = no procedure time was recorded and the encounter arrival time "
+                            "stands in (C0 ruling 4, W1.18). Such revisions are kept as evidence but never counted: "
+                            "their outcome rows carry attribution procedure_date_encounter_arrival.",
+})
+# INSR_W8_COMMENTS_V1 W8.09: documented limitations, appended to the derived texts (INSR_20261029 coverage register).
+def _insr_w8_note(column, sentence):
+    """Append one sentence to an existing DERIVED text; KeyError if W6 removed the column."""
+    DERIVED[column] = DERIVED[column].rstrip(".") + ". " + sentence
+
+
+DERIVED["implanter_practitioner_id"] = ("Implanting practitioner: not captured at source (Millennium records none on the implant log), "
+                                        "so it is NULL; use operator_practitioner_id.")
+_insr_w8_note("udi_capture_evidence", "A UDI is captured on roughly 10-20% of implants in any year; GMDN on about 75%.")
+_insr_w8_note("bmi", "Filled on under half of implants in every year.")
+_insr_w8_note("weight_kg", "Pre-operative weight fill rises from about 30% (2016) to about 78% (2025).")
+_insr_w8_note("smoking_status_date", "Structured smoking forms are rare before 2019 and cover under 40% of implants by 2025.")
+_insr_w8_note("outcome_type", "Events in the implant encounter (in_index_encounter_ind) include planned peri-operative care.")
+_insr_w8_note("registry", "iWeb coverage starts by registry: coronary 2013, non-coronary 2016, surgery 2017.")
+DERIVED["source_manufacturer"] = ("Manufacturer recorded in SurgiNet for this implant, as entered (free text, not normalised; "
+                                  "normalisation is deferred unless PMS customers ask for it, J33).")
+DERIVED["source_catalogue_number"] = ("Catalogue number recorded in SurgiNet for this implant, as entered (free text, not "
+                                      "normalised; deferred unless PMS customers ask for it, J33).")
+DERIVED["surgery_duration_minutes"] = ("Surgery stop minus start in minutes, as derived in bronze. NULL when either time is "
+                                       "missing; implausible values (negative or over 24 hours) are kept as recorded, so filter before use.")
 
 # Phase 1 columns: gold carries these comments only after the Task 7 apply (texts copied from the PMS-*-gold
 # components); until then the gold source has no comment, so they are supplied here. Gold comments win once live.
@@ -164,11 +233,30 @@ TAG_3_1 = {"implanter_practitioner_id", "operator_practitioner_id", "surgeon_pra
            "anaesthetist_practitioner_id"}
 
 
+# INSR_W6 W6.02 (J1, 2026-10-29): estate tags from the one shared helper (W7.02). shared_path points at the
+# folder holding estate_tags.py (prod: Prod/Pipelines/_shared; dev: the CC staging copy).
+import sys
+dbutils.widgets.text("shared_path", "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+sys.path.insert(0, dbutils.widgets.get("shared_path"))
+from estate_tags import estate_tags  # noqa: E402
+
+ESTATE_TAGS = estate_tags(spark)  # column_name -> (ig_risk, ig_severity) as integers (W7.02 contract); see tag()
+
+
+def own_class(c):
+    """The pre-J1 ig class of a column with no gold counterpart."""
+    if c in TAG_4_2: return "4", "2"
+    if c in TAG_3_2: return "3", "2"
+    if c in TAG_3_1: return "3", "1"
+    return "1", "1"
+
+
 def tag(c):
-    if c in TAG_4_2: return 4, 2
-    if c in TAG_3_2: return 3, 2
-    if c in TAG_3_1: return 3, 1
-    return 1, 1
+    """ig_risk / ig_severity for one column: the estate's gold tag when gold has the column name, else own_class.
+    Always strings: estate_tags returns integers, UC tag values (and the before -> after diff) are strings."""
+    if c in ESTATE_TAGS:
+        return tuple(str(v) for v in ESTATE_TAGS[c])
+    return own_class(c)
 
 
 def gold_comments(tables):
@@ -189,20 +277,41 @@ def lit(s):
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
-known = {}
-missing = []
+cat, sch = S.split(".")
+
+
+def current_tags():
+    """(table, column) -> (ig_risk, ig_severity) as tagged now, for the before -> after diff (INSR_W6 W6.02)."""
+    out = {}
+    for r in spark.sql(f"SELECT table_name, column_name, tag_name, tag_value FROM `{cat}`.information_schema.column_tags "
+                       f"WHERE schema_name = '{sch}' AND tag_name IN ('ig_risk', 'ig_severity')").collect():
+        out.setdefault((r.table_name, r.column_name), {})[r.tag_name] = r.tag_value
+    return {k: (v.get("ig_risk"), v.get("ig_severity")) for k, v in out.items()}
+
+
+# Plan every comment and tag first, so a missing comment fails the run before anything is written.
+known, missing, plan = {}, [], []
 for t in TABLES:
-    T = f"{S}.{t}"
     src = gold_comments(SOURCES[t])
-    for c in spark.table(T).columns:
+    for c in spark.table(f"{S}.{t}").columns:
         text = DERIVED.get(c) or src.get(c) or known.get(c) or PHASE1_COMMENTS.get(c)
         if not text:
             missing.append(f"{t}.{c}")
             continue
         known.setdefault(c, text)
-        spark.sql(f"COMMENT ON COLUMN {T}.`{c}` IS '{lit(text)}'")
-        r, s = tag(c)
-        spark.sql(f"ALTER MATERIALIZED VIEW {T} ALTER COLUMN `{c}` SET TAGS ('ig_risk' = '{r}', 'ig_severity' = '{s}')")
+        plan.append((t, c, text, tag(c)))
 assert not missing, f"columns without a comment: {missing}"
+
+before_tags = current_tags()
+changed = []
+for t, c, text, (r, s) in plan:
+    T = f"{S}.{t}"
+    spark.sql(f"COMMENT ON COLUMN {T}.`{c}` IS '{lit(text)}'")
+    if before_tags.get((t, c)) != (r, s):
+        changed.append((t, c, before_tags.get((t, c)), (r, s)))
+    spark.sql(f"ALTER MATERIALIZED VIEW {T} ALTER COLUMN `{c}` SET TAGS ('ig_risk' = '{r}', 'ig_severity' = '{s}')")
+print(f"tag changes ({len(changed)}):")
+for row in changed:
+    print("  ", row)
 print("governed", len(TABLES), "tables")
 

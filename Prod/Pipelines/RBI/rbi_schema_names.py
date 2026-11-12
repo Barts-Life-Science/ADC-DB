@@ -1,9 +1,11 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Column-name lists shared by rbi_schema (Spark) and rbi_docs (pure Python). Order matters."""
 STREAM_COLUMN_NAMES = [
     "resource_use_event_key", "domain", "stream", "unit_type", "quantity", "quantity_requested",
     "quantity_performed_result", "quantity_performed_reported", "quantity_unknown", "quantity_scheduled", "consumption_status",
     "consumption_evidence", "event_start", "event_end", "event_date_local", "financial_year", "person_id",
     "encounter_id", "attribution_method", "attribution_score", "candidate_count", "nurse_unit_code", "site_code",
+    "site_basis", "site_source_value",  # INSR_W6 W6.06
     "service_code", "clinic_code", "theatre_code", "tracking_class", "stratum_l1", "stratum_l2",
     "priced_by_other_stream", "drug_concept_id", "source_amount", "source_table", "source_key", "rule_version",
 ]

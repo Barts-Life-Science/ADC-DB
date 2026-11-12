@@ -267,6 +267,29 @@ def _build_frame_utc(since=None):
 
 # COMMAND ----------
 
+def _r1_attach(df, target, broadcast_batch=True):
+    """INSR R1 (mapping into bronze): add the mapping-lane columns of `target` to df before an overwrite, so the
+    columns and their tags survive it. A no-op for tables without lanes. Keys new in this run stay NULL here and are
+    filled by the R1_Mapping_Attach task after the resolver (deviation D1 of the R1 plan).
+    R1FIX_20261109: R1 classed map_allergy as an inline-attach builder (weekly full overwrite) but shipped no
+    allergy component; this is the same helper R1's aria/endobase/ccmds/msds components use."""
+    import sys
+    shared = ("/Workspace/Shared/PM-DE-Misc/Ben/Python/CC/INSR_20261029/R1/src/_shared"
+              if target.replace("`", "").startswith("8_dev.") else "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import mapping_attach
+    return mapping_attach.attach_axes(df, target, broadcast_batch=broadcast_batch)
+
+
+def _r1_retag(target):
+    """INSR R1: this builder's overwriteSchema write drops column comments and tags; re-apply the R1 lane columns'
+    comments and estate-copied ig tags right after it (mapping_attach.tag_and_comment; a no-op without lanes)."""
+    import mapping_attach
+    if mapping_attach.L.lanes_of_table(mapping_attach._bare(target)):
+        mapping_attach.tag_and_comment(spark, target)
+
+
 SOURCES = {
     "map_allergy:mill_allergy": "4_prod.raw.mill_allergy",
     "map_allergy:mill_nomenclature": "3_lookup.mill.mill_nomenclature",
@@ -293,24 +316,30 @@ lookups_advanced = any(
 )
 
 if FULL or lookups_advanced or not spark.catalog.tableExists(TARGET):
-    (build_frame(None)
+    (_r1_attach(build_frame(None), TARGET)  # R1FIX_20261109: R1 lane columns survive the overwrite
      .write.format("delta")
      .option("delta.enableChangeDataFeed", "true")
      .mode("overwrite")
      .option("overwriteSchema", "true")
      .saveAsTable(TARGET))
+    _r1_retag(TARGET)  # the overwrite dropped the lane columns' comments and tags
     print(f"FULL build -> {TARGET} (forced={lookups_advanced})")
 else:
     since = get_watermark(CONTROL, "map_allergy:mill_allergy")
     inc = build_frame(since)
     inc.createOrReplaceTempView("_allergy_inc")
+    # R1FIX_20261109: name the source's columns explicitly; SET * / INSERT * would also name the R1 lane columns.
+    _inc_columns = [f"`{c}`" for c in inc.columns]
+    _inc_update = ", ".join(f"t.{c} = s.{c}" for c in _inc_columns)
+    _inc_insert = ", ".join(_inc_columns)
+    _inc_values = ", ".join(f"s.{c}" for c in _inc_columns)
     spark.sql(f"""
         MERGE INTO {TARGET} t
         USING _allergy_inc s
         ON t.ALLERGY_INSTANCE_ID = s.ALLERGY_INSTANCE_ID
         WHEN MATCHED AND (t.ADC_UPDT < s.ADC_UPDT OR t.CURRENT_IND <> s.CURRENT_IND)
-             THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+             THEN UPDATE SET {_inc_update}
+        WHEN NOT MATCHED THEN INSERT ({_inc_insert}) VALUES ({_inc_values})
     """)
     print(f"INCREMENTAL since {since}")
 
@@ -345,5 +374,4 @@ print("view + comment done")
 # 5. Verify the next weekly run against the measured S1 steady-state runtime.
 
 dbutils.notebook.exit(json.dumps({"result": "BUILT", "target": TARGET, "target_schema": TARGET_SCHEMA}, sort_keys=True))
-
 

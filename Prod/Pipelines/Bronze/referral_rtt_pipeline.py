@@ -37,8 +37,11 @@ RUN_ID = bronze_run_id()
 ATTEMPT_ID = uuid.uuid4().hex
 RUN_AS_OF = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
 
-PIPELINE_LOGIC_VERSION = "2026.08.v1.5"
-LOGIC_VERSION_INT = 2026081102
+# INSR_W1_REFERRAL_BACKFILL_V1 (2026-11-04): bumped so the first run after the release is FULL. The INSR columns
+# (REFERRED_BY_PRID, the LUNA/e-RS identifiers) are added by DDL; an incremental run with no new LUNA data
+# left all 10.7M existing referrals NULL in them (P2.W1.60 / P2.W1.63 asserts).
+PIPELINE_LOGIC_VERSION = "2026.11.v1.6"
+LOGIC_VERSION_INT = 2026110401
 LOGIC_SOURCE = "__PIPELINE_LOGIC__"
 
 assert not TARGET_SCHEMA.lower().startswith("4_prod") or ALLOW_PRODUCTION_WRITE, (
@@ -97,16 +100,33 @@ LOOKUP_SOURCES = {SRC_REFERENCE, SRC_PATIENT, SRC_ENCOUNTERS}
 EXPECTED_COLUMNS = {
     SRC_REFERRAL: {
         "SourceSystemOID", "ReferralOID", "WaitingListOID", "PathwayOID", "PatientOID", "UBRN",
+        "ReferralReason", "ReferralComments", "ReferredByOrganisation",  # INSR_W1_IDENTIFIER_RETAIN_V1
         "AdminCategory_RVID", "Site_RVID", "TreatmentFunction_RVID", "ServiceTypeRequested_RVID",
         "ReferralReceivedDateTime", "ReferralPriority_RVID", "ReferralSource_RVID",
         "ReferralStatus_RVID", "ReferralStatusChangeReason_RVID", "ReferralStatusChangeDateTime",
         "EncounterType_RVID", "SuspectedCancerSite_RVID", "BusinessUnit", "Division", "SourceOID",
         "OriginalReferralReceivedDateTime", "ReferredBy_OrgID", "ReferringFacility_RVID",
         "BookingType_RVID", "CreatedDateTime", "ModifiedDateTime", "ActiveInd", "ADC_UPDT",
+        "ReferredBy_PRID",  # INSR_W1_REFERRER_PRID_V1
     },
     SRC_ERS: {
         "SourceSystemOID", "ReferralOID", "UBRNReceived", "eReferralPathwayStart",
         "eRSServiceName", "eRSSpecialty", "ADC_UPDT",
+        # INSR_W1_IDENTIFIER_RETAIN_V1
+        "LocalPatientID",
+        "NHSNumber",
+        "PatientName",
+        "ReferralReason",
+        "ReferralComments",
+        "ReferredByOrganisation",
+        "ReferredByTeamName",
+        "ReferredToTeamName",
+        "LeadClinicianForename",
+        "LeadClinicianSurname",
+        "ReferredByCareProviderForename",
+        "ReferredByCareProviderSurname",
+        "ReferredToCareProviderForename",
+        "ReferredToCareProviderSurname",
     },
     SRC_RTT_CORE: {
         "SourceSystemOID", "PathwayOID", "PatientOID", "ClockStartDateTime", "ClockStopDateTime",
@@ -193,6 +213,8 @@ EXPECTED_TARGET_SCHEMAS = {
     MAP_REFERRAL: {
         "SOURCE_SYSTEM_OID": "bigint", "REFERRAL_OID": "bigint",
         "WAITING_LIST_OID": "bigint", "PATHWAY_OID": "bigint", "PATIENT_OID": "bigint",
+        "LOCAL_PATIENT_ID": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "NHS_NUMBER": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
         "UBRN": "string", "ADMIN_CATEGORY_RVID": "bigint", "SITE_RVID": "bigint",
         "TREATMENT_FUNCTION_RVID": "bigint", "SERVICE_TYPE_REQUESTED_RVID": "bigint",
         "REFERRAL_RECEIVED_DATETIME": "timestamp", "REFERRAL_PRIORITY_RVID": "bigint",
@@ -205,11 +227,31 @@ EXPECTED_TARGET_SCHEMAS = {
         "REFERRING_FACILITY_RVID": "bigint", "BOOKING_TYPE_RVID": "bigint",
         "CREATED_DATETIME": "timestamp", "MODIFIED_DATETIME": "timestamp",
         "ACTIVE_IND": "boolean", "REFERRAL_SOURCE_ADC_UPDT": "timestamp",
+        "REFERRAL_REASON": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "REFERRAL_COMMENTS": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "REFERRED_BY_ORGANISATION": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
         "ERS_UBRN_RECEIVED": "date", "ERS_PATHWAY_START": "date",
         "ERS_SERVICE_NAME": "string", "ERS_SPECIALTY": "string",
-        "ERS_SOURCE_ADC_UPDT": "timestamp", "PERSON_ID": "bigint",
+        "ERS_SOURCE_ADC_UPDT": "timestamp",
+        "ERS_LOCAL_PATIENT_ID": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_NHS_NUMBER": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_PATIENT_NAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRAL_REASON": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRAL_COMMENTS": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_BY_ORGANISATION": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_BY_TEAM_NAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_TO_TEAM_NAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_LEAD_CLINICIAN_FORENAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_LEAD_CLINICIAN_SURNAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_BY_CARE_PROVIDER_FORENAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_BY_CARE_PROVIDER_SURNAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_TO_CARE_PROVIDER_FORENAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "ERS_REFERRED_TO_CARE_PROVIDER_SURNAME": "string",  # INSR_W1_IDENTIFIER_RETAIN_V1
+        "PERSON_ID": "bigint",
         "PERSON_LINK_METHOD": "string", "XWALK_SOURCE_ADC_UPDT": "timestamp",
         "SOURCE_ADC_UPDT": "timestamp",
+        # INSR_W1_REFERRER_PRID_V1: directly after SOURCE_ADC_UPDT, where DDL adds it (ADD COLUMNS ... AFTER).
+        "REFERRED_BY_PRID": "bigint",
     },
     MAP_RTT_PATHWAY: {
         "SOURCE_SYSTEM_OID": "bigint", "PATHWAY_OID": "bigint", "PERIOD_OID": "bigint",
@@ -284,15 +326,30 @@ ALIAS_VERSION = None
 ALIAS_LIVE_VERSION = None
 RUN_FUTURE_HORIZON = None
 
-BANNED_EXACT_COLUMNS = {
-    "MRN", "MRN_NORM", "NHS_NUMBER", "NHS_NORM", "LOCAL_PATIENT_ID", "LEGACY_PATIENT_ID",
-    "PATIENT_NAME", "FORENAME", "SURNAME", "DATE_OF_BIRTH", "DOB", "POSTCODE",
-    "ADDRESS_LINE_1", "ADDRESS_LINE_2", "ADDRESS_LINE_3", "ADDRESS_LINE_4",
-    "TELEPHONE_HOME", "TELEPHONE_MOBILE", "REFERRAL_REASON", "REFERRAL_COMMENTS",
-    "REFERRED_BY_CARE_PROVIDER_FORENAME", "REFERRED_BY_CARE_PROVIDER_SURNAME",
-    "REFERRED_TO_CARE_PROVIDER_FORENAME", "REFERRED_TO_CARE_PROVIDER_SURNAME",
-    "LEAD_CLINICIAN_FORENAME", "LEAD_CLINICIAN_SURNAME", "REFERRED_BY_TEAM_NAME",
-    "REFERRED_TO_TEAM_NAME", "REFERRED_BY_ORGANISATION",
+# INSR_W1_IDENTIFIER_RETAIN_V1: identifier and free-text columns are published and tagged (ig_risk / ig_severity by
+# Table Metadata Compliance), never excluded from bronze; de-identification is serve-time. This set used to be a ban
+# list; it is now the list of identifier columns map_referral publishes, which assert_no_banned_columns reports.
+IDENTIFIER_COLUMNS = {
+    "LOCAL_PATIENT_ID",
+    "NHS_NUMBER",
+    "REFERRAL_REASON",
+    "REFERRAL_COMMENTS",
+    "REFERRED_BY_ORGANISATION",
+    "ERS_LOCAL_PATIENT_ID",
+    "ERS_NHS_NUMBER",
+    "ERS_PATIENT_NAME",
+    "ERS_REFERRAL_REASON",
+    "ERS_REFERRAL_COMMENTS",
+    "ERS_REFERRED_BY_ORGANISATION",
+    "ERS_REFERRED_BY_TEAM_NAME",
+    "ERS_REFERRED_TO_TEAM_NAME",
+    "ERS_LEAD_CLINICIAN_FORENAME",
+    "ERS_LEAD_CLINICIAN_SURNAME",
+    "ERS_REFERRED_BY_CARE_PROVIDER_FORENAME",
+    "ERS_REFERRED_BY_CARE_PROVIDER_SURNAME",
+    "ERS_REFERRED_TO_CARE_PROVIDER_FORENAME",
+    "ERS_REFERRED_TO_CARE_PROVIDER_SURNAME",
+    "REFERRED_BY_PRID",
 }
 
 
@@ -321,20 +378,16 @@ def assert_expected_columns(table: str, expected: set[str]) -> None:
 
 
 def assert_no_banned_columns(df: DataFrame, label: str) -> dict:
-    heartbeat_run_lock(f"PII validation {label}")
+    """Report the identifier columns present in df (INSR_W1_IDENTIFIER_RETAIN_V1). It never fails: identifiers are
+    published and tagged, not excluded. The name is kept so its five call sites and the pii_inspection summary are
+    unchanged; banned_columns stays in the result, always empty, for readers of older run summaries."""
+    heartbeat_run_lock(f"identifier inspection {label}")
     actual = {column.upper() for column in df.columns}
-    exact = sorted(actual & BANNED_EXACT_COLUMNS)
-    token_banned = sorted(
-        column for column in actual
-        if any(token in column for token in ("PATIENT_NAME", "FORENAME", "SURNAME", "ADDRESS_", "TELEPHONE_"))
-    )
-    banned = sorted(set(exact + token_banned))
-    if banned:
-        fail(f"{label}: banned PII/free-text columns present: {banned}")
     return {
         "status": "PASS",
         "inspected_column_count": len(df.columns),
-        "banned_columns": banned,
+        "identifier_columns": sorted(actual & IDENTIFIER_COLUMNS),
+        "banned_columns": [],
     }
 
 
@@ -559,7 +612,21 @@ def health_checkpoint(source: str) -> dict | None:
 
 
 def with_row_hash(df: DataFrame) -> DataFrame:
-    columns = sorted(column for column in df.columns if column not in HASH_EXCLUDE)
+    """
+    Change hash over the business columns of a staged row.
+
+    BRONZE_PERF_20261101_RTT_HASH_V1: the *SOURCE_ADC_UPDT columns (SOURCE_ADC_UPDT, XWALK_, CORE_, ACTIVITY_,
+    REFERRAL_, ERS_, PERIOD_, TAG_) record when an upstream row was last landed, not what it says. A weekly re-land
+    of the patient and alias tables moved XWALK_SOURCE_ADC_UPDT on almost every row, so 13.3M map_rtt_activity
+    rows were rewritten on 11-01 (23.1M on 10-18) although about 99% had no business change. Whatever an upstream
+    change does to a published value is caught by that value's own column. The clocks are still stored; they now
+    advance when the row's content changes. The first run after this change rewrites each row once to store the
+    new hash.
+    """
+    columns = sorted(
+        column for column in df.columns
+        if column not in HASH_EXCLUDE and not column.endswith("SOURCE_ADC_UPDT")
+    )
     payload = F.to_json(
         F.struct(*[F.col(column).alias(column) for column in columns]),
         options={"ignoreNullFields": "false"},
@@ -1435,12 +1502,17 @@ def build_referral(xwalk: DataFrame, lookup: DataFrame) -> tuple[DataFrame, dict
         F.col("SourceOID").cast("long").alias("SOURCE_OID"),
         F.col("OriginalReferralReceivedDateTime").alias("ORIGINAL_REFERRAL_RECEIVED_DATETIME"),
         F.col("ReferredBy_OrgID").cast("long").alias("REFERRED_BY_ORG_ID"),
+        F.col("ReferredBy_PRID").cast("long").alias("REFERRED_BY_PRID"),  # INSR_W1_REFERRER_PRID_V1
         F.col("ReferringFacility_RVID").cast("long").alias("REFERRING_FACILITY_RVID"),
         F.col("BookingType_RVID").cast("long").alias("BOOKING_TYPE_RVID"),
         F.col("CreatedDateTime").alias("CREATED_DATETIME"),
         F.col("ModifiedDateTime").alias("MODIFIED_DATETIME"),
         F.col("ActiveInd").cast("boolean").alias("ACTIVE_IND"),
         F.col("ADC_UPDT").alias("REFERRAL_SOURCE_ADC_UPDT"),
+        # INSR_W1_IDENTIFIER_RETAIN_V1: referral free text and organisation, published and tagged.
+        F.col("ReferralReason").cast("string").alias("REFERRAL_REASON"),
+        F.col("ReferralComments").cast("string").alias("REFERRAL_COMMENTS"),
+        F.col("ReferredByOrganisation").cast("string").alias("REFERRED_BY_ORGANISATION"),
     )
     assert_unique_non_null(core, TARGET_KEYS[MAP_REFERRAL], SRC_REFERRAL)
     core_rows = core.count()
@@ -1462,6 +1534,21 @@ def build_referral(xwalk: DataFrame, lookup: DataFrame) -> tuple[DataFrame, dict
         F.col("eRSServiceName").alias("ERS_SERVICE_NAME"),
         F.col("eRSSpecialty").alias("ERS_SPECIALTY"),
         F.col("ADC_UPDT").alias("ERS_SOURCE_ADC_UPDT"),
+        # INSR_W1_IDENTIFIER_RETAIN_V1: e-RS patient, clinician and team identifiers and free text, published and tagged.
+        F.col("LocalPatientID").cast("string").alias("ERS_LOCAL_PATIENT_ID"),
+        F.col("NHSNumber").cast("string").alias("ERS_NHS_NUMBER"),
+        F.col("PatientName").cast("string").alias("ERS_PATIENT_NAME"),
+        F.col("ReferralReason").cast("string").alias("ERS_REFERRAL_REASON"),
+        F.col("ReferralComments").cast("string").alias("ERS_REFERRAL_COMMENTS"),
+        F.col("ReferredByOrganisation").cast("string").alias("ERS_REFERRED_BY_ORGANISATION"),
+        F.col("ReferredByTeamName").cast("string").alias("ERS_REFERRED_BY_TEAM_NAME"),
+        F.col("ReferredToTeamName").cast("string").alias("ERS_REFERRED_TO_TEAM_NAME"),
+        F.col("LeadClinicianForename").cast("string").alias("ERS_LEAD_CLINICIAN_FORENAME"),
+        F.col("LeadClinicianSurname").cast("string").alias("ERS_LEAD_CLINICIAN_SURNAME"),
+        F.col("ReferredByCareProviderForename").cast("string").alias("ERS_REFERRED_BY_CARE_PROVIDER_FORENAME"),
+        F.col("ReferredByCareProviderSurname").cast("string").alias("ERS_REFERRED_BY_CARE_PROVIDER_SURNAME"),
+        F.col("ReferredToCareProviderForename").cast("string").alias("ERS_REFERRED_TO_CARE_PROVIDER_FORENAME"),
+        F.col("ReferredToCareProviderSurname").cast("string").alias("ERS_REFERRED_TO_CARE_PROVIDER_SURNAME"),
     ).alias("ers")
     core_ids = core.select("SOURCE_SYSTEM_OID", "REFERRAL_OID").alias("core_ids")
     contained = ers.join(
@@ -1482,8 +1569,18 @@ def build_referral(xwalk: DataFrame, lookup: DataFrame) -> tuple[DataFrame, dict
             f"distinct={distinct_contained}, max={max_multiplicity}"
         )
 
+    # INSR_W1_IDENTIFIER_RETAIN_V1: the LUNA patient identifiers the crosswalk already reads, published on the referral.
+    # luna_patient_core is unique on (SourceSystemOID, PatientOID) (the person_xwalk_stg check), so the join cannot fan out.
+    patient_identifiers = pinned_source(SRC_PATIENT).select(
+        F.coalesce(F.col("SourceSystemOID"), F.lit(LUNA_SOURCE_SYSTEM_OID)).cast("long").alias("SOURCE_SYSTEM_OID"),
+        F.col("PatientOID").cast("long").alias("PATIENT_OID"),
+        F.col("LocalPatientID").cast("string").alias("LOCAL_PATIENT_ID"),
+        F.col("NHSNumber").cast("string").alias("NHS_NUMBER"),
+    )
+    assert_unique_non_null(patient_identifiers, ["SOURCE_SYSTEM_OID", "PATIENT_OID"], f"{SRC_PATIENT} identifiers")
     result = (
         core.join(contained, ["SOURCE_SYSTEM_OID", "REFERRAL_OID"], "left")
+        .join(patient_identifiers, ["SOURCE_SYSTEM_OID", "PATIENT_OID"], "left")
         .join(xwalk, ["SOURCE_SYSTEM_OID", "PATIENT_OID"], "left")
         .withColumn(
             "SOURCE_ADC_UPDT",
@@ -1749,6 +1846,12 @@ def add_performed_timestamp(df: DataFrame, raw_column: str, output_column: str) 
     )
 
 
+# R1FIX_20261109: an RTT activity whose pathway is missing from luna_rtt_core (deleted or merged in LUNA) lands with
+# no core link instead of failing the run. More orphans than this is a systemic source gap and still fails.
+RTT_ORPHAN_ACTIVITY_MIN_LIMIT = 100
+RTT_ORPHAN_ACTIVITY_MAX_SHARE = 0.0001   # 0.01% of activity rows
+
+
 def build_rtt_activity(xwalk: DataFrame, lookup: DataFrame) -> tuple[DataFrame, dict]:
     heartbeat_run_lock("RTT activity source gates")
     if CARRY_SCH_EVENT_ID:
@@ -1792,10 +1895,15 @@ def build_rtt_activity(xwalk: DataFrame, lookup: DataFrame) -> tuple[DataFrame, 
         core_link.select("SOURCE_SYSTEM_OID", "PATHWAY_OID"),
         ["SOURCE_SYSTEM_OID", "PATHWAY_OID"], "left_anti",
     ).count()
+    orphan_limit = max(RTT_ORPHAN_ACTIVITY_MIN_LIMIT, int(raw_rows * RTT_ORPHAN_ACTIVITY_MAX_SHARE))
+    if unmatched_core > orphan_limit:
+        fail(f"RTT activity: {unmatched_core} rows do not resolve to unique RTT core (limit {orphan_limit})")
     if unmatched_core:
-        fail(f"RTT activity: {unmatched_core} rows do not resolve to unique RTT core")
+        print(f"[RTT] WARNING: {unmatched_core} activity rows have no RTT core pathway (orphaned in LUNA); "
+              "they land with no core or person link (CORE_SOURCE_ADC_UPDT NULL).")
     result = (
-        activity.join(core_link, ["SOURCE_SYSTEM_OID", "PATHWAY_OID"], "inner")
+        # Left join: core_link is unique on the key (asserted above), so no row fans out; orphans keep NULL links.
+        activity.join(core_link, ["SOURCE_SYSTEM_OID", "PATHWAY_OID"], "left")
         .join(xwalk, ["SOURCE_SYSTEM_OID", "PATIENT_OID"], "left")
         .drop("PATIENT_OID")
         .withColumn(

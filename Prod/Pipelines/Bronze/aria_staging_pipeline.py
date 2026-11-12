@@ -127,11 +127,33 @@ def dq_all_clinical(df, admin_stamps):
             and f.name not in admin_stamps and not f.name.endswith("_CLEAN")]
     return dq_columns(df, cols), cols
 
+def _r1_attach(df, target, broadcast_batch=True):
+    """INSR R1 (mapping into bronze): add the mapping-lane columns of `target` to df before an overwrite, so the
+    columns and their tags survive it. A no-op for tables without lanes. Keys new in this run stay NULL here and are
+    filled by the R1_Mapping_Attach task after the resolver (deviation D1 of the R1 plan)."""
+    import sys
+    shared = ("/Workspace/Shared/PM-DE-Misc/Ben/Python/CC/INSR_20261029/R1/src/_shared"
+              if target.replace("`", "").startswith("8_dev.") else "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import mapping_attach
+    return mapping_attach.attach_axes(df, target, broadcast_batch=broadcast_batch)
+
+
+def _r1_retag(target):
+    """INSR R1: this builder's overwriteSchema write drops column comments and tags; re-apply the R1 lane columns'
+    comments and estate-copied ig tags right after it (mapping_attach.tag_and_comment; a no-op without lanes)."""
+    import mapping_attach
+    if mapping_attach.L.lanes_of_table(mapping_attach._bare(target)):
+        mapping_attach.tag_and_comment(spark, target)
+
+
 def replace_with_tombstones(df, target, key_cols):
     """Deterministic replace with NO silent hard deletes (S2.2 lifecycle): rows present in
     the prior published version but absent from the fresh build are re-appended with
     SOURCE_PRESENT_IND=false, retaining their previous column values and stamps.
     A key that reappears at source is resurrected as present (its tombstone drops out)."""
+    df = _r1_attach(df, target)  # INSR R1: lane columns survive the overwrite
     fresh = df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
     v_prev = table_version(target) if spark.catalog.tableExists(target) else None
     (fresh.write.format("delta").mode("overwrite")
@@ -142,6 +164,7 @@ def replace_with_tombstones(df, target, key_cols):
                            key_cols, "left_anti")
                      .withColumn("SOURCE_PRESENT_IND", F.lit(False)))
         gone.write.format("delta").mode("append").saveAsTable(target)
+    _r1_retag(target)  # INSR R1: overwriteSchema dropped the lane columns' comments and tags
 
 def table_fingerprint(tbl, exclude=("PIPELINE_UPDT_DT_TM",)):
     """Canonical whole-row fingerprint: order-independent sum of xxhash64 over the JSON of

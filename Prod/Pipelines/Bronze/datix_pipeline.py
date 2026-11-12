@@ -58,49 +58,60 @@ def has_col(table,col): return col.lower() in {c.lower() for c in spark.table(ta
 def nonblank(c): return F.length(F.trim(F.col(c).cast("string")))>0
 def active_incident_filter(df): return df.join(F.broadcast(INC_IDS),F.col("inc_id").cast("long")==F.col("_inc_id"),"inner").drop("_inc_id")
 
-def _snapshot_rows_from_history(table, version):
-    """Recover an exact full-snapshot count through contiguous metadata commits."""
-    history = (spark.sql(f"DESCRIBE HISTORY {qname(table)}")
-               .where(F.col("version") <= int(version)).orderBy(F.col("version").desc()).collect())
-    expected = int(version)
-    metadata_only = {"SET TBLPROPERTIES", "UNSET TBLPROPERTIES", "CHANGE COLUMN",
-                     "ADD COLUMNS", "DROP COLUMNS", "RENAME COLUMN", "OPTIMIZE",
-                     "VACUUM START", "VACUUM END"}
+# DATIX_SNAPSHOT_BASELINE_V2: week-over-week baseline from retained Delta history.
+# The raw Datix tables are replaced in full each week (CREATE OR REPLACE TABLE AS SELECT).
+# V1 pinned a fixed September version with no stored count and re-derived the count from
+# history; once Delta's 30-day log retention dropped that version the guard failed closed
+# on every run. V2 compares against the previous full snapshot, which weekly writes keep
+# inside retention indefinitely.
+FULL_SNAPSHOT_OPERATIONS = {"CREATE TABLE AS SELECT", "CREATE OR REPLACE TABLE AS SELECT", "REPLACE TABLE AS SELECT"}
+NON_DATA_OPERATIONS = {"SET TBLPROPERTIES", "UNSET TBLPROPERTIES", "CHANGE COLUMN", "ADD COLUMNS",
+                       "DROP COLUMNS", "RENAME COLUMN", "OPTIMIZE", "VACUUM START", "VACUUM END",
+                       "UPGRADE PROTOCOL", "ROW TRACKING BACKFILL"}
+
+def _is_full_snapshot_write(row):
+    """True when a history row replaced the whole table (CTAS/RTAS or an unpredicated overwrite)."""
+    operation = row["operation"]
+    parameters = row["operationParameters"] or {}
+    if operation in FULL_SNAPSHOT_OPERATIONS:
+        return True
+    return operation == "WRITE" and parameters.get("mode", "").lower() == "overwrite" and not parameters.get("predicate")
+
+def _previous_snapshot_rows(table):
+    """Row count of the full snapshot before the current one, read from retained Delta history.
+
+    Walks history newest-first. Commits after the current snapshot must be metadata-only,
+    otherwise the table is no longer a pure snapshot and the guard fails closed. The count
+    is the previous snapshot write's exact numOutputRows.
+    """
+    history = spark.sql(f"DESCRIBE HISTORY {qname(table)}").orderBy(F.col("version").desc()).collect()
+    snapshots = [row for row in history if _is_full_snapshot_write(row)]
+    if len(snapshots) < 2:
+        raise RuntimeError(f"{table}: retained history holds {len(snapshots)} full snapshot(s); need 2 for a baseline")
+    current_snapshot, previous_snapshot = snapshots[0], snapshots[1]
     for row in history:
-        if int(row["version"]) != expected:
-            raise RuntimeError(f"{table}: incomplete snapshot-count history at {expected}")
-        operation = row["operation"]
-        parameters = row["operationParameters"] or {}
-        full_write = operation in {"CREATE TABLE AS SELECT", "CREATE OR REPLACE TABLE AS SELECT", "REPLACE TABLE AS SELECT"}
-        full_write = full_write or (operation == "WRITE" and parameters.get("mode", "").lower() == "overwrite" and not parameters.get("predicate"))
-        if full_write:
-            value = (row["operationMetrics"] or {}).get("numOutputRows")
-            if value is None or not str(value).isdigit():
-                raise RuntimeError(f"{table}: full snapshot has no exact numOutputRows")
-            return int(value)
-        if operation not in metadata_only:
-            raise RuntimeError(f"{table}: cannot derive snapshot baseline through {operation}")
-        expected -= 1
-    raise RuntimeError(f"{table}: retained history does not prove baseline version {version}")
+        if int(row["version"]) <= int(current_snapshot["version"]):
+            break
+        if row["operation"] not in NON_DATA_OPERATIONS:
+            raise RuntimeError(f"{table}: data-changing {row['operation']} at version {row['version']} after the current snapshot")
+    value = (previous_snapshot["operationMetrics"] or {}).get("numOutputRows")
+    if value is None or not str(value).isdigit():
+        raise RuntimeError(f"{table}: previous snapshot (version {previous_snapshot['version']}) has no exact numOutputRows")
+    return int(previous_snapshot["version"]), int(value)
 
 def assert_snapshot_not_shrunk(table):
+    """Fail if a raw snapshot lost more than 20% of its rows since the previous weekly snapshot.
+
+    Snapshot sources drive SOURCE_PRESENT_IND=false in bronze, so a truncated raw load would
+    mark live rows absent. Sample mode reads a bounded cohort and skips the check.
+    """
     if SAMPLE_MODE:
         return
-    pins = (spark.table("6_mgmt.bronze.tdx_source_pins")  # OGR_NO_DEV_V1/datix
-            .where(F.col("source_table") == table).select("row_count", "delta_version").collect())
-    if len(pins) != 1:
-        raise RuntimeError(f"{table}: expected one saved snapshot baseline, found {len(pins)}")
-    prior = pins[0]
-    baseline = prior["row_count"]
-    if baseline is None:
-        baseline = _snapshot_rows_from_history(table, prior["delta_version"])
-    baseline = int(baseline)
-    if baseline < 0:
-        raise RuntimeError(f"{table}: negative baseline count")
+    baseline_version, baseline = _previous_snapshot_rows(table)
     current = spark.table(table).count()
     if current * 5 < baseline * 4:
-        raise RuntimeError(f"{table}: snapshot shrink guard: current={current}, baseline={baseline}")
-    print(f"Snapshot count verified: {table}: baseline={baseline}, current={current}")
+        raise RuntimeError(f"{table}: snapshot shrink guard: current={current}, baseline={baseline} (version {baseline_version})")
+    print(f"Snapshot count verified: {table}: baseline={baseline} (version {baseline_version}), current={current}")
 for _table in SNAPSHOT_SOURCES: assert_snapshot_not_shrunk(_table)
 
 def with_anon_state(df,outputs=("anon_text",)):
@@ -117,20 +128,491 @@ def finalise(df,key_cols,source_table,source_row_col):
     payload=sorted(c for c in df.columns if c not in excluded and not c.startswith("anon_"))
     return df.withColumn("ROW_HASH",F.sha2(F.to_json(F.struct(*[F.col(c) for c in payload])),256)).withColumn("ADC_UPDT",F.current_timestamp())
 
+# INSR_W8_COMMENTS_V1 (W8.04): canonical bronze comments, generated from the INSR W8.02 dictionary. Edit the dictionary,
+# never this literal. Column names are the bronze (upper-case) names.
+INSR_W8_BRONZE_COMMENTS = {
+ "map_safety_incident": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "AFFECTED_PATIENT_COUNT": "Count of patients recorded as affected by the clinical safety incident.",
+  "CONTEXT_FINGERPRINT_CURRENT": "SHA-256 of the incident's current identifying context (names, birth date, postcode, reporter, investigator and participants); anonymised narrative text is released only while its anon_context_fingerprint matches this value.",
+  "ENCNTR_ID": "Unique identifier for the Encounter table.",
+  "ENCOUNTER_LINK_CONFIDENCE": "HIGH when the linked encounter has HIGH arrival and departure confidence; LOW when an inpatient/ED departure was unresolved and bounded at arrival + 1 day; else MEDIUM.",
+  "ENCOUNTER_LINK_METHOD": "Method by which the clinical safety incident was linked to an encounter record.",
+  "ENCOUNTER_LINK_RULE": "Rule that set encounter_id (TDX-E2 incident-time overlap with Millennium encounter *_BEST bounds).",
+  "INCIDENT_DT_TM": "Date and time the clinical safety incident occurred, derived from the Datix incident date and incident time fields.",
+  "INCIDENT_DT_TM_CLEAN": "Cleaned version of the date and time the clinical safety incident occurred, derived from the Datix incident date and incident time fields.",
+  "INCIDENT_TIME_VALID_IND": "Incident time was recorded (an undated incident time spans the whole incident day in TDX-E2).",
+  "INC_ACCTYPE": "Type of accident recorded for the incident.",
+  "INC_BODYPART": "Part of the body affected or injured in the incident.",
+  "INC_CARESTAGE": "Code for the stage of care at which the incident occurred, as recorded in Datix.",
+  "INC_CATEGORY": "Coded category of the incident.",
+  "INC_CATEGORY_DISPLAY": "Descriptive label of the Datix incident category associated with the code.",
+  "INC_CAUSE": "Recorded cause of the incident in Datix.",
+  "INC_CLINGROUP": "Code for the clinical group or division associated with the incident in Datix.",
+  "INC_CLINOUTCOME": "Clinical outcome recorded for the incident in Datix.",
+  "INC_CLINOUTCOME2": "Secondary clinical outcome recorded for the incident in Datix.",
+  "INC_CLINTYPE": "Code for the clinical incident type recorded in Datix.",
+  "INC_CONSEQUENCE": "Coded consequence score used in the risk grading of the incident.",
+  "INC_DIRECTORATE": "Code for the directorate associated with the incident.",
+  "INC_DOB": "Date of birth of the person involved in the incident.",
+  "INC_ETHNICITY": "Ethnicity of the person affected by the incident, as recorded in Datix.",
+  "INC_FURTHER_INV": "Datix incident field recording whether further investigation of the incident is required.",
+  "INC_GENDER": "Gender of the person involved in the incident as recorded in Datix.",
+  "INC_GRADE": "Overall risk grade of the incident derived from consequence and likelihood.",
+  "INC_GRADE_DISPLAY": "Descriptive label for the Datix incident grade code.",
+  "INC_HEAD": "Code identifying the head or senior manager associated with the incident record in Datix.",
+  "INC_IMPACT": "Impact classification of the incident.",
+  "INC_INJURY": "Type or nature of injury sustained in the incident.",
+  "INC_INVESTIGATOR": "Person assigned to investigate the incident, as recorded in Datix.",
+  "INC_IS_RIDDOR": "Flag indicating whether the incident is reportable under RIDDOR (Reporting of Injuries, Diseases and Dangerous Occurrences Regulations).",
+  "INC_LIKELIHOOD": "Coded likelihood of recurrence used in the risk grading of the incident.",
+  "INC_LOCACTUAL": "Code for the specific location where the incident occurred.",
+  "INC_LOCATION": "Current location of the equipment involved in the incident.",
+  "INC_LOCTYPE": "Coded type of location where the incident occurred.",
+  "INC_MGR": "Code identifying the handler or manager responsible for the incident record in Datix.",
+  "INC_NAME": "Name of the person affected by or associated with the incident as recorded in Datix.",
+  "INC_NOTIFY": "Notification details recorded for the incident, such as who was notified.",
+  "INC_NSPECIALTY": "Specialty recorded for the incident, likely an alternative or national specialty classification in Datix.",
+  "INC_ORGANISATION": "Code for the organisation in which the incident occurred, as recorded in Datix.",
+  "INC_OURREF": "Local incident reference number assigned by the organisation in Datix.",
+  "INC_OUTCOMECODE": "Code recording the outcome of the incident.",
+  "INC_PAT_TYPE": "Type of patient involved in the incident, as recorded in Datix.",
+  "INC_POSTCODE": "Postcode recorded against the incident.",
+  "INC_RATING": "Numeric risk rating of the incident derived from risk grading.",
+  "INC_RC_REQUIRED": "Datix incident field recording whether a root cause analysis is required for the incident.",
+  "INC_REPNAME": "Name of the person who reported the incident.",
+  "INC_REPORTEDBY": "Role or staff category of the person who reported the incident, as recorded in Datix.",
+  "INC_RESULT": "Recorded result or outcome of the incident in Datix.",
+  "INC_RIDDOR": "RIDDOR-related classification recorded for the incident.",
+  "INC_RIDDORNO": "RIDDOR reference number assigned to the incident report.",
+  "INC_RIDLOC": "RIDDOR location classification for where the incident occurred.",
+  "INC_SEVERITY": "Coded severity or harm level assigned to the incident.",
+  "INC_SEVERITY_DISPLAY": "Descriptive label for the incident severity code shown to Datix users.",
+  "INC_SPECIALTY": "Code for the clinical specialty associated with the incident.",
+  "INC_SUBCATEGORY": "Coded subcategory of the incident within its category.",
+  "INC_SUBCATEGORY_DISPLAY": "Descriptive label for the Datix incident subcategory code.",
+  "INC_TREATMENT": "Treatment received as a result of the incident.",
+  "INC_TYPE": "Coded incident type indicating who or what was affected, such as patient or staff.",
+  "INC_TYPE_DISPLAY": "Descriptive label for the Datix incident type code.",
+  "INC_UNIT": "Code for the organisational unit or site where the incident occurred.",
+  "INC_UNIT_TYPE": "Code recording the type of unit associated with the Datix incident.",
+  "INVESTIGATION_COMPLETE_DT_TM": "Date and time the investigation of the clinical safety incident was completed, sourced from Datix.",
+  "INVESTIGATION_START_DT_TM": "Date and time the investigation of the clinical safety incident was started, sourced from Datix.",
+  "NOTIFIED_DT_TM": "Date and time of notification recorded against the clinical safety incident in Datix, populated for very few records.",
+  "OPENED_DT_TM": "Date and time the clinical safety incident record was opened in Datix.",
+  "PERSON_ID": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number.",
+  "PERSON_LINK_METHOD": "Method by which the clinical safety incident was linked to a person record.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "RECORDID": "Datix record identifier for the incident, uniquely identifying each incident record in incidents_main.",
+  "REPORTED_DT_TM": "Date and time the clinical safety incident was reported, sourced from Datix.",
+  "REP_APPROVED": "Approval status code of the incident record within the Datix review workflow.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SECGROUP": "Security group associated with the incident record for Datix access control.",
+  "SECGROUP_DISPLAY": "Descriptive text for the Datix security group code.",
+  "SECLEVEL": "Security level assigned to the incident record for Datix access control.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none."
+ },
+ "map_safety_incident_action": {
+  "ACT_BY_INITS": "Datix staff initials code of the user who completed the action.",
+  "ACT_CHAIN_ID": "Integer identifier of the action chain that the action belongs to, where applicable.",
+  "ACT_CLINGROUP": "Code for the clinical group associated with the action.",
+  "ACT_COST": "Cost estimate recorded for the action.",
+  "ACT_COST_MAX": "Maximum cost estimate recorded for the action.",
+  "ACT_COST_MIN": "Minimum cost estimate recorded for the action.",
+  "ACT_COST_TYPE": "Code indicating the type of cost recorded for the action.",
+  "ACT_DDONE": "Date on which the action was recorded as done.",
+  "ACT_DDUE": "Date by which the action is due to be completed.",
+  "ACT_DIRECTORATE": "Code for the directorate associated with the action.",
+  "ACT_DSTART": "Start date of the action.",
+  "ACT_FROM_INITS": "Datix staff initials code of the user who assigned the action.",
+  "ACT_LOCACTUAL": "Code for the specific location associated with the action.",
+  "ACT_LOCTYPE": "Code for the type of location associated with the action.",
+  "ACT_ORGANISATION": "Code for the organisation associated with the action.",
+  "ACT_PRIORITY": "Priority assigned to the action.",
+  "ACT_SCORE": "Integer score recorded against the action; its scoring scheme is not documented in the available metadata.",
+  "ACT_SPECIALTY": "Code for the specialty associated with the action.",
+  "ACT_STEP_NO": "Step number of the action within its action chain.",
+  "ACT_TO_INITS": "Datix staff initials code of the user to whom the action is assigned.",
+  "ACT_TYPE": "Code indicating the type of action.",
+  "ACT_UNIT": "Code for the site or unit associated with the action.",
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "INC_ID": "Identifier of the safety incident to which the action relates, sourced from the incident identifier in the incident action mapping and the case identifier on Datix action records.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "RECORDID": "Datix record identifier for the action, with one row per action.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SECGROUP": "Datix security group associated with the action record.",
+  "SECLEVEL": "Datix security level applied to the action record.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none.",
+  "UPDATEDDATE": "Date and time the action record was last updated in Datix."
+ },
+ "map_safety_incident_factor": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "DEVICE_BATCH_NUMBER": "Batch or lot number of the medical device involved in the clinical safety incident factor, as recorded in the source.",
+  "DEVICE_EQUIPMENT": "Medical device or equipment recorded as involved in the safety incident factor.",
+  "DEVICE_INVOLVEMENT_FACTORS": "Recorded factors describing how the medical device was involved in the clinical safety incident.",
+  "DEVICE_MANUFACTURER": "Manufacturer of the medical device involved in the safety incident factor.",
+  "DEVICE_MODEL": "Model of the medical device involved in the safety incident factor.",
+  "DEVICE_SERIAL_NUMBER": "Serial number of the medical device involved in the clinical safety incident factor, as recorded in the source.",
+  "DEVICE_SUPPLIER": "Supplier of the medical device recorded as a factor in the clinical safety incident, as captured in the source.",
+  "DEVICE_TYPE": "Type or category of the medical device involved in the safety incident factor.",
+  "FACTOR_ATTRIBUTES_JSON": "JSON of the raw Datix factor attributes (drug, route, dose, …) as recorded.",
+  "FACTOR_CODE": "Code identifying a contributing factor recorded against a clinical safety incident, derived from the Datix equipment or medication drug fields via the incident factor mapping.",
+  "FACTOR_DISPLAY": "Display text describing the contributing factor recorded against a clinical safety incident, derived from the Datix equipment or medication drug fields.",
+  "FACTOR_MAP_CONFIDENCE": "Numeric confidence score for the mapping applied to the clinical safety incident factor, populated only where a mapping was made.",
+  "FACTOR_MAP_METHOD": "Method used to map the clinical safety incident factor to a target concept or code.",
+  "FACTOR_MAP_RULE_ID": "Identifier of the mapping rule applied to map the clinical safety incident factor.",
+  "FACTOR_MAP_VERSION": "Version of the mapping resource or rules used to map the clinical safety incident factor.",
+  "FACTOR_ORDINAL": "Sequence number of the factor within its clinical safety incident.",
+  "FACTOR_ROW_ID": "Internal identifier for each incident factor row, derived from the Datix incident record or LFPSE incident identifier.",
+  "FACTOR_SOURCE_RECORD_ID": "Identifier of the source Datix incident or LFPSE record from which the incident factor row was derived.",
+  "FACTOR_SOURCE_TABLE": "Name of the source table from which the clinical safety incident factor was derived.",
+  "FACTOR_TARGET_CODE": "SNOMED code the Datix drug text maps to via 3_lookup.omop.drug_name_lexicon; null when unmapped.",
+  "FACTOR_TARGET_DISPLAY": "Display of factor_target_code.",
+  "FACTOR_TARGET_SYSTEM": "Code system of the mapped medication factor (SNOMED CT dm+d VTM or Substance).",
+  "FACTOR_TYPE": "Type or category of the contributing factor recorded for the clinical safety incident.",
+  "INC_ID": "Identifier of the Datix incident record that this LFPSE row relates to.",
+  "LFPSE_ID": "Numeric identifier of the associated Learn From Patient Safety Events (LFPSE) record for the incident factor, where one exists.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_FIELDS": "Source field or fields from which the clinical safety incident factor was extracted.",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from."
+ },
+ "map_safety_incident_injury": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "CON_ID": "Identifier of the Datix contact (person involved in the incident) who sustained the injury.",
+  "INC_BODYPART": "Datix code identifying the body part affected by the recorded injury, which may be blank.",
+  "INC_BODYPART_DISPLAY": "Descriptive label of the body part represented by the code.",
+  "INC_ID": "Identifier of the Datix incident to which the injury entry relates.",
+  "INC_INJURY": "Datix code identifying the type of injury recorded against the incident contact.",
+  "INC_INJURY_DISPLAY": "Descriptive label for the injury type code.",
+  "LISTORDER": "Display or sequence order of the injury entry within the incident-contact combination.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "RECORDID": "Datix record identifier for the injury entry row in the inc_injuries table.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none."
+ },
+ "map_safety_incident_lfpse": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "CON_ID": "Identifier of the Datix contact record that this LFPSE row relates to, where applicable.",
+  "INC_ID": "Identifier of the Datix incident record that this LFPSE row relates to.",
+  "LFPSE_BLOOD_INVOLVED": "LFPSE response recording the blood involved in the reported event.",
+  "LFPSE_BLOOD_PROBLEM": "LFPSE response describing the problem with blood involved in the reported event.",
+  "LFPSE_BLOOD_PRODUCTS_BATCH": "LFPSE response recording the batch of blood products involved in the reported event.",
+  "LFPSE_BLOOD_PRODUCTS_BRAND": "LFPSE response recording the brand of blood products involved in the reported event.",
+  "LFPSE_BLOOD_PRODUCTS_INVOLVED": "LFPSE response recording the blood products involved in the reported event.",
+  "LFPSE_BLOOD_PRODUCTS_NOT_USED": "LFPSE response relating to blood products not being used when they should have been in the reported event.",
+  "LFPSE_BLOOD_PRODUCTS_PROBLEM": "LFPSE response describing the problem with blood products involved in the reported event.",
+  "LFPSE_BLOOD_WAS_NOT_USED": "LFPSE response relating to blood not being used when it should have been in the reported event.",
+  "LFPSE_BUILDINGS_INFRASTRUCTURE": "LFPSE response recording the buildings or infrastructure involved in the reported event.",
+  "LFPSE_BUILDINGS_INFRASTRUCTURE_INVOLVED": "LFPSE response indicating whether buildings or infrastructure were involved in the reported event.",
+  "LFPSE_BUILDINGS_INFRASTRUCTURE_NOT_USED": "LFPSE response relating to buildings or infrastructure not being used when they should have been in the reported event.",
+  "LFPSE_BUILDINGS_INFRASTRUCTURE_PROBLEM": "LFPSE response describing the problem with buildings or infrastructure involved in the reported event.",
+  "LFPSE_CQC_CRITERIA": "LFPSE response recording the Care Quality Commission notification criteria applicable to the reported event.",
+  "LFPSE_CQC_NOTIFY": "LFPSE response indicating whether the Care Quality Commission should be notified of the reported event.",
+  "LFPSE_DAMAGED_BLOOD": "LFPSE response relating to damaged blood involved in the reported event.",
+  "LFPSE_DAMAGED_BLOOD_PRODUCTS": "LFPSE response relating to damaged blood products involved in the reported event.",
+  "LFPSE_DATA_SHARING_OPT_OUT": "LFPSE response relating to data-sharing opt-out for the reported event.",
+  "LFPSE_DATE": "Date recorded for the LFPSE event.",
+  "LFPSE_DEPRIVATION_OF_LIBERTY": "LFPSE response relating to deprivation of liberty for the reported event.",
+  "LFPSE_DESIGNATIONS_MENTAL_HEALTH": "LFPSE field recording mental health designations relevant to the reported event.",
+  "LFPSE_DETECTION_POINT": "LFPSE field recording the point at which the event was detected.",
+  "LFPSE_DEVICE_INVOLVEMENT_FACTORS": "LFPSE field recording the factors describing how a device was involved in the event.",
+  "LFPSE_DEVICE_TYPE": "LFPSE field recording the type of device involved in the event.",
+  "LFPSE_DEVICE_USED_UNNECESSARILY": "LFPSE field giving details where a device was used unnecessarily in the event.",
+  "LFPSE_DRUGS_INVOLVED": "LFPSE field recording the medications involved in the event.",
+  "LFPSE_DRUG_INVOLVEMENT_FACTORS": "LFPSE field recording the factors describing how medication was involved in the event.",
+  "LFPSE_DRUG_REACTION": "LFPSE field recording a drug reaction associated with the event.",
+  "LFPSE_DRUG_USED_TOO_MUCH": "LFPSE field giving details where too much of a medication was involved in the event.",
+  "LFPSE_DUTY_OF_CANDOUR": "LFPSE field recording whether duty of candour applies to the event.",
+  "LFPSE_ESTATES_SERVICES": "LFPSE field recording estates services relevant to the event.",
+  "LFPSE_ESTATES_SERVICES_INVOLVED": "LFPSE field recording whether or which estates services were involved in the event.",
+  "LFPSE_ESTATES_SERVICES_NOT_USED": "LFPSE field giving details where estates services were not used in relation to the event.",
+  "LFPSE_ESTATES_SERVICES_PROBLEM": "LFPSE field describing the problem with estates services involved in the event.",
+  "LFPSE_ESTIMATED_TIME": "LFPSE field recording the estimated time of the event, stored as a string.",
+  "LFPSE_FROM_ONLINE_FORMS": "LFPSE field indicating whether the record originated from Datix online forms.",
+  "LFPSE_GOOD_CARE_DETECTION_FACTOR": "LFPSE field recording the factor or factors through which good care was detected in the reported event.",
+  "LFPSE_HSIB_NOTIFY": "LFPSE field indicating whether the event is notifiable to the Healthcare Safety Investigation Branch (HSIB).",
+  "LFPSE_IDENTIFIED_LOCATION": "LFPSE field recording the location identified as where the reported event occurred.",
+  "LFPSE_INCIDENT_OCCURRED_TODAY": "LFPSE field indicating whether the reported incident occurred on the day of reporting.",
+  "LFPSE_INVOLVED_AGENTS": "LFPSE field recording the agents involved in the event, such as medication, devices, blood products, tissues and organs, estates, IT systems or people.",
+  "LFPSE_INVOLVED_PERSONS_ACTIONS": "LFPSE field recording the actions of people involved that contributed to the reported event.",
+  "LFPSE_INVOLVED_PROCESSES": "LFPSE field recording the care processes involved in the reported event.",
+  "LFPSE_IS_ANONYMOUS": "LFPSE field indicating whether the report was submitted anonymously.",
+  "LFPSE_IT_SYSTEMS_INVOLVEMENT_FACTORS": "LFPSE field recording how IT systems or software were involved in the reported event.",
+  "LFPSE_LEVEL_OF_CONCERN": "LFPSE field recording the reporter's level of concern about the reported event or risk.",
+  "LFPSE_LOCAL_AUTHORITY_SAFEGUARDING": "LFPSE field indicating whether the event involves or was referred for local authority safeguarding.",
+  "LFPSE_LOCATION_AT_RISK": "LFPSE field recording the location affected by an identified risk.",
+  "LFPSE_LOCATION_KNOWN": "LFPSE field indicating whether the location of the reported event is known.",
+  "LFPSE_LOCATION_WITHIN_SERVICE": "LFPSE field recording the location within the service where the reported event occurred.",
+  "LFPSE_MANUFACTURER": "LFPSE field recording the manufacturer of a product, such as a device or medication, involved in the reported event.",
+  "LFPSE_MARVIN_REFERENCE_NUMBER": "LFPSE field holding an external MARVIN reference number associated with the reported event.",
+  "LFPSE_MEDICATION_ADMINISTERED_INCORRECTLY": "LFPSE field recording details of medication administered incorrectly in the reported event.",
+  "LFPSE_MEDICATION_ADMINISTRATOR": "LFPSE field recording who administered the medication involved in the reported event.",
+  "LFPSE_MODEL": "LFPSE field recording the model of a device or product involved in the reported event.",
+  "LFPSE_NEVER_EVENT": "LFPSE field recorded in Datix indicating whether the patient safety event was considered a Never Event.",
+  "LFPSE_NEVER_EVENT_TYPE": "LFPSE field recorded in Datix giving the type or category of Never Event associated with the patient safety event.",
+  "LFPSE_NHSBT_REPORT_NUMBER": "External reference number of a related report made to NHS Blood and Transplant (NHSBT), recorded for the LFPSE event.",
+  "LFPSE_ORGANISATION": "LFPSE field recording the organisation associated with the reported patient safety event.",
+  "LFPSE_OUTCOME_TYPE": "LFPSE field recording the type of outcome of the reported patient safety event.",
+  "LFPSE_PATIENT_EVENT": "LFPSE field indicating or describing whether the recorded event is a patient event.",
+  "LFPSE_PATIENT_SAFETY_INCIDENT_HAS_OCCURRED": "LFPSE field indicating whether a patient safety incident has occurred, as opposed to a risk or other event type.",
+  "LFPSE_PEOPLE_ACTION_FACTORS": "LFPSE field recording the factors relating to people's actions that were involved in the event.",
+  "LFPSE_PEOPLE_ACTION_TOO_MUCH": "LFPSE field recording details where people involved in the event took too much of an action.",
+  "LFPSE_PEOPLE_INVOLVEMENT_FACTOR": "LFPSE field recording how people were involved as a factor in the event.",
+  "LFPSE_PRECISE_TIME": "LFPSE field recording the precise time at which the event occurred, stored as text.",
+  "LFPSE_PROBLEM_MEDICATION_PACKAGING": "LFPSE field recording problems with medication packaging involved in the event.",
+  "LFPSE_RADIOTHERAPY_INCIDENT_CODE": "LFPSE field recording the radiotherapy incident classification code for the event.",
+  "LFPSE_RECORD_LVL_ONE": "LFPSE level-one record field held on the Datix LFPSE record.",
+  "LFPSE_RECORD_LVL_TWO": "LFPSE level-two record field held on the Datix LFPSE record.",
+  "LFPSE_REFERENCE_NUMBER": "LFPSE reference number assigned to the reported event.",
+  "LFPSE_REPORTER_INVOLVEMENT": "LFPSE field recording how the reporter was involved in the event.",
+  "LFPSE_REPORTER_ORGANISATION": "Organisation of the person reporting the LFPSE event as captured in Datix.",
+  "LFPSE_REPORTER_ROLE": "Role of the person reporting the LFPSE event as captured in Datix.",
+  "LFPSE_REPORTER_TYPE": "Type of reporter submitting the LFPSE event record as captured in Datix.",
+  "LFPSE_RESPONSIBLE_SPECIALTY": "Clinical specialty responsible for the care associated with the LFPSE event.",
+  "LFPSE_RISK_IDENTIFIED_LOCATION": "Location where the patient safety risk was identified for an LFPSE risk record.",
+  "LFPSE_RISK_IMMINENT": "Indicator of whether the recorded patient safety risk is imminent.",
+  "LFPSE_RISK_POPULATION": "Population or patient group potentially affected by the recorded patient safety risk.",
+  "LFPSE_RISK_SERVICE_AREA": "Service area associated with the recorded patient safety risk.",
+  "LFPSE_RISK_THEME": "Theme or category assigned to the recorded patient safety risk.",
+  "LFPSE_RISK_TIMEFRAME": "Timeframe within which the recorded patient safety risk is expected to materialise.",
+  "LFPSE_SABRE_REPORT_NUMBER": "External SABRE report reference number linked to the LFPSE event.",
+  "LFPSE_SAFETY_CHALLENGES": "Safety challenges recorded as relevant to the LFPSE event.",
+  "LFPSE_SERIOUS_INCIDENT": "Indicator of whether the LFPSE event is classed as a serious incident.",
+  "LFPSE_SERVICE_AREA": "Service area in which the LFPSE event occurred as captured in Datix.",
+  "LFPSE_SHOT_REPORT_NUMBER": "External SHOT haemovigilance report reference number linked to the LFPSE event.",
+  "LFPSE_TISSUE_ORGANS_INVOLVEMENT_FACTOR": "Factor describing how tissues or organs were involved in the LFPSE event.",
+  "LFPSE_TISSUE_ORGANS_NOT_USED": "Details recorded where tissues or organs were not used when they should have been in the LFPSE event.",
+  "LFPSE_TISSUE_ORGANS_USED_TOO_MUCH": "Details recorded where too much tissue or organ material was used in the LFPSE event.",
+  "LFPSE_TOO_LITTLE_BLOOD_PRODUCTS": "LFPSE reporting field capturing information on too little of a blood product being used in the recorded event.",
+  "LFPSE_TOO_LITTLE_BLOOD_USED": "LFPSE reporting field capturing information on too little blood being used in the recorded event.",
+  "LFPSE_TOO_MUCH_BLOOD_PRODUCTS": "LFPSE reporting field capturing information on too much of a blood product being used in the recorded event.",
+  "LFPSE_TOO_MUCH_BLOOD_USED": "LFPSE reporting field capturing information on too much blood being used in the recorded event.",
+  "LFPSE_TYPE": "LFPSE event type recorded for the Datix record.",
+  "LFPSE_WRONG_BLOOD": "LFPSE reporting field capturing information on the wrong blood being involved in the recorded event.",
+  "LFPSE_WRONG_BLOOD_PRODUCTS": "LFPSE reporting field capturing information on the wrong blood product being involved in the recorded event.",
+  "LFPSE_WRONG_BUILDINGS_INFRASTRUCTURE": "LFPSE reporting field capturing information on wrong buildings or infrastructure involved in the recorded event.",
+  "LFPSE_WRONG_ESTATES_SERVICES": "LFPSE reporting field capturing information on wrong estates services involved in the recorded event.",
+  "LFPSE_YELLOW_CARD_REFERENCE": "External Yellow Card reference number associated with the LFPSE record.",
+  "MED_ID": "Identifier of the Datix medication record that this LFPSE row relates to, where applicable.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "RECORDID": "Record identifier for the row in the Datix lfpse_main table.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none."
+ },
+ "map_safety_incident_participant": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "CON_ADDRESS": "Address of the contact.",
+  "CON_CLINGROUP": "Clinical group code associated with the Datix contact's organisational placement.",
+  "CON_DIRECTORATE": "Directorate code associated with the Datix contact's organisational placement.",
+  "CON_DISABILITY": "Disability status or details recorded for the Datix contact.",
+  "CON_DOB": "Date of birth of the contact.",
+  "CON_DOD": "Date of death recorded for the Datix contact.",
+  "CON_EMAIL": "Email address recorded for the Datix contact.",
+  "CON_EMPL_GRADE": "Employment grade recorded for the Datix contact.",
+  "CON_ETHNICITY": "Ethnicity of the contact.",
+  "CON_FAX": "Fax number of the contact.",
+  "CON_FORENAMES": "Forename(s) of the contact.",
+  "CON_GENDER": "Gender of the contact.",
+  "CON_ID": "Identifier of the Datix contact record for the patient associated with this LFPSE submission.",
+  "CON_JOBTITLE": "Job title of the contact as free text.",
+  "CON_LANGUAGE": "Language recorded for the Datix contact.",
+  "CON_LOCACTUAL": "Actual location code or codes associated with the Datix contact.",
+  "CON_MRN": "Medical record number recorded for the Datix contact participating in the safety incident, sourced from the Datix contact number field.",
+  "CON_NHSNO": "NHS number recorded for the Datix contact.",
+  "CON_ORGCODE": "Organisation code associated with the Datix contact's organisational placement.",
+  "CON_POSTCODE": "Postcode of the contact's address.",
+  "CON_RELIGION": "Religion or belief recorded for the contact.",
+  "CON_SEX_ORIENTATION": "Sexual orientation recorded for the contact.",
+  "CON_SPECIALTY": "Specialty code associated with the Datix contact's organisational placement.",
+  "CON_SUBTYPE": "Code for the subtype of the Datix contact, refining the contact type.",
+  "CON_SURNAME": "Surname of the contact.",
+  "CON_TEL1": "Primary telephone number of the contact.",
+  "CON_TEL2": "Secondary telephone number of the contact.",
+  "CON_TITLE": "Title or honorific of the contact.",
+  "CON_TYPE": "Code indicating the type of contact, such as patient or staff category.",
+  "CON_UNIT": "Unit code associated with the Datix contact's organisational placement.",
+  "DOB_AGREES_IND": "Indicator of whether the date of birth recorded on the Datix contact agrees with the birth date of the resolved person record.",
+  "INC_ID": "Identifier of the Datix incident record associated with this LFPSE patient detail record.",
+  "LFPSE_AGE_AT_TIME_OF_INCIDENTS_DAYS": "Patient's age at the time of the incident, expressed in days, as recorded for the LFPSE submission.",
+  "LFPSE_AGE_BRACKET": "Raw code for the patient's age bracket at the time of the incident, as recorded for the LFPSE submission.",
+  "LFPSE_GENDER": "Raw code for the patient's gender as recorded for the LFPSE submission.",
+  "LFPSE_ID": "Identifier of the Learn from Patient Safety Events (LFPSE) submission to which this patient detail record belongs.",
+  "LFPSE_PATIENT_ETHNICITY": "Raw code for the patient's ethnicity as recorded for the LFPSE submission.",
+  "LFPSE_PATIENT_RECORDID": "Record identifier of the linked patient details record in the Datix LFPSE patient details source, where one applies.",
+  "LFPSE_PATIENT_SEQUENCE": "Sequence number distinguishing individual patients within an LFPSE submission.",
+  "LFPSE_PHYSICAL_HARM": "Raw code for the level of physical harm to the patient recorded for the LFPSE submission.",
+  "LFPSE_PSYCHOLOGICAL_HARM": "Raw code for the level of psychological harm to the patient recorded for the LFPSE submission.",
+  "LFPSE_STRENGTH_OF_ASSOCIATION": "Raw code for the strength of association between the incident and the patient harm recorded for the LFPSE submission.",
+  "LINK_ABS_END": "End date of the contact's absence recorded against this link.",
+  "LINK_ABS_START": "Start date of the contact's absence recorded against this link.",
+  "LINK_AGE": "Age of the linked contact recorded against the link to the Datix record.",
+  "LINK_AGE_BAND": "Age band of the linked contact recorded against this link.",
+  "LINK_ATTEMPTED_ASSAULT": "Indicator of whether the incident involving the linked contact involved an attempted assault.",
+  "LINK_BECOME_UNCONSCIOUS": "Indicator of whether the linked contact became unconscious as a result of the incident.",
+  "LINK_BODYPART1": "Primary body part injured for the linked contact in relation to the linked Datix record.",
+  "LINK_CLIN_FACTORS": "Clinical factors recorded for the linked contact in relation to the incident.",
+  "LINK_DATE_ADMISSION": "Date of admission recorded for the linked contact on the Datix record.",
+  "LINK_DAYSAWAY": "Number of days the linked contact was away from work as a result of the event.",
+  "LINK_DECEASED": "Indicator of whether the linked contact is deceased.",
+  "LINK_DIRECT_INDIRECT": "Indicator of whether the linked contact was directly or indirectly involved in, or affected by, the incident.",
+  "LINK_DISCOMFORT_CAUSED": "Indicator of whether discomfort was caused to the linked contact in the incident.",
+  "LINK_DOD": "Date of death of the linked contact as recorded for this link.",
+  "LINK_HARASSMENT": "Indicator of whether the incident involving the linked contact involved harassment.",
+  "LINK_HOSPITAL_24HOURS": "Indicator of whether the linked contact was admitted to hospital for more than 24 hours following the incident.",
+  "LINK_INJURIES": "Injury details recorded for the linked contact in relation to the linked Datix record.",
+  "LINK_INJURY1": "Primary injury recorded for the linked contact in relation to the linked Datix record.",
+  "LINK_INJURY_CAUSED": "Indicator of whether injury was caused to the linked contact in the incident.",
+  "LINK_IS_RIDDOR": "Indicator of whether the event is reportable under RIDDOR for the linked contact.",
+  "LINK_MHACT": "Indicator of whether the linked contact was detained under the Mental Health Act.",
+  "LINK_MHACT_SECTION": "Mental Health Act section applicable to the linked contact.",
+  "LINK_MHCPA": "Mental health Care Programme Approach status recorded for the linked contact.",
+  "LINK_MH_OBSERVE": "Mental health observation level recorded for the linked contact.",
+  "LINK_NPSA": "NPSA-related classification recorded for the linked contact on the Datix record.",
+  "LINK_NPSA_ROLE": "NPSA-related role of the linked contact in the Datix record.",
+  "LINK_PATRELATION": "Relationship of the linked contact to the patient involved in the Datix record.",
+  "LINK_PRIMARY": "Flag for whether this contact link is the primary link for the contact on the associated Datix record.",
+  "LINK_RECORDID": "Datix identifier for the contact link record within the link_contacts table.",
+  "LINK_REQ_RESUSCITATION": "Indicator of whether the linked contact required resuscitation as a result of the incident.",
+  "LINK_RIDDOR": "RIDDOR reporting detail recorded for the contact on the linked Datix record.",
+  "LINK_ROLE": "Code indicating the role the contact plays in relation to the linked Datix record.",
+  "LINK_ROLE_DISPLAY": "Descriptive label for the Datix link role code.",
+  "LINK_STATUS": "Status of the contact in relation to the linked Datix record.",
+  "LINK_TREATMENT": "Treatment received by the linked contact in connection with the Datix record.",
+  "LINK_TYPE": "Code indicating the type of link between the contact and the Datix record.",
+  "LINK_VERBAL_ABUSE": "Indicator of whether the incident involving the linked contact involved verbal abuse.",
+  "LINK_WORKED_ALONE": "Indicator of whether the linked contact was working alone at the time of the incident.",
+  "LOGIN": "Datix user account login name for the contact.",
+  "PARTICIPANT_CLASS": "Classification of the incident participant derived from the Datix contact type and contact link role.",
+  "PARTICIPANT_SOURCE": "Indicates the source from which the safety incident participant record was derived, carried from the bronze safety incident participant mapping.",
+  "PERSON_ID": "This is the value of the unique primary identifier of the person table.  It is an internal system assigned number.",
+  "PERSON_RESOLUTION_RULE": "Rule used to resolve the incident participant to a person record through the patient identifier mapping.",
+  "PERSON_RESOLUTION_STATUS": "Outcome status of the attempt to resolve the incident participant to a person record.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none.",
+  "TOTAL_ABSENCE": "Total absence recorded for the linked contact, likely related to the absence start and end dates; units are not documented."
+ },
+ "map_safety_incident_status": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "INC_ID": "Identifier of the clinical safety incident to which this status audit record relates, sourced from the Datix incident record ID.",
+  "LOGIN": "Login of the user who recorded or changed the incident status in Datix.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "STATUS": "Status value assigned to the safety incident at this point in its audit history.",
+  "STATUS_DT_TM": "Date and time at which the incident status was recorded.",
+  "STATUS_ROW_ID": "Derived identifier for an individual incident status audit row, built from the status date and user login.",
+  "STATUS_SEQUENCE": "Order of this status change within the incident's status history, derived from the status date and login."
+ },
+ "map_safety_text_fragment": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "AFFECTED_PATIENT_COUNT": "Number of patients affected by the associated safety incident.",
+  "ANON_INPUT_DIGEST": "SHA-256 digest of the fragment text as presented to the redactor; a changed digest marks the row for re-anonymisation.",
+  "CONTEXT_FINGERPRINT_CURRENT": "SHA-256 of the incident's current identifying context (names, birth date, postcode, reporter, investigator and participants); anonymised narrative text is released only while its anon_context_fingerprint matches this value.",
+  "FIELD_NAME": "Name of the source field from which the safety text fragment was taken.",
+  "FRAGMENT_ID": "Identifier of the safety text fragment, carried from the bronze safety text fragment mapping and derived from Datix action or incident record identifiers.",
+  "FRAGMENT_ROLE": "Role or category of the safety text fragment within the incident documentation.",
+  "INCIDENT_DT_TM": "Date and time at which the patient safety incident occurred, carried through from the source incident record via the bronze incident mappings.",
+  "INCIDENT_PERSON_ID": "Internal person identifier for the patient associated with the safety incident.",
+  "INC_ID": "Identifier of the Datix incident record that this LFPSE row relates to.",
+  "INC_OURREF": "Local incident reference number assigned by the organisation in Datix.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "PRIORITY_BASIS": "Basis or rationale used to assign priority to the safety text document.",
+  "PRIORITY_DT_TM": "Timestamp used to prioritise or order the safety text fragment, taken from the fragment mapping and derived from Datix action update date fields.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_OBJECT_TABLE": "Name of the source table from which the safety text fragment originated.",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_RECORD_ID": "Record identifier of the originating Datix source record, either an action or an incident, from which the text fragment was taken.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from.",
+  "SOURCE_UPDT_DT_TM": "Last-update time of the row in the source system (for Datix, updateddate); NULL when the source supplies none.",
+  "TEXT": "Free-text content of the safety fragment, drawn from Datix action description and action monitoring narrative fields.",
+  "TEXT_LENGTH": "Character length of TEXT, the source narrative fragment before anonymisation.",
+  "TEXT_SHA256": "SHA-256 of TEXT, the source narrative fragment before anonymisation.",
+  "anon_context_fingerprint": "Hash of the contextual inputs the redactor used for this row; the anonymised text is released only while it matches the current context.",
+  "anon_identity_fingerprint": "Hash of the patient identity details the record-driven redactor used for this row.",
+  "anon_processed_at": "When the redactor last processed this row's text.",
+  "anon_redaction_count": "Number of redactions the redactor applied to the source text.",
+  "anon_redactor_version": "Version of the redactor that produced the anonymised text.",
+  "anon_source_text_sha": "SHA-256 digest of the text the redactor processed; when it no longer matches the current input digest the anonymised text is stale.",
+  "anon_status": "Outcome of the anonymisation run for this row's free text (anonymized when it succeeded).",
+  "anon_text": "Anonymised version of text: identifiers detected in the free text are replaced by placeholders; published alongside the source column, which gold releases only when anonymisation succeeded."
+ }
+}
+INSR_W8_BRONZE_TABLE_COMMENTS = {
+ "map_safety_incident": "One row per Datix patient-safety incident (incident reports, not incidence rates or proven causality), keyed by Datix RECORDID. Curated bronze input to silver clinical_safety_incident; source-faithful columns, decodes in silver.",
+ "map_safety_incident_action": "One row per action recorded against a Datix incident, keyed by RECORDID. Curated bronze input to silver clinical_safety_incident_action; source-faithful columns, decodes in silver.",
+ "map_safety_incident_factor": "One row per contributory factor (medication, device or process) recorded on a Datix incident. Curated bronze input to silver clinical_safety_incident_factor; source-faithful columns, decodes in silver.",
+ "map_safety_incident_injury": "One row per recorded injury on a Datix incident, keyed by RECORDID. Curated bronze input to silver clinical_safety_incident_injury; source-faithful columns, decodes in silver.",
+ "map_safety_incident_lfpse": "One row per LFPSE (Learn from Patient Safety Events) submission linked to a Datix incident, keyed by RECORDID. Curated bronze input to silver clinical_safety_incident_lfpse; source-faithful columns, decodes in silver.",
+ "map_safety_incident_participant": "One row per person linked to a Datix incident (patient, staff or other), keyed by the Datix link record id. Curated bronze input to silver clinical_safety_incident_participant; source-faithful columns, decodes in silver.",
+ "map_safety_incident_status": "One row per status change of a Datix incident. Curated bronze input to silver clinical_safety_incident_status; source-faithful columns, decodes in silver.",
+ "map_safety_text_fragment": "One row per Datix incident narrative fragment (description, action, outcome and similar free text), with the released anonymised text. Curated bronze input to silver text_safety_document; source-faithful columns, decodes in silver."
+}
+
+
+def _insr_w8_sql(text):
+    """Escape a comment for a single-quoted SQL literal."""
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _insr_w8_comment(table, column):
+    """Dictionary comment for one bronze column; KeyError for a column the dictionary does not know."""
+    return INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]][column]
+
+
+def _insr_w8_assert_covered(table, columns):
+    """Refuse to publish a table with a column the comment dictionary does not cover (checked before any write)."""
+    known = INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]]
+    missing = [c for c in columns if c not in known]
+    if missing:
+        raise KeyError(f"INSR_W8_COMMENTS_V1: {table} columns missing from the comment dictionary: {missing}")
+
+
 def governance(table):
-    spark.sql(f"COMMENT ON TABLE {qname(table)} IS 'TDX Datix curated bronze product. Reported incidents and associations are not incidence rates or proven causality.'")
-    ids=("PERSON","ENCNTR","NHS","MRN","NAME","DOB","DOD","POSTCODE","ADDRESS","TEL","PHONE","FAX","EMAIL","LOGIN","INITIAL","SERIAL","BATCH_NUMBER")  # PMS_DATIX_DEVICE_V1: batch/lot is a device identifier
-    texts=("TEXT","NOTES","DESCR","ACTION","OUTCOME","PROGRESS","SYNOPSIS","MONITOR","RESOURCE","PROBLEM")
+    spark.sql(f"COMMENT ON TABLE {qname(table)} IS '{_insr_w8_sql(INSR_W8_BRONZE_TABLE_COMMENTS[table.split('.')[-1]])}'")
+    # INSR_W1_TAG_HEURISTIC_RETIRED_V1: ig_risk/ig_severity come from Table Metadata Compliance (estate-copied), never from column names.
     for c in spark.table(table).columns:
-        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{c.replace('`','``')}` COMMENT 'TDX Datix bronze field {c}.'")
-        u=c.upper()
-        if any(x in u for x in ids): risk,severity="4","2"
-        elif any(x in u for x in texts) or u.startswith("ANON_"): risk,severity="3","2"
-        elif u in {"SECLEVEL","SECGROUP","SOURCE_SECURITY_LEVEL","SOURCE_SECURITY_GROUP"}: risk,severity="2","1"
-        else: risk,severity="1","1"
-        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{c.replace('`','``')}` SET TAGS ('ig_risk'='{risk}','ig_severity'='{severity}')")
+        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{c.replace('`','``')}` COMMENT '{_insr_w8_sql(_insr_w8_comment(table, c))}'")
 
 def publish(df,target,keys,snapshot=False):
+    _insr_w8_assert_covered(target, df.columns)  # INSR_W8_COMMENTS_V1: before any write
     if SAMPLE_MODE and REUSE_SAMPLE_TABLES and spark.catalog.tableExists(target) and target.split(".")[-1] not in FORCE_SAMPLE_TARGETS:
         return {"target":target,"operation":"REUSED_SAMPLE","rows":spark.table(target).count()}
     def validate(candidate):
@@ -615,7 +1097,11 @@ for table,id_col,inc_col,admit_sql,updt_col,fields in FRAGMENT_SOURCES:
 frags=reduce(lambda a,b:a.unionByName(b),parts)
 header=spark.table(INCIDENT).select(F.col("RECORDID").alias("INC_ID"),F.col("PERSON_ID").alias("INCIDENT_PERSON_ID"),"AFFECTED_PATIENT_COUNT","CONTEXT_FINGERPRINT_CURRENT","INC_OURREF","INCIDENT_DT_TM")
 frags=(frags.join(header,"INC_ID","left").withColumn("FRAGMENT_ID",F.sha2(F.concat_ws("|","SOURCE_OBJECT_TABLE","SOURCE_RECORD_ID","FIELD_NAME"),256)).withColumn("FRAGMENT_ROLE",F.col("FIELD_NAME"))
-    .withColumn("TEXT_SHA256",F.sha2("TEXT",256)).withColumn("TEXT_LENGTH",F.length("TEXT")).withColumn("ANON_INPUT_DIGEST",F.sha2(F.to_json(F.struct(F.coalesce(F.col("TEXT"),F.lit("")).alias("TEXT"))),256)).withColumn("PRIORITY_DT_TM",F.coalesce("SOURCE_UPDT_DT_TM","SOURCE_ADC_UPDT")))
+    .withColumn("TEXT_SHA256",F.sha2("TEXT",256)).withColumn("TEXT_LENGTH",F.length("TEXT")).withColumn("ANON_INPUT_DIGEST",F.sha2(F.to_json(F.struct(F.coalesce(F.col("TEXT"),F.lit("")).alias("TEXT"))),256)).withColumn("PRIORITY_DT_TM",F.coalesce("SOURCE_UPDT_DT_TM","SOURCE_ADC_UPDT"))
+    # INSR_W1_DATIX_PRIORITY_V1: the anonymisation queue drains newest PRIORITY_DT_TM first. About 13% of fragments
+    # have no source update time, so they queue by ADC load time instead; PRIORITY_BASIS says which. It does not
+    # enter ANON_INPUT_DIGEST, so no fragment is re-anonymised because of it.
+    .withColumn("PRIORITY_BASIS",F.when(F.col("SOURCE_UPDT_DT_TM").isNotNull(),F.lit("SOURCE_UPDT_DT_TM")).otherwise(F.lit("ADC_LOAD_FALLBACK"))))
 frags=with_anon_state(frags,["anon_text"]); frags=finalise(frags,["FRAGMENT_ID"],"Datix admitted narrative fragments","FRAGMENT_ID")
 fragment_result=publish(frags,FRAGMENT,["FRAGMENT_ID"],snapshot=True)
 

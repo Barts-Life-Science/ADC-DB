@@ -406,6 +406,53 @@ def bronze_merge_assignments(frame, table_name: str, source_alias: str = "s"):
     return projected, assignments
 
 
+# R1FIX_20261109: columns of a bronze table that another writer owns.
+# - anon_*: written by the anonymisation publisher (Anon_Bronze_Task).
+# - INSR R1 lane columns <LANE>_MAPPING / _MAP_KEY / _MAP_COMPONENTS_JSON: written by the R1 attach task.
+# A base builder never names these columns in its contract checks or MERGEs. Its full-rebuild overwrites carry the R1
+# columns through as typed NULLs (bronze_keep_r1_columns) so the table schema never narrows: a narrowed schema breaks
+# every change-feed reader whose window spans the rewrite (bronze run 178236917345566, 2026-11-08).
+_BRONZE_R1_SHARED = "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"
+
+
+def bronze_is_r1_lane_column(column_name) -> bool:
+    """True for an INSR R1 lane column. The names come from R1's lane registry (mapping_contract.is_r1_column),
+    never from a suffix guess, so an unrelated column that happens to end in _MAPPING is not affected."""
+    import sys
+    if _BRONZE_R1_SHARED not in sys.path:
+        sys.path.append(_BRONZE_R1_SHARED)
+    import mapping_contract
+    return mapping_contract.is_r1_column(str(column_name).upper())
+
+
+def bronze_is_owned_additive_column(column_name) -> bool:
+    """True for a column another writer owns: anon_* or an INSR R1 lane column."""
+    return str(column_name).lower().startswith("anon_") or bronze_is_r1_lane_column(column_name)
+
+
+def bronze_without_owned_columns(columns):
+    """The given StructFields or column names minus the owned additive columns, order kept. Contract guards compare
+    what is left with the builder's expected schema."""
+    return [c for c in columns if not bronze_is_owned_additive_column(getattr(c, "name", c))]
+
+
+def bronze_keep_r1_columns(frame, table_name: str):
+    """Use right before a full-rebuild overwrite (overwriteSchema) of an existing table: append every R1 lane column
+    the live table has but `frame` lacks, as a typed NULL. The overwrite then keeps the table's schema; the R1 attach
+    task re-fills the rebuilt rows from the change feed. A table without lane columns gets `frame` back unchanged."""
+    if not bronze_table_exists(table_name):
+        return frame
+    missing = [
+        field for field in bronze_active_spark().table(table_name).schema.fields
+        if bronze_is_r1_lane_column(field.name) and field.name not in frame.columns
+    ]
+    if not missing:
+        return frame
+    return frame.select(
+        "*", *[_bronze_F.lit(None).cast(field.dataType).alias(field.name) for field in missing]
+    )
+
+
 # BRONZE_REPAIR_272860676151023_R2
 _BRONZE_APPROVED_ADDITIVE_COLUMNS = {
     "map_text_events": {
@@ -446,6 +493,7 @@ def bronze_assert_primary_contract(table_name: str):
         (name, data_type)
         for name, data_type in additive
         if allowed.get(name) != data_type
+        and not bronze_is_r1_lane_column(name)  # R1FIX_20261109: owned by the R1 attach task
     ]
     if actual_base != expected or unapproved:
         raise RuntimeError(

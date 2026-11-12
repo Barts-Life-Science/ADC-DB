@@ -8,6 +8,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 # Schema the pms_pharma pipeline publishes to (4_prod.pms_pharma in prod, 8_dev.pms in dev).
 dbutils.widgets.text("schema", "4_prod.pms_pharma")
 S = dbutils.widgets.get("schema")
@@ -151,18 +152,61 @@ DERIVED = {
     # vitals and scores
     "vital_name": "body_weight (SNOMED 27113001) | body_height (50373000).",
     "score": "news2_total.",
+    # INSR_W6 W6.03: new columns (L986, L1012, L1079, L906)
+    "drug_code_system": "Code system of drug_code (the OMOP target system, http://snomed.info/sct, https://dmd.nhs.uk "
+                        "or the source system), so codes from different vocabularies are never compared as one.",
+    "ethnicity_code_system": "Code system of ethnicity_code: the OMOP target system, else the source system.",
+    "test_display_source": "Which display test_display came from: target (OMOP target display) or source.",
+    "future_start_ind": "True when the order starts after this build ran (a planned order, not yet an exposure).",
+    "end_datetime_basis": "Which field gave end_datetime: discontinued | projected_stop | event_end; NULL when none.",
+    "end_datetime_projected_ind": "True when end_datetime is a projected stop rather than a recorded discontinuation.",
+    "measurement_basis": "measured (SNOMED 27113001 / 50373000) | estimated (OMOP 3026600 Weight Estimated / 3035463 "
+                         "Height/Length Estimated).",
 }
+# INSR_W6 W6.03: coverage notes measured in INSR_20261029 W0 (values are 2026-10-29 estate figures).
+DERIVED["exposure_source"] += (" Coverage differs by feed: administrations exist from 2021-08 (eMAR go-live, raw and "
+                               "gold agree), and order-detail eras step in 2017-06, 2019-05 and 2021-09, so per-feed "
+                               "counts are not comparable across those dates (L808).")
+DERIVED["dose_value"] += (" NULL share among eligible records: administrations 0%; dispenses 100% (dispenses carry "
+                          "quantity, not dose); orders 66% from 2022 and 90-98% before (free-text dose orders with no "
+                          "structured dose, nothing recoverable from order attributes) (L835).")
+DERIVED["vital_name"] = ("body_weight | body_height. Measured rows use SNOMED 27113001 / 50373000, estimated rows OMOP "
+                         "3026600 / 3035463 (see measurement_basis); a charting change from 2024-04 roughly doubled "
+                         "measured weight rows while estimated ones fell, so use both bases for trends (L906).")
+DERIVED["gp_registration_start"] = ("Start of the current GP registration. 1948-07-04 23:00 UTC (the NHS founding day) "
+                                    "is a placeholder that gold sets to NULL; 2014-05-08 and 2017-09-01 heaps are system "
+                                    "cut-over effective dates, not registration starts (L1060).")
+DERIVED["encounter_class"] += (" Admission source is filled on about 9.6% of encounters in raw and gold alike (source "
+                               "capture); period_end and length of stay are NULL while the encounter is open (L1079).")
 TABLE_DERIVED = {
     ("pms_concomitant_medication", "status"): "Order status as recorded.",
     ("pms_adr_signal", "drug_display"): "Drug as recorded on the signal (LFPSE: free-text drugs-involved list).",
     ("pms_adr_signal", "drug_code"): "Drug code of the signal where coded (SNOMED/dm+d); NULL for LFPSE.",
     ("pms_death", "days_from_index"): "Days from the drug-set index date to death_date.",
+    # INSR_W8_COMMENTS_V1 W8.09: documented limitations (INSR_20261029 coverage register; W0 ledger figures).
+    ("pms_lab", "uln_source"): "result | modal | none. Own ranges exist only on Cerner-linked results; the legacy LIMS feed carries no reference range, so most ULNs are the modal value (Hy's law screen relies on it).",
+    ("pms_lab", "uln"): "Upper limit of normal used: the result's own reference_range_high (Cerner-linked results only), else the modal one for analyte x unit; NULL when neither exists.",
+    ("pms_comorbidity", "condition_datetime"): "Condition onset, else recorded time. Condition history starts in about 2005; earlier years are sparse at source.",
+    ("pms_comorbidity", "clinical_status_display"): "Clinical status as recorded; ICD-10 coded diagnoses carry no status at source, so it is set only on problem-list records (SNOMED and Cerner nomenclatures).",
+    ("pms_comorbidity", "verification_status_display"): "Verification status as recorded; ICD-10 coded diagnoses carry none at source, so it is set only on problem-list records (SNOMED and Cerner nomenclatures).",
+    ("pms_adr_signal", "signal_source"): "order_discontinuation (from 2021-11) | allergy_record (from 2014-11) | datix_medication_factor (from 2014-03) | lfpse_drug_reaction (from 2023-10). Adverse reactions are under-reported in every source.",
+    ("pms_exposure", "dose_value"): "Per-dose amount (see dose_basis). Complete on administrations; on orders and dispenses it depends on the source record and may be NULL.",
+    ("pms_exposure", "route"): "Route of administration as recorded; complete on administrations, sparser on orders and dispenses.",
 }
 
 # COMMAND ----------
 
-# ig tags. Keys and record identifiers are 4/2; every date/timestamp column, the area and practice codes, year of
-# birth and free text (which can embed identifiers) are 3/2; everything else 1/1.
+# INSR_W6 W6.02 (J1, 2026-10-29): estate tags from the one shared helper (W7.02). shared_path points at the
+# folder holding estate_tags.py (prod: Prod/Pipelines/_shared; dev: the CC staging copy).
+import sys
+dbutils.widgets.text("shared_path", "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+sys.path.insert(0, dbutils.widgets.get("shared_path"))
+from estate_tags import estate_tags  # noqa: E402
+
+ESTATE_TAGS = estate_tags(spark)  # column_name -> (ig_risk, ig_severity) as integers (W7.02 contract); see tag()
+
+# ig tags for columns gold does not have (the pre-J1 classes): keys and record identifiers 4/2; every date/timestamp
+# column, the area and practice codes, year of birth and free text (which can embed identifiers) 3/2; the rest 1/1.
 TAG_4_2 = {"person_id", "encounter_id", "order_id", "patient_event_key", "exposure_record_key", "signal_record_key",
            "peak_alt_result_key", "peak_bilirubin_result_key", "max_alp_result_key", "episode_key"}
 TAG_3_2 = {"lsoa", "gp_practice_ods_code", "year_of_birth", "dose_text", "reaction_text", "indication",
@@ -170,13 +214,21 @@ TAG_3_2 = {"lsoa", "gp_practice_ods_code", "year_of_birth", "dose_text", "reacti
            "condition_source_display"}
 
 
-def tag(column, data_type):
-    """ig_risk / ig_severity for one column."""
+def own_class(column, data_type):
+    """The pre-J1 ig class of a column with no gold counterpart."""
     if column in TAG_4_2:
-        return 4, 2
+        return "4", "2"
     if column in TAG_3_2 or data_type in ("DATE", "TIMESTAMP", "TIMESTAMP_NTZ"):
-        return 3, 2
-    return 1, 1
+        return "3", "2"
+    return "1", "1"
+
+
+def tag(column, data_type):
+    """ig_risk / ig_severity for one column: the estate's gold tag when gold has the column name, else own_class.
+    Always strings: estate_tags returns integers, UC tag values (and the before -> after diff) are strings."""
+    if column in ESTATE_TAGS:
+        return tuple(str(v) for v in ESTATE_TAGS[column])
+    return own_class(column, data_type)
 
 
 def gold_comments(tables):
@@ -202,7 +254,18 @@ def sql_text(s):
 
 cat, sch = S.split(".")  # INCR_FIX_20261018: no published-table gate here (removed at Ben's direction)
 
-missing = []
+
+def current_tags():
+    """(table, column) -> (ig_risk, ig_severity) as tagged now, for the before -> after diff (INSR_W6 W6.02)."""
+    out = {}
+    for r in spark.sql(f"SELECT table_name, column_name, tag_name, tag_value FROM `{cat}`.information_schema.column_tags "
+                       f"WHERE schema_name = '{sch}' AND tag_name IN ('ig_risk', 'ig_severity')").collect():
+        out.setdefault((r.table_name, r.column_name), {})[r.tag_name] = r.tag_value
+    return {k: (v.get("ig_risk"), v.get("ig_severity")) for k, v in out.items()}
+
+
+before_tags = current_tags()
+missing, changed = [], []
 for t, sources in SOURCES.items():
     src = gold_comments(sources)
     cols = spark.sql(f"SELECT column_name, upper(data_type) data_type FROM `{cat}`.information_schema.columns "
@@ -214,8 +277,13 @@ for t, sources in SOURCES.items():
             continue
         spark.sql(f"COMMENT ON COLUMN {S}.`{t}`.`{c.column_name}` IS '{sql_text(text)}'")
         r, s = tag(c.column_name, c.data_type)
+        if before_tags.get((t, c.column_name)) != (r, s):
+            changed.append((t, c.column_name, before_tags.get((t, c.column_name)), (r, s)))
         spark.sql(f"ALTER MATERIALIZED VIEW {S}.`{t}` ALTER COLUMN `{c.column_name}` "
                   f"SET TAGS ('ig_risk' = '{r}', 'ig_severity' = '{s}')")
+print(f"tag changes ({len(changed)}):")
+for row in changed:
+    print("  ", row)
 assert not missing, f"columns without a comment: {missing}"
-dbutils.notebook.exit(f"governed {len(SOURCES)} tables in {S}")
+dbutils.notebook.exit(f"governed {len(SOURCES)} tables in {S}; {len(changed)} tag changes")
 

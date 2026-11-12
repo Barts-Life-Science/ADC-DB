@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Shared schema and small Spark helpers for the RBI resource-use dataset.
 
 Every stream builder ends with `to_stream`, so all streams union cleanly into the published
@@ -38,6 +39,8 @@ STREAM_COLUMNS = [
     ("candidate_count", "int"),
     ("nurse_unit_code", "string"),
     ("site_code", "string"),
+    ("site_basis", "string"),          # INSR_W6 W6.06
+    ("site_source_value", "string"),   # INSR_W6 W6.06
     ("service_code", "string"),
     ("clinic_code", "string"),
     ("theatre_code", "string"),

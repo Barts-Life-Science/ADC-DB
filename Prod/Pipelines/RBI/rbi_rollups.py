@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Published RBI tables (spec §3): the costed fact and its summaries.
 
 Every summary sums the fact, so totals agree with it by construction. The authoritative
@@ -16,7 +17,7 @@ COST_COLUMNS = [
 ]
 FACT_COLUMNS = STREAM_COLUMNS + COST_COLUMNS + [("spell_encounter_id", "bigint"), ("journey_keys", "array<string>")]
 DOMAINS = ("beds", "theatres", "outpatients_ed", "diagnostics_drugs", "costing")
-ACTUAL_BASES = ("actual_plics", "actual_ncc_allocated", "drug_expenditure_actual")
+ACTUAL_BASES = ("actual_plics", "actual_ncc_allocated", "drug_expenditure_actual", R.NCC_PLAN_B_BASIS)  # INSR_W6 W6.07
 
 
 def to_fact(df):
@@ -110,8 +111,13 @@ def _within_observation(fact):
     return fact.where(~F.coalesce(beyond, F.lit(False)))
 
 
-def spell_resource_summary(fact):
-    """One row per inpatient spell: resource quantities and £ by basis."""
+def spell_resource_summary(fact, encounters=None, window_start=None):
+    """One row per inpatient spell: resource quantities and £ by basis.
+
+    INSR_W6 W6.07 (L1614): with gold spine_encounter and the window start, two censoring flags say whether the spell
+    began before the window (its first rows are cut off) and whether it is still open. Without them the flags are NULL.
+    spell_first_event / spell_last_event are UTC instants: a 2019-03-31 23:xx UTC event is 2019-04-01 in London.
+    """
     s = fact.where(F.col("spell_encounter_id").isNotNull())
     out = s.groupBy("spell_encounter_id").agg(
         F.min("person_id").alias("person_id"),
@@ -134,7 +140,20 @@ def spell_resource_summary(fact):
         exact_sum(F.when(F.col("cost_basis") == "modelled_bottom_up", F.col("cost_total"))).alias("cost_modelled"),
         exact_sum(F.when(F.col("stream") == "plics_unallocated", _all_cost())).alias("cost_unallocated"),
     )
-    return out.withColumn("financial_year", financial_year(F.to_date(london(F.col("spell_first_event")))))
+    out = out.withColumn("financial_year", financial_year(F.to_date(london(F.col("spell_first_event")))))
+    if encounters is None:
+        return out.withColumns({"spell_admitted_before_window_ind": F.lit(None).cast("boolean"),
+                                "spell_open_ind": F.lit(None).cast("boolean")})
+    # _enc_found tells "no gold encounter" (flags unknown: NULL) apart from "encounter with no discharge" (open).
+    enc = encounters.select(F.col("encounter_id").cast("bigint").alias("spell_encounter_id"),
+                            F.col("period_start").alias("_enc_start"), F.col("discharge_datetime").alias("_enc_discharge"),
+                            F.lit(True).alias("_enc_found"))
+    return (out.join(enc, "spell_encounter_id", "left")
+               .withColumns({
+                   "spell_admitted_before_window_ind": F.to_date(london(F.col("_enc_start"))) < F.to_date(F.lit(window_start)),
+                   "spell_open_ind": F.when(F.col("_enc_found"), F.col("_enc_discharge").isNull()),
+               })
+               .drop("_enc_start", "_enc_discharge", "_enc_found"))
 
 
 def _domain_costs():
@@ -142,9 +161,30 @@ def _domain_costs():
     return [exact_sum(F.when(F.col("domain") == d, _all_cost())).alias(f"cost_{d}") for d in DOMAINS]
 
 
-def journey_resource_summary(fact):
-    """One row per spine journey: cross-setting resource use and £ (spec §3)."""
+def journey_resource_summary(fact, journeys=None, window_start=None):
+    """One row per spine journey: cross-setting resource use and £ (spec §3).
+
+    INSR_W6 W6.07 (L1614): with gold spine_journey and the window start, journey_starts_before_window_ind and
+    journey_open_ind say whether first_event / last_event are cut off by the window or by an open journey.
+    """
     j = fact.where(F.col("journey_keys").isNotNull()).withColumn("journey_key", F.explode("journey_keys"))
+    out = _journey_totals(j)
+    if journeys is None:
+        return out.withColumns({"journey_starts_before_window_ind": F.lit(None).cast("boolean"),
+                                "journey_open_ind": F.lit(None).cast("boolean")})
+    # _j_found tells "no gold journey" (flags unknown: NULL) apart from "journey with no end" (open).
+    jr = journeys.select("journey_key", F.col("period_start").alias("_j_start"), F.col("period_end").alias("_j_end"),
+                         F.lit(True).alias("_j_found"))
+    return (out.join(jr, "journey_key", "left")
+               .withColumns({
+                   "journey_starts_before_window_ind": F.to_date(london(F.col("_j_start"))) < F.to_date(F.lit(window_start)),
+                   "journey_open_ind": F.when(F.col("_j_found"), F.col("_j_end").isNull()),
+               })
+               .drop("_j_start", "_j_end", "_j_found"))
+
+
+def _journey_totals(j):
+    """The per-journey aggregates of journey_resource_summary (exploded fact rows in)."""
     return j.groupBy("journey_key").agg(
         F.min("person_id").alias("person_id"),
         F.min(_observed_instant("event_start")).alias("first_event"),  # RBI_REL_20261025
@@ -223,6 +263,10 @@ def costed_activity_unit(hrg, fin_map, fact, window_start):
                 F.min("treatment_function_cd").alias("treatment_function_cd"),
                 F.min("admission_datetime").alias("activity_start"), F.max("discharge_datetime").alias("activity_end"),
                 F.count(F.lit(1)).alias("episode_count"))
+           # INSR_W6 W6.07 (L1690, ruling 11): APC spells are bounded to the window by their end (start when there is no
+           # end), like every stream; spells with neither date stay (they cannot be out of bounds).
+           .where(F.coalesce(F.col("activity_end"), F.col("activity_start")).isNull()
+                  | (F.coalesce(F.col("activity_end"), F.col("activity_start")) >= F.to_timestamp(F.lit(window_start))))
            .join(enc_cost, "encounter_id", "left")
            .withColumns({"setting": F.lit("admitted"),
                          "link_method": F.when(F.col("encounter_id").isNotNull(), F.lit("fin_spell")).otherwise(F.lit("none")),
@@ -258,6 +302,38 @@ def costed_activity_unit(hrg, fin_map, fact, window_start):
     cols = ["activity_unit_key", "setting", "person_id", "encounter_id", "appointment_key", "link_method", "hrg_cd", "hrg_desc",
             "treatment_function_cd", "activity_start", "activity_end", "episode_count", "cost_total", "cost_actual", "cost_modelled"]
     return apc.select(*cols).unionByName(op.select(*cols))
+
+
+def rbi_coverage(links, activities, fact):
+    """What RBI can see, by financial year (INSR_W6 W6.07; L1542, L1566, J23). Long format, one row per
+    financial_year x measure x dimension:
+    - plics_link_rate (dimension = feed_type): PLICS/SLAM activities with a score-1 link / all activities;
+    - plics_episode_end_defaulted (dimension = feed_type): activities whose episode end is the FY-end default (J23)
+      / all activities; NULL numerator until gold carries episode_end_defaulted_ind (W2.06);
+    - actual_cost_share (dimension = stream): £ with an actual basis / all £ in the fact.
+    Counts and £ are summed as DECIMAL (exact_sum) and returned as DOUBLE.
+    """
+    keys = ["extract_cd", "activity_record_id"]
+    defaulted = (F.col("episode_end_defaulted_ind") if "episode_end_defaulted_ind" in activities.columns
+                 else F.lit(None).cast("boolean"))
+    a = activities.select(*keys, financial_year(F.to_date(london(F.col("event_datetime")))).alias("financial_year"),
+                          defaulted.alias("_defaulted"))
+    la = links.select(*keys, "feed_type", "link_score").join(a, keys, "left")
+    link = (la.groupBy("financial_year", F.col("feed_type").alias("dimension"))
+            .agg(exact_sum(F.when(F.col("link_score") == 1.0, F.lit(1.0)).otherwise(F.lit(0.0))).alias("numerator"),
+                 exact_sum(F.lit(1.0)).alias("denominator"),
+                 exact_sum(F.when(F.col("_defaulted"), F.lit(1.0)).when(F.col("_defaulted").isNotNull(), F.lit(0.0)))
+                 .alias("_defaulted_n")))
+    link_rate = link.select("financial_year", F.lit("plics_link_rate").alias("measure"), "dimension", "numerator",
+                            "denominator")
+    defaulted_rate = link.select("financial_year", F.lit("plics_episode_end_defaulted").alias("measure"), "dimension",
+                                 F.col("_defaulted_n").alias("numerator"), "denominator")
+    money = (fact.groupBy("financial_year", F.col("stream").alias("dimension"))
+             .agg(exact_sum(F.when(F.col("cost_basis").isin(*ACTUAL_BASES), _all_cost())).alias("numerator"),
+                  exact_sum(_all_cost()).alias("denominator"))
+             .select("financial_year", F.lit("actual_cost_share").alias("measure"), "dimension", "numerator", "denominator"))
+    out = link_rate.unionByName(defaulted_rate).unionByName(money)
+    return out.withColumn("rate", F.when(F.col("denominator") > 0, F.col("numerator") / F.col("denominator")))
 
 
 def attribution_summary(fact):

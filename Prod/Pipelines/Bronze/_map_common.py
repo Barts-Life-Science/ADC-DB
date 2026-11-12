@@ -5463,8 +5463,9 @@ def _pipeline_assert_contract(
     # The anonymisation publisher owns additive anon_* columns. Base producers must
     # neither reject nor overwrite them, while every non-anon contract difference
     # remains a hard failure.
-    actual_base = tuple(field for field in actual if not field[0].lower().startswith("anon_"))
-    additive = tuple(field for field in actual if field[0].lower().startswith("anon_"))
+    # R1FIX_20261109: the INSR R1 lane columns are owned by the R1 attach task in the same way.
+    actual_base = tuple(field for field in actual if not bronze_is_owned_additive_column(field[0]))
+    additive = tuple(field for field in actual if bronze_is_owned_additive_column(field[0]))
     if actual_base == expected and additive:
         return
 
@@ -7622,4 +7623,3 @@ def finalize_map_pipeline_run():
     )
     print(result_json)
     return result_json
-

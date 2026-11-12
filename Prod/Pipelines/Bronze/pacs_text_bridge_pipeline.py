@@ -326,6 +326,9 @@ ADMIN_STAMPS = {
     "BLOB_ADC_UPDT",
     "REPORT_SRC_ADC_UPDT",
     "PIPELINE_UPDT_DT_TM",
+    # INSR_W1_BRIDGE_ANON_STATE_V1 (fix 2026-11-04): the reattached anon engine processing time is an admin stamp,
+    # not a clinical date, so dq_triplet_gate must not demand _CLEAN/_FUTURE_IND/_SENTINEL_IND companions for it.
+    "anon_processed_at",
 }
 
 BRIDGE_COLUMNS = [
@@ -1075,6 +1078,41 @@ accounting = collect_accounting(report_stats)
 print("[B12][ACCOUNTING]", json.dumps(accounting, default=str, sort_keys=True))
 
 replace_with_tombstones(build_candidate(state_start), TARGET, ["REPORT_ID"])
+
+# INSR_W1_BRIDGE_ANON_STATE_V1: reattach anonymisation state after the overwrite, exactly as pacs_pipeline does for
+# map_pacs_report (ANON_TEXT_STATE_REATTACH_V3_2). Anon_Bronze_Task snapshots the state to <control>.state_pacs_report_bridge
+# after every anon_pacs_report_bridge run. A row whose text changed keeps its old anon_source_text_sha, so the engine
+# sees the drift and re-anonymises it; unchanged rows are not paid for twice.
+BRIDGE_ANON_STATE_TABLE = ("6_mgmt.anon" if TARGET_SCHEMA == "4_prod.bronze" else "8_dev.anon") + ".state_pacs_report_bridge"
+BRIDGE_ANON_OUTPUTS = ["anon_bridged_text"]
+BRIDGE_ANON_STATE_TYPES = {"anon_status": "STRING", "anon_redactor_version": "STRING", "anon_source_text_sha": "STRING",
+                           "anon_identity_fingerprint": "STRING", "anon_context_fingerprint": "STRING",
+                           "anon_redaction_count": "BIGINT", "anon_processed_at": "TIMESTAMP"}
+
+
+def reattach_bridge_anon_state():
+    """Add the anon columns back to the rebuilt bridge and MERGE the saved state onto it by REPORT_ID; verify 1:1."""
+    present = {field.name for field in spark.table(TARGET).schema.fields}
+    for name, kind in [(o, "STRING") for o in BRIDGE_ANON_OUTPUTS] + list(BRIDGE_ANON_STATE_TYPES.items()):
+        if name not in present:
+            spark.sql(f"ALTER TABLE {qname(TARGET)} ADD COLUMNS (`{name}` {kind})")
+    if not spark.catalog.tableExists(BRIDGE_ANON_STATE_TABLE):
+        print(f"[B12][ANON_STATE] {BRIDGE_ANON_STATE_TABLE} absent; nothing to reattach")
+        return {"matched": 0}
+    columns = BRIDGE_ANON_OUTPUTS + list(BRIDGE_ANON_STATE_TYPES)
+    expected = spark.table(TARGET).join(spark.table(BRIDGE_ANON_STATE_TABLE).select("REPORT_ID"), "REPORT_ID", "inner").count()
+    spark.sql(f"MERGE INTO {qname(TARGET)} t USING {qname(BRIDGE_ANON_STATE_TABLE)} s ON t.REPORT_ID <=> s.REPORT_ID "
+              "WHEN MATCHED THEN UPDATE SET " + ", ".join(f"t.`{c}` = s.`{c}`" for c in columns))
+    mismatch = F.lit(False)
+    for column in columns:
+        mismatch = mismatch | ~F.col(f"t.`{column}`").eqNullSafe(F.col(f"s.`{column}`"))
+    check = spark.table(TARGET).alias("t").join(spark.table(BRIDGE_ANON_STATE_TABLE).alias("s"), "REPORT_ID").agg(
+        F.count(F.lit(1)).alias("matched"), F.sum(F.when(mismatch, 1).otherwise(0)).alias("mismatches")).first()
+    assert int(check["matched"]) == int(expected) and int(check["mismatches"] or 0) == 0, check
+    return check.asDict()
+
+
+print("[B12][ANON_STATE]", json.dumps(reattach_bridge_anon_state(), default=str))
 
 apply_comments(accounting)
 ig_tag_table(TARGET, BRIDGE_IG)

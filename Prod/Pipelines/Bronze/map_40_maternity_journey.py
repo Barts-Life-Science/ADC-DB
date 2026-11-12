@@ -3226,7 +3226,7 @@ CLINICAL_CHANGE_CODES = IMPLANT_RELEVANT_CODES + [PROCEDURE_CONFIRM_CD, PROCEDUR
 GROUP_KEYS = ['ENCNTR_ID', 'PARENT_EVENT_ID', 'COLLATING_SEQ']
 MAPPING_COLUMNS = ['SNOMED_DEVICE_CONCEPT_ID', 'SNOMED_DEVICE_CONCEPT_NAME', 'DEVICE_TYPE', 'MAPPING_CONFIDENCE', 'GMDN_CODE', 'GMDN_NAME', 'MAPPING_LAYER', 'CONFIDENCE_TIER', 'MAPPING_SOURCE', 'MAPPING_CANDIDATE_COUNT', 'MAPPING_CONFLICT_IND', 'MAPPING_ROW_HASH']
 SOURCE_ATTRIBUTE_EVENT_SCHEMA = StructType([StructField('CLINICAL_EVENT_ID', LongType(), True), StructField('EVENT_ID', LongType(), True), StructField('EVENT_CD', LongType(), True), StructField('EVENT_TITLE_TEXT', StringType(), True), StructField('EVENT_TAG', StringType(), True), StructField('RESULT_VAL', StringType(), True), StructField('ATTRIBUTE_NAME', StringType(), True), StructField('ATTRIBUTE_VALUE', StringType(), True), StructField('VALUE_SOURCE', StringType(), True), StructField('VALUE_CONFLICT_IND', BooleanType(), True), StructField('ADC_UPDT', TimestampType(), True), StructField('VALID_FROM_DT_TM', TimestampType(), True), StructField('VALID_UNTIL_DT_TM', TimestampType(), True), StructField('RESULT_STATUS_CD', LongType(), True), StructField('RECORD_STATUS_CD', LongType(), True)])
-schema_map_implant_details_v2 = StructType([StructField('EVENT_ID', LongType(), False), StructField('ENCNTR_ID', LongType(), True), StructField('PERSON_ID', LongType(), True), StructField('PRIMARY_PROCEDURE', StringType(), True), StructField('PROCEDURE_CAT', LongType(), True), StructField('PERFORMED_PRSNL_ID', LongType(), True), StructField('CLINSIG_UPDT_DT_TM', TimestampType(), True), StructField('CATALOGUE_NUMBER', StringType(), True), StructField('COMPATIBILITY', StringType(), True), StructField('CONFIRM_MANUFACTURER', StringType(), True), StructField('CONFIRM_STERILITY', StringType(), True), StructField('EXPIRY_DATE', TimestampType(), True), StructField('IMPLANT_DESCRIPTION', StringType(), True), StructField('MANUFACTURER', StringType(), True), StructField('QUANTITY', StringType(), True), StructField('SCRUB_NURSE_CONFIRMS', StringType(), True), StructField('SCRUB_NURSE_READ', StringType(), True), StructField('SERIAL_NUMBER', StringType(), True), StructField('SIDE_OF_PROCEDURE', StringType(), True), StructField('SIZE', StringType(), True), StructField('STERILISATION_DATE', TimestampType(), True), StructField('SURGEON_CONFIRM', StringType(), True), StructField('GS1_IDENTIFIER', StringType(), True), StructField('GS1_PRODUCTION_DATE', TimestampType(), True), StructField('GS1_EXPIRY_DATE', TimestampType(), True), StructField('GS1_BATCH_NUMBER', StringType(), True), StructField('GS1_SERIAL_NUMBER', StringType(), True), StructField('HIBCC_DEVICE_ID', StringType(), True), StructField('HIBCC_PROD_ID', StringType(), True), StructField('ADC_UPDT', TimestampType(), True), StructField('SNOMED_DEVICE_CONCEPT_ID', LongType(), True), StructField('SNOMED_DEVICE_CONCEPT_NAME', StringType(), True), StructField('DEVICE_TYPE', StringType(), True), StructField('MAPPING_CONFIDENCE', DoubleType(), True), StructField('BASE_CLINICAL_EVENT_ID', LongType(), True), StructField('PARENT_EVENT_ID', LongType(), True), StructField('COLLATING_SEQ', StringType(), True), StructField('IMPLANT_SEQUENCE', IntegerType(), True), StructField('IMPLANT_FORM_EVENT_ID', LongType(), True), StructField('EVENT_START_DT_TM', TimestampType(), True), StructField('EVENT_END_DT_TM', TimestampType(), True), StructField('IMPLANT_DT_TM', TimestampType(), True), StructField('VALID_FROM_DT_TM', TimestampType(), True), StructField('VALID_UNTIL_DT_TM', TimestampType(), True), StructField('RESULT_STATUS_CD', LongType(), True), StructField('RECORD_STATUS_CD', LongType(), True), StructField('BASE_EVENT_ADC_UPDT', TimestampType(), True), StructField('SOURCE_MAX_ADC_UPDT', TimestampType(), True), StructField('CONTRIBUTOR_SYSTEM_CD', LongType(), True), StructField('ORGANIZATION_ID', LongType(), True), StructField('UPDT_CNT', LongType(), True), StructField('BASE_CURRENT_VERSION_COUNT', IntegerType(), True), StructField('QUANTITY_RAW', StringType(), True), StructField('QUANTITY_NUMERIC', DecimalType(18, 4), True), StructField('QUANTITY_PARSE_STATUS', StringType(), True), StructField('EXPIRY_DATE_RAW', StringType(), True), StructField('STERILISATION_DATE_RAW', StringType(), True), StructField('GROUPING_METHOD', StringType(), True), StructField('GROUPING_AMBIGUOUS_IND', BooleanType(), True), StructField('GROUPING_CANDIDATE_COUNT', IntegerType(), True), StructField('VALUE_CONFLICT_COUNT', IntegerType(), True), StructField('SOURCE_ATTRIBUTE_EVENTS', ArrayType(SOURCE_ATTRIBUTE_EVENT_SCHEMA), True), StructField('PROCEDURE_EVENT_ID', LongType(), True), StructField('PROCEDURE_PARENT_EVENT_ID', LongType(), True), StructField('PROCEDURE_MATCH_METHOD', StringType(), True), StructField('GMDN_CODE', LongType(), True), StructField('GMDN_NAME', StringType(), True), StructField('MAPPING_LAYER', StringType(), True), StructField('CONFIDENCE_TIER', StringType(), True), StructField('MAPPING_SOURCE', StringType(), True), StructField('MAPPING_CANDIDATE_COUNT', IntegerType(), True), StructField('MAPPING_CONFLICT_IND', BooleanType(), True), StructField('UDI_DI', StringType(), True), StructField('UDI_STANDARD', StringType(), True), StructField('BEST_EXPIRY_DATE', TimestampType(), True), StructField('EXPIRY_DATE_SOURCE', StringType(), True), StructField('EXPIRY_DATE_CONFLICT_IND', BooleanType(), True), StructField('SOURCE_ROW_HASH', StringType(), True), StructField('MAPPING_ROW_HASH', StringType(), True)])
+schema_map_implant_details_v2 = StructType([StructField('EVENT_ID', LongType(), False), StructField('ENCNTR_ID', LongType(), True), StructField('PERSON_ID', LongType(), True), StructField('PRIMARY_PROCEDURE', StringType(), True), StructField('PROCEDURE_CAT', LongType(), True), StructField('PERFORMED_PRSNL_ID', LongType(), True), StructField('CLINSIG_UPDT_DT_TM', TimestampType(), True), StructField('CATALOGUE_NUMBER', StringType(), True), StructField('COMPATIBILITY', StringType(), True), StructField('CONFIRM_MANUFACTURER', StringType(), True), StructField('CONFIRM_STERILITY', StringType(), True), StructField('EXPIRY_DATE', TimestampType(), True), StructField('IMPLANT_DESCRIPTION', StringType(), True), StructField('MANUFACTURER', StringType(), True), StructField('QUANTITY', StringType(), True), StructField('SCRUB_NURSE_CONFIRMS', StringType(), True), StructField('SCRUB_NURSE_READ', StringType(), True), StructField('SERIAL_NUMBER', StringType(), True), StructField('SIDE_OF_PROCEDURE', StringType(), True), StructField('SIZE', StringType(), True), StructField('STERILISATION_DATE', TimestampType(), True), StructField('SURGEON_CONFIRM', StringType(), True), StructField('GS1_IDENTIFIER', StringType(), True), StructField('GS1_PRODUCTION_DATE', TimestampType(), True), StructField('GS1_EXPIRY_DATE', TimestampType(), True), StructField('GS1_BATCH_NUMBER', StringType(), True), StructField('GS1_SERIAL_NUMBER', StringType(), True), StructField('HIBCC_DEVICE_ID', StringType(), True), StructField('HIBCC_PROD_ID', StringType(), True), StructField('ADC_UPDT', TimestampType(), True), StructField('SNOMED_DEVICE_CONCEPT_ID', LongType(), True), StructField('SNOMED_DEVICE_CONCEPT_NAME', StringType(), True), StructField('DEVICE_TYPE', StringType(), True), StructField('MAPPING_CONFIDENCE', DoubleType(), True), StructField('BASE_CLINICAL_EVENT_ID', LongType(), True), StructField('PARENT_EVENT_ID', LongType(), True), StructField('COLLATING_SEQ', StringType(), True), StructField('IMPLANT_SEQUENCE', IntegerType(), True), StructField('IMPLANT_FORM_EVENT_ID', LongType(), True), StructField('EVENT_START_DT_TM', TimestampType(), True), StructField('EVENT_END_DT_TM', TimestampType(), True), StructField('IMPLANT_DT_TM', TimestampType(), True), StructField('VALID_FROM_DT_TM', TimestampType(), True), StructField('VALID_UNTIL_DT_TM', TimestampType(), True), StructField('RESULT_STATUS_CD', LongType(), True), StructField('RECORD_STATUS_CD', LongType(), True), StructField('BASE_EVENT_ADC_UPDT', TimestampType(), True), StructField('SOURCE_MAX_ADC_UPDT', TimestampType(), True), StructField('CONTRIBUTOR_SYSTEM_CD', LongType(), True), StructField('ORGANIZATION_ID', LongType(), True), StructField('UPDT_CNT', LongType(), True), StructField('BASE_CURRENT_VERSION_COUNT', IntegerType(), True), StructField('QUANTITY_RAW', StringType(), True), StructField('QUANTITY_NUMERIC', DecimalType(18, 4), True), StructField('QUANTITY_PARSE_STATUS', StringType(), True), StructField('QUANTITY_PARSE_RULE', StringType(), True), StructField('EXPIRY_DATE_RAW', StringType(), True), StructField('STERILISATION_DATE_RAW', StringType(), True), StructField('GROUPING_METHOD', StringType(), True), StructField('GROUPING_AMBIGUOUS_IND', BooleanType(), True), StructField('GROUPING_CANDIDATE_COUNT', IntegerType(), True), StructField('VALUE_CONFLICT_COUNT', IntegerType(), True), StructField('SOURCE_ATTRIBUTE_EVENTS', ArrayType(SOURCE_ATTRIBUTE_EVENT_SCHEMA), True), StructField('PROCEDURE_EVENT_ID', LongType(), True), StructField('PROCEDURE_PARENT_EVENT_ID', LongType(), True), StructField('PROCEDURE_MATCH_METHOD', StringType(), True), StructField('GMDN_CODE', LongType(), True), StructField('GMDN_NAME', StringType(), True), StructField('MAPPING_LAYER', StringType(), True), StructField('CONFIDENCE_TIER', StringType(), True), StructField('MAPPING_SOURCE', StringType(), True), StructField('MAPPING_CANDIDATE_COUNT', IntegerType(), True), StructField('MAPPING_CONFLICT_IND', BooleanType(), True), StructField('UDI_DI', StringType(), True), StructField('UDI_STANDARD', StringType(), True), StructField('BEST_EXPIRY_DATE', TimestampType(), True), StructField('EXPIRY_DATE_SOURCE', StringType(), True), StructField('EXPIRY_DATE_CONFLICT_IND', BooleanType(), True), StructField('SOURCE_ROW_HASH', StringType(), True), StructField('MAPPING_ROW_HASH', StringType(), True)])
 schema_map_implant_detail_events = StructType([StructField('CLINICAL_EVENT_ID', LongType(), False), StructField('EVENT_ID', LongType(), True), StructField('ENCNTR_ID', LongType(), True), StructField('PERSON_ID', LongType(), True), StructField('PARENT_EVENT_ID', LongType(), True), StructField('COLLATING_SEQ', StringType(), True), StructField('EVENT_CD', LongType(), True), StructField('EVENT_TITLE_TEXT', StringType(), True), StructField('EVENT_TAG', StringType(), True), StructField('RESULT_VAL', StringType(), True), StructField('CATALOG_CD', LongType(), True), StructField('ATTRIBUTE_NAME', StringType(), True), StructField('ATTRIBUTE_VALUE', StringType(), True), StructField('VALUE_SOURCE', StringType(), True), StructField('VALUE_CONFLICT_IND', BooleanType(), True), StructField('EVENT_START_DT_TM', TimestampType(), True), StructField('EVENT_END_DT_TM', TimestampType(), True), StructField('PERFORMED_DT_TM', TimestampType(), True), StructField('CLINSIG_UPDT_DT_TM', TimestampType(), True), StructField('PERFORMED_PRSNL_ID', LongType(), True), StructField('VALID_FROM_DT_TM', TimestampType(), True), StructField('VALID_UNTIL_DT_TM', TimestampType(), True), StructField('RESULT_STATUS_CD', LongType(), True), StructField('RECORD_STATUS_CD', LongType(), True), StructField('CONTRIBUTOR_SYSTEM_CD', LongType(), True), StructField('ORGANIZATION_ID', LongType(), True), StructField('UPDT_CNT', LongType(), True), StructField('ADC_UPDT', TimestampType(), True), StructField('TRUST', StringType(), True), StructField('CURRENT_VERSION_CANDIDATE_COUNT', IntegerType(), True), StructField('SOURCE_ROW_HASH', StringType(), True)])
 
 def _sql_name(table_name: str) -> str:
@@ -3382,31 +3382,80 @@ def _parse_encoded_date(column_name: str):
     digits = F.regexp_extract(F.col(column_name), '1:(\\d{8})', 1)
     return F.when(F.length(digits) == 8, F.try_to_timestamp(digits, F.lit("yyyyMMdd")))
 
+# INSR_W1_IMPLANT_QTY_V2: ordered implant quantity parse (L1307, F9). QUANTITY is free text: digits, number
+# words, multipliers ("x2", "2x"), a count with a unit noun ("2 screws") and scanned barcodes. A value above
+# IMPLANT_QTY_MAX_PLAUSIBLE is a barcode or catalogue number, never a count: it keeps its raw text and gets no
+# numeric value. Reference rules and tests: ~/work/insr_20261029/w1/patches/refs/implant_qty.py.
+IMPLANT_QTY_RULE_ID = 'IMPLANT_QTY_V2'
+IMPLANT_QTY_MAX_PLAUSIBLE = 100
+IMPLANT_QTY_NUMBER_WORDS = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10}
+
+
+def _implant_qty_word_value(column):
+    """Integer value of an English number word one..ten, else NULL."""
+    pairs = [item for word, value in IMPLANT_QTY_NUMBER_WORDS.items() for item in (F.lit(word), F.lit(value))]
+    return F.element_at(F.create_map(*pairs), column)
+
+
 def _add_quantity_columns(df: DataFrame) -> DataFrame:
-    normalized_column = "_QUANTITY_NORMALIZED"
-    result = df.withColumn(
-        normalized_column,
-        F.regexp_replace(F.trim(F.col("QUANTITY_RAW")), ",", "."),
+    """
+    Add QUANTITY (raw copy), QUANTITY_NUMERIC, QUANTITY_PARSE_STATUS and QUANTITY_PARSE_RULE.
+
+    The text is trimmed, lower-cased, whitespace-collapsed and ',' is read as '.'. First matching rule wins:
+      1 plain number                                   -> PARSED
+      2 number word, or "1 (one)" where both agree     -> PARSED_WORD
+      3 "x2" or "2x"                                   -> PARSED_MULTIPLIER
+      4 two or more separate numbers ("2 x 3")         -> AMBIGUOUS, numeric NULL
+      5 one integer followed by words ("2 screws")     -> PARSED_LEADING_INTEGER
+      6 anything else                                  -> UNPARSED
+    Any parsed value above IMPLANT_QTY_MAX_PLAUSIBLE becomes IMPLAUSIBLE with a NULL numeric. So does a number too long
+    even for DECIMAL(38, 4): it is a barcode too. Plausibility is judged on DECIMAL(38, 4) and only the output is cast to
+    DECIMAL(18, 4), because a 15+ digit barcode does not fit DECIMAL(18, 4) and try_cast would hide it as NULL/PARSED.
+    """
+    # Named intermediate columns let the overflow-safe try_cast run as SQL; an ANSI cast would raise on serverless.
+    result = df.withColumn('_QTY_NORM', F.regexp_replace(F.trim(F.regexp_replace(F.lower(F.col('QUANTITY_RAW')), '\\s+', ' ')), ',', '.'))
+    result = result.withColumn('_QTY_PAREN_DIGITS', F.regexp_extract(F.col('_QTY_NORM'), '^([0-9]+) ?\\(([a-z]+)\\)$', 1))
+    norm = F.col('_QTY_NORM')
+    missing = F.col('QUANTITY_RAW').isNull() | (F.length(norm) == 0)
+    plain = F.when(norm.rlike('^[+-]?[0-9]+(\\.[0-9]+)?$'), norm)
+    paren_number = F.expr("try_cast(nullif(`_QTY_PAREN_DIGITS`, '') AS INT)")
+    paren_word = _implant_qty_word_value(F.regexp_extract(norm, '^([0-9]+) ?\\(([a-z]+)\\)$', 2))
+    word_value = F.coalesce(_implant_qty_word_value(norm), F.when(paren_word == paren_number, paren_word))
+    multiplier = F.coalesce(
+        F.when(norm.rlike('^x ?[0-9]+$'), F.regexp_extract(norm, '^x ?([0-9]+)$', 1)),
+        F.when(norm.rlike('^[0-9]+ ?x$'), F.regexp_extract(norm, '^([0-9]+) ?x$', 1)),
     )
-    parsed = F.when(
-        F.col(normalized_column).rlike(r"^[+-]?\d+(?:\.\d+)?$"),
-        F.expr(f"try_cast(`{normalized_column}` AS DECIMAL(18, 4))"),
+    compound = norm.rlike('[0-9]+[^0-9]+[0-9]+')
+    leading = F.when(norm.rlike('^[0-9]+ ?[a-z]+( [a-z]+)?$'), F.regexp_extract(norm, '^([0-9]+)', 1))
+    rule_status = (
+        F.when(missing, F.lit('MISSING'))
+        .when(plain.isNotNull(), F.lit('PARSED'))
+        .when(word_value.isNotNull(), F.lit('PARSED_WORD'))
+        .when(multiplier.isNotNull(), F.lit('PARSED_MULTIPLIER'))
+        .when(compound, F.lit('AMBIGUOUS'))
+        .when(leading.isNotNull(), F.lit('PARSED_LEADING_INTEGER'))
+        .otherwise(F.lit('UNPARSED'))
     )
+    value_text = (
+        F.when(rule_status == 'PARSED', plain)
+        .when(rule_status == 'PARSED_WORD', word_value.cast('string'))
+        .when(rule_status == 'PARSED_MULTIPLIER', multiplier)
+        .when(rule_status == 'PARSED_LEADING_INTEGER', leading)
+    )
+    result = (
+        result.withColumn('_QTY_RULE_STATUS', rule_status)
+        .withColumn('_QTY_VALUE_TEXT', value_text)
+        .withColumn('_QTY_VALUE_WIDE', F.expr('try_cast(`_QTY_VALUE_TEXT` AS DECIMAL(38, 4))'))
+    )
+    # A value text that is a number but does not fit even DECIMAL(38, 4) is implausible, never PARSED with a NULL value.
+    implausible = F.col('_QTY_VALUE_TEXT').isNotNull() & (F.col('_QTY_VALUE_WIDE').isNull() | (F.col('_QTY_VALUE_WIDE') > F.lit(IMPLANT_QTY_MAX_PLAUSIBLE)))
     return (
         result
-        .withColumn("QUANTITY", F.col("QUANTITY_RAW"))
-        .withColumn("QUANTITY_NUMERIC", parsed)
-        .withColumn(
-            "QUANTITY_PARSE_STATUS",
-            F.when(
-                F.col("QUANTITY_RAW").isNull()
-                | (F.length(F.trim(F.col("QUANTITY_RAW"))) == 0),
-                F.lit("MISSING"),
-            )
-            .when(parsed.isNotNull(), F.lit("PARSED"))
-            .otherwise(F.lit("UNPARSED")),
-        )
-        .drop(normalized_column)
+        .withColumn('QUANTITY', F.col('QUANTITY_RAW'))
+        .withColumn('QUANTITY_NUMERIC', F.when(~implausible, F.col('_QTY_VALUE_WIDE').cast('decimal(18,4)')))
+        .withColumn('QUANTITY_PARSE_STATUS', F.when(implausible, F.lit('IMPLAUSIBLE')).otherwise(F.col('_QTY_RULE_STATUS')))
+        .withColumn('QUANTITY_PARSE_RULE', F.lit(IMPLANT_QTY_RULE_ID))
+        .drop('_QTY_NORM', '_QTY_PAREN_DIGITS', '_QTY_RULE_STATUS', '_QTY_VALUE_TEXT', '_QTY_VALUE_WIDE')
     )
 def _normalize_barcode(column):
     return F.regexp_replace(F.regexp_replace(F.regexp_replace(F.trim(column), '^\\]C1', ''), '\\((\\d{2})\\)', '$1'), '[\\r\\n]', '')
@@ -3588,6 +3637,8 @@ def validate_implant_details(raise_on_error: bool=True) -> Dict[str, int]:
         F.sum(F.col('SOURCE_ROW_HASH').isNull().cast('long')).alias(
             'missing_source_hash'
         ),
+        # INSR_W1_IMPLANT_QTY_V2: a numeric quantity above the plausible maximum is a barcode, never a count.
+        F.sum((F.col('QUANTITY_NUMERIC') > F.lit(IMPLANT_QTY_MAX_PLAUSIBLE)).cast('long')).alias('implausible_numeric_quantity'),
     ).first().asDict()
     structural['duplicate_event_ids'] = (
         structural['row_count'] - structural['distinct_event_ids']
@@ -3602,6 +3653,7 @@ def validate_implant_details(raise_on_error: bool=True) -> Dict[str, int]:
             ).first().asDict()
         )
     fatal = {
+        'implausible_numeric_quantity': structural.get('implausible_numeric_quantity', 0),  # INSR_W1_IMPLANT_QTY_V2
         'duplicate_event_ids': structural.get('duplicate_event_ids', 0),
         'null_event_ids': structural.get('null_event_ids', 0),
         'missing_source_hash': structural.get('missing_source_hash', 0),

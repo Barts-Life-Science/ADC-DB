@@ -186,10 +186,14 @@ def inventory_excluded(name: str) -> bool:
 
 
 def drop_pii(df: DataFrame, extra=()):
-    drops = {name for name in df.columns if is_pii_column(name)}
-    drops.update(name for name in extra if name in df.columns)
-    ordered = sorted(drops)
-    return df.drop(*ordered), ordered
+    """Retain identifiers in Bronze; report the PII-named columns present (INSR_W1_REGISTRY_RETAIN_V1).
+
+    Estate rule: identifier columns are published and tagged, never excluded; de-identification is serve-time.
+    Same shim as registry_pipeline's inlined copy, so the two stay in sync.
+    """
+    retained = {name for name in df.columns if is_pii_column(name)}
+    retained.update(name for name in extra if name in df.columns)
+    return df, sorted(retained)
 
 
 def to_snake(df: DataFrame) -> DataFrame:

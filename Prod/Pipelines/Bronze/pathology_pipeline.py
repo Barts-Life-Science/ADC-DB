@@ -544,12 +544,43 @@ def join_specimen_map(frame, spark, config: PipelineConfig):
     )
 
 
-def _cerner_order_specimen(spark, config: PipelineConfig):
-    """One SPECIMEN TYPE and one BODYSITE per order (deterministic pick), and the order activity type."""
+# PATH_EXPANSION_SCOPED_STAGES_V1 (2026-11-01): the weekly incremental run touches ~1M parents, but its scoped joins
+# were shuffled hash joins against whole tables (map_pathology 184 GiB, mill_order_detail 9.9bn rows), so every run
+# moved terabytes across the network and lost workers mid-shuffle. Staged key sets up to this many rows are broadcast
+# instead: each large table is then filtered where it is read and is never shuffled. Larger key sets (a near-full
+# week) fall back to the shuffled join, which gives the same rows.
+SCOPE_BROADCAST_KEY_LIMIT = 10_000_000
+
+
+def _broadcast_keys(keys):
+    """Broadcast a staged key frame when it holds at most SCOPE_BROADCAST_KEY_LIMIT rows; otherwise return it as is.
+
+    `keys` should read a staged (materialized) table, so the count is cheap and the broadcast side is stable.
+    """
+    _, _, F, _ = _imports()
+    return F.broadcast(keys) if keys.count() <= SCOPE_BROADCAST_KEY_LIMIT else keys
+
+
+def _cerner_order_specimen(spark, config: PipelineConfig, order_ids=None):
+    """One SPECIMEN TYPE and one BODYSITE per order (deterministic pick), and the order activity type.
+
+    PATH_EXPANSION_SCOPED_STAGES_V1: with `order_ids` (a staged one-column `order_id` frame), mill_order_detail
+    (9.9bn rows) and mill_orders are cut to those orders before the window and the aggregate. Both are keyed by
+    order_id, so the result for each kept order is unchanged; both tables are clustered on ORDER_ID, so the
+    broadcast filter also lets Delta skip files instead of shuffling 155M specimen rows every run.
+    """
     _, Window, F, _ = _imports()
     detail = (
         spark.table(config.order_detail_table)
         .filter(F.col("OE_FIELD_MEANING").isin("SPECIMEN TYPE", "BODYSITE") & F.col("ORDER_ID").isNotNull())
+    )
+    orders = spark.table(config.orders_table).filter(F.col("ORDER_ID").isNotNull())
+    if order_ids is not None:
+        wanted = _broadcast_keys(order_ids.select(F.col("order_id").cast("double").alias("ORDER_ID")))
+        detail = detail.join(wanted, "ORDER_ID", "left_semi")
+        orders = orders.join(wanted, "ORDER_ID", "left_semi")
+    detail = (
+        detail
         .select(
             F.col("ORDER_ID").cast("long").alias("order_id"),
             "OE_FIELD_MEANING",
@@ -581,8 +612,7 @@ def _cerner_order_specimen(spark, config: PipelineConfig):
         .agg(F.min("_display").alias("_activity_type"))
     )
     order_activity = (
-        spark.table(config.orders_table)
-        .filter(F.col("ORDER_ID").isNotNull())
+        orders
         .groupBy(F.col("ORDER_ID").cast("long").alias("order_id"))
         .agg(F.max(F.col("ACTIVITY_TYPE_CD").cast("long")).alias("_activity_cd"))
         .join(code_value, "_activity_cd", "left")
@@ -719,16 +749,24 @@ def core_input_scope(spark, config: PipelineConfig, touched_parent_keys):
     the LabNo inside a LIMS parent key when the parent has left map_pathology) and the groups they were in
     last run (map_pathology_accession_source). Returns (parents[source_parent_key], labs[normalized_lab_no]).
     An empty-string lab number is kept: it is itself a shared group key.
+
+    PATH_EXPANSION_SCOPED_STAGES_V1: `touched_parent_keys` is the run's staged touched table. When it is small enough,
+    it and the groups derived from it are broadcast, so the two large tables are filtered as they are read.
     """
     _, _, F, _ = _imports()
     touched = touched_parent_keys.select("source_system", "source_parent_key").dropDuplicates()
+    small = touched.count() <= SCOPE_BROADCAST_KEY_LIMIT
+    touched_side = F.broadcast(touched) if small else touched
     accession_source = spark.table(f"{config.bronze_schema}.map_pathology_accession_source")
     previous_groups = (
-        accession_source.join(touched, ["source_system", "source_parent_key"], "inner")
+        accession_source.join(touched_side, ["source_system", "source_parent_key"], "inner")
         .select("match_group_key")
         .dropDuplicates()
     )
-    previous_members = accession_source.join(previous_groups, "match_group_key", "inner").select(
+    # A parent has one match group (measured 2026-11-01: 461M parents, max 1 group each, history rows included),
+    # so the group set is no larger than the touched set.
+    previous_side = F.broadcast(previous_groups) if small else previous_groups
+    previous_members = accession_source.join(previous_side, "match_group_key", "inner").select(
         "source_parent_key", "normalized_lab_no"
     )
     current_members = (
@@ -738,7 +776,7 @@ def core_input_scope(spark, config: PipelineConfig, touched_parent_keys):
             "source_parent_key",
             _normalize_lab_no(F.col("lab_no")).alias("normalized_lab_no"),
         )
-        .join(touched, ["source_system", "source_parent_key"], "inner")
+        .join(touched_side, ["source_system", "source_parent_key"], "inner")
         .select("source_parent_key", "normalized_lab_no")
     )
     key_lab = F.split(F.col("source_parent_key"), "[|]").getItem(2)
@@ -768,43 +806,86 @@ def _scope_lims_sample(sample, scope):
     lab_hit = labs.select(F.col("normalized_lab_no").alias("_scope_lab"), F.lit(True).alias("_lab_hit"))
     parent_hit = parents.select(F.col("source_parent_key").alias("_scope_parent_key"), F.lit(True).alias("_parent_hit"))
     return (
-        keyed.join(lab_hit, "_scope_lab", "left")
-        .join(parent_hit, "_scope_parent_key", "left")
+        keyed.join(_broadcast_keys(lab_hit), "_scope_lab", "left")
+        .join(_broadcast_keys(parent_hit), "_scope_parent_key", "left")
         .where(F.coalesce(F.col("_lab_hit"), F.lit(False)) | F.coalesce(F.col("_parent_hit"), F.lit(False)))
         .drop("_scope_parent_key", "_scope_lab", "_lab_hit", "_parent_hit")
     )
 
 
-def _scope_map_pathology(mapped, scope):
-    """Keep every map_pathology row of each parent that has a scoped lab number or is a scoped parent.
+def _scope_map_parent_keys(mapped, scope):
+    """source_parent_key of every map_pathology parent that has a scoped lab number or is a scoped parent.
 
-    Whole parents are kept because raw_map and linked aggregate per parent.
+    Whole parents are kept (the caller filters map_pathology by these keys) because raw_map and linked aggregate
+    per parent.
     """
     _, _, F, _ = _imports()
     parents, labs = scope
     lab_parents = (
         mapped.select("source_parent_key", _normalize_lab_no(F.col("lab_no")).alias("normalized_lab_no"))
-        .join(labs, "normalized_lab_no", "inner")
+        .join(_broadcast_keys(labs), "normalized_lab_no", "inner")
         .select("source_parent_key")
     )
-    keep = lab_parents.unionByName(parents.select("source_parent_key")).dropDuplicates()
-    return mapped.join(keep, "source_parent_key", "left_semi")
+    return lab_parents.unionByName(parents.select("source_parent_key")).dropDuplicates()
 
 
-def build_source_stage(spark, config: PipelineConfig, scope=None):
+@dataclass(frozen=True)
+class ScopedInputs:
+    """The incremental run's inputs, each staged once to a scratch Delta table (PATH_EXPANSION_SCOPED_STAGES_V1).
+
+    sample:    active LIMS sample rows of the scope (all columns), before the per-(LIMSNo, LabNo) dedup
+    mapped:    every map_pathology row of every scoped parent (all columns)
+    order_ids: Cerner order ids carried by the scoped map_pathology rows (one column, `order_id` long)
+    """
+
+    sample: object
+    mapped: object
+    order_ids: object
+
+
+def stage_scoped_inputs(spark, config: PipelineConfig, scope, materialize) -> ScopedInputs:
+    """Cut the large inputs down to the scope once, so no later step reads or shuffles the whole tables.
+
+    The rows kept are exactly those PATH_CORE_INPUT_SCOPE_V1 kept (same filters); they are now staged instead of
+    being re-derived inside one large query, where Spark planned each reuse as another full scan and shuffle.
+    """
+    _, _, F, _ = _imports()
+    sample = spark.table(config.sample_table).filter(F.expr(_active_filter(spark, config.sample_table)))
+    scoped_sample = materialize(_scope_lims_sample(sample, scope), "scoped_sample")
+
+    mapped = spark.table(config.map_pathology_table)
+    map_parents = materialize(_scope_map_parent_keys(mapped, scope), "scoped_map_parents")
+    scoped_map = materialize(mapped.join(_broadcast_keys(map_parents), "source_parent_key", "left_semi"), "scoped_map")
+
+    order_ids = materialize(
+        scoped_map.filter(F.col("source_table") == "linked")
+        .select(F.col("order_id").cast("long").alias("order_id"))
+        .where(F.col("order_id").isNotNull())
+        .dropDuplicates(),
+        "scoped_orders",
+    )
+    return ScopedInputs(sample=scoped_sample, mapped=scoped_map, order_ids=order_ids)
+
+
+def build_source_stage(spark, config: PipelineConfig, inputs: ScopedInputs | None = None, materialize=None):
     """Build one row per existing source parent plus accession-grain auxiliaries.
 
-    PATH_CORE_INPUT_SCOPE_V1 (2026-10-18): with `scope` = (parents, labs) from core_input_scope(), the LIMS
-    sample and map_pathology inputs are cut down before the expensive deduplication and aggregations.
+    PATH_CORE_INPUT_SCOPE_V1 (2026-10-18): an incremental run passes `inputs` (stage_scoped_inputs), so the LIMS
+    sample, map_pathology and Cerner order inputs are already cut down before the deduplication and aggregations.
     run_core still applies its exact match-group filter afterwards, so the scope only has to be a superset.
+
+    PATH_EXPANSION_SCOPED_STAGES_V1 (2026-11-01): with `materialize`, the two frames this builder joins back to
+    themselves (the LIMS parents, before the orderables default; the source rows, before the accession-id lookup)
+    are staged first. Without staging, Spark planned each self-join as a second copy of the whole input plan.
     """
 
     _, Window, F, _ = _imports()
-    sample = spark.table(config.sample_table).filter(
-        F.expr(_active_filter(spark, config.sample_table))
-    )
-    if scope is not None:
-        sample = _scope_lims_sample(sample, scope)
+    if inputs is not None:
+        sample = inputs.sample
+    else:
+        sample = spark.table(config.sample_table).filter(
+            F.expr(_active_filter(spark, config.sample_table))
+        )
     sample_window = Window.partitionBy("LIMSNo", "LabNo").orderBy(
         F.col("ADC_UPDT").desc_nulls_last(),
         F.col("SampleDT").desc_nulls_last(),
@@ -817,9 +898,7 @@ def build_source_stage(spark, config: PipelineConfig, scope=None):
         .drop("_rn")
     )
 
-    mapped = spark.table(config.map_pathology_table)
-    if scope is not None:
-        mapped = _scope_map_pathology(mapped, scope)
+    mapped = inputs.mapped if inputs is not None else spark.table(config.map_pathology_table)
     raw_map = (
         mapped.filter(F.col("source_table") == "raw")
         .groupBy("source_parent_key")
@@ -928,7 +1007,9 @@ def build_source_stage(spark, config: PipelineConfig, scope=None):
     )
 
     # STM_SPECIMEN_TYPE_V1/pipeline: Cerner members take SPECIMEN TYPE / BODYSITE from their order, LIMS members are namespaced.
-    order_specimen, order_activity = _cerner_order_specimen(spark, config)
+    order_specimen, order_activity = _cerner_order_specimen(
+        spark, config, order_ids=inputs.order_ids if inputs is not None else None
+    )
     linked = (
         linked.drop("body_site_code", "specimen_type_code")
         .join(order_specimen, "order_id", "left")
@@ -941,6 +1022,9 @@ def build_source_stage(spark, config: PipelineConfig, scope=None):
         .withColumn("activity_type", F.col("_activity_type"))
         .drop("_od_specimen_code", "_od_body_site_code", "_activity_type")
     )
+    if materialize is not None:
+        # _raw_specimen_stage joins `raw` to an aggregate of itself (the orderables default).
+        raw = materialize(raw, "raw_parents")
     raw = _raw_specimen_stage(spark, config, raw)
     source = raw.unionByName(linked)
     source = source.withColumn("normalized_lab_no", _normalize_lab_no(F.col("lab_no")))
@@ -987,16 +1071,22 @@ def build_source_stage(spark, config: PipelineConfig, scope=None):
         .otherwise(F.lit("unresolved")),
     )
 
-    accession_source_table = f"{config.bronze_schema}.map_pathology_accession_source"
-    existing = (
-        spark.table(accession_source_table)
-        .filter(F.col("is_current") == True)
-        .groupBy("source_accession_id")
-        .agg(F.min("pathology_accession_id").alias("_existing_accession_id"))
-        if table_exists(spark, accession_source_table)
-        else None
-    )
+    if materialize is not None:
+        # The accession-id lookup below joins `source` to its own distinct ids.
+        source = materialize(source, "source_parents")
     source_ids = source.select("source_accession_id").distinct()
+
+    accession_source_table = f"{config.bronze_schema}.map_pathology_accession_source"
+    existing = None
+    if table_exists(spark, accession_source_table):
+        current_sources = spark.table(accession_source_table).filter(F.col("is_current") == True)
+        if inputs is not None:
+            # Only this run's source accessions need their existing id; without this the incremental run
+            # aggregated all 458M current rows. The min() per id is unchanged for every id kept.
+            current_sources = current_sources.join(_broadcast_keys(source_ids), "source_accession_id", "left_semi")
+        existing = current_sources.groupBy("source_accession_id").agg(
+            F.min("pathology_accession_id").alias("_existing_accession_id")
+        )
     if existing is not None:
         source_ids = source_ids.join(existing, "source_accession_id", "left")
     else:
@@ -1471,12 +1561,15 @@ def build_requested_test_rows(spark, source_stage, config: PipelineConfig):
     )
 
 
-def build_report_rows(spark, source_stage, config: PipelineConfig):
+def build_report_rows(spark, source_stage, config: PipelineConfig, mapped=None):
+    """Report rows of the source stage's parents. `mapped` (PATH_EXPANSION_SCOPED_STAGES_V1) is map_pathology
+    already filtered to those parents; it defaults to the whole table, and the inner join below gives the same rows."""
     _, Window, F, _ = _imports()
     source_map = source_stage.select(
         "source_system", "source_parent_key", "source_accession_id", "pathology_accession_id"
     ).dropDuplicates(["source_system", "source_parent_key"])
-    mapped_source = spark.table(config.map_pathology_table).withColumn(
+    mapped = mapped if mapped is not None else spark.table(config.map_pathology_table)
+    mapped_source = mapped.withColumn(
         "_source_system",
         F.when(F.col("source_table") == "raw", F.lit("TFC_LIMS")).otherwise(
             F.lit("CERNER")
@@ -1589,7 +1682,8 @@ def build_report_rows(spark, source_stage, config: PipelineConfig):
     )
 
 
-def build_result_equivalence_rows(spark, source_stage, report_rows, config: PipelineConfig):
+def build_result_equivalence_rows(spark, source_stage, report_rows, config: PipelineConfig, mapped=None):
+    """Result-equivalence rows of the source stage's parents. `mapped` as in build_report_rows."""
     _, Window, F, _ = _imports()
     source_map = source_stage.select(
         "source_system",
@@ -1597,7 +1691,7 @@ def build_result_equivalence_rows(spark, source_stage, report_rows, config: Pipe
         "pathology_accession_id",
         "person_projection_status",
     ).dropDuplicates(["source_system", "source_parent_key"])
-    mapped = spark.table(config.map_pathology_table).withColumn(
+    mapped = (mapped if mapped is not None else spark.table(config.map_pathology_table)).withColumn(
         "source_system",
         F.when(F.col("source_table") == "raw", "TFC_LIMS").otherwise("CERNER"),
     )
@@ -1728,18 +1822,20 @@ def run_core(
 
     try:
         ensure_contracts(spark, config)
-        scope = None
+        inputs = None
         if touched_parent_keys is not None:
-            # Stage the narrow input scope once; the builder then reads small inputs (see build_source_stage).
+            # Stage the narrow input scope once, then the scoped inputs themselves (PATH_EXPANSION_SCOPED_STAGES_V1):
+            # from here on no step reads map_pathology, the LIMS samples or the Cerner order tables in full.
             scope_parents, scope_labs = core_input_scope(spark, config, touched_parent_keys)
             scope = (materialize(scope_parents, "scope_parents"), materialize(scope_labs, "scope_labs"))
-        source_stage = build_source_stage(spark, config, scope=scope)
+            inputs = stage_scoped_inputs(spark, config, scope, materialize)
+        source_stage = build_source_stage(spark, config, inputs=inputs, materialize=materialize)
         scoped_match_groups = None
         if touched_parent_keys is not None:
             _, _, F, _ = _imports()
-            touched = touched_parent_keys.select(
-                "source_system", "source_parent_key"
-            ).dropDuplicates()
+            touched = _broadcast_keys(
+                touched_parent_keys.select("source_system", "source_parent_key").dropDuplicates()
+            )
             new_groups = source_stage.join(
                 touched,
                 ["source_system", "source_parent_key"],
@@ -1756,11 +1852,12 @@ def run_core(
                 )
                 .select("match_group_key")
             )
-            scoped_match_groups = (
-                new_groups.unionByName(previous_groups).dropDuplicates()
+            # Staged: the group set is joined here and again by every scoped stale reconciliation below.
+            scoped_match_groups = materialize(
+                new_groups.unionByName(previous_groups).dropDuplicates(), "match_groups"
             )
             source_stage = source_stage.join(
-                scoped_match_groups,
+                _broadcast_keys(scoped_match_groups),
                 "match_group_key",
                 "inner",
             )
@@ -1774,6 +1871,19 @@ def run_core(
         )
         source_stage, aliases = apply_merge_map(identity_stage, merge_map)
         source_stage = materialize(source_stage, "source")
+
+        # PATH_EXPANSION_SCOPED_STAGES_V1: the report and result-equivalence builders inner-join map_pathology to
+        # the stage's parents. Filter it to those parents once, by broadcast, instead of shuffling all 1.9bn rows
+        # in each builder. A full run keeps reading the whole table.
+        output_map = None
+        if inputs is not None:
+            output_parents = materialize(source_stage.select("source_parent_key").distinct(), "output_parents")
+            output_map = materialize(
+                spark.table(config.map_pathology_table).join(
+                    _broadcast_keys(output_parents), "source_parent_key", "left_semi"
+                ),
+                "output_map",
+            )
 
         outputs = {
             "map_pathology_accession_source": build_accession_source_rows(
@@ -1795,7 +1905,7 @@ def run_core(
             config,
         )
         reports = materialize(
-            build_report_rows(spark, source_stage, config),
+            build_report_rows(spark, source_stage, config, mapped=output_map),
             "report",
         )
         outputs["map_pathology_report"] = reports
@@ -1805,6 +1915,7 @@ def run_core(
                 source_stage,
                 reports,
                 config,
+                mapped=output_map,
             )
         )
 

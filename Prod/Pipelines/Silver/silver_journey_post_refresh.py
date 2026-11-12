@@ -57,13 +57,16 @@ dbutils.widgets.dropdown("metadata_check_action", "fail", ["fail", "warn", "skip
 _METADATA_SCHEMA = dbutils.widgets.get("metadata_schema")
 _METADATA_MODULUS = int(dbutils.widgets.get("metadata_check_modulus"))
 _METADATA_ACTION = dbutils.widgets.get("metadata_check_action")
-_GOLD_SHARED_FILE = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Gold/gold_journey_shared.py"
+_GOLD_SHARED_FILE = "/Workspace/Shared/ADC-DB/Prod/Pipelines/Gold/gold_tables/lifecycle_join_keys.json"  # INSR R3: GoldSpec lifecycle index
 
 
 def _gold_lifecycle_join_keys(path):
     """Read GOLD_V2_LIFECYCLE join keys from the gold shared file by AST; {} if unreadable."""
     try:
         with open(path) as handle:
+            if path.endswith(".json"):  # INSR R3: {gold table: join keys}, generated from the GoldSpec modules
+                import json as _json
+                return _json.load(handle)
             tree = _ast.parse(handle.read())
     except Exception as error:
         print(f"gold lifecycle keys unavailable ({error}); falling back to table comments")

@@ -7,6 +7,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 from functools import reduce
 
 from pyspark import pipelines as dp
@@ -14,6 +15,7 @@ from pyspark.sql import functions as F
 
 import rbi_streams as S
 from rbi_linkage import apply_attribution, attendance_intervals, attribution_candidates
+from rbi_streams import apply_site, encounter_facility, location_facility  # INSR_W6 W6.06
 from rbi_schema import restrict_to_sample, sample_persons, try_bigint
 
 GOLD = spark.conf.get("rbi.gold_schema", "4_prod.gold")
@@ -61,6 +63,18 @@ def sampled(df):
 
 # COMMAND ----------
 
+# INSR_W6 W6.06 (J25, L1589): one site vocabulary, the Millennium facility. Locations and encounters are lookups,
+# never person-sampled (a stay's person can differ from its encounter's person after merges).
+@dp.materialized_view(name="_location_facility", private=True)
+def _location_facility():
+    return location_facility(gold("reference_location"))
+
+
+@dp.materialized_view(name="_encounter_facility", private=True)
+def _encounter_facility():
+    return encounter_facility(spark.read.table(STAY_SOURCE))
+
+
 STREAMS = []  # names of the stream MVs, unioned below
 
 
@@ -98,7 +112,7 @@ def _stream_theatre_case():
 
 @stream("_stream_outpatient_appointment")
 def _stream_outpatient_appointment():
-    return S.outpatient_appointments(sampled(gold("clinical_appointment")), WINDOW)
+    return S.outpatient_appointments(sampled(gold("clinical_appointment")), WINDOW, spark.read.table("_location_facility"))
 
 
 @stream("_stream_tracking_attendance")
@@ -125,7 +139,7 @@ def _stream_imaging_exam():
 
 @stream("_stream_medication_admin")
 def _stream_medication_admin():
-    return S.medication_admins(sampled(gold("clinical_medication_admin")), WINDOW)
+    return S.medication_admins(sampled(gold("clinical_medication_admin")), WINDOW, spark.read.table("_location_facility"))
 
 
 @stream("_stream_high_cost_drug")
@@ -161,7 +175,8 @@ def _attributed(stream_table):
 
     @dp.materialized_view(name=attr_name, private=True)
     def _attr():
-        return apply_attribution(spark.read.table(stream_table), spark.read.table(cand_name))
+        attributed = apply_attribution(spark.read.table(stream_table), spark.read.table(cand_name))
+        return apply_site(attributed, spark.read.table("_encounter_facility"))  # INSR_W6 W6.06: site after the encounter
     return attr_name
 
 

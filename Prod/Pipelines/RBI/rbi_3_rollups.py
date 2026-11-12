@@ -5,6 +5,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 
@@ -39,12 +40,12 @@ def resource_use_event():
 
 @dp.materialized_view(name="spell_resource_summary", comment="See governance comments.")
 def spell_resource_summary():
-    return U.spell_resource_summary(spark.read.table("resource_use_event"))
+    return U.spell_resource_summary(spark.read.table("resource_use_event"), gold("spine_encounter"), WINDOW)  # INSR_W6 W6.07
 
 
 @dp.materialized_view(name="journey_resource_summary", comment="See governance comments.")
 def journey_resource_summary():
-    return U.journey_resource_summary(spark.read.table("resource_use_event"))
+    return U.journey_resource_summary(spark.read.table("resource_use_event"), gold("spine_journey"), WINDOW)  # INSR_W6 W6.07
 
 
 @dp.materialized_view(name="person_month_resource", comment="See governance comments.")
@@ -61,6 +62,13 @@ def service_day_activity():
 def costed_activity_unit():
     return U.costed_activity_unit(sampled(gold("clinical_hrg_grouping")), spark.read.table("_fin_encounter"),
                                   spark.read.table("resource_use_event"), WINDOW)
+
+
+@dp.materialized_view(name="rbi_coverage", comment="See governance comments.")
+def rbi_coverage():
+    # INSR_W6 W6.07 (L1542, L1566, J23): link rate, FY-end defaults and actual-cost share by financial year.
+    return U.rbi_coverage(spark.read.table("plics_activity_link"), spark.read.table("_costed_activity"),
+                          spark.read.table("resource_use_event"))
 
 
 @dp.materialized_view(name="attribution_summary", comment="See governance comments.")

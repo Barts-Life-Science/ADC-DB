@@ -326,7 +326,7 @@ COMMENT 'Curated BloodTrack ABO/RhD map to standard SNOMED blood-group concepts,
 
 def _seed(table, rows, business_cols):
     payload = [
-        tuple(row) + ("CURATED", "PROPOSED", "1.0.0", None, None)
+        tuple(row) + ("CURATED", "APPLIED", "1.0.0", None, None)  # INSR_W1_BLOODTRACK_V1: applied on seeding, no gate
         for row in rows
     ]
     frame = spark.createDataFrame(payload, schema=spark.table(table).schema)
@@ -578,18 +578,13 @@ linked = (
     .withColumn("CARE_SITE_MATCH_STATUS", F.lit("NOT_MAPPED"))
 )
 
-explicit = [
-    name
-    for name in DROP_COLUMNS + ["UserName", "PatientNumber"]
-    if name in linked.columns
-]
+# INSR_W1_BLOODTRACK_V1: identifiers and staff names are published and tagged (Table Metadata Compliance), never
+# dropped; de-identification is serve-time. Only the low-value technical columns are dropped.
+explicit = [name for name in LOW_VALUE_DROPS if name in linked.columns]
 trimmed = linked.drop(*explicit)
-trimmed, backstop = drop_pii(trimmed)
-assert not backstop, (
-    "drop_pii removed columns beyond the explicit policy: "
-    f"{backstop}"
-)
-print("[PII_DROP] transaction " + json.dumps(sorted(explicit)))
+trimmed, retained_identifiers = drop_pii(trimmed)
+print("[LOW_VALUE_DROP] transaction " + json.dumps(sorted(explicit)))
+print("[IDENTIFIER_RETAIN] transaction " + json.dumps(sorted(set(retained_identifiers) | {n for n in IDENTIFIER_DROPS + STAFF_DROPS + ["UserName", "PatientNumber"] if n in trimmed.columns})))
 
 txn = (
     parse_flags(with_effective_time(trimmed))
@@ -624,7 +619,9 @@ txn = (
         blank_to_null(F.col("PatientRequirements")),
     )
     .withColumn("EXPIRY_TS_QUALITY", date_quality("ExpiryDate"))
-    .drop("Quantity", "Comments", "Alerts", "_MRN_NORM")
+    .drop("Quantity", "Comments", "Alerts")
+    # INSR_W1_IDENTIFIER_RETAIN_V1: the normalised MRN used for linkage is published (tagged), not dropped.
+    .withColumnRenamed("_MRN_NORM", "SOURCE_MRN_NORM")
     .withColumnRenamed(
         "TransactionID",
         "BLOODTRACK_TRANSACTION_ID",
@@ -651,25 +648,18 @@ txn = (
 )
 
 pg = spark.table(PRODUCT_MAP_TABLE)
+# INSR_W1_BLOODTRACK_V1: every map row with a concept is applied; there is no APPROVED/PROPOSED curation gate. The
+# row's method, a rule id and the map table travel with the concept as provenance.
 pg_app = pg.select(
     F.col("BLOOD_PRODUCT_GROUP").alias("_PRODUCT_GROUP_KEY"),
-    F.when(
-        F.col("MAPPING_STATUS") == "APPROVED",
-        F.col("PRODUCT_CONCEPT_ID"),
-    ).alias("PRODUCT_CONCEPT_ID"),
-    F.when(
-        F.col("MAPPING_STATUS") == "APPROVED",
-        F.col("PRODUCT_CONCEPT_NAME"),
-    ).alias("PRODUCT_CONCEPT_NAME"),
-    F.when(
-        F.col("MAPPING_STATUS") == "APPROVED",
-        F.col("PROC_CONCEPT_ID"),
-    ).alias("PRODUCT_PROC_CONCEPT_ID"),
-    F.when(
-        F.col("MAPPING_STATUS") == "APPROVED",
-        F.col("PROC_CONCEPT_NAME"),
-    ).alias("PRODUCT_PROC_CONCEPT_NAME"),
+    F.col("PRODUCT_CONCEPT_ID").alias("PRODUCT_CONCEPT_ID"),
+    F.col("PRODUCT_CONCEPT_NAME").alias("PRODUCT_CONCEPT_NAME"),
+    F.col("PROC_CONCEPT_ID").alias("PRODUCT_PROC_CONCEPT_ID"),
+    F.col("PROC_CONCEPT_NAME").alias("PRODUCT_PROC_CONCEPT_NAME"),
     F.col("MAPPING_STATUS").alias("PRODUCT_MAPPING_STATUS"),
+    F.col("MAPPING_METHOD").alias("PRODUCT_MAPPING_METHOD"),
+    F.concat(F.lit("BT_PRODUCT_GROUP_MAP_"), F.coalesce(F.col("MAPPING_VERSION"), F.lit("1.0.0"))).alias("PRODUCT_MAPPING_RULE_ID"),
+    F.lit(PRODUCT_MAP_TABLE).alias("PRODUCT_MAPPING_SOURCE"),
 )
 txn = (
     txn.join(
@@ -693,14 +683,10 @@ bg = spark.table(BLOODGROUP_MAP_TABLE)
 def join_bg(df, src_col, out_prefix):
     lookup = bg.select(
         F.col("BLOOD_GROUP_SOURCE_VALUE").alias("_BG_KEY"),
-        F.when(
-            F.col("MAPPING_STATUS") == "APPROVED",
-            F.col("SNOMED_CONCEPT_ID"),
-        ).alias(f"{out_prefix}_CONCEPT_ID"),
-        F.when(
-            F.col("MAPPING_STATUS") == "APPROVED",
-            F.col("SNOMED_CONCEPT_NAME"),
-        ).alias(f"{out_prefix}_CONCEPT_NAME"),
+        F.col("SNOMED_CONCEPT_ID").alias(f"{out_prefix}_CONCEPT_ID"),  # INSR_W1_BLOODTRACK_V1: no gate
+        F.col("SNOMED_CONCEPT_NAME").alias(f"{out_prefix}_CONCEPT_NAME"),
+        F.col("MAPPING_METHOD").alias(f"{out_prefix}_MAPPING_METHOD"),
+        F.concat(F.lit("BT_BLOOD_GROUP_MAP_"), F.coalesce(F.col("MAPPING_VERSION"), F.lit("1.0.0"))).alias(f"{out_prefix}_MAPPING_RULE_ID"),
         F.col("MAPPING_STATUS").alias(
             f"{out_prefix}_MAPPING_STATUS"
         ),
@@ -817,6 +803,7 @@ txn_write = registry_update_table(
         "OPERATOR_MATCH_STATUS": "NOT_ATTEMPTED in v1; personnel linkage requires an approved deterministic crosswalk.",
         "CARE_SITE_CD": "Populated only from an approved BloodTrack-location crosswalk; null in v1.",
         "SOURCE_PATIENT_NUMBER": "Source MRN retained for trace-back and episode linkage; not treated as an NHS number.",
+        "SOURCE_MRN_NORM": "Digits-only normalisation of SOURCE_PATIENT_NUMBER (the BloodTrack MRN) used for MRN linkage and TRANSFUSION_KEY. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
         "PERSON_ID": "Cerner PERSON_ID via deterministic MRN alias type 10 linkage.",
         "LINKAGE_STATUS": "MATCHED_MRN, AMBIGUOUS, or UNMATCHED for this MRN-only feed.",
         "SOURCE_RECORD_UPDATED_TS": "Genuine per-row source update timestamp; included in ROW_HASH.",
@@ -1048,7 +1035,31 @@ episode = (
         ),
     )
     .withColumn("END_QUANTITY_UNIT_STATUS", F.lit("UNKNOWN"))
+    # INSR_W1_BLOODTRACK_V1 / BT_QTY_UNIT_V1: the source mixes millilitres and unit counts in one field. The unit is
+    # inferred, never converted: > 20 is ML, an integer 1-10 is UNIT_COUNT, 0 is ZERO, anything else AMBIGUOUS.
+    .withColumn("END_QUANTITY_UNIT_INFERRED",
+                F.when(F.col("END_QUANTITY_VALUE").isNull(), F.lit(None).cast("string"))
+                .when(F.col("END_QUANTITY_VALUE") == 0, F.lit("ZERO"))
+                .when(F.col("END_QUANTITY_VALUE") > 20, F.lit("ML"))
+                .when(F.col("END_QUANTITY_VALUE").between(1, 10) & (F.col("END_QUANTITY_VALUE") == F.floor(F.col("END_QUANTITY_VALUE"))), F.lit("UNIT_COUNT"))
+                .otherwise(F.lit("AMBIGUOUS")))
+    .withColumn("END_QUANTITY_ML", F.when(F.col("END_QUANTITY_UNIT_INFERRED") == "ML", F.col("END_QUANTITY_VALUE")))
+    .withColumn("QUANTITY_UNIT_RULE", F.lit("BT_QTY_UNIT_V1"))
 )
+
+# INSR_W1_BLOODTRACK_V1: ISBT 128 PRODUCT_CODE -> SNOMED blood-product concept from the W1.07 Opus-gated map, with
+# its provenance. A code absent from the map stays NULL (never a queue).
+ISBT_PRODUCT_MAP_TABLE = f"{bronze_lookup_schema(TARGET_SCHEMA)}.bloodtrack_isbt_product_map"
+ISBT_COLUMNS = [("CONCEPT_ID", "ISBT_PRODUCT_CONCEPT_ID", "bigint"), ("CONCEPT_NAME", "ISBT_PRODUCT_CONCEPT_NAME", "string"),
+                ("MAPPING_METHOD", "ISBT_MAPPING_METHOD", "string"), ("MAPPING_RULE_ID", "ISBT_MAPPING_RULE_ID", "string"),
+                ("MAPPING_MODEL", "ISBT_MAPPING_MODEL", "string"), ("MAPPING_SCORE", "ISBT_MAPPING_SCORE", "double")]
+if table_exists(ISBT_PRODUCT_MAP_TABLE):  # _registry_common helper (bronze_table_exists is _bronze_common only)
+    isbt_map = spark.table(ISBT_PRODUCT_MAP_TABLE).select(
+        F.col("PRODUCT_CODE").alias("_ISBT_PRODUCT_CODE"), *[F.col(src).cast(kind).alias(dst) for src, dst, kind in ISBT_COLUMNS])
+    episode = episode.join(isbt_map, episode["PRODUCT_CODE"] == isbt_map["_ISBT_PRODUCT_CODE"], "left").drop("_ISBT_PRODUCT_CODE")
+else:
+    for _src, _dst, _kind in ISBT_COLUMNS:
+        episode = episode.withColumn(_dst, F.lit(None).cast(_kind))
 
 multi = (
     (F.col("BEGIN_SUCCESS_COUNT") > 1)
@@ -1097,6 +1108,8 @@ episode = (
         "SOURCE_MRN_MISSING_IND",
         F.col("_MRN_KEY") == "<NULL>",
     )
+    # INSR_W1_IDENTIFIER_RETAIN_V1: publish the normalised MRN the episode is grouped on (identifier, tagged).
+    .withColumn("SOURCE_MRN_NORM", F.when(F.col("_MRN_KEY") != "<NULL>", F.col("_MRN_KEY")))
     .withColumn(
         "TRANSFUSION_KEY",
         F.sha2(
@@ -1212,9 +1225,11 @@ episode_write = registry_update_table(
     "BloodTrack transfusion episodes, one row per unit-recipient group. Successful begin/end "
     "scans are paired deterministically; incomplete, multi-event, and clock-order groups are "
     "retained with an explicit TRANSFUSION_STATUS. Failed and null-UnitID scans remain in "
-    "map_bloodtrack_transaction.",
+    "map_bloodtrack_transaction. BloodTrack went live in 2023-05 (no earlier rows exist at source); "
+    "many units carry only a begin scan (STARTED_NO_END). INSR_W1_BLOODTRACK_V1.",
     {
-        "TRANSFUSION_KEY": "SHA-256 of BLOODTRACK|UnitID|normalized-MRN; primary key. The normalized MRN is not published.",
+        "TRANSFUSION_KEY": "SHA-256 of BLOODTRACK|UnitID|normalized-MRN; primary key. The normalized MRN is SOURCE_MRN_NORM.",
+        "SOURCE_MRN_NORM": "Digits-only normalisation of SOURCE_PATIENT_NUMBER (the BloodTrack MRN) used for MRN linkage and TRANSFUSION_KEY. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
         "TRANSFUSION_STATUS": "COMPLETED, STARTED_NO_END, END_WITHOUT_START, MULTIPLE_SUCCESS_EVENTS, or CLOCK_ORDER_ERROR.",
         "ELAPSED_MINUTES": "Selected end minus begin effective time, only when end is on or after begin.",
         "AMBIGUITY_IND": "True for multi-success or clock-order groups.",
@@ -1226,10 +1241,14 @@ episode_write = registry_update_table(
         "SOURCE_EVENT_COUNT": "All source scans sharing this unit-recipient group.",
         "SOURCE_MRN_MISSING_IND": "True when PatientNumber could not be normalized; the identifier itself is not published.",
         "PERSON_ID": "Cerner PERSON_ID when the normalized MRN maps consistently to one linked person.",
-        "PRODUCT_CONCEPT_ID": "SNOMED product concept when the curated map row is APPROVED.",
-        "UNIT_GROUP_CONCEPT_ID": "SNOMED unit blood-group concept when the curated map row is APPROVED.",
-        "PATIENT_GROUP_CONCEPT_ID": "SNOMED scan-time patient blood-group concept when the curated map row is APPROVED.",
-        "END_QUANTITY_UNIT_STATUS": "Always UNKNOWN; the source supplies no reliable quantity unit.",
+        "PRODUCT_CONCEPT_ID": "SNOMED product concept from the product-group map (every row with a concept is applied; provenance in PRODUCT_MAPPING_*).",
+        "UNIT_GROUP_CONCEPT_ID": "SNOMED unit blood-group concept from the blood-group map (provenance in UNIT_GROUP_MAPPING_*).",
+        "PATIENT_GROUP_CONCEPT_ID": "SNOMED scan-time patient blood-group concept from the blood-group map (provenance in PATIENT_GROUP_MAPPING_*).",
+        "END_QUANTITY_UNIT_STATUS": "Always UNKNOWN; the source supplies no quantity unit. See END_QUANTITY_UNIT_INFERRED.",
+        "END_QUANTITY_UNIT_INFERRED": "BT_QTY_UNIT_V1 inferred unit of END_QUANTITY_VALUE: ML (>20), UNIT_COUNT (integer 1-10), ZERO, AMBIGUOUS. Not converted.",
+        "END_QUANTITY_ML": "END_QUANTITY_VALUE when the inferred unit is ML, else NULL.",
+        "QUANTITY_UNIT_RULE": "Rule id of the unit inference (BT_QTY_UNIT_V1).",
+        "ISBT_PRODUCT_CONCEPT_ID": "SNOMED blood-product concept for the ISBT 128 PRODUCT_CODE from 3_lookup.omop.bloodtrack_isbt_product_map (method/model/score in ISBT_MAPPING_*).",
     },
 )
 
@@ -1294,7 +1313,9 @@ check(
     target_fail,
     f"source={src_fail}",
 )
-banned = {
+# INSR_W1_BLOODTRACK_V1: identifiers and staff names are published (tagged), so the release check now requires them
+# present instead of absent. Deviation from the plan text: without this the old txn_pii_absent check fails every run.
+published_identifiers = {
     "PATIENT_NAME",
     "PATIENT_BIRTH_DATE",
     "PATIENT_GENDER",
@@ -1305,9 +1326,9 @@ banned = {
     "USER_NAME",
 }
 check(
-    "txn_pii_absent",
-    not (set(t.columns) & banned),
-    sorted(set(t.columns) & banned),
+    "txn_identifiers_published",
+    published_identifiers <= set(t.columns),
+    sorted(published_identifiers - set(t.columns)),
 )
 if not PUBLISH_OPERATOR_USERNAME:
     leaked = tc.where(
@@ -1370,14 +1391,11 @@ check(
     ec_rows,
     f"expected_groups={expected_groups}",
 )
-episode_identifier_columns = {
-    "SOURCE_MRN_NORM",
-    "SOURCE_PATIENT_NUMBER",
-}
+# INSR_W1_IDENTIFIER_RETAIN_V1: identifiers are published and tagged; the episode must carry its grouping MRN.
 check(
-    "episode_identifiers_absent",
-    not (set(e.columns) & episode_identifier_columns),
-    sorted(set(e.columns) & episode_identifier_columns),
+    "episode_identifiers_published",
+    "SOURCE_MRN_NORM" in e.columns,
+    sorted(c for c in e.columns if c in {"SOURCE_MRN_NORM", "SOURCE_PATIENT_NUMBER"}),
 )
 
 _c = spark.table(OMOP_CONCEPT).select(
@@ -1390,9 +1408,7 @@ _c = spark.table(OMOP_CONCEPT).select(
 
 
 def bad_map(table, id_cols):
-    ids = spark.table(table).where(
-        F.col("MAPPING_STATUS") == "APPROVED"
-    )
+    ids = spark.table(table)  # INSR_W1_BLOODTRACK_V1: every applied row is validated, not only APPROVED ones
     count = 0
     for column in id_cols:
         count += (

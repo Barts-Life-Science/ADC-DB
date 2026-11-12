@@ -6,6 +6,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 from datetime import datetime, timedelta, timezone
 
 from pyspark import pipelines as dp
@@ -13,7 +14,7 @@ from pyspark.sql import Window
 from pyspark.sql import functions as F
 
 GOLD = spark.conf.get("pms.gold_schema", "4_prod.gold")
-RULES_VERSION = "pms-2026.09.1"
+RULES_VERSION = "pms-2026.10.1"  # INSR_W6 W6.04: J21 outcome split, serial capture gate, zero ids, sterilisation
 
 
 def gold(table):
@@ -113,14 +114,38 @@ IMPLANT_COLS = ("patient_event_key", "person_id", "encounter_id", "implant_event
 
 
 def _implants():
-    return gold("clinical_procedure").where("source_object = 'implant'").select(*IMPLANT_COLS)
+    # INSR_W6 W6.04 (L1307): the quantity parse status/rule columns arrive from W1.01 via W2.20; NULL until then.
+    p = gold("clinical_procedure")
+    return p.where("source_object = 'implant'").select(*IMPLANT_COLS, col_or_null(p, "quantity_parse_status"),
+                                                       col_or_null(p, "quantity_parse_rule"))
+
+
+# INSR_W6 W6.04 (C0 ruling 4, W1.18): procedures with no PROC_DT_TM are landed with the encounter's arrival time and
+# procedure_date_basis = encounter_arrival. That time is not when the procedure happened, so such rows never order
+# events against an implant: they are left out of Z94 laterality and site families, and revisions built on them are
+# published with attribution procedure_date_encounter_arrival, which is not in COUNTED_ATTRIBUTION (uncounted).
+PROCEDURE_DATE_APPROX = "encounter_arrival"
+DATE_BASIS_ATTRIBUTION = "procedure_date_encounter_arrival"
 
 
 def _opcs():
-    # Millennium-coded OPCS rows (dotted codes). Shared by laterality, site family and revision rules.
-    return (gold("clinical_procedure").where("source_object = 'millennium_procedure'")
+    """Millennium-coded OPCS rows (dotted codes), with procedure_date_basis (NULL until W1.18/W2.20 reach gold).
+    Shared by laterality, site family and revision rules."""
+    p = gold("clinical_procedure")
+    return (p.where("source_object = 'millennium_procedure'")
             .select("patient_event_key", "person_id", "encounter_id", "performed_start",
-                    F.col("procedure_source_code").alias("opcs"), "procedure_source_display"))
+                    F.col("procedure_source_code").alias("opcs"), "procedure_source_display",
+                    col_or_null(p, "procedure_date_basis")))
+
+
+def _approx_date(c):
+    """True when a procedure_date_basis column says the time is the encounter-arrival stand-in (NULL -> False)."""
+    return F.coalesce(c == F.lit(PROCEDURE_DATE_APPROX), F.lit(False))
+
+
+def _exact_opcs():
+    """_opcs() rows whose performed_start is the recorded procedure time."""
+    return _opcs().where(~_approx_date(F.col("procedure_date_basis")))
 
 
 def _z94_side(events, key):
@@ -128,7 +153,7 @@ def _z94_side(events, key):
     # events: (key, encounter_id, performed_start). Used for implants (Task 9) and revisions (Task 11).
     ev = events.select(F.col(key).alias("_k"), F.col("encounter_id").alias("_enc"),
                        F.to_date("performed_start").alias("_d"))
-    z = (_opcs().where("opcs LIKE 'Z94%'")
+    z = (_exact_opcs().where("opcs LIKE 'Z94%'")  # INSR_W6 W6.04 (W1.18): exact-time rows only
          .select(F.col("encounter_id").alias("z_enc"), F.to_date("performed_start").alias("z_d"), F.col("opcs").alias("z")))
     j = ev.join(z, (ev._enc == z.z_enc) & (F.abs(F.datediff(ev._d, z.z_d)) <= 1))
     g = j.groupBy("_k").agg(
@@ -174,7 +199,8 @@ def site_family(code):
 def _site_families():
     # Families of the OPCS procedures coded in the implant encounter within a day of the implant.
     imp = _implants().select("patient_event_key", F.col("encounter_id").alias("_enc"), F.to_date("performed_start").alias("_d"))
-    o = (_opcs().select(F.col("encounter_id").alias("o_enc"), F.to_date("performed_start").alias("o_d"),
+    # INSR_W6 W6.04 (W1.18): exact-time rows only.
+    o = (_exact_opcs().select(F.col("encounter_id").alias("o_enc"), F.to_date("performed_start").alias("o_d"),
                         site_family(F.col("opcs")).alias("fam"))
          .where("fam IS NOT NULL"))
     j = imp.join(o, (imp._enc == o.o_enc) & (F.abs(F.datediff(imp._d, o.o_d)) <= 1))
@@ -183,6 +209,7 @@ def _site_families():
 
 # Implant attributes (gold clinical_procedure_implant_attribute). 877,630 of 3.34M (key, attribute) pairs carry
 # more than one distinct value, so the latest wins and every other value is published in attribute_conflicts.
+STERILISATION_RULE = "attr_sterilisation_not_after_implant"  # INSR_W6 W6.04 (L1452)
 ATTRS = {"SIZE": "implant_size", "EXPIRY_DATE_RAW": "implant_expiry_raw",
          "STERILISATION_DATE_RAW": "implant_sterilisation_raw"}
 
@@ -212,11 +239,25 @@ def _attributes():
                .withColumn("implant_sterilisation_date", cerner_date("implant_sterilisation_raw")))
 
 
+# DEVICE_PERSON_RULE_V1 (2026-11-11): an exposure needs a person, as in PMS pharma (pms.person_present): gold nulls
+# person_id for a person outside scope (one 2026-11-08 implant), and pms_patient then held a NULL person, which has no
+# primary key and failed the browser publish ("join targets without a primary key: ['pms_patient']").
+DEVICE_PERSON_RULE = {"pms.person_present": "person_id IS NOT NULL"}
+
+
 @dp.materialized_view(
     name="pms_device_exposure",
-    comment="One implanted device (gold clinical_procedure implant row) with device identity, UDI capture evidence, laterality and index-date quality.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One implanted device (gold clinical_procedure implant row) with device identity, UDI capture "
+        "evidence, laterality and index-date quality. Coverage: Implant capture at St Bartholomew's is "
+        "complete from August 2024, when its theatre implant documentation changed: its exposures in "
+        "2024-09..2025-04 run at 5.1 times the 2024-04..07 rate (its performed theatre cases 3.1 times, "
+        "other sites 1.0), so earlier St Bartholomew's implants are under-recorded; complete-through "
+        "month per release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     cluster_by=["person_id"],
 )
+@dp.expect_all_or_drop(DEVICE_PERSON_RULE)
 def pms_device_exposure():
     i = _implants()
     dm = gold("reference_device_mapping")
@@ -227,6 +268,9 @@ def pms_device_exposure():
         "mapping_confidence", "confidence_tier", "mapping_rule_id", "mapping_layer", "mapping_ambiguous_ind")]
     d = dm.select(F.col("source_event_id").alias("_dm_event_id"), *dmc)
     year = F.year("performed_start")
+    # INSR_W6 W6.04 (L1452): a device cannot be sterilised after it was implanted.
+    sterilised_after_index = F.coalesce((year > 1970) & (F.col("implant_sterilisation_date") > F.to_date("performed_start")),
+                                        F.lit(False))
     out = (i.join(d, i.implant_event_id.cast("string") == F.col("_dm_event_id"), "left")
             .join(_laterality(), "patient_event_key", "left")
             .join(_site_families(), "patient_event_key", "left")
@@ -240,7 +284,8 @@ def pms_device_exposure():
          .when(year <= 1970, F.lit("epoch_truncated")).otherwise(F.lit("recorded")).alias("index_date_status"),
         F.when(year > 1970, F.to_date("performed_start")).alias("index_date"),
         "implant_description", "device_display", "manufacturer", "serial_number", "batch_number",
-        "udi_di", "udi_standard", "quantity", "device_snomed_code", "device_snomed_display",
+        "udi_di", "udi_standard", "quantity", "quantity_parse_status", "quantity_parse_rule",
+        "device_snomed_code", "device_snomed_display",
         F.when(F.col("udi_standard") == "GS1", F.lit("gs1_scan"))
          .when(F.col("udi_standard") == "HIBCC", F.lit("hibcc_scan"))
          .when(F.col("udi_di").isNotNull(), F.lit("udi_other"))
@@ -248,12 +293,18 @@ def pms_device_exposure():
         *[F.col(c) for c in d.columns if c != "_dm_event_id"],
         F.col("procedure_source_code").alias("implant_procedure_code"),
         F.col("procedure_source_display").alias("implant_procedure_display"),
-        F.col("performer_practitioner_id").alias("implanter_practitioner_id"),
+        # INSR_W6 W6.04 (L1288, F7): 0 = not recorded (the source never records the implanter), so NULL.
+        F.expr("nullif(performer_practitioner_id, 0)").alias("implanter_practitioner_id"),
         "laterality_snomed_code", "laterality_display",
         F.coalesce("laterality_method", F.lit("none")).alias("laterality_method"),
         F.coalesce("site_families", F.array().cast("array<string>")).alias("site_families"),
         "implant_size", "implant_expiry_raw", "implant_expiry_date", "implant_sterilisation_raw",
-        "implant_sterilisation_date",
+        # INSR_W6 W6.04 (L1452): published NULL when after the implant date (raw kept); within 31 days of the expiry
+        # date the two fields were probably swapped at entry.
+        F.when(~sterilised_after_index, F.col("implant_sterilisation_date")).alias("implant_sterilisation_date"),
+        F.when(sterilised_after_index, F.lit(STERILISATION_RULE)).alias("implant_sterilisation_rule"),
+        F.when(sterilised_after_index, F.abs(F.datediff("implant_expiry_date", "implant_sterilisation_date")) <= 31)
+         .alias("implant_sterilisation_swap_suspected_ind"),
         F.when(year > 1970, F.to_date("performed_start") > F.col("implant_expiry_date")).alias("implant_expired_at_index_ind"),
         F.coalesce("attribute_conflicts", F.array().cast("array<string>")).alias("attribute_conflicts"),
         F.lit(RULES_VERSION).alias("rules_version"),
@@ -269,7 +320,15 @@ CASE_COLS = [("theatre_case_key", "string"), ("surgical_case_number", "string"),
              ("patient_type_display", "string"), ("surgical_specialty_id", "bigint"), ("surgeon_practitioner_id", "bigint"),
              ("anaesthetist_practitioner_id", "bigint"), ("institution_display", "string"),
              ("operating_location_display", "string"), ("implant_expected_ind", "boolean"),
-             ("implant_expected_source", "string"), ("person_id", "bigint"), ("encounter_id", "bigint")]
+             ("implant_expected_source", "string"), ("person_id", "bigint"), ("encounter_id", "bigint"),
+             # INSR_W6 W6.04 (L1326): W2.10's derived duration (1-1440 min: bronze value, else stop minus start)
+             ("duration_minutes_derived", "double"), ("duration_source", "string")]
+# Published names for the derived duration pair (the gold names are generic).
+CASE_RENAME = {"duration_minutes_derived": "surgery_duration_minutes_derived", "duration_source": "surgery_duration_source"}
+# INSR_W6 W6.04 (J38, L1257): St Bartholomew's performed theatre cases rose about 3x from 2024-08 while other sites
+# stayed flat (P7_L1257): a SurgiNet capture go-live, not more activity. Rule id capture_era_sbh_2024_08.
+SBH_CAPTURE_START = "2024-08-01"
+SBH_PATTERN = r"Bartholomew"
 
 
 def _cases():
@@ -290,6 +349,9 @@ def pms_procedure_context():
         "exposure_id", "person_id", "encounter_id", "implant_event_id", "index_datetime", "index_date",
         "gmdn_code", "implanter_practitioner_id")
     c = _cases().select(*[F.col(n).alias("c_" + n) for n, _ in CASE_COLS])
+    # INSR_W6 W6.04 (L1288, F7): practitioner id 0 = not recorded; NULL it before the surgeon-first operator coalesce.
+    c = (c.withColumn("c_surgeon_practitioner_id", F.expr("nullif(c_surgeon_practitioner_id, 0)"))
+          .withColumn("c_anaesthetist_practitioner_id", F.expr("nullif(c_anaesthetist_practitioner_id, 0)")))
     ti = gold("reference_theatre_implant").where("mill_implant_event_id IS NOT NULL").select(
         F.col("mill_implant_event_id").alias("x_event_id"), F.col("theatre_case_key").alias("x_case_key"),
         F.col("implant_link_method").alias("x_method"))
@@ -327,7 +389,13 @@ def pms_procedure_context():
         "exposure_id", "theatre_case_key",
         F.coalesce("link_method", F.lit("none")).alias("case_link_method"), F.col("link_rank").alias("case_link_rank"),
         F.coalesce("link_ambiguous_ind", F.lit(False)).alias("case_link_ambiguous_ind"),
-        *[F.col("c_" + n).alias(n) for n, _ in CASE_COLS if n not in ("theatre_case_key", "person_id", "encounter_id")],
+        *[F.col("c_" + n).alias(CASE_RENAME.get(n, n)) for n, _ in CASE_COLS
+          if n not in ("theatre_case_key", "person_id", "encounter_id")],
+        # INSR_W6 W6.04 (J38): capture era of the case's site (rule capture_era_sbh_2024_08).
+        F.when(F.coalesce(F.col("c_institution_display").rlike(SBH_PATTERN), F.lit(False)),
+               F.when(F.col("index_date") >= F.lit(SBH_CAPTURE_START).cast("date"), F.lit("sbh_from_2024_08"))
+                .when(F.col("index_date").isNotNull(), F.lit("sbh_before_2024_08")))
+         .when(F.col("c_institution_display").isNotNull(), F.lit("stable")).alias("capture_era"),
         F.col("_operator").alias("operator_practitioner_id"),
         F.when(F.col("_operator").isNotNull() & F.col("gmdn_code").isNotNull() & F.col("index_datetime").isNotNull(),
                F.dense_rank().over(ow)).alias("operator_device_type_case_ordinal"),
@@ -384,10 +452,17 @@ COMORBIDITY_RULES = {
     "smoking": r"^F17|^Z72\.0", "anticoagulation_long_term": r"^Z92\.1",
 }
 VITALS = {"bmi": ("60621009", 10.0, 80.0), "weight_kg": ("27113001", 20.0, 350.0), "height": ("50373000", 0.9, 250.0)}
+# INSR_FU_DEVICE_ESTIMATED_VITALS_V1 (Ben 2026-11-09): covariates use measured values only, as pharma pms_vital does.
+# Since SCT_TRUD_V1, estimated weight/height/BMI rows also carry the body weight/height/BMI SNOMED code; the
+# OMOP 'Estimated' LOINC concepts are what tells them apart (gold 11-09: 707,723 weights, 148,506 heights, 124,658 BMI).
+VITAL_ESTIMATED_CONCEPTS = [3026600, 3035463, 36304833]   # Body weight / Body height / BMI [Ratio] Estimated
 # Pre-op labs: gold clinical_pathology_result, preferred result only, latest in the 90 days before index.
 # name -> (test SNOMED codes, accepted UCUM units). The unit filter matters: HbA also maps to 313995005, NULL unit.
+# INSR_W6 W6.05 (L1402): total Hb is 1022431000000105 ("Haemoglobin estimation", PATHMAPFIX path_total_hb_v1); g/dL
+# results are converted to g/L (x10) and preop_haemoglobin_unit_basis records the conversion.
+HB_DL_FACTOR = 10.0
 LABS = {
-    "haemoglobin": (["313995005"], ["g/L"]), "albumin": (["104485008"], ["g/L"]),
+    "haemoglobin": (["1022431000000105"], ["g/L", "g/dL"]), "albumin": (["104485008"], ["g/L"]),
     "creatinine": (["313936008", "113075003"], ["umol/L"]), "egfr": (["791801000000102"], ["mL/min"]),
     "hba1c": (["43396009"], ["mmol/mol"]), "crp": (["55235003"], ["mg/L"]), "wbc": (["767002"], ["10*9/L"]),
 }
@@ -403,7 +478,16 @@ def _latest_before(df, t_col, days, part="exposure_id", tiebreak=None):
 
 @dp.materialized_view(
     name="pms_baseline",
-    comment="Per exposure: comorbidity flags (ICD-10 rules, 5 years before the implant time), indication diagnoses in the index encounter, latest BMI/weight/height (365 d), smoking status (5 y) and pre-op labs (90 d). Same-day date-only evidence is excluded and listed.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Per exposure: comorbidity flags (ICD-10 rules, 5 years before the implant time), indication "
+        "diagnoses in the index encounter, latest measured BMI/weight/height (365 d; estimated values excluded), "
+        "smoking status (5 y) and "
+        "pre-op labs (90 d). Same-day date-only evidence is excluded and listed. Coverage: HbA1c results "
+        "for October-December 2021 are held as (Pending) with no value in the source LIMS (9% of October, "
+        "60% of November and 79% of December keys) and were never replaced by a numeric version; "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
+    ),
     cluster_by=["exposure_id"],
 )
 def pms_baseline():
@@ -422,7 +506,8 @@ def pms_baseline():
             .agg(F.sort_array(F.collect_set("code")).alias("same_day_date_only_icd10_codes")))
     ind = (e.join(cond, (e.person_id == cond.person_id) & (e.encounter_id == cond.c_enc))
             .groupBy("exposure_id").agg(F.sort_array(F.collect_set("code")).alias("index_encounter_icd10_codes")))
-    v = gold("clinical_vital_sign").where(F.col("vital_snomed_code").isin([c for c, _, _ in VITALS.values()])).select(
+    estimated = F.coalesce(F.col("vital_omop_concept_id").cast("bigint").isin(VITAL_ESTIMATED_CONCEPTS), F.lit(False))
+    v = gold("clinical_vital_sign").where(F.col("vital_snomed_code").isin([c for c, _, _ in VITALS.values()]) & ~estimated).select(
         "person_id", "vital_snomed_code", "value_number", F.col("event_datetime").alias("v_t"))
     vj = e.join(v, "person_id")
     parts = [flags, sd, ind]
@@ -447,9 +532,18 @@ def pms_baseline():
     lj = e.join(lab, "person_id")
     for name, (codes, units) in LABS.items():
         x = lj.where(F.col("test_snomed_code").isin(codes) & F.col("ucum_code").isin(units))
+        basis = []
+        if name == "haemoglobin":  # INSR_W6 W6.05: one scale (g/L), conversion recorded
+            in_dl = F.col("ucum_code") == "g/dL"
+            # value_number is DECIMAL(38,10); multiplying by the float factor gives DOUBLE, so cast back to keep the
+            # published preop_haemoglobin type unchanged (decimal(38,10) on 2026-10-30).
+            x = (x.withColumn("value_number", F.when(in_dl, F.col("value_number") * HB_DL_FACTOR)
+                                               .otherwise(F.col("value_number")).cast("decimal(38,10)"))
+                  .withColumn("_hb_basis", F.when(in_dl, F.lit("g_dl_x10")).otherwise(F.lit("g_l"))))
+            basis = [F.col("_hb_basis").alias("preop_haemoglobin_unit_basis")]
         x = _latest_before(x, "l_t", 90, tiebreak=F.col("value_number").desc())
         parts.append(x.select("exposure_id", F.col("value_number").alias(f"preop_{name}"),
-                              F.to_date("l_t").alias(f"preop_{name}_date")))
+                              F.to_date("l_t").alias(f"preop_{name}_date"), *basis))
     out = e.select("exposure_id")
     for p in parts:
         out = out.join(p, "exposure_id", "left")
@@ -459,7 +553,7 @@ def pms_baseline():
                       "bmi", "bmi_date", "weight_kg", "weight_kg_date", "height_cm", "height_date",
                       "smoking_status_snomed_code", "smoking_status_snomed_display", "smoking_status_source_display",
                       "smoking_status_map_method", "smoking_status_date",
-                      *[c for n in LABS for c in (f"preop_{n}", f"preop_{n}_date")],
+                      *[c for n in LABS for c in (f"preop_{n}", f"preop_{n}_date")], "preop_haemoglobin_unit_basis",
                       F.lit(RULES_VERSION).alias("rules_version"))
 
 
@@ -472,6 +566,12 @@ ICD10_OUTCOMES = {
     ("periprosthetic_fracture", "icd10_m96_6"): r"^M96\.6",
 }
 REVISION_RX = r"(?i)\brevision\b|\bremoval of\b|\bre-?implant|\bconversion\b|\breplacement of prosthe"
+# INSR_W6 W6.04 (J21, L1427): a revision whose description names a planned second stage (rule revision_staged_v1).
+REVISION_STAGED_RX = r"(?i)\bsecond[ -]stage\b|\btwo[ -]stage\b|\bstage (2|ii|two)\b|\bstaged\b"
+REVISION_STAGED_RULE = "revision_staged_v1"
+# J21: these outcome types split into <type>_index_stay when recorded in the implant encounter (planned peri-operative
+# care or staged surgery, not a post-implant complication).
+INDEX_STAY_SPLIT = ["icu_admission", "revision_procedure"]
 BILATERAL = "51440002"
 # Contacts that did not happen: excluded from readmission, ED and last-contact. Blank status (2.32M) is kept
 # and its share is reported by V10.
@@ -527,7 +627,8 @@ def _revisions():
     return rv.join(side, "patient_event_key", "left").select(
         F.col("patient_event_key").alias("rv_key"), "person_id", F.col("encounter_id").alias("o_enc"),
         F.col("performed_start").alias("t"), F.col("opcs").alias("code"),
-        F.col("procedure_source_display").alias("disp"), site_family(F.col("opcs")).alias("fam"), "rv_side")
+        F.col("procedure_source_display").alias("disp"), site_family(F.col("opcs")).alias("fam"), "rv_side",
+        F.col("procedure_date_basis").alias("rv_date_basis"))  # INSR_W6 W6.04 (W1.18)
 
 
 def _revision_links():
@@ -537,13 +638,21 @@ def _revision_links():
     j = (e.join(rv, "person_id").where((F.col("t") > F.col("idx_t")) & F.array_contains("site_families", F.col("fam"))
                                        & _side_ok(F.col("idx_side"), F.col("rv_side"))))
     return (_latest_prior_instance(j, "rv_key")
-            .withColumn("attribution", F.when(F.col("idx_side").isNotNull() & F.col("rv_side").isNotNull(), F.lit("site_side"))
+            # INSR_W6 W6.04 (W1.18): an encounter-arrival date cannot be ordered against the implant -> uncounted.
+            .withColumn("attribution", F.when(_approx_date(F.col("rv_date_basis")), F.lit(DATE_BASIS_ATTRIBUTION))
+                                         .when(F.col("idx_side").isNotNull() & F.col("rv_side").isNotNull(), F.lit("site_side"))
                                          .otherwise(F.lit("site_side_unknown"))))
 
 
 @dp.materialized_view(
     name="pms_outcome_event",
-    comment="Long-format outcome events and device evidence per exposure: rule id, timing against the implant time, attribution and candidate count. counted_ind marks the rows that feed pms_dataset. Surveillance rules, not adjudicated outcomes.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Long-format outcome events and device evidence per exposure: rule id, timing against the implant "
+        "time, attribution and candidate count. counted_ind marks the rows that feed pms_dataset. "
+        "Surveillance rules, not adjudicated outcomes. Outcome events include planned peri-operative care "
+        "recorded in the implant encounter (in_index_encounter_ind); counted_ind marks the events "
+        "pms_dataset counts."
+    ),
     cluster_by=["exposure_id"],
 )
 def pms_outcome_event():
@@ -566,7 +675,8 @@ def pms_outcome_event():
         F.concat_ws(" | ", "organism_text", "specimen_type_code",
                     F.when(F.col("suspected_ind"), F.lit("suspected"))).alias("det"))
     mj = e_dated.join(mi, "person_id").where(F.col("event_datetime") <= F.col("idx_t") + F.expr("INTERVAL 365 DAYS"))
-    parts.append(_outcome(mj, "microbiology_isolate", "micro_isolate_365d", "event_datetime",
+    # INSR_W6 W6.04 (J21): any isolate within 365 days, not only device-site infections, hence the name.
+    parts.append(_outcome(mj, "microbiology_any_isolate", "micro_isolate_365d", "event_datetime",
                           "clinical_microbiology_isolate", "org", "det", same_enc("o_enc")))
 
     rl = _revision_links().withColumn("det", F.concat_ws(" | ", "fam", "code", "disp"))
@@ -642,6 +752,12 @@ def pms_outcome_event():
     out = parts[0]
     for p in parts[1:]:
         out = out.unionByName(p)
+    # INSR_W6 W6.04 (J21): index-stay ICU and revision rows get their own outcome types.
+    index_stay = F.coalesce(F.col("in_index_encounter_ind"), F.lit(False))
+    out = out.withColumn("outcome_type",
+                         F.when(index_stay & F.col("outcome_type").isin(*INDEX_STAY_SPLIT),
+                                F.concat(F.col("outcome_type"), F.lit("_index_stay")))
+                          .otherwise(F.col("outcome_type")))
     serial = F.col("outcome_type") == "safety_incident_device_serial"
     out = on_or_before_as_of(out.where(serial | kept), F.to_date("event_datetime"), keep_null=True)  # INCR_FIX_20261018
     ix = spark.read.table("pms_device_exposure").select("exposure_id", "index_date")
@@ -651,6 +767,11 @@ def pms_outcome_event():
                .withColumn("days_from_index", F.datediff(F.to_date("event_datetime"), F.col("index_date")))
                .withColumn("counted_ind", F.coalesce(counted, F.lit(False)))
                .drop("index_date").dropDuplicates(["exposure_id", "outcome_type", "source_key", "event_datetime"])
+               # INSR_W6 W6.04 (J21): index_stay_ind = recorded in the implant encounter; staged_procedure_ind on revisions.
+               .withColumn("index_stay_ind", F.coalesce(F.col("in_index_encounter_ind"), F.lit(False)))
+               .withColumn("staged_procedure_ind", F.when(F.col("outcome_type").startswith("revision_procedure"),
+                                                          F.coalesce(F.col("detail").rlike(REVISION_STAGED_RX), F.lit(False))))
+               .withColumn("staged_procedure_rule", F.when(F.col("staged_procedure_ind"), F.lit(REVISION_STAGED_RULE)))
                .withColumn("rules_version", F.lit(RULES_VERSION)))
 
 
@@ -668,6 +789,7 @@ def pms_patient_evidence():
         F.col("t").alias("event_datetime"), F.col("rv_key").alias("source_key"), F.col("code").alias("procedure_code"),
         F.col("disp").alias("procedure_display"), F.col("fam").alias("site_family"), F.col("rv_side").alias("laterality_snomed_code"),
         F.when(F.col("fam").isNull(), F.lit("no_site_family")).otherwise(F.lit("no_matching_prior_exposure")).alias("unattributed_reason"),
+        F.col("rv_date_basis").alias("procedure_date_basis"),  # INSR_W6 W6.04 (W1.18)
         F.lit(RULES_VERSION).alias("rules_version"))
 
 # COMMAND ----------
@@ -782,8 +904,9 @@ def pms_registry_device_procedure():
 # COMMAND ----------
 
 OUTCOME_TYPES = ["infection", "mechanical_complication", "other_device_complication", "periprosthetic_fracture",
-                 "microbiology_isolate", "revision_procedure", "repeat_same_gmdn_implant", "safety_incident_person",
-                 "safety_incident_device_serial", "readmission", "ed_attendance", "icu_admission", "death"]
+                 "microbiology_any_isolate", "revision_procedure", "revision_procedure_index_stay",
+                 "repeat_same_gmdn_implant", "safety_incident_person", "safety_incident_device_serial", "readmission",
+                 "ed_attendance", "icu_admission", "icu_admission_index_stay", "death"]  # INSR_W6 W6.04 (J21)
 HORIZONS = [30, 90, 365]
 PATIENT_COLS = ["sex", "birth_date", "age_at_first_index", "ethnicity_display", "ethnicity_snomed_code", "lsoa",
                 "imd_decile", "imd_quintile", "imd_method", "nhs_number"]
@@ -793,6 +916,22 @@ PATIENT_COLS = ["sex", "birth_date", "age_at_first_index", "ethnicity_display", 
 DATIX_LINK_MIN_RATE = 0.8
 
 
+# INSR_W6 W6.04 (ruling 12, 2026-10-29; L1186): Datix device-serial outcome flags need serials on both sides. The
+# capture rate is the share of Datix device-factor rows whose serial has >= 5 normalised characters (0.185 on
+# 2026-10-29). Below 0.5 an absent serial match means nothing, so the serial flags are NULL, not false.
+DATIX_SERIAL_MIN_CAPTURE = 0.5
+SERIAL_MIN_CHARS = 5
+
+
+def _datix_serial_capture():
+    """One row: datix_device_serial_capture_rate over Datix device-factor rows."""
+    fac = gold("clinical_safety_incident_factor")
+    serial = _norm_serial(col_or_null(fac, "device_serial_number"))
+    return (fac.where(F.col("factor_type") == "device")
+               .agg((F.count(F.when(F.length(serial) >= SERIAL_MIN_CHARS, 1)) / F.count(F.lit(1)))
+                    .alias("datix_device_serial_capture_rate")))
+
+
 def _datix_link_rate():
     return (gold("clinical_safety_incident").where(F.upper(F.trim("inc_type")).isin("PATIE1", "PATIE2"))
             .agg((F.count("person_id") / F.count("*")).alias("datix_person_link_rate")))
@@ -800,7 +939,13 @@ def _datix_link_rate():
 
 @dp.materialized_view(
     name="pms_dataset",
-    comment="Analysis table: one row per implanted device with identity, procedure context, patient, baseline, follow-up, first-event days and 30/90/365-day outcome flags from counted outcome rows only (NULL when follow-up is shorter than the horizon and no event occurred).",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Analysis table: one row per implanted device with identity, procedure context, patient, "
+        "baseline, follow-up, first-event days and 30/90/365-day outcome flags from counted outcome rows "
+        "only (NULL when follow-up is shorter than the horizon and no event occurred). One row per "
+        "implanted device exposure (exposure_id). Tables join on exposure_id and person_id only: there "
+        "are no other cross-table keys (L1129)."
+    ),
     cluster_by=["gmdn_code", "person_id"],
 )
 def pms_dataset():
@@ -822,7 +967,9 @@ def pms_dataset():
                                          F.min("days_from_index").alias("first_pre_index_device_serial_days")))
     sd = ev.where(F.col("timing") == "same_day_date_only").groupBy("exposure_id").agg(
         F.count("*").alias("n_same_day_date_only_events"))
-    pe = spark.read.table("pms_patient_evidence").select(F.col("person_id").alias("pe_person"), F.col("event_datetime").alias("pe_t"))
+    # INSR_W6 W6.04 (W1.18): encounter-arrival dated revisions stay as evidence but are not counted after index.
+    pe = (spark.read.table("pms_patient_evidence").where(~_approx_date(F.col("procedure_date_basis")))
+          .select(F.col("person_id").alias("pe_person"), F.col("event_datetime").alias("pe_t")))
     upe = (ex.select("exposure_id", "person_id", "index_datetime", "index_date").where("index_date IS NOT NULL")
              .join(pe, (F.col("person_id") == F.col("pe_person")) & (F.col("pe_t") > F.col("index_datetime")))
              .groupBy("exposure_id").agg(F.count("*").alias("n_patient_revisions_unattributed_after_index")))
@@ -837,9 +984,20 @@ def pms_dataset():
            # INCR_FIX_20261018: equi-join on a constant key, not crossJoin, so pms_dataset can refresh incrementally.
            .withColumn("_pms_rate_key", F.lit(True))
            .join(_datix_link_rate().withColumn("_pms_rate_key", F.lit(True)), "_pms_rate_key")
+           .join(_datix_serial_capture().withColumn("_pms_rate_key", F.lit(True)), "_pms_rate_key")  # INSR_W6 W6.04
            .drop("_pms_rate_key"))
     datix_ok = F.col("datix_person_link_rate") >= DATIX_LINK_MIN_RATE
-    gate = lambda t, c: F.when(datix_ok, c) if t == "safety_incident_person" else c
+    # INSR_W6 W6.04 (ruling 12): serial flags only when capture >= 0.5 and this exposure's serial is usable.
+    serial_ok = ((F.col("datix_device_serial_capture_rate") >= DATIX_SERIAL_MIN_CAPTURE)
+                 & (F.length(_norm_serial(F.col("serial_number"))) >= SERIAL_MIN_CHARS))
+
+    def gate(t, c):
+        """NULL a person-incident value below the person-link floor and a device-serial value without serial capture."""
+        if t == "safety_incident_person":
+            return F.when(datix_ok, c)
+        if t == "safety_incident_device_serial":
+            return F.when(serial_ok, c)
+        return c
     flags = []
     for t in OUTCOME_TYPES:
         for h in HORIZONS:
@@ -848,11 +1006,13 @@ def pms_dataset():
                                   .when(F.col("followup_days") >= h, F.lit(False))).alias(f"{t}_{h}d"))
     counts = [gate(t, F.coalesce(F.col(f"n_{t}"), F.lit(0))).alias(f"n_{t}") for t in OUTCOME_TYPES]
     firsts = [gate(t, F.col(f"first_{t}_days")).alias(f"first_{t}_days") for t in OUTCOME_TYPES]
-    extra = [F.coalesce(F.col(c), F.lit(0)).alias(c) for c in
-             ("n_pre_index_device_serial_incidents", "n_same_day_date_only_events",
-              "n_patient_revisions_unattributed_after_index")]
+    extra = [F.when(serial_ok, F.coalesce(F.col("n_pre_index_device_serial_incidents"), F.lit(0)))
+              .alias("n_pre_index_device_serial_incidents"),
+             F.when(serial_ok, F.col("first_pre_index_device_serial_days")).alias("first_pre_index_device_serial_days"),
+             *[F.coalesce(F.col(c), F.lit(0)).alias(c) for c in
+               ("n_same_day_date_only_events", "n_patient_revisions_unattributed_after_index")]]
     skip = ({f"n_{t}" for t in OUTCOME_TYPES} | {f"first_{t}_days" for t in OUTCOME_TYPES}
-            | {"n_pre_index_device_serial_incidents", "n_same_day_date_only_events",
+            | {"n_pre_index_device_serial_incidents", "first_pre_index_device_serial_days", "n_same_day_date_only_events",
                "n_patient_revisions_unattributed_after_index"})
     return j.select(*[c for c in j.columns if c not in skip], *firsts, *counts, *extra, *flags,
                     F.lit(RULES_VERSION).alias("rules_version"))

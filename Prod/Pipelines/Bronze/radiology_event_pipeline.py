@@ -263,9 +263,15 @@ def keyed_upsert(target, key_cols, df):
     df MUST already carry ROW_HASH = xxhash64(to_json(struct(<all published non-admin cols>)))."""
     df.createOrReplaceTempView("s3_upsert_src")
     on = " AND ".join(f"t.{c} = s.{c}" for c in key_cols)
+    # R1FIX_20261109: name the source's columns explicitly. UPDATE SET * / INSERT * would also name the INSR R1 lane
+    # columns of map_radiology_event, which the R1 attach task owns and this source lacks.
+    columns = [f"`{c}`" for c in df.columns]
+    update_set = ", ".join(f"t.{c} = s.{c}" for c in columns)
+    insert_columns = ", ".join(columns)
+    insert_values = ", ".join(f"s.{c}" for c in columns)
     spark.sql(f"""MERGE INTO {target} t USING s3_upsert_src s ON {on}
-        WHEN MATCHED AND t.ROW_HASH <> s.ROW_HASH THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *""")
+        WHEN MATCHED AND t.ROW_HASH <> s.ROW_HASH THEN UPDATE SET {update_set}
+        WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})""")
     return spark.sql(f"DESCRIBE HISTORY {target} LIMIT 1").collect()[0]["operationMetrics"]
 
 def latest_per_key(df, key_cols, order_exprs):
@@ -730,7 +736,18 @@ if not spark.catalog.tableExists(TARGET):
 # target lacks; any retype or disappearing column aborts before the write.
 _have={f.name.lower():f.dataType.simpleString() for f in spark.table(TARGET).schema.fields}
 _want={f.name.lower():(f.name,f.dataType.simpleString()) for f in out.schema.fields}
-_bad=sorted([c for c,(_,t) in _want.items() if c in _have and _have[c]!=t]+[c for c in _have if c not in _want])
+# R1FIX_20261109b: the INSR R1 lane columns (exam lane) are owned by the R1 attach task, not this builder: a target
+# column missing from the stage is only a "disappearing column" when it is not one of them. (This notebook does not
+# %run _bronze_common, so it asks R1's lane registry directly.)
+def _r1_is_lane_column(name):
+    """True for an INSR R1 lane column (<LANE>_MAPPING, _MAP_KEY, _MAP_COMPONENTS_JSON), from R1's lane registry."""
+    import sys
+    shared = "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import mapping_contract
+    return mapping_contract.is_r1_column(str(name).upper())
+_bad=sorted([c for c,(_,t) in _want.items() if c in _have and _have[c]!=t]+[c for c in _have if c not in _want and not c.startswith("anon_") and not _r1_is_lane_column(c)])
 assert not _bad,f"non-additive schema change on {TARGET}: {_bad}"
 _add=[(n,t) for c,(n,t) in _want.items() if c not in _have]
 if _add:

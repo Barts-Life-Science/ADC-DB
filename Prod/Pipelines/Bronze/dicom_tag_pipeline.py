@@ -4,7 +4,8 @@
 # Owned scope:
 #   /Workspace/Shared/PM-DE-Misc/Ben/Python/CC/BronzeCompleteness/dicom_tag_pipeline
 #   8_dev.bronze.map_dicom_file_attribute
-#   run-scoped 8_dev.bronze.s6_dicom_* scratch objects
+#   run-scoped <target_schema>.s6_dicom_<run>_pivot scratch (dropped at run end); run evidence appended to
+#   <control_schema>.dicom_tag_run_evidence (6_mgmt.bronze for prod)
 #
 # Pure Python notebook: no %run and no production writes.
 # The source is a deep PILOT slice, not estate-wide DICOM coverage.
@@ -104,7 +105,10 @@ if not RUN_TOKEN:
     raise ValueError("run_id must contain at least one alphanumeric character")
 
 SCRATCH_PIVOT = f"{TARGET_SCHEMA}.s6_dicom_{RUN_TOKEN}_pivot"
-SCRATCH_EVIDENCE = f"{TARGET_SCHEMA}.s6_dicom_{RUN_TOKEN}_evidence"
+# DICOM_EVIDENCE_LOG_V1 (2026-11-11): run evidence is appended to ONE log table in the control schema (6_mgmt.bronze
+# for prod, the dev schema for dev) with a run_id column, instead of a new s6_dicom_<run>_evidence table in the target
+# schema on every run (15 had accumulated in 4_prod.bronze by 11-10).
+EVIDENCE_LOG = f"{CONTROL_SCHEMA}.dicom_tag_run_evidence"
 
 print(json.dumps({
     "pipeline": PIPELINE,
@@ -112,7 +116,7 @@ print(json.dumps({
     "action": ACTION,
     "run_id": RUN_ID,
     "scratch_pivot": SCRATCH_PIVOT,
-    "scratch_evidence": SCRATCH_EVIDENCE,
+    "evidence_log": EVIDENCE_LOG,
     "force_rebuild": FORCE_REBUILD,
     "interrupt_after_phase": INTERRUPT_AFTER_PHASE,
     "target": TARGET,
@@ -926,16 +930,40 @@ def enrich_and_publish(versions, accounting):
 
 # COMMAND ----------
 
+EVIDENCE_LOG_COMMENT = (
+    "Run evidence of the DICOM tag pipeline (s6_b13_dicom_tag_pipeline): one row per named metric per run, value as "
+    "JSON text, with the run id, pipeline version and the time the row was recorded. Benchmark and correctness "
+    "diagnostics (status, source and target versions, timings, cluster); no patient data.")
+EVIDENCE_LOG_COLUMNS = {
+    "run_id": "Pipeline run id (the bronze job run id for scheduled runs).",
+    "pipeline_version": "PIPELINE_VERSION of the notebook that wrote the row.",
+    "metric": "Evidence metric name.",
+    "value": "Metric value as JSON text.",
+    "recorded_at": "When the row was written.",
+}
+
+
+def ensure_evidence_log():
+    """Create the evidence log once, with its table and column comments and operational ig tags (0/0, the value every
+    other 6_mgmt control/audit table carries)."""
+    if spark.catalog.tableExists(EVIDENCE_LOG):
+        return
+    columns = ", ".join(f"{c} {'TIMESTAMP' if c == 'recorded_at' else 'STRING'} COMMENT '{sql_quote(t)}'"
+                        for c, t in EVIDENCE_LOG_COLUMNS.items())
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {EVIDENCE_LOG} ({columns}) USING DELTA "
+              f"COMMENT '{sql_quote(EVIDENCE_LOG_COMMENT)}'")
+    for c in EVIDENCE_LOG_COLUMNS:
+        spark.sql(f"ALTER TABLE {EVIDENCE_LOG} ALTER COLUMN {c} SET TAGS ('ig_risk' = '0', 'ig_severity' = '0')")
+
+
 def write_evidence(record):
-    payload = [(str(k), json.dumps(v, default=str, sort_keys=True)) for k, v in sorted(record.items())]
-    spark.createDataFrame(payload, "metric STRING, value STRING") \
+    """Append one run's evidence (metric -> JSON value) to the evidence log."""
+    ensure_evidence_log()
+    payload = [(RUN_ID, PIPELINE_VERSION, str(k), json.dumps(v, default=str, sort_keys=True))
+               for k, v in sorted(record.items())]
+    spark.createDataFrame(payload, "run_id STRING, pipeline_version STRING, metric STRING, value STRING") \
          .withColumn("recorded_at", F.current_timestamp()) \
-         .write.format("delta").mode("append").saveAsTable(SCRATCH_EVIDENCE)
-    set_properties(SCRATCH_EVIDENCE, {
-        "s6.pipeline.version": PIPELINE_VERSION,
-        "s6.run_id": RUN_ID,
-        "s6.evidence.kind": "BENCHMARK_AND_CORRECTNESS",
-    })
+         .write.format("delta").mode("append").saveAsTable(EVIDENCE_LOG)
 
 def cluster_evidence():
     values = {}
@@ -1157,5 +1185,4 @@ dbutils.notebook.exit(json.dumps(evidence, default=str))
 # Rollback:
 #   - Because this is a new table, human rollback is DROP of the newly-created prod table
 #     after downstream-use confirmation. No existing production object is mutated.
-
 

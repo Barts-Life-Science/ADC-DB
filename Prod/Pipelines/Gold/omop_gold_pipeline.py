@@ -30,6 +30,9 @@ import pyspark.sql.functions as F
 from pyspark import pipelines as dp
 
 PIPELINE_VERSION = "1.0.0-og-2026-10-16"
+# INSR_20261029 (INSR_W5_OMOP_V1): release tag for the W5 gold metadata rows; PIPELINE_VERSION is unchanged
+# because it is part of every gold table comment.
+INSR_RELEASE = "insr-20261029"
 
 # ==== Configuration and fail-closed source reads ====
 
@@ -114,85 +117,27 @@ def silver_schema(table):
 
 # ==== Mapping admission gate (verbatim from gold journey) ====
 
-# The policy JSON is the gold pipeline's `journey.s3b_policies` configuration, copied at
-# deploy time so OMOP gold and gold journey admit exactly the same mappings. An empty
-# policy set would withhold every similarity-scored mapping, so it is refused.
-GOLD_V2_POLICIES = json.loads(spark.conf.get("journey.s3b_policies", "{}"))
+# INSR R1 (mapping into bronze): the admission policy is data (3_lookup.omop.mapping_admission_policy), read once at
+# graph build; one gate module serves gold and omop_gold (design rev 3 decision 7; R1 plan deviation D6). In
+# omop_gold a policy change re-plans the gated MVs once, as a journey.s3b_policies change did. After R4 no gold dataset
+# calls this literal form: views join the policy table and materialised tables join the per-key _mapping_admission MV
+# (Ben's 2026-11-01 ruling), so for gold a policy change is a data change.
+import sys as _r1_sys
+_r1_sys.path.append(spark.conf.get("journey.r1_shared_path", "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"))
+import mapping_admission_gate as R1G  # noqa: E402
+R1_POLICY = R1G.load_policy(spark, spark.conf.get("journey.r1_policy_table",
+                                                  "`3_lookup`.omop.mapping_admission_policy"))
+GOLD_V2_POLICIES = R1_POLICY.banded
+GOVERNED_TRANSLATION_RULES = R1_POLICY.translation_prefixes
+GOVERNED_ROLLUP_RULES = R1_POLICY.rollup_prefixes
 if not GOLD_V2_POLICIES:
-    raise ValueError("journey.s3b_policies is empty: copy it from the gold pipeline configuration")
-
-# Copied verbatim from Prod/Pipelines/Gold/gold_journey_shared.py (2026-10-16); the
-# test suite compares the syntax trees, so edit both or neither.
-GOVERNED_TRANSLATION_RULES = (
-    "omop:maps_to:", "trud:icd10:closest", "trud:icdsctmap:single",
-    "trud:opcs4:closest", "trud:opcssctmap:single", "trud.nicip.",
-    "omop:concept_name:exact", "ukcore:ethnic_category:",
-    "form:smoking_status_instrument:", "powerform:S5:validated", "ucum:unit:",
-    "score:component:validated", "omop:concept_synonym:exact", "nicip:",
-    "bronze.map_medication_order:", "bronze.map_med_admin:LOOKUP_STANDARD_MAP",
-    "bronze.map_med_admin:EXACT_UNIQUE_STANDARD_NAME", "bronze.map_med_admin:RXNORM_CODE",
-    "bronze.map_med_admin:SNOMED_CODE", "bronze.map_condition:NATIVE",
-    "bronze.map_procedure:NATIVE", "omop:snomed_concept_crosswalk", "source:",
-    "omop:concept_synonym:exact:lower", "concept_synonym:exact:lower",
-    "rxnorm:mmsl_gn:snomedct_us:", "ecds:chief_complaint:description_exact",
-    "ecds:chief_complaint:pool_seed_exact", "ecds:chief_complaint:rfv_exact", "ecds:chief_complaint:closest",
-    "nicip:preferred_term:exact:", "nicip:synonym:exact:", "nicip:preferred_term:closest",
-    "dmd:id:native", "dmd:name:exact",
-    "bronze.map_implant_details:LAYER1_UDI_GUDID", "bronze.map_implant_details:LAYER1B_CATALOGUE_GUDID",
-    "bronze.map_implant_details:LAYER2_EXACT_ANCHOR", "bronze.map_implant_details:LAYER3_BRAND_RULE",
-    "bronze.map_implant_details:LAYER4_CLEANED_ANCHOR", "bronze.map_implant_details:LAYER6_OPCS_STANDARD",
-)
-GOVERNED_ROLLUP_RULES = ("trud:icdsctmap:rollup", "trud:opcssctmap:rollup")
+    raise ValueError("mapping_admission_policy has no banded policy: refusing to withhold every scored mapping")
 
 # GOLD_COMPACT_GATE_PATCH_APPLIED v1
 def _s3_axis_gate_and_policy(item):
-    """Decide whether a mapped target meets the configured policy and return its provenance.
-
-    Governed rule prefixes and policies are array literals tested by higher-order functions, so
-    the expression is one size whatever their number. Unrolled per-prefix OR and per-policy CASE
-    chains made Enzyme planning of the QC twins exhaust the driver (2026-09-25/26 gold failures).
-    """
-    method = item["map_method"]
-    rule = F.coalesce(item["map_rule_id"], F.lit(""))
-    native = method == "source_native"
-    levels = F.coalesce(item["map_rollup_levels"], F.lit(99))
-    translation = (
-        (method.isin("rule", "exact_synonym")
-         & F.exists(F.array(*[F.lit(p) for p in GOVERNED_TRANSLATION_RULES]), lambda p: rule.startswith(p)))
-        | ((method == "ancestor_rollup")
-           & F.exists(F.array(*[F.lit(p) for p in GOVERNED_ROLLUP_RULES]), lambda p: rule.startswith(p))
-           & (levels <= F.lit(4)))
-    ) & ~rule.contains("EXACT_string_similarity")
-    policy_id = F.when(native, F.lit("source_native")).when(translation, F.lit("governed_translation"))
-    banded = F.lit(False)
-    if GOLD_V2_POLICIES:
-        policies = F.array(*[
-            F.struct(
-                F.lit(current_id).alias("id"),
-                F.lit(policy["method"]).alias("method"),
-                F.lit(f":{policy['lane']}:").alias("lane"),
-                F.lit(policy["scoring_model"]).alias("scoring_model"),
-                F.lit(policy["hierarchy_version"]).alias("hierarchy_version"),
-                F.lit(float(policy["cutoff"])).alias("cutoff"),
-                F.lit(int(policy.get("rollup_config", {}).get("max_levels", 3))).alias("max_levels"),
-            )
-            for current_id, policy in sorted(GOLD_V2_POLICIES.items())
-        ])
-        matched = F.filter(policies, lambda p: (
-            (method == p["method"]) &
-            rule.contains(p["lane"]) &
-            (F.coalesce(item["map_scoring_model"], F.lit("")) == p["scoring_model"]) &
-            F.coalesce(item["map_version"], F.lit("")).contains(p["hierarchy_version"]) &
-            (F.coalesce(item["map_cosine"], F.lit(0.0)) >= p["cutoff"]) &
-            ((method != "ancestor_rollup") | (levels <= p["max_levels"]))
-        ))
-        # The last matching policy in id order wins, as the unrolled CASE chain did.
-        banded = F.size(matched) > 0
-        policy_id = F.when(banded, F.element_at(matched, -1)["id"]).otherwise(policy_id)
-    rejected = F.coalesce(item["map_status"], F.lit("")).isin("judge_rejected", "vetoed_polarity")
-    gate = F.coalesce((native | translation | banded) & ~rejected, F.lit(False))
-    policy_id = F.when(rejected, F.concat(F.lit("withheld:"), item["map_status"])).otherwise(policy_id)
-    return gate, F.coalesce(policy_id, F.lit("withheld:no_matching_policy"))
+    """Decide whether a mapped target meets the configured policy and return its provenance: the shared gate
+    (mapping_admission_gate.gate_and_policy, AST-equal to the previous body) over the table-held policy."""
+    return R1G.gate_and_policy(item, R1_POLICY)
 
 
 # The S3 axis travels as JSON in silver provenance (`map_axis_json`, added by
@@ -305,12 +250,19 @@ def _og_person_gate():
     gold death table. `_og_sex` is Male/Female only, for the sex-plausibility finding.
     """
     flags = read_source("omop_person_research_flags").select("person_id", "research_exclusion_reason")
+    # INSR_W5 W5.03 (J7, C0 ruling 1): persons with an observation period (silver _om_observation_start, never
+    # observation_period, whose end moves every run) and the silver person_scope flag.
+    periods = (read_source("_om_observation_start").where(F.col("_exclusion_reason").isNull())
+               .select("person_id", F.lit(True).alias("_og_has_period")))
+    scope = read_source("omop_person_scope").select("person_id", F.col("in_scope").alias("_og_in_scope"))
     deaths = read_source("death").groupBy("person_id").agg(F.min("death_date").alias("_og_raw_death_date"))
     persons = (
         read_source("person")
         .select("person_id", "birth_datetime", "gender_concept_id")
         .join(flags, "person_id", "left")
         .join(deaths, "person_id", "left")
+        .join(periods, "person_id", "left")  # INSR_W5 W5.03
+        .join(scope, "person_id", "left")  # INSR_W5 W5.03
         .withColumn("_og_birth_date", F.to_date("birth_datetime"))
     )
     persons = _after_release(persons, "_og_birth_date", "_og_birth_after_release")  # INCR_FIX_20261018
@@ -321,6 +273,8 @@ def _og_person_gate():
         F.when(F.col("research_exclusion_reason").isNotNull(),
                F.concat(F.lit("research_excluded:"), F.col("research_exclusion_reason")))
         .when(F.col("_og_birth_after_release"), F.lit("birth_after_release_date"))
+        .when(~F.coalesce(F.col("_og_in_scope"), F.lit(False)), F.lit("person_not_in_scope"))  # INSR_W5 W5.03
+        .when(F.col("_og_has_period").isNull(), F.lit("no_observation_period"))  # INSR_W5 W5.03
         .alias("_og_person_reason"),
         F.col("birth_datetime").alias("_og_birth_datetime"),
         F.when(birth_date.isNull() | (F.col("_og_raw_death_date") >= birth_date), F.col("_og_raw_death_date"))
@@ -366,6 +320,7 @@ TABLE_RULES = {
         "advisory": {
             "valid_cause_concept": "cause_concept_id IS NULL OR cause_concept_id >= 0",
             "death_date_matches_datetime": "death_datetime IS NULL OR CAST(death_datetime AS DATE) = death_date",
+            "cause_text_present": "cause_source_value IS NULL OR length(translate(cause_source_value, concat(' ', char(9), char(10), char(11), char(12), char(13), char(160)), '')) > 0",  # INSR_W4
         },
     },
     "observation_period": {
@@ -409,6 +364,7 @@ TABLE_RULES = {
         "advisory": {
             "valid_dates": "visit_detail_start_date <= visit_detail_end_date",
             "within_study_window": "visit_detail_start_date >= '2012-01-01'",
+            "end_not_sentinel": "visit_detail_end_date < '2099-12-31'",  # INSR_W4
             "valid_visit_detail_concept_value": "visit_detail_concept_id > 0",
         },
     },
@@ -423,6 +379,7 @@ TABLE_RULES = {
         "advisory": {
             "valid_concept_value": "condition_concept_id > 0",
             "within_study_window": "condition_start_date >= '2012-01-01'",
+            "end_not_sentinel": "condition_end_date IS NULL OR condition_end_date < '2099-12-31'",  # INSR_W4
             "valid_status_concept": "condition_status_concept_id IS NULL OR condition_status_concept_id >= 0",
         },
     },
@@ -453,6 +410,7 @@ TABLE_RULES = {
             "valid_concept_value": "drug_concept_id > 0",
             "valid_dates": "drug_exposure_end_date >= drug_exposure_start_date",
             "within_study_window": "drug_exposure_start_date >= '2012-01-01'",
+            "end_not_sentinel": "drug_exposure_end_date < '2099-12-31'",  # INSR_W4
             "valid_quantity": "quantity IS NULL OR quantity > 0",
             "valid_days_supply": "days_supply IS NULL OR days_supply > 0",
         },
@@ -468,6 +426,7 @@ TABLE_RULES = {
         "advisory": {
             "valid_concept_value": "device_concept_id > 0",
             "within_study_window": "device_exposure_start_date >= '2012-01-01'",
+            "end_not_sentinel": "device_exposure_end_date IS NULL OR device_exposure_end_date < '2099-12-31'",  # INSR_W4
             "valid_quantity": "quantity IS NULL OR quantity > 0",
         },
     },
@@ -484,6 +443,8 @@ TABLE_RULES = {
             "within_study_window": "measurement_date >= '2012-01-01'",
             "single_value_kind": "value_as_number IS NULL OR value_as_concept_id IS NULL",
             "valid_range": "range_high IS NULL OR range_low IS NULL OR range_high >= range_low",
+            "value_magnitude": "value_as_number IS NULL OR abs(value_as_number) <= 1e12",  # INSR_W4
+            "placeholder_value": "NOT (upper(coalesce(value_source_value, '')) IN ('ZZZB', 'ZZZM', 'ZZZS') OR (upper(coalesce(measurement_source_value, '')) LIKE '%FIT%' AND value_as_number IN (999, 9999)))",  # INSR_W4
         },
     },
     "observation": {
@@ -509,6 +470,7 @@ TABLE_RULES = {
         },
         "advisory": {
             "within_study_window": "specimen_date >= '2012-01-01'",
+            "valid_concept_value": "specimen_concept_id > 0",  # INSR_W4
             "valid_quantity": "quantity IS NULL OR quantity > 0",
         },
     },
@@ -564,6 +526,7 @@ TABLE_RULES = {
         },
         "advisory": {
             "valid_dates": "episode_end_date IS NULL OR episode_end_date >= episode_start_date",
+            "end_not_sentinel": "episode_end_date IS NULL OR episode_end_date < '2099-12-31'",  # INSR_W4
         },
     },
     "genomic_test": {
@@ -651,6 +614,14 @@ TABLE_RULES = {
         "advisory": {},
     },
 }
+
+
+# INSR_W5 W5.16 (F7, L415): personnel ids 0 (placeholder) and 1 (system account) are not providers. W5.04 removes
+# them in silver; this advisory counts any that come back.
+INSR_W5_PROVIDER_TABLES = ["person", "visit_occurrence", "visit_detail", "condition_occurrence", "procedure_occurrence",
+                           "drug_exposure", "device_exposure", "measurement", "observation"]
+for _table in INSR_W5_PROVIDER_TABLES:
+    TABLE_RULES[_table]["advisory"]["provider_not_placeholder"] = "provider_id IS NULL OR provider_id NOT IN (0, 1)"
 
 
 def _expectations(table):
@@ -907,6 +878,33 @@ def _null_ends_before_start(frame, spec):
     return frame
 
 
+# INSR_W5 W5.06 (L439, F9, J33): measurement values gold withholds; the row stays and silver keeps the value.
+# The rules mirror the W4.09 advisories, which therefore read 0 on the published table.
+INSR_W5_MEASUREMENT_PLACEHOLDER_VALUES = ("ZZZB", "ZZZM", "ZZZS")
+
+
+def _insr_measurement_repairs(frame):
+    """NULL a value beyond 1e12 in magnitude or a placeholder (ZZZ* codes; FIT 999/9999), and NULL both range bounds
+    when low > high. Flags are computed first, so the bounds are judged on their original values."""
+    placeholder = (
+        F.upper(F.coalesce(F.col("value_source_value"), F.lit(""))).isin(*INSR_W5_MEASUREMENT_PLACEHOLDER_VALUES)
+        | (F.upper(F.coalesce(F.col("measurement_source_value"), F.lit(""))).contains("FIT")
+           & F.col("value_as_number").isin(999, 9999))
+    )
+    return (
+        frame
+        .withColumn("_og_bad_value", F.coalesce((F.abs(F.col("value_as_number")) > F.lit(1e12)) | placeholder, F.lit(False)))
+        .withColumn("_og_bad_range", F.coalesce(F.col("range_low") > F.col("range_high"), F.lit(False)))
+        .withColumn("value_as_number", F.when(~F.col("_og_bad_value"), F.col("value_as_number")))
+        .withColumn("range_low", F.when(~F.col("_og_bad_range"), F.col("range_low")))
+        .withColumn("range_high", F.when(~F.col("_og_bad_range"), F.col("range_high")))
+        .drop("_og_bad_value", "_og_bad_range")
+    )
+
+
+INSR_W5_VALUE_REPAIRS = {"measurement": _insr_measurement_repairs}
+
+
 def _public_frame(table, spec):
     """The published gold table: silver minus audit drops, with pointer and end-date repairs."""
     silver = read_source(table)
@@ -914,6 +912,7 @@ def _public_frame(table, spec):
     kept = silver.join(dropped, spec["id"], "left_anti")
     kept = _null_dropped_pointers(kept, spec["fk_null"])
     kept = _null_ends_before_start(kept, spec)
+    kept = INSR_W5_VALUE_REPAIRS.get(table, lambda frame: frame)(kept)  # INSR_W5 W5.06
     return kept.select(*silver.columns)
 
 
@@ -942,6 +941,117 @@ for _table, _spec in FACT_TABLES.items():
         _register_fact_table(_table, _spec)
 
 
+# ==== INSR W4.09: OMOP rule-family audits (F5a, F6, F10, F12, F22). Internal; never a public fact. ====  # INSR_W4
+
+# (table, pointer column, parent table, parent key) for the F12 orphan audit (L562); 0 counts as an orphan.
+INSR_W4_FK_PAIRS = [
+    ("provider", "care_site_id", "care_site", "care_site_id"),
+    ("care_site", "location_id", "location", "location_id"),
+    ("visit_occurrence", "care_site_id", "care_site", "care_site_id"),
+    ("visit_occurrence", "provider_id", "provider", "provider_id"),
+    ("condition_occurrence", "provider_id", "provider", "provider_id"),
+    ("procedure_occurrence", "provider_id", "provider", "provider_id"),
+    ("drug_exposure", "provider_id", "provider", "provider_id"),
+    ("device_exposure", "provider_id", "provider", "provider_id"),
+    ("measurement", "provider_id", "provider", "provider_id"),
+    ("observation", "provider_id", "provider", "provider_id"),
+]
+
+
+@dp.materialized_view(name="_og_audit_fk_orphans",
+                      comment="Internal (INSR W4.09 F12): published pointers whose parent row is not published, per table and column.")
+def _og_audit_fk_orphans():
+    """Left-anti each non-NULL pointer against its published parent keys, then count per (table, column)."""
+    frames = []
+    for table, column, parent, key in INSR_W4_FK_PAIRS:
+        child = spark.read.table(table).select(F.col(column).alias("_og_fk")).where(F.col("_og_fk").isNotNull())
+        parents = spark.read.table(parent).select(F.col(key).alias("_og_fk")).distinct()
+        frames.append(child.join(parents, "_og_fk", "left_anti")
+                      .select(F.lit(table).alias("cdm_table"), F.lit(column).alias("cdm_column")))
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.groupBy("cdm_table", "cdm_column").agg(F.count(F.lit(1)).alias("orphan_rows"))
+
+
+@dp.materialized_view(name="_og_audit_outside_op",
+                      comment="Internal (INSR W4.09 F6/F22, L315/OHDSI DQD): published fact rows outside every observation period of their person.")
+def _og_audit_outside_op():
+    """Per fact table: rows whose start date lies in no observation period of the person."""
+    periods = spark.read.table("observation_period").select(
+        F.col("person_id").alias("_og_op_person"), "observation_period_start_date", "observation_period_end_date")
+    frames = []
+    for table, spec in FACT_TABLES.items():
+        if not spec["findings"] or (spec["optional"] and not source_exists(table)):
+            continue
+        facts = spark.read.table(table).select("person_id", F.col(spec["start_date"]).alias("_og_start"))
+        outside = facts.join(periods, (facts.person_id == periods._og_op_person)
+                             & facts._og_start.between(periods.observation_period_start_date,
+                                                       periods.observation_period_end_date), "left_anti")
+        frames.append(outside.select(F.lit(table).alias("cdm_table")))
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.groupBy("cdm_table").agg(F.count(F.lit(1)).alias("rows_outside_op"))
+
+
+@dp.materialized_view(name="_og_audit_measurement_units",
+                      comment="Internal (INSR W4.09 F10, L439): measurement concepts published with more than one unit.")
+def _og_audit_measurement_units():
+    """Concepts whose published measurements carry more than one unit_concept_id."""
+    return (spark.read.table("measurement").groupBy("measurement_concept_id")
+            .agg(F.countDistinct("unit_concept_id").alias("n_units"), F.count(F.lit(1)).alias("n_rows"))
+            .where(F.col("n_units") > 1))
+
+
+@dp.materialized_view(name="_og_audit_end_after_release",
+                      comment="Internal (INSR W4.09 F5a, L532): published end dates after the silver release date, per table and column.")
+def _og_audit_end_after_release():
+    """End dates that equi-join a calendar day after the release date (no run-date literal; see _og_future_day)."""
+    future = spark.read.table("_og_future_day").select("_og_future_date")
+    frames = []
+    for table, spec in FACT_TABLES.items():
+        for end_date, _ in spec["end_pairs"]:
+            if spec["optional"] and not source_exists(table):
+                continue
+            ends = spark.read.table(table).select(F.col(end_date).alias("_og_future_date"))
+            frames.append(ends.join(future, "_og_future_date")
+                          .select(F.lit(table).alias("cdm_table"), F.lit(end_date).alias("cdm_column")))
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.groupBy("cdm_table", "cdm_column").agg(F.count(F.lit(1)).alias("rows_after_release"))
+
+
+@dp.materialized_view(name="_og_visit_null_share",
+                      comment="Internal (INSR W4.09 F22, L715): published rows and rows with a NULL visit_occurrence_id per fact table.")
+def _og_visit_null_share():
+    """Rows and NULL-visit rows per fact table that carries visit_occurrence_id (sums over LONG, not DOUBLE)."""
+    frames = []
+    for table, spec in FACT_TABLES.items():
+        if "visit_occurrence_id" not in spec["fk_null"] or (spec["optional"] and not source_exists(table)):
+            continue
+        frames.append(spark.read.table(table).select(
+            F.lit(table).alias("cdm_table"), F.col("visit_occurrence_id").isNull().cast("long").alias("_og_null")))
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return union.groupBy("cdm_table").agg(F.count(F.lit(1)).alias("rows"), F.sum("_og_null").alias("null_visit_rows"))
+
+
+if source_exists("pregnancy"):
+    @dp.materialized_view(name="_og_audit_stale_pregnancy",
+                          comment="Internal (INSR W4.09 F22, L495): open pregnancy episodes that started more than 300 days before the release date (report-only).")
+    def _og_audit_stale_pregnancy():
+        """Open pregnancies older than 300 days at the release date, via a constant-key equi-join to _og_release."""
+        release = spark.read.table("_og_release").withColumn("_og_release_key", F.lit(True))
+        open_episodes = (spark.read.table("pregnancy").where(F.col("pregnancy_end_date").isNull())
+                         .withColumn("_og_release_key", F.lit(True)))
+        return (open_episodes.join(release, "_og_release_key")
+                .where(F.col("pregnancy_start_date") < F.date_sub(F.col("_og_release_date"), 300))
+                .agg(F.count(F.lit(1)).alias("stale_open_pregnancies")))
+
+
 # COMMAND ----------
 
 # ==== Person and death ====
@@ -965,7 +1075,11 @@ def _og_audit_person():
 
 @dp.materialized_view(
     name="person",
-    comment=f"OMOP CDM person: the research cohort of omop_silver (omop_gold {PIPELINE_VERSION}).",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        f"OMOP CDM person: the research cohort of omop_silver (omop_gold {PIPELINE_VERSION}). OMOP person "
+        f"scope: persons with an observation period built from every in-window fact date; persons with "
+        f"none are dropped (J7)."
+    ),
     schema=silver_schema("person"),
     table_properties={"quality": "gold"},
 )
@@ -1177,7 +1291,8 @@ GOLD_METADATA_ROWS = [
     (1002, "omop_gold_mapping_policy_ids", ",".join(sorted(GOLD_V2_POLICIES))),
     (1003, "omop_gold_rules", "person gate (omop_person_research_flags + birth after release); "
                               "S3D mapping gate; start after source_release_date; parent integrity; "
-                              "FK nulling; end-before-start nulling"),
+                              "FK nulling; end-before-start nulling; person scope and observation period (INSR W5.03)"),
+    (1004, "person_scope", "omop_gold publishes persons that are in scope (silver person_scope.in_scope: a qualifying encounter or any clinical row; C0 ruling 1, 2026-10-29) and have an observation period (J7); silver OMOP keeps every person. Dropped persons are counted in omop_gold_drop_metrics as person_not_in_scope and no_observation_period."),
 ]
 
 
@@ -1203,10 +1318,152 @@ def metadata():
         F.col("_og_release_date").alias("metadata_date"),
         F.col("_og_release_date").cast("timestamp").alias("metadata_datetime"),
     )
-    return silver.unionByName(gold.select(*silver.columns))
+    # INSR_W5 W5.12: complete_through:<table> rows (ids 1100+), dated by the complete-through day.
+    complete = spark.read.table("omop_gold_complete_through").select(
+        F.col("metadata_id"), F.lit(0).cast("int").alias("metadata_concept_id"),
+        F.lit(0).cast("int").alias("metadata_type_concept_id"),
+        F.concat(F.lit("complete_through:"), F.col("table_name")).alias("name"),
+        F.date_format("complete_through_date", "yyyy-MM-dd").alias("value_as_string"),
+        F.lit(None).cast("int").alias("value_as_concept_id"), F.lit(None).cast("double").alias("value_as_number"),
+        F.col("complete_through_date").alias("metadata_date"),
+        F.col("complete_through_date").cast("timestamp").alias("metadata_datetime"))
+    return silver.unionByName(gold.select(*silver.columns)).unionByName(complete.select(*silver.columns))
 
 
 # COMMAND ----------
+
+# ==== INSR W5.12: published rows per table and month, and the complete-through month (F1, F2, J12, L692) ====
+# INSR_W5 W5.12
+# omop_gold_domain_month counts published rows per (table, start month). _og_domain_month_stats adds the median of the
+# 12 months before each month (a self-join on table_name; no window frame). omop_gold_complete_through takes, per
+# table, the latest month before the release month that is not low; a month in the last 6 before the release month is
+# low when its rows are under 80% of that median (at least 6 prior months). The release month comes from _og_release
+# by a constant-key equi-join, never from the run date.
+INSR_W5_COMPLETE_RATIO = 0.8
+INSR_W5_TRAILING_MONTHS = 6
+INSR_W5_DOMAIN_TABLES = [table for table, spec in FACT_TABLES.items()
+                         if table != "observation_period" and (not spec["optional"] or source_exists(table))]
+INSR_W5_COMPLETE_THROUGH_IDS = {table: 1100 + i for i, table in enumerate(sorted(INSR_W5_DOMAIN_TABLES))}
+
+
+# Declared schemas carry the column comments (og_check comment_coverage_95 runs at P5.5; a refresh writes them).
+INSR_W5_DOMAIN_MONTH_SCHEMA = (
+    "table_name STRING COMMENT 'OMOP CDM table the rows are published in.', "
+    "month DATE COMMENT 'First day of the month of the row start date.', "
+    "rows BIGINT COMMENT 'Published rows of the table starting in that month.'")
+INSR_W5_COMPLETE_THROUGH_SCHEMA = (
+    "metadata_id BIGINT COMMENT 'metadata_id of the table complete_through metadata row (1100 and up).', "
+    "table_name STRING COMMENT 'OMOP CDM table this completeness date describes.', "
+    "complete_through_month DATE COMMENT 'Latest month before the release month whose rows are not under 80% of the prior-12-month median.', "
+    "complete_through_date DATE COMMENT 'Last day of complete_through_month: the table is considered complete up to this date.', "
+    "first_low_month DATE COMMENT 'Earliest low month (under 80% of its prior-12-month median) in the trailing six months; NULL when none.'")
+
+
+@dp.materialized_view(name="omop_gold_domain_month", schema=INSR_W5_DOMAIN_MONTH_SCHEMA,
+                      comment="INSR W5.12: published rows per OMOP table and start month (BIGINT counts); feeds complete-through and the F1 volume audit.")
+def omop_gold_domain_month():
+    """One row per (table_name, month) with its published row count."""
+    frames = [spark.read.table(table).select(F.lit(table).alias("table_name"),
+                                             F.trunc(F.col(FACT_TABLES[table]["start_date"]), "month").alias("month"))
+              for table in INSR_W5_DOMAIN_TABLES]
+    union = frames[0]
+    for frame in frames[1:]:
+        union = union.unionByName(frame)
+    return (union.where(F.col("month").isNotNull()).groupBy("table_name", "month")
+            .agg(F.count(F.lit(1)).cast("bigint").alias("rows")))
+
+
+@dp.materialized_view(name="_og_domain_month_stats",
+                      comment="Internal (INSR W5.12): each table-month with the median rows of the 12 months before it.")
+def _og_domain_month_stats():
+    """Self-join on table_name over the prior 12 months, then percentile_approx (BIGINT input, no window frame)."""
+    current = spark.read.table("omop_gold_domain_month")
+    prior = current.select(F.col("table_name").alias("_p_table"), F.col("month").alias("_p_month"),
+                           F.col("rows").alias("_p_rows"))
+    joined = current.join(prior, (F.col("table_name") == F.col("_p_table"))
+                          & (F.col("_p_month") >= F.add_months(F.col("month"), -12))
+                          & (F.col("_p_month") < F.col("month")), "left")
+    return joined.groupBy("table_name", "month", "rows").agg(
+        F.percentile_approx("_p_rows", 0.5).alias("median_prior_12"),
+        F.count("_p_month").alias("prior_months"))
+
+
+@dp.materialized_view(name="omop_gold_complete_through", schema=INSR_W5_COMPLETE_THROUGH_SCHEMA,
+                      comment="INSR W5.12 (J12, F2, L692): per OMOP table, the last month considered complete at this release (latest month before the release month that is not under 80% of its prior-12 median); surfaced as metadata complete_through:<table>.")
+def omop_gold_complete_through():
+    """Per table: the latest month before the release month that is not low, as a month and its last day."""
+    release = (spark.read.table("_og_release").select(F.trunc("_og_release_date", "month").alias("_release_month"))
+               .withColumn("_og_release_key", F.lit(True)))
+    stats = spark.read.table("_og_domain_month_stats").withColumn("_og_release_key", F.lit(True)).join(release, "_og_release_key")
+    trailing = ((F.col("month") < F.col("_release_month"))
+                & (F.col("month") >= F.add_months(F.col("_release_month"), -INSR_W5_TRAILING_MONTHS)))
+    low = trailing & (F.col("prior_months") >= 6) & (F.col("rows") < F.col("median_prior_12") * F.lit(INSR_W5_COMPLETE_RATIO))
+    ids = F.create_map(*[F.lit(x) for kv in INSR_W5_COMPLETE_THROUGH_IDS.items() for x in kv])
+    per_table = stats.groupBy("table_name").agg(
+        F.max(F.when((F.col("month") < F.col("_release_month")) & ~low, F.col("month"))).alias("_through"),
+        F.min(F.when(low, F.col("month"))).alias("_first_low"))
+    return per_table.select(ids[F.col("table_name")].cast("long").alias("metadata_id"), "table_name",
+                            F.col("_through").alias("complete_through_month"),
+                            F.last_day(F.col("_through")).alias("complete_through_date"),
+                            F.col("_first_low").alias("first_low_month"))
+
+
+# ==== INSR W5.16: omop_gold QC pack (F1, F9, F13, F14g) beside the W4.09 audits. Internal; never a public fact. ====
+# F13 keys: every FACT_TABLES id plus the published tables outside FACT_TABLES (death is one row per person).
+INSR_W5_KEYED_TABLES = {table: spec["id"] for table, spec in FACT_TABLES.items()
+                        if not spec["optional"] or source_exists(table)}
+INSR_W5_KEYED_TABLES.update({'person': 'person_id', 'death': 'person_id', 'provider': 'provider_id', 'care_site': 'care_site_id', 'location': 'location_id'})
+
+
+def _insr_register_key_audit(table, key):
+    """F13: one GROUP_AGGREGATE MV per table listing primary keys published more than once (expected empty)."""
+
+    @dp.materialized_view(name=f"_og_audit_dup_{table}",
+                          comment=f"Internal (INSR W5.16 F13): {table}.{key} values published more than once.")
+    def audit():
+        """Keys with more than one published row."""
+        return (spark.read.table(table).groupBy(F.col(key).alias("cdm_row_id"))
+                .agg(F.count(F.lit(1)).alias("rows")).where(F.col("rows") > 1))
+
+
+for _table, _key in INSR_W5_KEYED_TABLES.items():
+    _insr_register_key_audit(_table, _key)
+
+
+@dp.materialized_view(name="_og_audit_race_letter",
+                      comment="Internal (INSR W5.16 F14g, L472): race source codes of published persons that have no NHS letter in omop_race_map (code 0, no source value, is excluded).")
+def _og_audit_race_letter():
+    """Persons per race source code without a crosswalk letter (expected empty after W5.07)."""
+    letters = read_lookup("omop_race_map").select(F.col("ethnicity_code").alias("race_source_value"), "nhs_letter")
+    return (spark.read.table("person").where(F.coalesce(F.col("race_source_value"), F.lit("0")) != "0")
+            .join(letters, "race_source_value", "left").where(F.col("nhs_letter").isNull())
+            .groupBy("race_source_value").agg(F.count(F.lit(1)).alias("persons")))
+
+
+@dp.materialized_view(name="_og_audit_volume_step",
+                      comment="Internal (INSR W5.16 F1): table-months whose published rows are under half or over twice the median of the 12 months before (at least 6 prior months).")
+def _og_audit_volume_step():
+    """Volume steps from _og_domain_month_stats (W5.12)."""
+    ratio = F.col("rows") / F.col("median_prior_12")
+    return (spark.read.table("_og_domain_month_stats")
+            .where((F.col("prior_months") >= 6) & (F.col("median_prior_12") > 0) & ((ratio < 0.5) | (ratio > 2.0)))
+            .select("table_name", "month", "rows", "median_prior_12", ratio.alias("ratio_to_median")))
+
+
+@dp.materialized_view(name="_og_audit_measurement_tail",
+                      comment="Internal (INSR W5.16 for master W5.06 F9, L439): measurement concept-units whose largest published value exceeds 100 x their p99.9 (values scaled x1000 to BIGINT).")
+def _og_audit_measurement_tail():
+    """Per (measurement_concept_id, unit_concept_id): rows, p99.9 and maximum of value_as_number x 1000 as BIGINT
+    (percentile_approx over BIGINT keeps the MV incremental, per the 2026-10-18 probe; gold already NULLs |v| > 1e12,
+    so the scaled value fits a BIGINT); kept where p99.9 > 0 and max > 100 x p99.9."""
+    scaled = F.round(F.col("value_as_number") * F.lit(1000)).cast("bigint")
+    stats = (spark.read.table("measurement").where(F.col("value_as_number").isNotNull())
+             .groupBy("measurement_concept_id", "unit_concept_id")
+             .agg(F.count(F.lit(1)).alias("rows"),
+                  F.percentile_approx(scaled, 0.999).alias("p999_x1000"),
+                  F.max(scaled).alias("max_x1000")))
+    return stats.where((F.col("p999_x1000") > 0) & (F.col("max_x1000") > F.col("p999_x1000") * 100))
+
 
 # ==== Sidecars: drop metrics, findings and mapping provenance ====
 
@@ -1253,6 +1510,17 @@ def omop_concept_provenance():
         "cdm_table", "cdm_row_id")
     provenance = read_source("omop_concept_provenance")
     kept = provenance.join(dropped, ["cdm_table", "cdm_row_id"], "left_anti")
+    # INSR_W5 W5.13 (L629, J19): map_version falls back to the vocabulary release, then the silver pipeline version.
+    # The S3 axis columns (map_axis_json, scoring_model, map_confidence) stay NULL where the mapping has no S3 axis.
+    vocabulary = (read_source("cdm_source").agg(F.max("vocabulary_version").alias("_og_vocab_version"))
+                  .withColumn("_og_vocab_key", F.lit(True)))
+    kept = (
+        kept.withColumn("_og_vocab_key", F.lit(True)).join(vocabulary, "_og_vocab_key", "left")
+        .withColumn("map_version", F.coalesce(F.col("map_version"),
+                                              F.concat(F.lit("vocabulary:"), F.col("_og_vocab_version")),
+                                              F.concat(F.lit("pipeline:"), F.col("pipeline_version"))))
+        .drop("_og_vocab_key", "_og_vocab_version")
+    )
     return _with_gate(kept).drop("_og_gate_pass")
 
 

@@ -159,12 +159,35 @@ def add_pregnancy_link(df):
             .withColumn("PERSON_ID", F.col("_PREG_PERSON_ID"))
             .drop("_PREGNANCY_ID", "_PREG_PERSON_ID"))
 
+def _r1_attach(df, target, broadcast_batch=True):
+    """INSR R1 (mapping into bronze): add the mapping-lane columns of `target` to df before an overwrite, so the
+    columns and their tags survive it. A no-op for tables without lanes. Keys new in this run stay NULL here and are
+    filled by the R1_Mapping_Attach task after the resolver (deviation D1 of the R1 plan)."""
+    import sys
+    shared = ("/Workspace/Shared/PM-DE-Misc/Ben/Python/CC/INSR_20261029/R1/src/_shared"
+              if target.replace("`", "").startswith("8_dev.") else "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import mapping_attach
+    return mapping_attach.attach_axes(df, target, broadcast_batch=broadcast_batch)
+
+
+def _r1_retag(target):
+    """INSR R1: this builder's overwriteSchema write drops column comments and tags; re-apply the R1 lane columns'
+    comments and estate-copied ig tags right after it (mapping_attach.tag_and_comment; a no-op without lanes)."""
+    import mapping_attach
+    if mapping_attach.L.lanes_of_table(mapping_attach._bare(target)):
+        mapping_attach.tag_and_comment(spark, target)
+
+
 def publish(df, table_name):
+    df = _r1_attach(df, f"{SCHEMA}.{table_name}")  # INSR R1: lane columns survive the overwrite
     (df.withColumn("PIPELINE_UPDT_DT_TM", F.current_timestamp())
        .write.format("delta")
        .mode("overwrite")
        .option("overwriteSchema", "true")
        .saveAsTable(f"{SCHEMA}.{table_name}"))
+    _r1_retag(f"{SCHEMA}.{table_name}")  # INSR R1: overwriteSchema dropped the lane columns' comments and tags
 
 # COMMAND ----------
 

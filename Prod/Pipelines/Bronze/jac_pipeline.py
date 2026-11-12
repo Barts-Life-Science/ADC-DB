@@ -52,6 +52,8 @@ MRN_ALIAS_TYPE, NHS_ALIAS_TYPE = 10, 18
 
 ISSUE_TABLE = f"{TARGET_SCHEMA}.map_pharmacy_issue"
 HOMECARE_TABLE = f"{TARGET_SCHEMA}.map_homecare_request"
+# INSR_W1_JAC_HOMECARE_DMD_V1: Opus-verified embedding lane for homecare lines the exact rules leave UNMAPPED.
+HOMECARE_DMD_MAP_TABLE = f"{bronze_lookup_schema(TARGET_SCHEMA)}.jac_homecare_item_dmd_map"
 DRUG_TABLE = f"{bronze_lookup_schema(TARGET_SCHEMA)}.map_pharmacy_drug"
 STATE_TABLE = f"{bronze_control_schema(TARGET_SCHEMA)}.jac_pipeline_state"
 
@@ -794,8 +796,8 @@ DRUG_COMMENTS = {
     "DMD_VTM_CODE": "SNOMED CT identifier from the automatically matched dm+d VTM.",
     "DMD_VTM_NAME": "Preferred name of the automatically matched dm+d VTM.",
     "DRUG_MAPPING_METHOD": "VTM_NAME, VTM_SYNONYM, UNMAPPED, or DISABLED; exact equality only.",
-    "CURATED_DMD_CONCEPT_ID": "Human override, effective only when CURATED_STATUS is APPROVED.",
-    "CURATED_STATUS": "Curation status: APPROVED, PROPOSED, or REJECTED.",
+    "CURATED_DMD_CONCEPT_ID": "Rule override VTM (INSR_W1_JAC_RULE_OVERRIDE_V1): applied whenever it is a valid dm+d VTM; DRUG_MAPPING_METHOD reads RULE_OVERRIDE.",
+    "CURATED_STATUS": "Legacy curation label kept as provenance (APPROVED, PROPOSED, REJECTED); it no longer gates the override.",
     "CURATED_NOTES": "Human curation notes; preserved by pipeline refreshes.",
     "ROW_HASH": "SHA-256 of pipeline-managed business columns; curation columns excluded.",
     "SOURCE_PRESENT_IND": "False when the drug id disappeared from both current issue snapshots.",
@@ -849,8 +851,7 @@ if _drug_needed:
         .withColumn(
             "_effective_concept_id",
             F.when(
-                (F.col("CURATED_STATUS") == "APPROVED")
-                & F.col("_curated_valid_vtm_concept_id").isNotNull(),
+                F.col("_curated_valid_vtm_concept_id").isNotNull(),  # INSR_W1_JAC_RULE_OVERRIDE_V1
                 F.col("_curated_valid_vtm_concept_id"),
             ).otherwise(F.col("DMD_VTM_CONCEPT_ID").cast("long")),
         )
@@ -937,8 +938,9 @@ def effective_drug_mapping() -> DataFrame:
         )
         .withColumn(
             "_use_curated",
-            (F.col("CURATED_STATUS") == "APPROVED")
-            & F.col("_curated_concept_id").isNotNull(),
+            # INSR_W1_JAC_RULE_OVERRIDE_V1: a valid curated VTM is a rule override applied without a status gate;
+            # CURATED_STATUS is provenance only. (2,794 APPROVED rows all carry a concept; no other status does.)
+            F.col("_curated_concept_id").isNotNull(),
         )
     )
     return drug.select(
@@ -955,7 +957,7 @@ def effective_drug_mapping() -> DataFrame:
         F.when(F.col("_use_curated"), F.col("_curated_name"))
         .otherwise(F.col("DMD_VTM_NAME"))
         .alias("DMD_VTM_NAME"),
-        F.when(F.col("_use_curated"), F.lit("CURATED_APPROVED"))
+        F.when(F.col("_use_curated"), F.lit("RULE_OVERRIDE"))
         .otherwise(F.col("DRUG_MAPPING_METHOD"))
         .alias("DRUG_MAPPING_METHOD"),
     )
@@ -1146,10 +1148,10 @@ ISSUE_COMMENTS = {
     "PERSON_MATCH_STATUS": "MATCHED or the reason no PERSON_ID was assigned.",
     "MRN_CANDIDATES": "Distinct active Cerner PERSON_ID candidates for the normalised MRN.",
     "NHS_CANDIDATES": "Distinct active Cerner PERSON_ID candidates for the checksum-valid NHS number.",
-    "DMD_VTM_CONCEPT_ID": "Effective valid dm+d VTM OMOP concept_id from exact matching or approved curation.",
+    "DMD_VTM_CONCEPT_ID": "Effective valid dm+d VTM OMOP concept_id from exact matching or a curated rule override (INSR_W1_JAC_RULE_OVERRIDE_V1).",
     "DMD_VTM_CODE": "Effective dm+d VTM SNOMED CT identifier.",
     "DMD_VTM_NAME": "Effective dm+d VTM preferred name.",
-    "DRUG_MAPPING_METHOD": "CURATED_APPROVED, VTM_NAME, VTM_SYNONYM, UNMAPPED, or DISABLED.",
+    "DRUG_MAPPING_METHOD": "RULE_OVERRIDE (a valid curated dm+d VTM, applied without a status gate; CURATED_APPROVED before INSR_W1_JAC_RULE_OVERRIDE_V1), VTM_NAME, VTM_SYNONYM, UNMAPPED, or DISABLED.",
     "CARE_SITE_CD": "map_care_site key from a unique exact location-name match.",
     "CARE_SITE_MATCH_METHOD": "NAME_EXACT, UNMAPPED, or UNAVAILABLE.",
     "ROW_HASH": "SHA-256 of pipeline-managed business columns.",
@@ -1292,11 +1294,21 @@ HOMECARE_COMMENTS = {
     "DMD_VTM_CONCEPT_ID": "Valid dm+d VTM OMOP concept_id from exact item-description matching.",
     "DMD_VTM_CODE": "Matched dm+d VTM SNOMED CT identifier.",
     "DMD_VTM_NAME": "Matched dm+d VTM preferred name.",
-    "DRUG_MAPPING_METHOD": "VTM_NAME, VTM_SYNONYM, VTM_NAME_COMPOUND ('&' spelled ' + '), NON_DRUG (delivery/charge/consumable/service/nursing line, no concept), UNMAPPED, DISABLED, or NULL for itemless headers.",  # OGR_JAC_VTM_V1
+    "DRUG_MAPPING_METHOD": "VTM_NAME, VTM_SYNONYM, VTM_NAME_COMPOUND ('&' spelled ' + '), EMBEDDING_LLM_VERIFIED (Opus-verified embedding match, INSR_W1_JAC_HOMECARE_DMD_V1), NON_DRUG (delivery/charge/consumable/service/nursing line, no concept), UNMAPPED, DISABLED, or NULL for itemless headers.",  # OGR_JAC_VTM_V1
+    "DRUG_MAPPING_RULE_ID": "Rule id of an EMBEDDING_LLM_VERIFIED match (JAC_HOMECARE_DMD_OPUS_V1), else NULL.",
+    "DRUG_MAPPING_MODEL": "Verifier model of an EMBEDDING_LLM_VERIFIED match, else NULL.",
+    "DRUG_MAPPING_SCORE": "Cosine similarity of an EMBEDDING_LLM_VERIFIED match (text-embedding-3-large), else NULL.",
     "CARE_SITE_CD": "map_care_site key from a unique exact location-name match.",
     "CARE_SITE_MATCH_METHOD": "NAME_EXACT, UNMAPPED, or UNAVAILABLE.",
     "ROW_HASH": "SHA-256 of pipeline-managed business columns.",
     "SOURCE_PRESENT_IND": "False when the row disappeared from the current source snapshot.",
+    "HOMECARE_CONTACT_NAME": "Homecare delivery contact name. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_ADDR1": "Homecare delivery address line 1. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_ADDR2": "Homecare delivery address line 2. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_ADDR3": "Homecare delivery address line 3. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_ADDR4": "Homecare delivery address line 4. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_POSTCODE": "Homecare delivery postcode. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
+    "HOMECARE_CONTACT_TELEPHONE": "Homecare delivery contact telephone. Identifier, published and tagged. INSR_W1_IDENTIFIER_RETAIN_V1",
     "ADC_UPDT": "Timestamp this row was last inserted or changed by jac_pipeline.",
 }
 
@@ -1312,6 +1324,14 @@ if _homecare_needed:
             blank_to_null(F.col("costcentre")).alias("COSTCENTRE_NAME"),
             blank_to_null(F.col("indication")).alias("INDICATION"),
             blank_to_null(F.col("clinic")).alias("CLINIC"),
+            # INSR_W1_IDENTIFIER_RETAIN_V1: delivery-contact identifiers, published and tagged.
+            blank_to_null(F.col("homecarecontactname")).alias("HOMECARE_CONTACT_NAME"),
+            blank_to_null(F.col("homecarecontactaddr1")).alias("HOMECARE_CONTACT_ADDR1"),
+            blank_to_null(F.col("homecarecontactaddr2")).alias("HOMECARE_CONTACT_ADDR2"),
+            blank_to_null(F.col("homecarecontactaddr3")).alias("HOMECARE_CONTACT_ADDR3"),
+            blank_to_null(F.col("homecarecontactaddr4")).alias("HOMECARE_CONTACT_ADDR4"),
+            blank_to_null(F.col("homecarecontactpostcode")).alias("HOMECARE_CONTACT_POSTCODE"),
+            blank_to_null(F.col("homecarecontacttelephone")).alias("HOMECARE_CONTACT_TELEPHONE"),
             F.col("start_date").alias("SUPPLY_START_DATE"),
             F.col("supply_interval").cast("int").alias("SUPPLY_INTERVAL"),
             F.col("supply_period").cast("int").alias("SUPPLY_PERIOD"),
@@ -1447,9 +1467,38 @@ if _homecare_needed:
             .withColumn("DMD_VTM_NAME", F.when(hit, F.col("C_NAME")).otherwise(F.col("DMD_VTM_NAME")))
             .drop("MATCH_SOURCE", "COMPOUND_KEY", "C_CONCEPT_ID", "C_CODE", "C_NAME", "_COMPOUND_HIT")
         )
+        # INSR_W1_JAC_HOMECARE_DMD_V1: a line the exact/synonym/compound rules leave UNMAPPED takes the Opus-verified
+        # embedding match for its NAME_KEY, with the map's rule id, model and score. Rule matches above always win; a
+        # rejected key stays UNMAPPED (never a review queue). _USE_LANE is frozen before any replaced column is read.
+        if bronze_table_exists(HOMECARE_DMD_MAP_TABLE):
+            lane = spark.table(HOMECARE_DMD_MAP_TABLE).where(F.col("DMD_VTM_CONCEPT_ID").isNotNull()).select(
+                F.col("NAME_KEY").alias("_LANE_KEY"), F.col("DMD_VTM_CONCEPT_ID").cast("long").alias("_LANE_ID"),
+                F.col("DMD_VTM_CODE").alias("_LANE_CODE"), F.col("DMD_VTM_NAME").alias("_LANE_NAME"),
+                F.col("MAPPING_RULE_ID").alias("_LANE_RULE"), F.col("MAPPING_MODEL").alias("_LANE_MODEL"),
+                F.col("MAPPING_SCORE").cast("double").alias("_LANE_SCORE"))
+            homecare = (
+                homecare.join(lane, F.col("NAME_KEY") == F.col("_LANE_KEY"), "left")
+                .withColumn("_USE_LANE", F.coalesce((F.col("DRUG_MAPPING_METHOD") == "UNMAPPED") & F.col("_LANE_ID").isNotNull(), F.lit(False)))
+                .withColumn("DMD_VTM_CONCEPT_ID", F.when(F.col("_USE_LANE"), F.col("_LANE_ID")).otherwise(F.col("DMD_VTM_CONCEPT_ID")))
+                .withColumn("DMD_VTM_CODE", F.when(F.col("_USE_LANE"), F.col("_LANE_CODE")).otherwise(F.col("DMD_VTM_CODE")))
+                .withColumn("DMD_VTM_NAME", F.when(F.col("_USE_LANE"), F.col("_LANE_NAME")).otherwise(F.col("DMD_VTM_NAME")))
+                .withColumn("DRUG_MAPPING_RULE_ID", F.when(F.col("_USE_LANE"), F.col("_LANE_RULE")))
+                .withColumn("DRUG_MAPPING_MODEL", F.when(F.col("_USE_LANE"), F.col("_LANE_MODEL")))
+                .withColumn("DRUG_MAPPING_SCORE", F.when(F.col("_USE_LANE"), F.col("_LANE_SCORE")))
+                .withColumn("DRUG_MAPPING_METHOD", F.when(F.col("_USE_LANE"), F.lit("EMBEDDING_LLM_VERIFIED")).otherwise(F.col("DRUG_MAPPING_METHOD")))
+                .drop("_LANE_KEY", "_LANE_ID", "_LANE_CODE", "_LANE_NAME", "_LANE_RULE", "_LANE_MODEL", "_LANE_SCORE", "_USE_LANE")
+            )
+        else:
+            homecare = (homecare.withColumn("DRUG_MAPPING_RULE_ID", F.lit(None).cast("string"))
+                        .withColumn("DRUG_MAPPING_MODEL", F.lit(None).cast("string"))
+                        .withColumn("DRUG_MAPPING_SCORE", F.lit(None).cast("double")))
     else:
         homecare = (
             homecare.withColumn("NAME_KEY", F.lit(None).cast("string"))
+            # INSR_W1_JAC_HOMECARE_DMD_V1: provenance columns exist (NULL) when dm+d mapping is disabled too.
+            .withColumn("DRUG_MAPPING_RULE_ID", F.lit(None).cast("string"))
+            .withColumn("DRUG_MAPPING_MODEL", F.lit(None).cast("string"))
+            .withColumn("DRUG_MAPPING_SCORE", F.lit(None).cast("double"))
             .withColumn(
                 "DMD_VTM_CONCEPT_ID", F.lit(None).cast("long")
             )
@@ -1494,7 +1543,7 @@ if _homecare_needed:
     apply_comments(
         HOMECARE_TABLE,
         HOMECARE_COMMENTS,
-        "JAC specialist and high-cost homecare requests at item grain; delivery-contact PII excluded.",
+        "JAC specialist and high-cost homecare requests at item grain; delivery-contact identifiers (HOMECARE_CONTACT_*) are published and tagged (INSR_W1_IDENTIFIER_RETAIN_V1).",
     )
 else:
     print("[JAC] map_homecare_request: sources unchanged, skipping")
@@ -1735,33 +1784,11 @@ _summary["drug_row_weighted_mapping_rate"] = round(
     float(_drug_summary["row_weighted_mapping_rate"] or 0), 4
 )
 
-_banned_columns = {
-    "patient_name",
-    "patient_hospitalno",
-    "patient_natno",
-    "patient_reference",
-    "surname",
-    "forenames",
-    "hospital_no",
-    "nhs_no",
-    "username",
-    "terminal",
-    "comment",
-    "requestor",
-    "reference",
-    "homecarecontactname",
-    "homecarecontactaddr1",
-    "homecarecontactaddr2",
-    "homecarecontactaddr3",
-    "homecarecontactaddr4",
-    "homecarecontactpostcode",
-    "homecarecontacttelephone",
-}
-for _table in (ISSUE_TABLE, HOMECARE_TABLE, DRUG_TABLE):
-    _leaked = _banned_columns & {
-        column.lower() for column in spark.table(_table).columns
-    }
-    assert not _leaked, f"{_table} leaks excluded columns: {_leaked}"
+# INSR_W1_IDENTIFIER_RETAIN_V1: identifiers are published and tagged, never excluded, so there is no banned-column
+# check. The homecare delivery-contact identifiers must be present instead (a missing one means the carry regressed).
+_homecare_identifier_columns = {"HOMECARE_CONTACT_NAME", "HOMECARE_CONTACT_ADDR1", "HOMECARE_CONTACT_ADDR2", "HOMECARE_CONTACT_ADDR3", "HOMECARE_CONTACT_ADDR4", "HOMECARE_CONTACT_POSTCODE", "HOMECARE_CONTACT_TELEPHONE"}
+_missing_identifiers = _homecare_identifier_columns - {column.upper() for column in spark.table(HOMECARE_TABLE).columns}
+assert not _missing_identifiers, f"{HOMECARE_TABLE} lacks published identifier columns: {sorted(_missing_identifiers)}"
 
 assert verify_unique_key(
     spark.table(ISSUE_TABLE), ["PHARMACY_ISSUE_ID"]

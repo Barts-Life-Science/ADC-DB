@@ -5055,7 +5055,11 @@ if list(REGISTRY_CORONARY_LESION_COLUMN_COMMENTS) != REGISTRY_CORONARY_LESION_PU
 
 @materialized_view(
     name=_n("journey_clinical.registry_coronary_lesion"),
-    comment="Typed child of clinical_registry_entry for the coronary_lesion family. Per-lesion/per-vessel PCI and angiography detail from the iWeb coronary registry. The parent coronary procedure registry is not landed, so PARENT_ENTRY_ID is retained for future linkage but currently has no bronze parent and there is no reliable procedure date. Every governed bronze column is retained under its lower-case name.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Typed child of clinical_registry_entry for the coronary_lesion family: per-lesion and per-vessel "
+        "PCI and angiography detail from the iWeb coronary registry. Each lesion belongs to one coronary "
+        "procedure (parent_entry_id)."
+    ),
     column_comments=REGISTRY_CORONARY_LESION_COLUMN_COMMENTS,
     refresh_policy="auto",
 )
@@ -5316,6 +5320,18 @@ REGISTRY_ERACS_EPISODE_EXPECTED_SCHEMA = [
     ("FORENAME", "string"),
     ("NHS_NUMBER", "string"),
     ("DATE_OF_BIRTH", "date"),
+    ("TIMING_OF1ST_TIME", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF1ST_PARSE_STATUS", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF2ND_TIME", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF2ND_PARSE_STATUS", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF_ONDANSETRON_TIME", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF_ONDANSETRON_PARSE_STATUS", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF_PARACETAMOL_ADMINISTERED_TIME", "string"),  # INSR_W2 W2.20
+    ("TIMING_OF_PARACETAMOL_ADMINISTERED_PARSE_STATUS", "string"),  # INSR_W2 W2.20
+    ("BASELINE_ACT_NUM", "decimal(12,2)"),  # INSR_W2 W2.20
+    ("BASELINE_ACT_PARSE_STATUS", "string"),  # INSR_W2 W2.20
+    ("POST_PROTAMINE_ACT_NUM", "decimal(12,2)"),  # INSR_W2 W2.20
+    ("POST_PROTAMINE_ACT_PARSE_STATUS", "string"),  # INSR_W2 W2.20
 ]
 
 REGISTRY_ERACS_EPISODE_PUBLIC_COLUMNS = [
@@ -5476,6 +5492,18 @@ REGISTRY_ERACS_EPISODE_PUBLIC_COLUMNS = [
     "forename",
     "nhs_number",
     "date_of_birth",
+    "timing_of1st_time",  # INSR_W2 W2.20
+    "timing_of1st_parse_status",  # INSR_W2 W2.20
+    "timing_of2nd_time",  # INSR_W2 W2.20
+    "timing_of2nd_parse_status",  # INSR_W2 W2.20
+    "timing_of_ondansetron_time",  # INSR_W2 W2.20
+    "timing_of_ondansetron_parse_status",  # INSR_W2 W2.20
+    "timing_of_paracetamol_administered_time",  # INSR_W2 W2.20
+    "timing_of_paracetamol_administered_parse_status",  # INSR_W2 W2.20
+    "baseline_act_num",  # INSR_W2 W2.20
+    "baseline_act_parse_status",  # INSR_W2 W2.20
+    "post_protamine_act_num",  # INSR_W2 W2.20
+    "post_protamine_act_parse_status",  # INSR_W2 W2.20
 ]
 
 REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS = {
@@ -5636,6 +5664,18 @@ REGISTRY_ERACS_EPISODE_COLUMN_COMMENTS = {
     "forename": "Patient's forename as recorded on the source ERACS registry record.",
     "nhs_number": "NHS number recorded for the patient on the source ERACS registry record, used for national person identification and linkage.",
     "date_of_birth": "Patient's date of birth as recorded on the source ERACS registry record.",
+    "timing_of1st_time": "'HH:MM' parsed from TIMING_OF1ST (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "timing_of1st_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF1ST.",  # INSR_W2 W2.20
+    "timing_of2nd_time": "'HH:MM' parsed from TIMING_OF2ND (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "timing_of2nd_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF2ND.",  # INSR_W2 W2.20
+    "timing_of_ondansetron_time": "'HH:MM' parsed from TIMING_OF_ONDANSETRON (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "timing_of_ondansetron_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF_ONDANSETRON.",  # INSR_W2 W2.20
+    "timing_of_paracetamol_administered_time": "'HH:MM' parsed from TIMING_OF_PARACETAMOL_ADMINISTERED (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "timing_of_paracetamol_administered_parse_status": "PARSED, BLANK or UNPARSED for TIMING_OF_PARACETAMOL_ADMINISTERED.",  # INSR_W2 W2.20
+    "baseline_act_num": "Leading number parsed from BASELINE_ACT (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "baseline_act_parse_status": "PARSED, BLANK or UNPARSED for BASELINE_ACT.",  # INSR_W2 W2.20
+    "post_protamine_act_num": "Leading number parsed from POST_PROTAMINE_ACT (ERACS_TYPED_V1).",  # INSR_W2 W2.20
+    "post_protamine_act_parse_status": "PARSED, BLANK or UNPARSED for POST_PROTAMINE_ACT.",  # INSR_W2 W2.20
 }
 
 if IWEB_REGISTRY_SLOTS["eracs_episode"] != "4_prod.bronze.iweb_eracs_episode":
@@ -5817,6 +5857,18 @@ def registry_eracs_episode():
         s["FORENAME"].alias("forename"),
         s["NHS_NUMBER"].alias("nhs_number"),
         s["DATE_OF_BIRTH"].alias("date_of_birth"),
+        s["TIMING_OF1ST_TIME"].alias("timing_of1st_time"),  # INSR_W2 W2.20
+        s["TIMING_OF1ST_PARSE_STATUS"].alias("timing_of1st_parse_status"),  # INSR_W2 W2.20
+        s["TIMING_OF2ND_TIME"].alias("timing_of2nd_time"),  # INSR_W2 W2.20
+        s["TIMING_OF2ND_PARSE_STATUS"].alias("timing_of2nd_parse_status"),  # INSR_W2 W2.20
+        s["TIMING_OF_ONDANSETRON_TIME"].alias("timing_of_ondansetron_time"),  # INSR_W2 W2.20
+        s["TIMING_OF_ONDANSETRON_PARSE_STATUS"].alias("timing_of_ondansetron_parse_status"),  # INSR_W2 W2.20
+        s["TIMING_OF_PARACETAMOL_ADMINISTERED_TIME"].alias("timing_of_paracetamol_administered_time"),  # INSR_W2 W2.20
+        s["TIMING_OF_PARACETAMOL_ADMINISTERED_PARSE_STATUS"].alias("timing_of_paracetamol_administered_parse_status"),  # INSR_W2 W2.20
+        s["BASELINE_ACT_NUM"].alias("baseline_act_num"),  # INSR_W2 W2.20
+        s["BASELINE_ACT_PARSE_STATUS"].alias("baseline_act_parse_status"),  # INSR_W2 W2.20
+        s["POST_PROTAMINE_ACT_NUM"].alias("post_protamine_act_num"),  # INSR_W2 W2.20
+        s["POST_PROTAMINE_ACT_PARSE_STATUS"].alias("post_protamine_act_parse_status"),  # INSR_W2 W2.20
     )
 
 # COMMAND ----------
@@ -7562,7 +7614,7 @@ BABY_DELIVERY_COLUMN_COMMENTS = {
     "source_coding_system": "Coding system or source namespace in which the source code is defined for each baby delivery record. It is produced by the silver transformation and has no direct bronze-column lineage entry. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_code": "Code supplied by the originating source system for the represented concept for each baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",
     "source_display": "Human-readable label supplied by the source system for the source code for each baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
-    "baby_person_id": "Millennium identifier of the baby, carried as STRING from bronze BABY_PERSON_ID. Bronze requires one normalized baby NHS value matching exactly one active alias-type-18 person. Null when that unique linkage is unavailable; distinct from maternal person_id.",
+    "baby_person_id": "Millennium identifier of the baby as BIGINT from bronze BABY_PERSON_ID (0 published as NULL; INSR_W2 W2.11). Bronze requires one normalized baby NHS value matching exactly one active alias-type-18 person. Null when that unique linkage is unavailable; distinct from maternal person_id.",
     "birth_order": "Value describing birth order for the baby delivery record. It is derived from bronze field `BIRTHORDERMATERNITYSUS` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "pregnancy_outcome": "Value describing pregnancy outcome for the baby delivery record. It is derived from bronze field `PREGOUTCOME` in `4_prod.bronze.map_maternity_baby_delivery`. Whitespace and source sentinel text are retained unless the pipeline explicitly normalizes them; null means no value was supplied.",
     "delivery_method_code": "Source-system code representing delivery method for the baby delivery record. It is derived from bronze field `DELIVERYMETHODCODE` in `4_prod.bronze.map_maternity_baby_delivery`. Source code meanings and sentinel values are retained unless the pipeline explicitly maps them; null means no code was supplied.",

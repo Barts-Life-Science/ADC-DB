@@ -79,6 +79,13 @@ REPLACE_BUILT_FEEDS = {
         keys=["PACS_REPORT_ID"],
         outputs=["anon_report_text"],
     ),
+    # INSR_W1_BRIDGE_ANON_STATE_V1: the bridge is rebuilt by overwrite (pacs_text_bridge_pipeline), so its state is
+    # snapshotted after each anon run and reattached by the bridge pipeline after each rebuild.
+    "pacs_report_bridge": dict(
+        table="map_pacs_report_text_bridge",
+        keys=["REPORT_ID"],
+        outputs=["anon_bridged_text"],
+    ),
     "text_event": dict(
         table="map_text_events",
         keys=["EVENT_ID"],

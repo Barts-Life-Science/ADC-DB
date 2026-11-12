@@ -25,6 +25,68 @@ obs_date=spark.range(1).select(obs_date_expr.alias("d")).first()["d"]
 watermark=spark.table("6_mgmt.incr_updt_v2.watermark").where("watermark_id=101696 AND active_ind=1").select("watermark_timestamp").first()
 landing_ok=bool(watermark and watermark["watermark_timestamp"] and watermark["watermark_timestamp"].date()>=obs_date)
 
+# INSR_W8_COMMENTS_V1 (W8.04): canonical bronze comments, generated from the INSR W8.02 dictionary. Edit the dictionary,
+# never this literal. Column names are the bronze (upper-case) names.
+INSR_W8_BRONZE_COMMENTS = {
+ "map_bed_observation_run": {
+  "BEDS_ACTIVE": "Count of beds considered active for the bed status observation run, sourced from the bed observation run record.",
+  "BEDS_OBSERVED": "Count of beds for which a status observation was captured in the observation run.",
+  "OBSERVATION_DATE": "Calendar date to which the bed status observation run applies.",
+  "OBSERVED_AT": "Timestamp at which the bed status observation run was performed.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "REASON": "Explanation recorded with the observation run status, sourced from the bed observation run record.",
+  "SOURCE_DELTA_VERSION": "Delta version of the raw bed table read by the weekly bed-observation run.",
+  "STATUS": "Outcome status of the bed status observation run, sourced from the bed observation run record."
+ },
+ "map_bed_status_observation": {
+  "ADC_UPDT": "When bronze last wrote the row.",
+  "BED_ACTIVE_IND": "Indicator showing whether the source bed record is active, derived from the Millennium bed table active indicator.",
+  "BED_STATUS_CD": "Code value representing the status of this bed.",
+  "BED_STATUS_DISPLAY": "Display text describing the status of the bed at the time of observation, derived from the source bed status observation and Millennium code value lookup.",
+  "BED_UPDT_DT_TM": "Date and time the source bed record was last updated, taken from the Millennium bed table update timestamp.",
+  "DUP_BED_IND": "Indicator flagging whether this bed is a duplicate bed.",
+  "LOCATION_CD": "Code value identifying the bed location that this row describes.",
+  "LOC_ROOM_CD": "Code value identifying the parent room location of this bed.",
+  "NURSE_UNIT_CD": "Code identifying the nursing unit (ward) associated with the bed status observation.",
+  "NURSE_UNIT_DISPLAY": "Display name of the nursing unit in which the observed bed is located, derived from source observation, location unit mapping and Millennium code value lookup.",
+  "OBSERVATION_DATE": "Date of the weekly bed-observation run that captured this status: the run date, or the observation_date job parameter when one was given.",
+  "OBSERVED_AT": "Date and time at which the bed status observation was recorded, taken from the observation timestamp in the source bed status observation.",
+  "PIPELINE_RUN_ID": "Bronze pipeline run that last wrote the row.",
+  "ROOM_LOCATION_CD": "Code identifying the room location associated with the bed status observation.",
+  "ROW_HASH": "SHA-256 of the row's payload columns, used by the bronze MERGE to detect changes.",
+  "SOURCE_ABSENT_DETECTED_TS": "When bronze first found the row absent from the source snapshot; NULL while present.",
+  "SOURCE_ADC_UPDT": "When the source row was landed in raw (raw ADC_UPDT).",
+  "SOURCE_DELTA_VERSION": "Delta version of the raw bed table read by the weekly bed-observation run.",
+  "SOURCE_LAST_UTC_TS": "Most recent timestamp, in UTC, recorded on the source Millennium bed record, carried through unchanged from the source.",
+  "SOURCE_PRESENT_IND": "True while the row is present in the latest full source snapshot.",
+  "SOURCE_ROW_ID": "Native source row identifier, as text.",
+  "SOURCE_TABLE": "Bronze or raw source table the row came from."
+ }
+}
+INSR_W8_BRONZE_TABLE_COMMENTS = {
+ "map_bed_observation_run": "One row per weekly bed-observation run date, recording whether the snapshot was taken. Curated bronze input to silver clinical_bed_status_observation_coverage; source-faithful columns, decodes in silver.",
+ "map_bed_status_observation": "One row per bed location and weekly observation date: the bed's current status as captured by the weekly bed-observation run (snapshot, not within-week history). Curated bronze input to silver clinical_bed_status_observation; source-faithful columns, decodes in silver."
+}
+
+
+def _insr_w8_sql(text):
+    """Escape a comment for a single-quoted SQL literal."""
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _insr_w8_comment(table, column):
+    """Dictionary comment for one bronze column; KeyError for a column the dictionary does not know."""
+    return INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]][column]
+
+
+def _insr_w8_assert_covered(table, columns):
+    """Refuse to publish a table with a column the comment dictionary does not cover (checked before any write)."""
+    known = INSR_W8_BRONZE_COMMENTS[table.split('.')[-1]]
+    missing = [c for c in columns if c not in known]
+    if missing:
+        raise KeyError(f"INSR_W8_COMMENTS_V1: {table} columns missing from the comment dictionary: {missing}")
+
+
 def qname(n): return ".".join(f"`{p}`" for p in n.split("."))
 def merge_run(status,reason,version=None,beds=None,active=None):
     row=spark.createDataFrame([(obs_date,status,reason,version,beds,active,datetime.now(timezone.utc).replace(tzinfo=None),RUN_ID)],"OBSERVATION_DATE date, STATUS string, REASON string, SOURCE_DELTA_VERSION long, BEDS_OBSERVED long, BEDS_ACTIVE long, OBSERVED_AT timestamp, PIPELINE_RUN_ID string")
@@ -40,7 +102,7 @@ def merge_run(status,reason,version=None,beds=None,active=None):
         (DeltaTable.forName(spark,RUNS).alias("t").merge(row.alias("s"),"t.OBSERVATION_DATE=s.OBSERVATION_DATE")
          .whenMatchedUpdate(set={"STATUS":"s.STATUS","REASON":"s.REASON","SOURCE_DELTA_VERSION":"s.SOURCE_DELTA_VERSION","BEDS_OBSERVED":"s.BEDS_OBSERVED","BEDS_ACTIVE":"s.BEDS_ACTIVE","PIPELINE_RUN_ID":"s.PIPELINE_RUN_ID"})
          .whenNotMatchedInsertAll().execute())
-    spark.sql(f"COMMENT ON TABLE {qname(RUNS)} IS 'One row per scheduled Bronze TDX bed-observation attempt; skipped executions are explicit and no state is fabricated.'")
+    spark.sql(f"COMMENT ON TABLE {qname(RUNS)} IS '{_insr_w8_sql(INSR_W8_BRONZE_TABLE_COMMENTS[RUNS.split('.')[-1]])}'")  # INSR_W8_COMMENTS_V1
 
 if REQUIRE_TODAY and not landing_ok:
     merge_run("skipped","no successful current-date mill_bed landing")
@@ -67,11 +129,10 @@ else:
      .whenMatchedUpdate(condition="NOT (t.ROW_HASH <=> s.ROW_HASH)",set={c:f"s.`{c}`" for c in mutable})
      .whenNotMatchedInsertAll().execute())
 spark.sql(f"ALTER TABLE {qname(TARGET)} SET TBLPROPERTIES ('delta.enableChangeDataFeed'='true','delta.enableRowTracking'='true','delta.enableDeletionVectors'='true')")
-spark.sql(f"COMMENT ON TABLE {qname(TARGET)} IS 'Weekly complete current-state bed observation captured by Bronze_Pipeline_Parallel. No within-week history is claimed.'")
+spark.sql(f"COMMENT ON TABLE {qname(TARGET)} IS '{_insr_w8_sql(INSR_W8_BRONZE_TABLE_COMMENTS[TARGET.split('.')[-1]])}'")  # INSR_W8_COMMENTS_V1
 for table in [TARGET,RUNS] if spark.catalog.tableExists(RUNS) else [TARGET]:
     for col in spark.table(table).columns:
-        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{col}` COMMENT 'TDX bed-observation field {col}.'")
-        risk,severity=(("4","2") if col in {"LOCATION_CD","SOURCE_ROW_ID"} else ("1","1"))
-        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{col}` SET TAGS ('ig_risk'='{risk}','ig_severity'='{severity}')")
+        spark.sql(f"ALTER TABLE {qname(table)} ALTER COLUMN `{col}` COMMENT '{_insr_w8_sql(_insr_w8_comment(table, col))}'")
+        # INSR_W1_TAG_HEURISTIC_RETIRED_V1: ig_risk/ig_severity come from Table Metadata Compliance (estate-copied), never from column names.
 beds=obs.count(); active=obs.where("BED_ACTIVE_IND").count(); merge_run("observed",None,version,beds,active)
 dbutils.notebook.exit(json.dumps({"status":"observed","observation_date":str(obs_date),"source_delta_version":version,"beds":beds,"active":active},sort_keys=True))

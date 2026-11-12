@@ -1,4 +1,5 @@
 # Databricks notebook source
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 # RBI validation (spec §8): every check writes a row to <target>_meta.validation_result; the notebook fails if any check fails.
 # Also writes <target>_meta.stream_coverage. Sampling and bed settings are passed in explicitly. Lakeflow keeps a removed MV
 # as an inactive table, so whether rbi_sample_person exists says nothing about the run being validated (review fix 5).
@@ -223,10 +224,14 @@ KEYS = {
     "person_month_resource": "person_id, month", "service_day_activity": "stream, service_unit, site_code, event_date_local",
     "attribution_summary": "stream, attribution_method", "plics_activity_link": "extract_cd, activity_record_id",
     "cost_allocation_ledger": "cost_allocation_ledger_key",  # RBI_REL_20261025
+    "rbi_coverage": "financial_year, measure, dimension",  # INSR_W6 W6.07
 }
-for table, key in KEYS.items():
-    r = one(f"SELECT count(*) AS n FROM (SELECT {key} FROM {TARGET}.{table} GROUP BY {key} HAVING count(*) > 1)")
-    check(f"keys:{table}", r["n"] == 0, {"duplicate_keys": r["n"], "key": key})
+# INSR W4.10: the key checks as one UNION ALL statement instead of one statement per table.
+key_sql = " UNION ALL ".join(
+    f"SELECT '{table}' AS t, count(*) AS n FROM (SELECT {key} FROM {TARGET}.{table} GROUP BY {key} HAVING count(*) > 1)"
+    for table, key in KEYS.items())
+for row in spark.sql(key_sql).collect():
+    check(f"keys:{row['t']}", row["n"] == 0, {"duplicate_keys": row["n"], "key": KEYS[row["t"]]})
 
 # RBI_REL_20261025: the ledger's natural grain is unique too, and the key is never NULL (so the key check above is real).
 r = one(f"""SELECT count_if(cost_allocation_ledger_key IS NULL) AS null_keys,
@@ -252,6 +257,36 @@ check("observation:no future-dated observed rows or rollups", all(v == 0 for v i
 r = one(f"SELECT count_if(spell_last_event > current_timestamp()) AS spell_last_event_after_now FROM {TARGET}.spell_resource_summary")
 check("observation:spell_last_event after now (report-only)", True, r)
 
+# INSR_W6 W6.06 (J25): site_basis is set exactly when site_code is, and only from its vocabulary.
+r = one(f"""SELECT count_if(site_code IS NOT NULL AND site_basis IS NULL) AS site_without_basis,
+                   count_if(site_code IS NULL AND site_basis IS NOT NULL) AS basis_without_site,
+                   count_if(site_basis NOT IN ({in_list(R.SITE_BASES)})) AS unknown_basis
+            FROM {FACT} WHERE stream <> 'plics_unallocated'""")
+check("site:basis matches site_code", all(v == 0 for v in r.values()), r)
+
+# INSR_W6 W6.07: NCC plan B slices land on fact rows exactly (only when the arm is configured and has rows);
+# floor flags agree with n_entities; the APC arm of costed_activity_unit is inside the window.
+r = one(f"""
+  WITH l AS (SELECT resource_use_event_key, sum(amount) AS nb FROM {LEDGER}
+             WHERE cost_basis = '{R.NCC_PLAN_B_BASIS}' AND amount_kind = 'direct' AND resource_use_event_key IS NOT NULL GROUP BY 1)
+  SELECT count(*) AS plan_b_rows,
+         count_if(f.cost_basis = '{R.NCC_PLAN_B_BASIS}' AND abs(f.cost_total - l.nb) > 0.005) AS plan_b_row_mismatch
+  FROM l LEFT JOIN {FACT} f USING (resource_use_event_key)""")
+check("money:NCC plan B slices = fact rows", r["plan_b_row_mismatch"] == 0, r)
+# The floor the run under test was built with (the pipeline's rbi.min_calibration_activities). Prod passes none and the
+# pipeline default holds; the W9 dev smoke builds with 1 so cohort-sized strata price (review 2026-10-31: comparing that
+# build with the default 100 reported 1,025 false mismatches).
+dbutils.widgets.text("min_calibration_activities", str(int(R.MIN_CALIBRATION_ACTIVITIES)))
+MIN_N = int(dbutils.widgets.get("min_calibration_activities"))
+r = one(f"""SELECT count_if(meets_calibration_floor <> (n_entities >= {MIN_N})) AS floor_mismatch,
+                   count_if(used_for_pricing AND NOT meets_calibration_floor) AS priced_below_floor,
+                   count_if(unit_cost_outlier_ind) AS outliers_report_only
+            FROM {TARGET}.unit_cost_reference""")
+check("costing:floor flags", r["floor_mismatch"] == 0 and r["priced_below_floor"] == 0, r)
+r = one(f"""SELECT count_if(setting = 'admitted' AND coalesce(activity_end, activity_start) < TIMESTAMP'{W}') AS apc_before_window
+            FROM {TARGET}.costed_activity_unit""")
+check("observation:APC units inside the window", r["apc_before_window"] == 0, r)
+
 r = one(f"""SELECT (SELECT count(DISTINCT stream) FROM {FACT}) AS fact_streams,
                    (SELECT count(DISTINCT stream) FROM {TARGET}.attribution_summary) AS summary_streams""")
 check("attribution:summary covers streams", r["fact_streams"] == r["summary_streams"], r)
@@ -260,6 +295,50 @@ r = one(f"SELECT count(*) AS n FROM {TARGET}.unit_cost_backtest WHERE mape IS NO
 check("backtest:populated", r["n"] > 0 or SAMPLED, {**r, "sampled": SAMPLED})
 
 # COMMAND ----------
+
+# INSR W4.10 (F6, F9, F12, F23; L1670, L1715, L1542, L1589, L1735). Hard checks first, then report-only ones.
+# Hard (F6): no event ends before it starts (W6.06 NULLs inverted ends), summaries are ordered, ledger £ is never NULL.
+r = one(f"SELECT count_if(event_end < event_start) AS end_before_start FROM {FACT}")
+check("ordering:event_end >= event_start", r["end_before_start"] == 0, r)
+r = one(f"""SELECT (SELECT count_if(spell_first_event > spell_last_event) FROM {TARGET}.spell_resource_summary) AS spells,
+                   (SELECT count_if(first_event > last_event) FROM {TARGET}.journey_resource_summary) AS journeys""")
+check("ordering:summary first <= last", r["spells"] == 0 and r["journeys"] == 0, r)
+r = one(f"SELECT count_if(amount IS NULL) AS ledger_null_amount FROM {LEDGER}")
+check("money:ledger amount never NULL", r["ledger_null_amount"] == 0, r)
+# Report-only (F9): unit costs over 10x their stream/base-year median, and strata priced from fewer than 5 entities.
+r = one(f"""WITH m AS (SELECT stream, base_fy, percentile_approx(unit_cost, 0.5) AS med
+                      FROM {TARGET}.unit_cost_reference GROUP BY 1, 2)
+            SELECT count_if(u.unit_cost > 10 * m.med) AS over_10x_median, count_if(u.n_entities < 5) AS small_denominator
+            FROM {TARGET}.unit_cost_reference u JOIN m USING (stream, base_fy)""")
+check("costing:unit-cost outliers (report-only, k=10, n<5)", True, r)
+# Report-only (F12): PLICS EC/APC activities linked to an encounter or appointment, per extract; flag groups < 95%.
+links = spark.sql(f"""SELECT extract_cd, feed_type, count(*) AS n,
+                             count_if(encounter_id IS NOT NULL OR appointment_key IS NOT NULL) AS linked
+                      FROM {LINK} GROUP BY 1, 2""").collect()
+low = [(x.extract_cd, x.feed_type, round(x.linked / x.n, 4)) for x in links
+       if x.feed_type in ("EC", "APC") and x.n and x.linked / x.n < 0.95]
+check("linkage:PLICS EC/APC link rate >= 95% (report-only)", True, {"below_95": low[:50], "groups": len(links)})
+# Report-only (F23): site/theatre code fill per stream and financial year ('2023/24'), drops > 10pp on the prior year.
+fill = spark.sql(f"""WITH f AS (SELECT stream, financial_year,
+                                       avg(CASE WHEN site_code IS NULL THEN 0.0 ELSE 1.0 END) AS site_fill,
+                                       avg(CASE WHEN theatre_code IS NULL THEN 0.0 ELSE 1.0 END) AS theatre_fill
+                                FROM {FACT} GROUP BY 1, 2)
+                     SELECT a.stream, a.financial_year, a.site_fill, b.site_fill AS prev_site_fill,
+                            a.theatre_fill, b.theatre_fill AS prev_theatre_fill
+                     FROM f a JOIN f b ON a.stream = b.stream
+                      AND CAST(substr(a.financial_year, 1, 4) AS INT) = CAST(substr(b.financial_year, 1, 4) AS INT) + 1
+                     WHERE b.site_fill - a.site_fill > 0.10 OR b.theatre_fill - a.theatre_fill > 0.10""").collect()
+check("fill:site/theatre code drop > 10pp (report-only)", True, {"drops": [x.asDict() for x in fill][:50]})
+# Report-only (ledger NULLs): NULL money/quantity columns in the four rollups, one statement per rollup.
+rollup_nulls = {}
+for table in ("spell_resource_summary", "journey_resource_summary", "person_month_resource", "service_day_activity"):
+    money = [c for c, t in spark.table(f"{TARGET}.{table}").dtypes
+             if t == "double" and (c.startswith("cost_") or c in ("hcd_cost", "bed_days", "theatre_minutes")
+                                   or c.startswith("quantity") or c.endswith("_days"))]
+    if money:
+        row = one(f"SELECT {', '.join(f'count_if({c} IS NULL) AS {c}' for c in money)} FROM {TARGET}.{table}")
+        rollup_nulls[table] = {c: n for c, n in row.items() if n}
+check("money:rollup money/quantity NULLs (report-only)", True, rollup_nulls)
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {META}")
 spark.createDataFrame(results, "run_ts string, check_name string, passed boolean, detail string") \

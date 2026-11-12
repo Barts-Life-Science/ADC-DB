@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Costing for RBI: PLICS lines, unit-cost calibration, modelled pricing, actual allocation and
 source precedence (spec §4, §10.4–10.6).
 
@@ -56,7 +57,10 @@ def plics_weighted_lines(lines, activities):
     return (lines.join(act, ["extract_cd", "activity_record_id"], "inner")
             .select("extract_cd", "activity_record_id", "activity_cost_item_cd", "feed_type", "person_id",
                     stream.alias("stream"), component.alias("component"),
-                    (F.col("total_cost").cast("double") * F.col("source_duplicate_count")).alias("cost_weighted"),
+                    # INSR_W6 W6.07 (L1735): a line with no total_cost (or no duplicate count) carries no money: £0,
+                    # never NULL, so no ledger amount is NULL. The validate money checks already treat NULL as £0.
+                    F.coalesce(F.col("total_cost").cast("double") * F.col("source_duplicate_count"), F.lit(0.0))
+                     .alias("cost_weighted"),
                     (F.expr("try_cast(activity_count AS DOUBLE)") * F.col("source_duplicate_count")).alias("units_reported"),
                     _case(F.col("feed_type"), R.FEED_TYPE_SETTING).alias("setting"),
                     financial_year(F.col("_activity_date")).alias("financial_year"),
@@ -203,6 +207,29 @@ def calibrate_unit_costs(weighted_lines, links, events, cover, base_fys=None):
     return (out.withColumn("unit_cost", F.when(F.col("quantity") > 0, F.col("pounds") / F.col("quantity")))
             .join(reported, ["stream", "base_fy"], "left")
             .withColumn("cost_method_version", F.lit(COST_METHOD_VERSION)))
+
+
+def flag_unit_costs(unit_costs, min_n=R.MIN_CALIBRATION_ACTIVITIES):
+    """Add the calibration-floor and outlier flags to calibrate_unit_costs output (INSR_W6 W6.07, L1715).
+
+    meets_calibration_floor = n_entities >= min_n (small_denominator_ind is its negation); used_for_pricing = the
+    stratum can price rows (clears the floor, has a unit cost, and is in the stream's latest base FY, as price_keys
+    requires); unit_cost_outlier_ind = unit cost above R.UNIT_COST_OUTLIER_K x the stream x base-FY median. Flags only:
+    no row is removed and pricing is unchanged.
+    """
+    latest = unit_costs.groupBy("stream").agg(F.max("base_fy").alias("_latest_fy"))
+    median = (unit_costs.where(F.col("unit_cost").isNotNull()).groupBy("stream", "base_fy")
+              .agg(F.expr("percentile(unit_cost, 0.5)").alias("_median_unit_cost")))
+    floor = F.coalesce(F.col("n_entities") >= F.lit(min_n), F.lit(False))
+    return (unit_costs.join(latest, "stream", "left").join(median, ["stream", "base_fy"], "left")
+            .withColumns({
+                "meets_calibration_floor": floor,
+                "small_denominator_ind": ~floor,
+                "used_for_pricing": floor & F.col("unit_cost").isNotNull() & (F.col("base_fy") == F.col("_latest_fy")),
+                "unit_cost_outlier_ind": F.coalesce(
+                    F.col("unit_cost") > F.lit(R.UNIT_COST_OUTLIER_K) * F.col("_median_unit_cost"), F.lit(False)),
+            })
+            .drop("_latest_fy", "_median_unit_cost"))
 
 
 def overhead_ratios(weighted_lines, links, base_fys=None):
@@ -378,11 +405,12 @@ def allocate_plics_actuals(weighted_lines, links, events, cover):
             .unionByName(_ledger(_by_activity_component(superseded, "_pounds"), "superseded", "_pounds", "actual_plics")))
 
 
-def allocate_episode_totals(activities, links, events, modelled):
+def allocate_episode_totals(activities, links, events, modelled, basis="actual_ncc_allocated"):
     """Episode totals without cost lines (NCC2324 and similar) as ledger rows (spec §4.4).
 
     The total T of an activity with cost_line_count = 0 is shared over its linked encounter's
     rows in proportion to their modelled £. With no modelled row, T stays unallocated.
+    `basis` labels the ledger rows (INSR_W6 W6.07: NCC plan B uses R.NCC_PLAN_B_BASIS).
     """
     keys = ["extract_cd", "activity_record_id"]
     ep = (activities.where((F.col("cost_line_count") == 0) & F.col("total_cost_sum").isNotNull())
@@ -396,8 +424,24 @@ def allocate_episode_totals(activities, links, events, modelled):
     alloc = (m.join(tot, keys)
              .select(*keys, "component", "resource_use_event_key", (F.col("_total") * F.col("cost_modelled") / F.col("_m")).alias("_amt")))
     missed = ep.join(tot, keys, "left_anti")
-    return (_ledger(alloc, "direct", "_amt", "actual_ncc_allocated", "resource_use_event_key")
-            .unionByName(_ledger(missed, "unallocated", "_total", "actual_ncc_allocated")))
+    return (_ledger(alloc, "direct", "_amt", basis, "resource_use_event_key")
+            .unionByName(_ledger(missed, "unallocated", "_total", basis)))
+
+
+def allocate_ncc_plan_b(episodes, events, modelled):
+    """NCC plan B (INSR_W6 W6.07, L1566; decided 2026-10-17): NCC2324Episode-shaped episode totals that are not in gold
+    clinical_costed_activity, priced into the ledger as their own arm (cost_basis R.NCC_PLAN_B_BASIS).
+
+    Contract of `episodes`: extract_cd, activity_record_id, encounter_id (the native ENCNTRID), total_cost. Each
+    episode links to its own encounter (score 1 when present) and is shared exactly like allocate_episode_totals.
+    """
+    keys = ["extract_cd", "activity_record_id"]
+    links = episodes.select(*keys, F.col("encounter_id").cast("bigint").alias("encounter_id"),
+                            F.lit(None).cast("string").alias("appointment_key"),
+                            F.when(F.col("encounter_id").isNotNull(), F.lit(1.0)).alias("link_score"))
+    activities = episodes.select(*keys, F.lit(0).alias("cost_line_count"),
+                                 F.col("total_cost").cast("double").alias("total_cost_sum"))
+    return allocate_episode_totals(activities, links, events, modelled, basis=R.NCC_PLAN_B_BASIS)
 
 
 def ledger_event_allocations(ledger):
@@ -408,6 +452,8 @@ def ledger_event_allocations(ledger):
         exact_sum(F.when(plics & (F.col("amount_kind") == "direct"), F.col("amount"))).alias("plics_direct"),
         exact_sum(F.when(plics & (F.col("amount_kind") == "overhead"), F.col("amount"))).alias("plics_overhead"),
         exact_sum(F.when(ncc & (F.col("amount_kind") == "direct"), F.col("amount"))).alias("ncc_direct"),
+        exact_sum(F.when((F.col("cost_basis") == R.NCC_PLAN_B_BASIS) & (F.col("amount_kind") == "direct"),  # INSR_W6 W6.07
+                         F.col("amount"))).alias("ncc_plan_b_direct"),
     )
 
 
@@ -441,6 +487,7 @@ def apply_costs(events, modelled, allocations, overheads, cover):
     basis = (F.when(F.col("stream") == "high_cost_drug", F.lit("drug_expenditure_actual"))
              .when(F.col("plics_direct").isNotNull(), F.lit("actual_plics"))
              .when(F.col("ncc_direct").isNotNull(), F.lit("actual_ncc_allocated"))
+             .when(F.col("ncc_plan_b_direct").isNotNull(), F.lit(R.NCC_PLAN_B_BASIS))  # INSR_W6 W6.07
              .when(F.col("_is_hcd_admin") & F.col("_ledger_covers"), F.lit("covered_by_hcd_ledger"))
              .when(F.col("cost_modelled").isNotNull(), F.lit("modelled_bottom_up"))
              .otherwise(F.lit("none")))
@@ -458,6 +505,7 @@ def apply_costs(events, modelled, allocations, overheads, cover):
     total = (F.when(F.col("cost_basis") == "drug_expenditure_actual", F.col("source_amount"))
              .when(F.col("cost_basis") == "actual_plics", F.col("plics_direct"))
              .when(F.col("cost_basis") == "actual_ncc_allocated", F.col("ncc_direct"))
+             .when(F.col("cost_basis") == R.NCC_PLAN_B_BASIS, F.col("ncc_plan_b_direct"))
              .when(F.col("cost_basis") == "modelled_bottom_up", F.col("cost_modelled"))
              .otherwise(F.lit(0.0)))
     overhead = (F.when(F.col("cost_basis") == "actual_plics", F.coalesce(F.col("plics_overhead"), F.lit(0.0)))
@@ -467,10 +515,11 @@ def apply_costs(events, modelled, allocations, overheads, cover):
         "cost_reason": reason,
         "cost_total": F.coalesce(total, F.lit(0.0)),
         "cost_overhead": overhead,
-        "cost_modelled_shadow": F.when(F.col("cost_basis").isin("actual_plics", "actual_ncc_allocated"), F.col("cost_modelled")),
+        "cost_modelled_shadow": F.when(F.col("cost_basis").isin("actual_plics", "actual_ncc_allocated", R.NCC_PLAN_B_BASIS),
+                                       F.col("cost_modelled")),
         "cost_superseded": F.lit(0.0),
         "cost_method_version": F.lit(COST_METHOD_VERSION),
-    }).drop("plics_direct", "plics_overhead", "ncc_direct", "_setting", "overhead_ratio", "_is_hcd_admin",
+    }).drop("plics_direct", "plics_overhead", "ncc_direct", "ncc_plan_b_direct", "_setting", "overhead_ratio", "_is_hcd_admin",
             "_ledger_covers", "cost_modelled")
 
 

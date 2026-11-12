@@ -692,8 +692,16 @@ def run_source_preflight():
         left = base.join(frame, "ENTRY_ID", "left_anti").count()
         right = frame.join(base, "ENTRY_ID", "left_anti").count()
         set_differences[name] = {"pre1_not_module": left, "module_not_pre1": right}
-        if left or right:
+        # R1FIX_20261109: a later page without its pre1 row would lose the person link: still a hard failure.
+        if right:
             raise AssertionError(f"CS2010G 1:1 EntryId set assumption failed: {name} {set_differences[name]}")
+        # An entry still being filled in has pre1 only; the full outer join lands it with NULL later-page fields.
+        if left:
+            print(
+                "[SOURCE_PREFLIGHT] WARNING: "
+                f"{left} CS2010G entries have pre1 but no {name} row yet (form in progress); "
+                "they land with NULL fields for that page."
+            )
 
     sub = spark.table(f"{IWEB}.reg_cs2010g_subprocedure")
     sub_rows = sub.count()
@@ -957,11 +965,33 @@ def dq_all_clinical(df, admin_stamps):
             and f.name not in admin_stamps and not f.name.endswith("_CLEAN")]
     return dq_columns(df, cols), cols
 
+def _r1_attach(df, target, broadcast_batch=True):
+    """INSR R1 (mapping into bronze): add the mapping-lane columns of `target` to df before an overwrite, so the
+    columns and their tags survive it. A no-op for tables without lanes. Keys new in this run stay NULL here and are
+    filled by the R1_Mapping_Attach task after the resolver (deviation D1 of the R1 plan)."""
+    import sys
+    shared = ("/Workspace/Shared/PM-DE-Misc/Ben/Python/CC/INSR_20261029/R1/src/_shared"
+              if target.replace("`", "").startswith("8_dev.") else "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared")
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import mapping_attach
+    return mapping_attach.attach_axes(df, target, broadcast_batch=broadcast_batch)
+
+
+def _r1_retag(target):
+    """INSR R1: this builder's overwriteSchema write drops column comments and tags; re-apply the R1 lane columns'
+    comments and estate-copied ig tags right after it (mapping_attach.tag_and_comment; a no-op without lanes)."""
+    import mapping_attach
+    if mapping_attach.L.lanes_of_table(mapping_attach._bare(target)):
+        mapping_attach.tag_and_comment(spark, target)
+
+
 def replace_with_tombstones(df, target, key_cols):
     """Deterministic replace with NO silent hard deletes (S2.2 lifecycle): rows present in
     the prior published version but absent from the fresh build are re-appended with
     SOURCE_PRESENT_IND=false, retaining their previous column values and stamps.
     A key that reappears at source is resurrected as present (its tombstone drops out)."""
+    df = _r1_attach(df, target)  # INSR R1: lane columns survive the overwrite
     fresh = df.withColumn("SOURCE_PRESENT_IND", F.lit(True))
     v_prev = table_version(target) if spark.catalog.tableExists(target) else None
     (fresh.write.format("delta").mode("overwrite")
@@ -972,6 +1002,7 @@ def replace_with_tombstones(df, target, key_cols):
                            key_cols, "left_anti")
                      .withColumn("SOURCE_PRESENT_IND", F.lit(False)))
         gone.write.format("delta").mode("append").saveAsTable(target)
+    _r1_retag(target)  # INSR R1: overwriteSchema dropped the lane columns' comments and tags
 
 def table_fingerprint(tbl, exclude=("PIPELINE_UPDT_DT_TM",)):
     """Canonical whole-row fingerprint: order-independent sum of xxhash64 over the JSON of
@@ -1331,7 +1362,16 @@ DEVICE_TYPE_SEED = [
     (11, "Lead 2", "LEAD", 4236068, "Cardiac pacemaker lead", "CURATED", "PROPOSED", "1.0.0", None, None, None),
     (12, "Lead 3/CS", "LEAD", 4236068, "Cardiac pacemaker lead", "CURATED", "PROPOSED", "1.0.0", None, None, None),
 ]
-seed = spark.createDataFrame(DEVICE_TYPE_SEED, spark.table(DEVICE_MAP_TABLE).schema)
+def _device_seed_frame(table, rows):
+    """INSR_W1_MEDICONNECT_V1: the seed rows as a frame with the map's full schema. The tuples cover the curated
+    columns (the first len(row) of the table); provenance columns added later (MAPPING_RULE_ID, LLM_*) are NULL."""
+    schema = spark.table(table).schema
+    frame = spark.createDataFrame(rows, T.StructType(schema.fields[:len(rows[0])]))
+    return frame.select(*[F.col(field.name) if field.name in frame.columns
+                          else F.lit(None).cast(field.dataType).alias(field.name) for field in schema.fields])
+
+
+seed = _device_seed_frame(DEVICE_MAP_TABLE, DEVICE_TYPE_SEED)
 (
     DeltaTable.forName(spark, DEVICE_MAP_TABLE)
     .alias("target")
@@ -1433,10 +1473,11 @@ device_map = spark.table(DEVICE_MAP_TABLE).select(
     "DEVICE_ROLE",
     F.col("MAPPING_STATUS").alias("DEVICE_MAPPING_STATUS"),
     F.col("MAPPING_VERSION").alias("DEVICE_MAPPING_VERSION"),
-    F.when(F.col("MAPPING_STATUS") == "APPROVED", F.col("SNOMED_CONCEPT_ID"))
-    .cast("long").alias("DEVICE_SNOMED_CONCEPT_ID"),
-    F.when(F.col("MAPPING_STATUS") == "APPROVED", F.col("SNOMED_CONCEPT_NAME"))
-    .alias("DEVICE_SNOMED_CONCEPT_NAME"),
+    # INSR_W1_MEDICONNECT_V1: every row with a concept applies (no APPROVED gate); rule id and verifier verdict travel.
+    F.col("SNOMED_CONCEPT_ID").cast("long").alias("DEVICE_SNOMED_CONCEPT_ID"),
+    F.col("SNOMED_CONCEPT_NAME").alias("DEVICE_SNOMED_CONCEPT_NAME"),
+    F.col("MAPPING_RULE_ID").alias("DEVICE_MAPPING_RULE_ID"),
+    F.col("LLM_DECISION").alias("DEVICE_MAPPING_LLM_DECISION"),
 )
 devices = devices.join(device_map, "DEVICE_TYPE", "left")
 devices = resolve_persons(devices, mrn_col="PATIENTID")
@@ -1454,7 +1495,9 @@ registry_update_table(
         "PATIENTID": "Source MediConnect identifier, deterministically resolved as a Millennium MRN candidate.",
         "EXPLANTED_IND": "INFERRED from STATUS=1; semantics require confirmation against the source lookup.",
         "IMPLANTED_DATE_QUALITY": "VALID | SENTINEL (year <=1901) | FUTURE | MISSING; raw date retained.",
-        "DEVICE_SNOMED_CONCEPT_ID": "Applied only when the category mapping row is APPROVED; no model-level UDI claim.",
+        "DEVICE_SNOMED_CONCEPT_ID": "SNOMED device concept of the curated category map, applied without a status gate (INSR_W1_MEDICONNECT_V1); no model-level UDI claim.",
+        "DEVICE_MAPPING_RULE_ID": "Rule id of the category mapping (MEDICONNECT_TYPE_CURATED_V1).",
+        "DEVICE_MAPPING_LLM_DECISION": "Opus verifier verdict on the curated category concept (accept/choose/reject); evidence only, it never changes the concept.",
         "PERSON_ID": "Millennium PERSON_ID via a unique active MRN alias; NULL for ambiguous or unmatched rows.",
         "ADC_UPDT": "Source landing timestamp. Excluded from ROW_HASH because the full snapshot refreshes it daily.",
     },
@@ -1814,6 +1857,7 @@ def build_single_registry(
     extra_drop=(),
     col_comments=None,
     transform=None,
+    post_transform=None,
 ):
     source = spark.table(f"{IWEB}.{source_table}")
     frame = resolve_persons(source, mrn_col="MRN", nhs_col="NHSNumber")
@@ -1822,6 +1866,9 @@ def build_single_registry(
     frame, dropped = drop_pii(frame, extra=extra_drop)
     frame = with_source_metadata(frame, source_table, "EntryId")
     frame = to_snake(frame)
+    # INSR_W1_ERACS_TYPED_V1: post_transform sees the published (snake-case) column names.
+    if post_transform is not None:
+        frame = post_transform(frame)
     print(f"[IDENTIFIER_RETAIN] {target_table} " + json.dumps(dropped))
     return registry_update_table(
         frame,
@@ -1836,10 +1883,10 @@ build_single_registry(
     "reg_coronary_subprocedure",
     "iweb_coronary_lesion",
     "Per-lesion/per-vessel PCI and angiography detail from the iWeb coronary registry. "
-    "The parent coronary procedure registry is not landed, so PARENT_ENTRY_ID is retained for "
-    "future linkage but currently has no bronze parent and there is no reliable procedure date.",
+    "Each lesion belongs to one coronary procedure: PARENT_ENTRY_ID is the ENTRY_ID of its row in "
+    "iweb_coronary_procedure, which carries the procedure date.",  # INSR_W8_COMMENTS_V1 (W8.03 L3132)
     col_comments={
-        "PARENT_ENTRY_ID": "Foreign key to the currently un-landed iWeb coronary procedure registry.",
+        "PARENT_ENTRY_ID": "ENTRY_ID of the parent coronary procedure in iweb_coronary_procedure.",
         "DATE_LAST_CHANGED": "Source edit timestamp; it must not be interpreted as the procedure date.",
     },
 )
@@ -1875,11 +1922,46 @@ build_single_registry(
     transform=_acs_dates,
 )
 
+# INSR_W1_ERACS_TYPED_V1: typed companions for ERACS free-text fields. The raw columns are kept. A *_TIME column holds
+# 'HH:MM' parsed from texts such as '14h00', '0920', '17;00'; a *_NUM column holds the leading number of texts such as
+# '128' or '13.5 mm'. *_PARSE_STATUS is PARSED, BLANK or UNPARSED. A field is typed only when at least 90% of its
+# non-blank values parse (measured 2026-10-29 on all current rows). Reference rules: w1/patches/refs/eracs_parse.py.
+ERACS_TIME_FIELDS = ("TIMING_OF1ST", "TIMING_OF2ND", "TIMING_OF_ONDANSETRON", "TIMING_OF_PARACETAMOL_ADMINISTERED")
+# Not typed (keep rule, dev proof 2026-10-30): ADPMA35MM and AAMA35MM hold Yes/No (0% numeric); VCAP_THRESHOLD is 48%
+# numeric because about half its values are censored ("<2", "< 2", "<2V").
+ERACS_NUMBER_FIELDS = ("BASELINE_ACT", "POST_PROTAMINE_ACT")
+ERACS_TIME_PATTERN = "^([01]?[0-9]|2[0-3]) ?[:;h]? ?([0-5][0-9])$"
+ERACS_NUMBER_PATTERN = "^([0-9]+([.][0-9]+)?) ?[a-z/%]*$"
+
+
+def _eracs_typed_columns(frame: DataFrame) -> DataFrame:
+    """Add <field>_TIME / <field>_NUM and <field>_PARSE_STATUS beside each ERACS free-text field (raw kept)."""
+    for field in ERACS_TIME_FIELDS:
+        text = F.lower(F.trim(F.col(field)))
+        hours = F.regexp_extract(F.regexp_replace(text, "[.]", ":"), ERACS_TIME_PATTERN, 1)
+        minutes = F.regexp_extract(F.regexp_replace(text, "[.]", ":"), ERACS_TIME_PATTERN, 2)
+        parsed = F.length(minutes) > 0
+        frame = (frame.withColumn(f"{field}_TIME", F.when(parsed, F.concat(F.lpad(hours, 2, "0"), F.lit(":"), minutes)))
+                 .withColumn(f"{field}_PARSE_STATUS", F.when(F.coalesce(F.length(text), F.lit(0)) == 0, F.lit("BLANK"))
+                             .when(parsed, F.lit("PARSED")).otherwise(F.lit("UNPARSED"))))
+    for field in ERACS_NUMBER_FIELDS:
+        text = F.lower(F.trim(F.col(field)))
+        number = F.regexp_extract(text, ERACS_NUMBER_PATTERN, 1)
+        value = F.expr(f"try_cast(regexp_extract(lower(trim(`{field}`)), '{ERACS_NUMBER_PATTERN}', 1) AS DECIMAL(12, 2))")
+        frame = (frame.withColumn(f"{field}_NUM", F.when(F.length(number) > 0, value))
+                 .withColumn(f"{field}_PARSE_STATUS", F.when(F.coalesce(F.length(text), F.lit(0)) == 0, F.lit("BLANK"))
+                             .when(F.length(number) > 0, F.lit("PARSED")).otherwise(F.lit("UNPARSED"))))
+    return frame
+
+
 build_single_registry(
     "reg_eracs",
     "iweb_eracs_episode",
     "Enhanced Recovery After Cardiac Surgery pathway registry, live since 2025: pathway "
-    "timestamps, pacing, TEG/platelet mapping, transfusion, mobilisation and discharge milestones.",
+    "timestamps, pacing, TEG/platelet mapping and transfusion. Mobilisation and discharge milestone "
+    "fields are near-empty at source. *_TIME and *_NUM columns are typed parses of the free-text "
+    "TIMING_* and numeric fields (raw text kept), with a *_PARSE_STATUS each (INSR_20261029).",
+    post_transform=_eracs_typed_columns,
 )
 
 # COMMAND ----------
@@ -2745,7 +2827,6 @@ print(S6B_REGISTRY_PROMOTION_RUNBOOK)
 _registry_summary["s6b_registry_results"] = S6B_REGISTRY_RESULTS
 print(json.dumps(_registry_summary, sort_keys=True))
 dbutils.notebook.exit(json.dumps(_registry_summary, sort_keys=True))
-
 
 
 

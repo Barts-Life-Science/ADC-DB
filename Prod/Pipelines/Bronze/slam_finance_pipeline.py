@@ -287,6 +287,7 @@ def ig_tag_gate(table):
 # COMMAND ----------
 
 
+
 # COMMAND ----------
 
 import json
@@ -601,7 +602,9 @@ def assert_no_direct_identifiers(table_name):
 # COMMAND ----------
 
 
+
 # COMMAND ----------
+
 
 
 # COMMAND ----------
@@ -934,6 +937,7 @@ print(f"[SLAM-FIN] run={RUN_ID} target={TARGET_SCHEMA} force_full={FORCE_FULL}")
 # COMMAND ----------
 
 
+
 # COMMAND ----------
 
 def _apc_select_sql(watermark=None):
@@ -1110,6 +1114,7 @@ if RUN_SLAM_HRG:
 # COMMAND ----------
 
 
+
 # COMMAND ----------
 
 def _op_select_sql(watermark=None):
@@ -1209,6 +1214,7 @@ if RUN_SLAM_HRG:
     })
 
 # COMMAND ----------
+
 
 
 # COMMAND ----------
@@ -1395,6 +1401,7 @@ if RUN_FINANCE and table_exists(T_FIN):
     })
 
 # COMMAND ----------
+
 
 
 # COMMAND ----------
@@ -1872,6 +1879,96 @@ def _slice_exists(target, extract_cd):
 def _extract_versions(ep_table, cost_table):
     return {ep_table: source_version(ep_table), cost_table: source_version(cost_table)}
 
+# BRONZE_PERF_20261101_SLAM_COST_UNCHANGED_V1 ------------------------------------------------------------
+# ADF reloads the frozen PLICS extracts (PE2103, PE2122NCC) every week with CREATE OR REPLACE. The rows are the same
+# each time; only the landing stamp ADC_UPDT moves (checked 11-01: PE2103 cost, 10-24 vs 11-01 load, every other
+# column identical). The version check therefore rebuilt both slices every week, and the cost line items alone are
+# 181M rows rewritten and restamped, each reaching silver as a change.
+# The activity slice is still rebuilt whenever it is due: it is small (5.6M rows) and links people through alias
+# tables that do change, so its weekly refresh is real. Only the cost line items, which depend on nothing but the
+# cost source, are kept when that source's rows are unchanged.
+import hashlib
+
+SLAM_SOURCE_FINGERPRINT_TABLE = f"{CONTROL_SCHEMA}.map_slam_finance_source_fingerprint"
+SLAM_LANDING_COLUMNS = {"adc_updt"}  # set by the landing, not by SLAM; excluded from the content fingerprint
+_slam_fingerprint_cache = {}  # (source table, version) -> fingerprint, so one run scans a version once
+
+
+def _source_content_fingerprint(table_name, version):
+    """
+    Order-independent fingerprint of the business content of one Delta version of a source table: row count, the
+    sum of a 64-bit hash of every row over all columns except the landing stamp, and those columns' names and
+    types. Equal fingerprints mean the same rows (up to a hash collision). The sum is DECIMAL(38,0), so it cannot
+    overflow.
+    """
+    key = (table_name, int(version))
+    if key not in _slam_fingerprint_cache:
+        frame = spark.read.option("versionAsOf", int(version)).table(table_name)
+        columns = [f for f in frame.schema.fields if f.name.lower() not in SLAM_LANDING_COLUMNS]
+        row = frame.agg(
+            F.count(F.lit(1)).alias("row_count"),
+            F.sum(F.xxhash64(*[F.col(f"`{f.name}`") for f in columns]).cast("decimal(38,0)")).alias("hash_sum"),
+        ).first()
+        schema_text = ",".join(f"{f.name}:{f.dataType.simpleString()}" for f in columns)
+        schema_sha = hashlib.sha256(schema_text.encode("utf-8")).hexdigest()
+        _slam_fingerprint_cache[key] = f"rows={row['row_count']};hash_sum={row['hash_sum']};schema={schema_sha}"
+    return _slam_fingerprint_cache[key]
+
+
+def _stored_fingerprint(source_table, version):
+    """The fingerprint recorded for exactly this source version, or None."""
+    if not table_exists(SLAM_SOURCE_FINGERPRINT_TABLE):
+        return None
+    rows = (spark.table(SLAM_SOURCE_FINGERPRINT_TABLE)
+            .where((F.col("source_table") == source_table) & (F.col("source_version") == int(version)))
+            .select("fingerprint").collect())
+    return rows[0]["fingerprint"] if rows else None
+
+
+def _record_fingerprint(source_table, version):
+    """Remember the content of the source version a published cost slice now corresponds to (one row per source)."""
+    if _stored_fingerprint(source_table, version) is not None:
+        return
+    fingerprint = _source_content_fingerprint(source_table, version)
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {SLAM_SOURCE_FINGERPRINT_TABLE}
+        (source_table STRING, source_version BIGINT, fingerprint STRING, recorded_at TIMESTAMP)""")
+    spark.sql(f"""
+        MERGE INTO {SLAM_SOURCE_FINGERPRINT_TABLE} t
+        USING (SELECT '{source_table}' source_table, CAST({int(version)} AS BIGINT) source_version,
+                      '{fingerprint}' fingerprint) s
+        ON t.source_table = s.source_table
+        WHEN MATCHED THEN UPDATE SET source_version = s.source_version, fingerprint = s.fingerprint,
+                                     recorded_at = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT (source_table, source_version, fingerprint, recorded_at)
+            VALUES (s.source_table, s.source_version, s.fingerprint, current_timestamp())""")
+
+
+def _cost_slice_unchanged(extract_cd, cost_table, versions):
+    """
+    (keep, reason): keep is True when the published cost slice of this extract was built from rows identical to
+    the current cost source, so republishing it would only restamp it. The baseline is the recorded fingerprint of
+    the version the slice was built from, or that version read by time travel. Delta refuses time travel past its
+    7-day file retention, so with no recorded fingerprint and an old baseline the slice is republished as before.
+    """
+    if FORCE_FULL or not _slice_exists(T_COST, extract_cd):
+        return False, "force_full_or_missing_slice"
+    built_version = get_state_version(CONTROL_SCHEMA, T_COST, cost_table)
+    current_version = versions[cost_table]
+    if built_version is None:
+        return False, "no_state"
+    if built_version == current_version:
+        return True, "same_version"
+    baseline = _stored_fingerprint(cost_table, built_version)
+    if baseline is None:
+        try:
+            baseline = _source_content_fingerprint(cost_table, built_version)
+        except Exception as exc:  # vacuumed, or past the deleted-file retention
+            return False, f"baseline_v{built_version}_unreadable:{type(exc).__name__}"
+    if _source_content_fingerprint(cost_table, current_version) == baseline:
+        return True, f"same_content_v{built_version}_v{current_version}"
+    return False, "content_changed"
+
+
 def _extract_due(extract_cd, ep_table, cost_table, versions, ignore_force=False):
     return (
         (FORCE_FULL and not ignore_force)
@@ -1918,6 +2015,10 @@ if RUN_PLICS:
                                  F.col("EXTRACT_CD") == extract_cd).count()})
             continue
 
+        # BRONZE_PERF_20261101_SLAM_COST_UNCHANGED_V1: decide before building whether the cost slice is republished.
+        cost_unchanged, cost_reason = _cost_slice_unchanged(extract_cd, cost_table, versions)
+        _plics_evidence.append({"extract_cd": extract_cd, "cost_slice_kept": cost_unchanged, "reason": cost_reason})
+        print(f"[SLAM_COST_UNCHANGED] {extract_cd}: kept={cost_unchanged} ({cost_reason})")
         repeats = 3 if BENCHMARK_MODE and BENCHMARK_EXTRACT in {extract_cd, "ALL"} else 1
         repeat_evidence = []
         for repeat_no in range(1, repeats + 1):
@@ -1945,7 +2046,8 @@ if RUN_PLICS:
                 f"INTENTIONAL_RETRY_TEST {extract_cd}: validated stage retained; "
                 "target slices and state are untouched")
 
-        _replace_validated_slice(T_COST, stage_cost, extract_cd)
+        if not cost_unchanged:  # BRONZE_PERF_20261101_SLAM_COST_UNCHANGED_V1
+            _replace_validated_slice(T_COST, stage_cost, extract_cd)
         _replace_validated_slice(T_ACT, stage_act, extract_cd)
         _pending_plics_state_commits.extend([
             (T_ACT, ep_table, versions[ep_table]),
@@ -1957,7 +2059,7 @@ if RUN_PLICS:
                          "rows": spark.table(T_ACT).where(
                              F.col("EXTRACT_CD") == extract_cd).count()})
         _results.append({"table": T_COST, "extract_cd": extract_cd,
-                         "mode": "STAGE_VALIDATE_REPLACE",
+                         "mode": "KEPT_UNCHANGED_SOURCE" if cost_unchanged else "STAGE_VALIDATE_REPLACE",
                          "rows": spark.table(T_COST).where(
                              F.col("EXTRACT_CD") == extract_cd).count()})
 else:
@@ -2058,6 +2160,8 @@ if RUN_FINANCE and table_exists(T_FIN):
 if RUN_PLICS:
     for target_table, source_table, version in _pending_plics_state_commits:
         set_state_version(CONTROL_SCHEMA, target_table, source_table, version)
+        if target_table == T_COST:  # BRONZE_PERF_20261101_SLAM_COST_UNCHANGED_V1: baseline for next week's check
+            _record_fingerprint(source_table, version)
     # Supplemental NO_OP proof: the same source versions must be due=False twice after commit.
     for extract_cd in _processed_plics_extracts:
         ep_table, cost_table = SRC_PLICS[extract_cd]
@@ -2126,6 +2230,5 @@ PROMOTION_EVIDENCE_REQUIRED = {
     ],
 }
 print(json.dumps({"promotion_evidence_required": PROMOTION_EVIDENCE_REQUIRED}, sort_keys=True))
-
 
 

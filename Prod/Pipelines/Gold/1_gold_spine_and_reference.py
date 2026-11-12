@@ -10,6 +10,7 @@
 
 # COMMAND ----------
 
+# INSR_W4_ROWRULES_V1: W4 row rules (insr-v1); see gold_journey_shared.py
 from gold_journey_shared import (
     F,
     _n,
@@ -18,6 +19,7 @@ from gold_journey_shared import (
     _s3_gate_direct_public,
     _src,
     _with_comments,
+    _flag_person_scope_any,  # INSR_W3 W3.02
     dp,
 )
 
@@ -30,15 +32,7 @@ from gold_journey_shared import (
 # Temporary views share a definition; they do not guarantee one physical scan.
 
 
-@dp.temporary_view(name="_gold_person_keys")
-def _gold_person_keys():
-    """Read distinct non-null Silver person keys for Gold foreign-key checks."""
-    return (
-        spark.read.table(_src("spine_person"))
-        .select(F.col("person_id").alias("_qc_person_id"))
-        .where(F.col("_qc_person_id").isNotNull())
-        .dropDuplicates(["_qc_person_id"])
-    )
+# INSR_W3 W3.02: replaced by gold_qc._person_scope
 
 
 @dp.temporary_view(name="_gold_encounter_keys")
@@ -76,7 +70,7 @@ def _gold_person_dates():
         spark.read.table(_src("spine_person"))
         .select(
             F.col("person_id").alias("_qc_date_person_id"),
-            F.expr("CASE WHEN CAST(`birth_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`birth_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`birth_datetime` AS DATE) = DATE'2100-12-31' OR CAST(`birth_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`birth_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_datetime` END").alias("_qc_birth_datetime"),
+            F.expr("CASE WHEN CAST(`birth_datetime` AS DATE) IN (DATE'1901-01-01', DATE'1902-01-01', DATE'1910-01-01') THEN NULL ELSE CASE WHEN CAST(`birth_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`birth_datetime` AS DATE) = DATE'1900-01-01' OR YEAR(CAST(`birth_datetime` AS DATE)) >= 2100 OR CAST(`birth_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`birth_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_datetime` END END").alias("_qc_birth_datetime"),  # INSR_W3 W3.12: = spine_person
             F.expr("CASE WHEN `deceased_datetime` < `birth_datetime` THEN NULL ELSE `deceased_datetime` END").alias("_qc_deceased_datetime"),
         )
         .where(F.col("_qc_date_person_id").isNotNull())
@@ -84,6 +78,27 @@ def _gold_person_dates():
     )
 
 # COMMAND ----------
+
+# INSR_W3 W3.02 (C0 ruling 1, 2026-10-29): the gold person scope that _qc and _tdx_product read.
+@dp.materialized_view(
+    name=_n("gold_qc._person_scope"),
+    comment=(
+        "Internal: one row per silver spine person with the gold scope flag (in_scope = has_encounter OR "
+        "has_clinical_data, from silver reference_person_scope). Only the key and the flag, so a change to a person "
+        "descriptor does not reach the person twins. A single-source projection, so it refreshes incrementally."
+    ),
+    refresh_policy="auto",
+)
+def _gold_qc_person_scope():
+    """Project silver person_scope to the two columns gold joins on; one row per spine person."""
+    return (
+        spark.read.table(_src("reference_person_scope"))
+        .where(F.col("person_id").isNotNull())
+        .select(
+            F.col("person_id").cast("bigint").alias("_qc_scope_person_id"),
+            F.col("in_scope").alias("_qc_scope_in_scope"),
+        )
+    )
 
 # ==== journey_spine.care_participation ====
 
@@ -96,10 +111,12 @@ SPINE_CARE_PARTICIPATION_SELECT = [
     '`encounter_id` AS `encounter_id`',
     '`journey_key` AS `journey_key`',
     '`service_id` AS `service_id`',
-    '`practitioner_id` AS `practitioner_id`',
+    # INSR_W3 W3.07: Gold: NULL where practitioner 0 = no practitioner (F7; silver W2.01 already NULLs it).
+    "CASE WHEN CAST(`practitioner_id` AS BIGINT) = 0 THEN NULL ELSE `practitioner_id` END AS `practitioner_id`",
     '`role` AS `role`',
     "CASE WHEN CAST(`valid_from` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`valid_from` AS DATE)) < 9999 OR CAST(`valid_from` AS DATE) = DATE'1900-01-01' OR CAST(`valid_from` AS DATE) < DATE'1901-01-01' AND CAST(`valid_from` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `valid_from` END AS `valid_from`",
-    '`valid_to` AS `valid_to`',
+    # INSR_W3 W3.07: Gold: NULL where an open-end marker in [2099-12-31, 9999) (L3892: 94.6% of non-null valid_to).
+    "CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) THEN NULL ELSE `valid_to` END AS `valid_to`",
     '`construction_rule` AS `construction_rule`',
     '`construction_version` AS `construction_version`',
     '`source_table` AS `source_table`',
@@ -136,12 +153,25 @@ SPINE_CARE_PARTICIPATION_COLUMN_COMMENTS = {
     "loaded_at": "map_encounter.ADC_UPDT inherited unchanged through the canonical encounter row for each registrar, recorder or discharger participation. This is encounter ingestion provenance, not a practitioner update, role-validity timestamp or Silver refresh time; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_CARE_PARTICIPATION_PERSON_SCOPE_RULES = {
+    "gold.spine.care_participation.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_CARE_PARTICIPATION_ORPHAN_RULES = {
+    "gold.spine.care_participation.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_care_participation"),
     comment="Internal quality-controlled twin of spine_care_participation: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_CARE_PARTICIPATION_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_CARE_PARTICIPATION_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_CARE_PARTICIPATION_ORPHAN_RULES)
 def _gold_qc_spine_care_participation():
     """Quality-controlled twin of journey_spine.care_participation."""
     # 54 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -318,11 +348,24 @@ SPINE_ENCOUNTER_COLUMN_COMMENTS = {
     "loaded_at": "map_encounter.ADC_UPDT carried unchanged from the contributing bronze encounter row. This is ingestion provenance, not the Silver refresh time or encounter arrival/departure; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_ENCOUNTER_PERSON_SCOPE_RULES = {
+    "gold.spine.encounter.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_ENCOUNTER_ORPHAN_RULES = {
+    "gold.spine.encounter.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_encounter"),
     comment="Internal quality-controlled twin of spine_encounter: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
+@dp.expect_all_or_drop(SPINE_ENCOUNTER_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_ENCOUNTER_ORPHAN_RULES)
 def _gold_qc_spine_encounter():
     """Quality-controlled twin of journey_spine.encounter."""
     # 18 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -549,12 +592,18 @@ SPINE_ENCOUNTER_IDENTIFIER_COLUMN_COMMENTS = {
     "loaded_at": "map_encounter_identifier.PIPELINE_UPDT_DT_TM carried unchanged from the contributing bronze alias row. This records bronze processing provenance, not identifier validity or the Silver refresh time; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_ENCOUNTER_IDENTIFIER_ORPHAN_RULES = {
+    "gold.spine.encounter_identifier.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_encounter_identifier"),
     comment="Internal quality-controlled twin of spine_encounter_identifier: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_ENCOUNTER_IDENTIFIER_MANDATORY_RULES)
+@dp.expect_all(SPINE_ENCOUNTER_IDENTIFIER_ORPHAN_RULES)
 def _gold_qc_spine_encounter_identifier():
     """Quality-controlled twin of journey_spine.encounter_identifier."""
     df = _qc(
@@ -629,12 +678,19 @@ SPINE_EPISODE_SELECT = [
     '`source_row_id` AS `source_row_id`',
     '`record_status` AS `record_status`',
     '`record_status_effective_from` AS `record_status_effective_from`',
-    '`record_status_effective_to` AS `record_status_effective_to`',
+    # INSR_W3 W3.05: Gold: NULL where a pre-1901 date other than the named placeholders.
+    "CASE WHEN (CAST(`record_status_effective_to` AS DATE) < DATE'1901-01-01' AND CAST(`record_status_effective_to` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01')) THEN NULL ELSE `record_status_effective_to` END AS `record_status_effective_to`",
     '`loaded_at` AS `loaded_at`',
 ]
 
 # contract v2: QC/batch inputs come from internal _spine_episode_metadata; source history stays on the main research table.
 SPINE_EPISODE_ADVISORY_RULES = {
+    # INSR_W4 W4.06 numeric_plausibility (P9_L5193): Negative pause days come from the bronze source (L5193; W2.11 sign fix NO-GO).
+    'gold.spine.episode.pause_days.insr_f9_negative_pause':
+        'NOT COALESCE((`pause_days` < 0), FALSE)',
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.spine.episode.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # This bounds a period of validity, and a future end is exactly how the source says a
     # record is still current -- nulling it would assert the record is valid forever, which
     # is a stronger and worse claim than the one being corrected. Seen on 1 of 7,799,236
@@ -675,12 +731,25 @@ SPINE_EPISODE_COLUMN_COMMENTS = {
     "loaded_at": "map_episode.ADC_UPDT carried unchanged from the contributing bronze episode row. This is ingestion provenance, not the Silver refresh time or the clinical episode start/end; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_EPISODE_PERSON_SCOPE_RULES = {
+    "gold.spine.episode.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_EPISODE_ORPHAN_RULES = {
+    "gold.spine.episode.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_episode"),
     comment="Internal quality-controlled twin of spine_episode: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_EPISODE_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_EPISODE_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_EPISODE_ORPHAN_RULES)
 def _gold_qc_spine_episode():
     """Quality-controlled twin of journey_spine.episode."""
     # 618 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -791,12 +860,19 @@ SPINE_EPISODE_ENCOUNTER_COLUMN_COMMENTS = {
     "loaded_at": "map_episode_encounter.ADC_UPDT carried unchanged from the contributing bronze relationship row. This is ingestion provenance, not the Silver refresh time or relationship-validity time; a missing source timestamp remains null.",
 }
 
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_EPISODE_ENCOUNTER_ORPHAN_RULES = {
+    "gold.spine.episode_encounter.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+    "gold.spine.episode_encounter.episode_id.orphan_nulled": "NOT COALESCE(`_qc_episode_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_episode_encounter"),
     comment="Internal quality-controlled twin of spine_episode_encounter: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(SPINE_EPISODE_ENCOUNTER_MANDATORY_RULES)
+@dp.expect_all(SPINE_EPISODE_ENCOUNTER_ORPHAN_RULES)
 def _gold_qc_spine_episode_encounter():
     """Quality-controlled twin of journey_spine.episode_encounter."""
     df = _qc(
@@ -851,7 +927,8 @@ SPINE_JOURNEY_SELECT = [
     '`journey_type_code` AS `journey_type_code`',
     '`journey_type_display` AS `journey_type_display`',
     '`period_start` AS `period_start`',
-    "CASE WHEN `period_start` IS NOT NULL AND `period_end` IS NOT NULL AND `period_start` > `period_end` THEN NULL ELSE CASE WHEN CAST(`period_end` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `period_end` END END AS `period_end`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `period_start` IS NOT NULL AND `period_end` IS NOT NULL AND `period_start` > `period_end` THEN NULL ELSE CASE WHEN (CAST(`period_end` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`period_end` AS DATE)) < 9999) THEN NULL ELSE `period_end` END END AS `period_end`",
     '`period_start_basis` AS `period_start_basis`',  # SILVER_RELEASE_20261025 item 5
     '`period_end_basis` AS `period_end_basis`',  # SILVER_RELEASE_20261025 item 5
     '`status_code` AS `status_code`',
@@ -915,12 +992,25 @@ SPINE_JOURNEY_COLUMN_COMMENTS = {
     "loaded_at": "Greatest of ADC_UPDT from the selected map_mat_pregnancy row and maximum map_mat_birth.ADC_UPDT across all rows in the Pregnancy_ID group. The selected pregnancy row, not a maximum over all pregnancy versions, contributes its clock. Pregnancy and trimester rows carry the same value; clinical period boundaries and the current Silver refresh time are not used.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_JOURNEY_PERSON_SCOPE_RULES = {
+    "gold.spine.journey.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_JOURNEY_ORPHAN_RULES = {
+    "gold.spine.journey.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_journey"),
     comment="Internal quality-controlled twin of spine_journey: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_JOURNEY_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_JOURNEY_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_JOURNEY_ORPHAN_RULES)
 def _gold_qc_spine_journey():
     """Quality-controlled twin of journey_spine.journey."""
     # 4 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -1008,6 +1098,9 @@ SPINE_JOURNEY_LINK_MANDATORY_RULES = {
 }
 
 SPINE_JOURNEY_LINK_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_ordering (P9_L3913): Member end up to 24 h before its start reads as two clocks, not two events (L3913, J24): warn only.
+    'gold.spine.journey_link.table.insr_f6_inversion_short':
+        'NOT COALESCE((`member_end_datetime` < `member_start_datetime` AND `member_end_datetime` >= `member_start_datetime` - INTERVAL 24 HOURS), FALSE)',
     # This bounds a period of validity, and a future end is exactly how the source says a
     # record is still current -- nulling it would assert the record is valid forever, which
     # is a stronger and worse claim than the one being corrected. Seen on 55,712 of
@@ -1112,7 +1205,8 @@ SPINE_JOURNEY_PARTICIPANT_SELECT = [
     '`role_code` AS `role_code`',
     '`role_display` AS `role_display`',
     '`valid_from` AS `valid_from`',
-    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN CAST(`valid_to` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `valid_to` END END AS `valid_to`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) THEN NULL ELSE `valid_to` END END AS `valid_to`",
     '`construction_rule` AS `construction_rule`',
     '`construction_version` AS `construction_version`',
     '`source_system` AS `source_system`',
@@ -1160,12 +1254,25 @@ SPINE_JOURNEY_PARTICIPANT_COLUMN_COMMENTS = {
     "loaded_at": "Mother participants inherit the pregnancy/trimester journey load clock: greatest of selected map_mat_pregnancy.ADC_UPDT and maximum map_mat_birth.ADC_UPDT for the Pregnancy_ID group. Baby participants use only their own map_mat_birth.ADC_UPDT. The two arms are unioned without a mother/baby clock maximum or substitution of clinical validity times or the current Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_JOURNEY_PARTICIPANT_PERSON_SCOPE_RULES = {
+    "gold.spine.journey_participant.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_JOURNEY_PARTICIPANT_ORPHAN_RULES = {
+    "gold.spine.journey_participant.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_journey_participant"),
     comment="Internal quality-controlled twin of spine_journey_participant: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_JOURNEY_PARTICIPANT_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_JOURNEY_PARTICIPANT_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_JOURNEY_PARTICIPANT_ORPHAN_RULES)
 def _gold_qc_spine_journey_participant():
     """Quality-controlled twin of journey_spine.journey_participant."""
     # 106 rows point at a person_id the spine does not have. The pointer is nulled so it
@@ -1224,14 +1331,20 @@ SPINE_LOCATION_STAY_SELECT = [
     '`subject_id_system` AS `subject_id_system`',
     '`person_id` AS `person_id`',
     '`location_code` AS `location_code`',
-    "CASE WHEN CAST(`period_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_start` AS DATE)) < 9999 OR CAST(`period_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `period_start` END AS `period_start`",
-    "CASE WHEN CAST(`period_end` AS DATE) = DATE'2100-12-31' OR CAST(`period_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_end` AS DATE)) < 9999 THEN NULL ELSE `period_end` END AS `period_end`",
-    "CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR CAST(`occupancy_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `occupancy_start` END AS `occupancy_start`",  # GOLD_COLUMN_PARITY_V1
-    "CASE WHEN CAST(`occupancy_end` AS DATE) = DATE'2100-12-31' OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END AS `occupancy_end`",  # GOLD_COLUMN_PARITY_V1
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN CAST(`period_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_start` AS DATE)) < 9999 OR YEAR(CAST(`period_start` AS DATE)) >= 2100 THEN NULL ELSE `period_start` END AS `period_start`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`period_end` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`period_end` AS DATE)) < 9999) OR CAST(`period_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`period_end` AS DATE)) < 9999 THEN NULL ELSE `period_end` END AS `period_end`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR YEAR(CAST(`occupancy_start` AS DATE)) >= 2100 THEN NULL ELSE `occupancy_start` END AS `occupancy_start`",  # GOLD_COLUMN_PARITY_V1
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`occupancy_end` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999) OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END AS `occupancy_end`",  # GOLD_COLUMN_PARITY_V1
     '`occupancy_start_basis` AS `occupancy_start_basis`',  # GOLD_COLUMN_PARITY_V1
     '`occupancy_end_basis` AS `occupancy_end_basis`',  # GOLD_COLUMN_PARITY_V1
-    "CASE WHEN `occupancy_start` IS NOT NULL AND (CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR CAST(`occupancy_start` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `occupancy_start` END) IS NULL THEN NULL ELSE `occupancy_start_local` END AS `occupancy_start_local`",  # GOLD_COLUMN_PARITY_V1
-    "CASE WHEN `occupancy_end` IS NOT NULL AND (CASE WHEN CAST(`occupancy_end` AS DATE) = DATE'2100-12-31' OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END) IS NULL THEN NULL ELSE `occupancy_end_local` END AS `occupancy_end_local`",  # GOLD_COLUMN_PARITY_V1
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `occupancy_start` IS NOT NULL AND (CASE WHEN CAST(`occupancy_start` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_start` AS DATE)) < 9999 OR YEAR(CAST(`occupancy_start` AS DATE)) >= 2100 THEN NULL ELSE `occupancy_start` END) IS NULL THEN NULL ELSE `occupancy_start_local` END AS `occupancy_start_local`",  # GOLD_COLUMN_PARITY_V1
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `occupancy_end` IS NOT NULL AND (CASE WHEN (CAST(`occupancy_end` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999) OR CAST(`occupancy_end` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`occupancy_end` AS DATE)) < 9999 THEN NULL ELSE `occupancy_end` END) IS NULL THEN NULL ELSE `occupancy_end_local` END AS `occupancy_end_local`",  # GOLD_COLUMN_PARITY_V1
     "CASE WHEN UPPER(TRIM(CAST(`nurse_unit_code` AS STRING))) = '0' THEN NULL ELSE `nurse_unit_code` END AS `nurse_unit_code`",
     '`nurse_unit_display` AS `nurse_unit_display`',
     "CASE WHEN UPPER(TRIM(CAST(`building_code` AS STRING))) = '0' THEN NULL ELSE `building_code` END AS `building_code`",
@@ -1323,12 +1436,26 @@ SPINE_LOCATION_STAY_COLUMN_COMMENTS = {
     "loaded_at": "Maximum map_patient_journey.ADC_UPDT within the ENCNTR_ID and stop-discriminator group. The discriminator uses LOCATION_STOP_SEQUENCE when present, otherwise ENCNTR_LOC_HIST_ID. This is contributing ingestion provenance, not the Silver refresh time; null when all contributing ADC_UPDT values are null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_LOCATION_STAY_PERSON_SCOPE_RULES = {
+    "gold.spine.location_stay.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_LOCATION_STAY_ORPHAN_RULES = {
+    "gold.spine.location_stay.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+    "gold.spine.location_stay.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_location_stay"),
     comment="Internal quality-controlled twin of spine_location_stay: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_LOCATION_STAY_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_LOCATION_STAY_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_LOCATION_STAY_ORPHAN_RULES)
 def _gold_qc_spine_location_stay():
     """Quality-controlled twin of journey_spine.location_stay."""
     # 9,473 rows point at a encounter_id the spine does not have. The pointer is nulled so
@@ -1412,8 +1539,12 @@ SPINE_PERSON_SELECT = [
     '`gender_display` AS `gender_display`',
     "CASE WHEN UPPER(TRIM(CAST(`ethnicity_code` AS STRING))) = '0' THEN NULL ELSE `ethnicity_code` END AS `ethnicity_code`",
     '`ethnicity_display` AS `ethnicity_display`',
-    "CASE WHEN CAST(`birth_date` AS DATE) = DATE'1899-12-30' OR CAST(`birth_date` AS DATE) = DATE'1900-01-01' OR CAST(`birth_date` AS DATE) = DATE'2100-12-31' OR CAST(`birth_date` AS DATE) < DATE'1901-01-01' AND CAST(`birth_date` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_date` END AS `birth_date`",
-    "CASE WHEN CAST(`birth_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`birth_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`birth_datetime` AS DATE) = DATE'2100-12-31' OR CAST(`birth_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`birth_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_datetime` END AS `birth_datetime`",
+    # INSR_W3 W3.06: Gold: NULL where a 1901-01-01 / 1902-01-01 / 1910-01-01 birth placeholder (P3a: x66 / x24 / x160 the median day).
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN CAST(`birth_date` AS DATE) IN (DATE'1901-01-01', DATE'1902-01-01', DATE'1910-01-01') THEN NULL ELSE CASE WHEN CAST(`birth_date` AS DATE) = DATE'1899-12-30' OR CAST(`birth_date` AS DATE) = DATE'1900-01-01' OR YEAR(CAST(`birth_date` AS DATE)) >= 2100 OR CAST(`birth_date` AS DATE) < DATE'1901-01-01' AND CAST(`birth_date` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_date` END END AS `birth_date`",
+    # INSR_W3 W3.06: Gold: NULL where a 1901-01-01 / 1902-01-01 / 1910-01-01 birth placeholder (P3a: x66 / x24 / x160 the median day).
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN CAST(`birth_datetime` AS DATE) IN (DATE'1901-01-01', DATE'1902-01-01', DATE'1910-01-01') THEN NULL ELSE CASE WHEN CAST(`birth_datetime` AS DATE) = DATE'1899-12-30' OR CAST(`birth_datetime` AS DATE) = DATE'1900-01-01' OR YEAR(CAST(`birth_datetime` AS DATE)) >= 2100 OR CAST(`birth_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`birth_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `birth_datetime` END END AS `birth_datetime`",
     "CASE WHEN UPPER(TRIM(CAST(`birth_precision_code` AS STRING))) = '0' THEN NULL ELSE `birth_precision_code` END AS `birth_precision_code`",
     '`birth_precision_display` AS `birth_precision_display`',
     '`birth_precision_flag` AS `birth_precision_flag`',
@@ -1491,24 +1622,64 @@ SPINE_PERSON_COLUMN_COMMENTS.update({
     name: "Governed S3b ethnic-category mapping provenance."
     for name in _s3_axis_columns("ethnicity")
 })
+SPINE_PERSON_COLUMN_COMMENTS.update({  # INSR_W3 W3.03 (J8)
+    "bhrut_mrn": "Current BHRUT MRN (RF4 MRN pool) from silver reference_person_scope, selected by the same governed alias rule as current_mrn; NULL when the person has no BHRUT alias or the selection is ambiguous.",
+    "has_any_activity": "TRUE when the person has a row of any category (clinical or administrative) in a silver event feed, or any Millennium encounter row. TRUE for almost every gold person; FALSE only when the person is in scope solely through a non-Millennium contact (SLAM/CSDS/ED/theatre). The full spine, including persons without activity, is in silver.",
+    "person_source": "barts, bhrut, both or none: which Trust MRN pools hold an alias for the person (silver reference_person_scope).",
+    "test_patient_ind": "TRUE when the Millennium person record matches a test-patient name pattern and is a Person-type record; NULL while bronze carries no name keys (see test_patient_basis). Warning only: test patients are not dropped (J8).",
+    "test_patient_basis": "The rule that set test_patient_ind, or unavailable_no_name_keys_in_bronze.",
+})
+
+# INSR_W3 W3.03 (J8, F24): test patients are reported, never dropped.
+SPINE_PERSON_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.spine.person.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
+    "gold.spine.person.test_patient.warn": "NOT COALESCE(`test_patient_ind`, FALSE)",
+}
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_PERSON_PERSON_SCOPE_RULES = {
+    "gold.spine.person.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._spine_person"),
     comment="Internal quality-controlled twin of spine_person: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
+@dp.expect_all_or_drop(SPINE_PERSON_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_PERSON_ADVISORY_RULES)  # INSR_W3 W3.03
 def _gold_qc_spine_person():
     """Quality-controlled twin of journey_spine.person."""
     df = _qc("spine_person", SPINE_PERSON_SELECT)
+    # INSR_W3 W3.03 (J8): person descriptors from silver reference_person_scope, joined here only.
+    descriptors = spark.read.table(_src("reference_person_scope")).select(
+        F.col("person_id").cast("bigint").alias("_qc_desc_person_id"),
+        "bhrut_mrn",
+        "has_any_activity",
+        "person_source",
+        "test_patient_ind",
+        "test_patient_basis",
+    )
+    df = (df.join(descriptors, F.expr("try_cast(person_id AS BIGINT)") == F.col("_qc_desc_person_id"), "left")
+          .drop("_qc_desc_person_id"))
     return _with_comments(df, SPINE_PERSON_COLUMN_COMMENTS)
 
 @dp.materialized_view(
     name=_n("gold_spine.person"),
-    comment=(
-        "One resolved Millennium person with FHIR-aligned demographics and retained source "
-        "lifecycle. Gold QC twin of the silver product: 11 columns are repaired or nulled, 0 "
-        "check(s) are advisory. Each rule states its reason in the pipeline notebook, and "
-        "Lakeflow expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One resolved Millennium person with FHIR-aligned demographics and retained source lifecycle. "
+        "Gold QC twin of the silver product: 11 columns are repaired or nulled, 0 check(s) are advisory. "
+        "Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report "
+        "what every rule matched on each update. Gold person scope: a person is published when they have "
+        "a qualifying attended encounter or any clinical row (person_scope in_scope = has_encounter OR "
+        "has_clinical_data); test patients are flagged, not dropped. Silver keeps every person. Coverage: "
+        "Thirteen 1 January dates (1930-1980 decade and mid-decade years, and 2000-01-01) hold 5 to 7 "
+        "times the usual daily births: dates estimated to the year at registration; kept as recorded; "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -1546,6 +1717,11 @@ def gold_spine_person():
         '`current_mrn_status` AS `current_mrn_status`',
         '`mrn_selection_status` AS `mrn_selection_status`',
         '`current_mrn_pool` AS `current_mrn_pool`',  # SDI_MRN_POOL_V1/gold:
+        '`bhrut_mrn` AS `bhrut_mrn`',  # INSR_W3 W3.03 (J8): has_any_activity..test_patient_basis too
+        '`has_any_activity` AS `has_any_activity`',
+        '`person_source` AS `person_source`',
+        '`test_patient_ind` AS `test_patient_ind`',
+        '`test_patient_basis` AS `test_patient_basis`',
         '`nhs_number` AS `nhs_number`',
         '`nhs_number_status` AS `nhs_number_status`',
         '`nhs_number_selection_status` AS `nhs_number_selection_status`',
@@ -1576,7 +1752,8 @@ SPINE_PERSON_IDENTIFIER_SELECT = [
     '`identifier_type_code` AS `identifier_type_code`',
     '`status` AS `status`',
     "CASE WHEN CAST(`valid_from` AS DATE) = DATE'1900-01-01' OR CAST(`valid_from` AS DATE) < DATE'1901-01-01' AND CAST(`valid_from` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `valid_from` END AS `valid_from`",
-    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN CAST(`valid_to` AS DATE) = DATE'2100-12-31' OR CAST(`valid_to` AS DATE) = DATE'1900-01-01' OR CAST(`valid_to` AS DATE) < DATE'1901-01-01' AND CAST(`valid_to` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `valid_to` END END AS `valid_to`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) OR CAST(`valid_to` AS DATE) = DATE'1900-01-01' OR CAST(`valid_to` AS DATE) < DATE'1901-01-01' AND CAST(`valid_to` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `valid_to` END END AS `valid_to`",
     '`source_system` AS `source_system`',
     '`source_table` AS `source_table`',
     '`source_row_id` AS `source_row_id`',
@@ -1641,6 +1818,17 @@ SPINE_PERSON_IDENTIFIER_COLUMN_COMMENTS = {
     "loaded_at": "Arm-specific clock: map_person.ADC_UPDT for Millennium person IDs; always null for both community key and community number assignments; map_pacs_patient_link.ADC_UPDT for PACS; map_patient_identifier.PIPELINE_UPDT_DT_TM for Millennium aliases; map_endobase_patient.ADC_UPDT for EndoBase; map_cancer_ptl_linkage.ADC_UPDT for both Pathfinder MRN and NHS assignments. The eight arms are unioned without a cross-arm maximum or Silver refresh timestamp.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_PERSON_IDENTIFIER_PERSON_SCOPE_RULES = {
+    "gold.spine.person_identifier.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_PERSON_IDENTIFIER_ORPHAN_RULES = {
+    "gold.spine.person_identifier.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_person_identifier"),
     comment="Internal quality-controlled twin of spine_person_identifier: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -1648,6 +1836,8 @@ SPINE_PERSON_IDENTIFIER_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(SPINE_PERSON_IDENTIFIER_MANDATORY_RULES)
 @dp.expect_all(SPINE_PERSON_IDENTIFIER_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_PERSON_IDENTIFIER_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_PERSON_IDENTIFIER_ORPHAN_RULES)
 def _gold_qc_spine_person_identifier():
     """Quality-controlled twin of journey_spine.person_identifier."""
     df = _qc(
@@ -1747,15 +1937,23 @@ SPINE_PERSON_RELATIONSHIP_COLUMN_COMMENTS = {
     "loaded_at": "map_mat_birth.ADC_UPDT carried unchanged for the mother-to-child relationship. The three contributing source-update clocks are published separately as source_update_timestamp and do not replace this value; no parent-person or separate pregnancy load clock is joined.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_PERSON_RELATIONSHIP_PERSON_SCOPE_RULES = {
+    "gold.spine.person_relationship.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_person_relationship"),
     comment="Internal quality-controlled twin of spine_person_relationship: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(SPINE_PERSON_RELATIONSHIP_ADVISORY_RULES)
+@dp.expect_all_or_drop(SPINE_PERSON_RELATIONSHIP_PERSON_SCOPE_RULES)
 def _gold_qc_spine_person_relationship():
     """Quality-controlled twin of journey_spine.person_relationship."""
     df = _qc("spine_person_relationship", SPINE_PERSON_RELATIONSHIP_SELECT)
+    df = _flag_person_scope_any(df, ("source_person_id", "target_person_id"))  # INSR_W3 W3.02
     return _with_comments(df, SPINE_PERSON_RELATIONSHIP_COLUMN_COMMENTS)
 
 @dp.materialized_view(
@@ -1847,11 +2045,25 @@ SPINE_REQUEST_THREAD_COLUMN_COMMENTS = {
     "loaded_at": "Arm-specific contributing load clock: pathology takes the greatest requested-test ADC_UPDT and the linked report-series maximum ADC_UPDT across all its versions; medication takes the greatest administration ADC_UPDT and order ADC_UPDT; waiting-list takes ADC_UPDT of the selected whole representative version. The appointment join adds no clock, and the union does not aggregate across arms. Null when that edge has no contributing load timestamp; not Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+SPINE_REQUEST_THREAD_PERSON_SCOPE_RULES = {
+    "gold.spine.request_thread.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+SPINE_REQUEST_THREAD_ORPHAN_RULES = {
+    "gold.spine.request_thread.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+    "gold.spine.request_thread.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._spine_request_thread"),
     comment="Internal quality-controlled twin of spine_request_thread: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
+@dp.expect_all_or_drop(SPINE_REQUEST_THREAD_PERSON_SCOPE_RULES)
+@dp.expect_all(SPINE_REQUEST_THREAD_ORPHAN_RULES)
 def _gold_qc_spine_request_thread():
     """Quality-controlled twin of journey_spine.request_thread."""
     # 343,157 rows point at a encounter_id the spine does not have. The pointer is nulled so
@@ -1869,7 +2081,18 @@ def _gold_qc_spine_request_thread():
 
 @dp.materialized_view(
     name=_n("gold_spine.request_thread"),
-    comment="Directed indexed-event edges for pathology order-to-report, medication order-to-administration, and waiting-list entry-to-appointment routes. Pathology edges are accession-scoped co-membership (requested test and report series share an accession), not result-level attribution. Gold QC twin of the silver product: 4 columns are repaired or nulled, 0 check(s) are advisory. Each rule states its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule matched on each update.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Directed indexed-event edges for pathology order-to-report, medication order-to-administration, "
+        "and waiting-list entry-to-appointment routes. Pathology edges are accession-scoped co-membership "
+        "(requested test and report series share an accession), not result-level attribution. Gold QC "
+        "twin of the silver product: 4 columns are repaired or nulled, 0 check(s) are advisory. Each rule "
+        "states its reason in the pipeline notebook, and Lakeflow expectation metrics report what every "
+        "rule matched on each update. Rows with no person are kept: about 14% of request-thread edges "
+        "come from unlinked LIMS pathology requests and cannot be attributed to a person. Coverage: The "
+        "pathology arm of request threads drops from August 2017 as pathology reports fall at source "
+        "while orders rise; complete-through month per release: 6_mgmt.data_quality.release_finding "
+        "(finding_code F2_complete_through)."
+    ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
 )
@@ -2151,12 +2374,16 @@ REFERENCE_DEVICE_MAPPING_SELECT = [
 
 # contract v2: source history comes directly from the main research table; no separate metadata input is needed.
 REFERENCE_DEVICE_MAPPING_ADVISORY_RULES = {
+    # INSR_W4 W4.06 cross_field (estate 2026-10-29): A device mapping with confidence 0 should carry no concept (L3836).
+    'gold.reference.device_mapping.table.insr_f19_zero_confidence_mapped':
+        'NOT COALESCE((`mapping_confidence` = 0 AND (`snomed_concept_id` IS NOT NULL OR `standard_concept_id` IS NOT NULL)), FALSE)',
     # This bounds a period of validity, and a future end is exactly how the source says a
     # record is still current -- nulling it would assert the record is valid forever, which
     # is a stronger and worse claim than the one being corrected. Seen on 106,883 of 248,449
     # rows (43%) when profiled on 2026-08-24.
-    "gold.reference.device_mapping.expiry_date.future_owner":
-        "NOT COALESCE((CAST(`expiry_date` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS), FALSE)",
+    # INSR_W3 W3.08 (F16): an expiry date is a planned future date; warn only outside 1990..loaded_at+15y.
+    "gold.reference.device_mapping.expiry_date.expiry_window":
+        "NOT COALESCE(CAST(`expiry_date` AS DATE) < DATE'1990-01-01' OR CAST(`expiry_date` AS TIMESTAMP) > `loaded_at` + INTERVAL 15 YEARS, FALSE)",
 }
 
 REFERENCE_DEVICE_MAPPING_COLUMN_COMMENTS = {
@@ -2219,12 +2446,19 @@ REFERENCE_DEVICE_MAPPING_COLUMN_COMMENTS = {
     "loaded_at": "map_device_mapping.PIPELINE_LOADED_AT carried unchanged. This is the contributing bronze row-write clock, distinct from MAPPED_AT evaluation time and from Silver refresh time; a missing value remains null.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_DEVICE_MAPPING_PERSON_SCOPE_RULES = {
+    "gold.reference.device_mapping.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_device_mapping"),
     comment="Internal quality-controlled twin of reference_device_mapping: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_DEVICE_MAPPING_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_DEVICE_MAPPING_PERSON_SCOPE_RULES)
 def _gold_qc_reference_device_mapping():
     """Quality-controlled twin of journey_reference.device_mapping."""
     df = _qc("reference_device_mapping", REFERENCE_DEVICE_MAPPING_SELECT)
@@ -2232,11 +2466,10 @@ def _gold_qc_reference_device_mapping():
 
 @dp.materialized_view(
     name=_n("gold_reference.device_mapping"),
-    comment=(
-        "One best-effort implant-device mapping with source and terminology provenance. Gold "
-        "QC twin of the silver product: 0 columns are repaired or nulled, 1 check(s) are "
-        "advisory. Each rule states its reason in the pipeline notebook, and Lakeflow "
-        "expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Device-to-GMDN/GUDID mapping for implant catalogue items, best effort with provenance (method, "
+        "score, rule). A UDI is recorded on a minority of implants, so most mappings come from catalogue "
+        "and manufacturer text; unmapped items stay unmapped rather than guessed."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -2365,12 +2598,18 @@ REFERENCE_ENCOUNTER_ATTRIBUTE_COLUMN_COMMENTS = {
     "loaded_at": "map_encounter_attribute.PIPELINE_UPDT_DT_TM carried unchanged through the shared attribute projection. This is the contributing bronze write clock, not the attribute's effective dates, clinical value time or Silver refresh time.",
 }
 
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_ENCOUNTER_ATTRIBUTE_ORPHAN_RULES = {
+    "gold.reference.encounter_attribute.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_encounter_attribute"),
     comment="Internal quality-controlled twin of reference_encounter_attribute: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_ENCOUNTER_ATTRIBUTE_MANDATORY_RULES)
+@dp.expect_all(REFERENCE_ENCOUNTER_ATTRIBUTE_ORPHAN_RULES)
 def _gold_qc_reference_encounter_attribute():
     """Quality-controlled twin of journey_reference.encounter_attribute."""
     df = _qc(
@@ -2449,8 +2688,17 @@ REFERENCE_ENCOUNTER_BOUNDS_SELECT = [
     '`_source_row_id` AS `_source_row_id`',
     '`loaded_at` AS `loaded_at`',
 ]
+REFERENCE_ENCOUNTER_BOUNDS_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`bounds_birth_floor_applied_ind` AS `bounds_birth_floor_applied_ind`',
+]
 
 # contract v2: source history comes directly from the main research table; no separate metadata input is needed.
+REFERENCE_ENCOUNTER_BOUNDS_INSR_W4_ADVISORY_RULES = {  # INSR_W4
+    # INSR_W4 W4.05 date_ordering (estate 2026-10-29): The last ward move-in cannot follow its move-out unless the stay is still open (L3749).
+    'gold.reference.encounter_bounds.table.insr_f6_last_ward_inversion':
+        'NOT COALESCE((`last_ward_in_datetime` > `last_ward_out_datetime` AND NOT coalesce(`last_ward_still_open_ind`, FALSE)), FALSE)',
+}
+
 REFERENCE_ENCOUNTER_BOUNDS_MANDATORY_RULES = {
     # The flow nulls encounter_id when it names a parent the spine does not have, and this
     # rule then drops the row, because the row is only the start and end of an encounter, so
@@ -2487,6 +2735,15 @@ REFERENCE_ENCOUNTER_BOUNDS_COLUMN_COMMENTS = {
     "_source_row_id": "Millennium encounter identifier. One row per encounter with some recorded clinical activity; encounters with none are absent from this table.",
     "loaded_at": "Always NULL as a TIMESTAMP in the encounter-bounds projection. No load clock is supplied from map_encounter_activity_bounds or map_encounter_event_bounds, and the pipeline does not substitute event-boundary timestamps or the Silver refresh time.",
 }
+REFERENCE_ENCOUNTER_BOUNDS_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "bounds_birth_floor_applied_ind": "True when a bound before birth or at the epoch was nulled (INSR_W1_BOUNDS_COHERENT_V1). (bronze BOUNDS_BIRTH_FLOOR_APPLIED_IND, INSR W1). INSR_W2 W2.20."
+})
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_ENCOUNTER_BOUNDS_ORPHAN_RULES = {
+    "gold.reference.encounter_bounds.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_encounter_bounds"),
@@ -2494,6 +2751,8 @@ REFERENCE_ENCOUNTER_BOUNDS_COLUMN_COMMENTS = {
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_ENCOUNTER_BOUNDS_MANDATORY_RULES)
+@dp.expect_all(REFERENCE_ENCOUNTER_BOUNDS_ORPHAN_RULES)
+@dp.expect_all(REFERENCE_ENCOUNTER_BOUNDS_INSR_W4_ADVISORY_RULES)  # INSR_W4
 def _gold_qc_reference_encounter_bounds():
     """Quality-controlled twin of journey_reference.encounter_bounds."""
     df = _qc(
@@ -2505,11 +2764,14 @@ def _gold_qc_reference_encounter_bounds():
 
 @dp.materialized_view(
     name=_n("gold_reference.encounter_bounds"),
-    comment=(
-        "One full-outer encounter activity and event bounds row. Gold QC twin of the silver "
-        "product: 1 columns are repaired or nulled, 1 rule(s) drop rows, 0 check(s) are "
-        "advisory. Each rule states its reason in the pipeline notebook, and Lakeflow "
-        "expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One full-outer encounter activity and event bounds row. Gold QC twin of the silver product: 1 "
+        "columns are repaired or nulled, 1 rule(s) drop rows, 0 check(s) are advisory. Each rule states "
+        "its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule "
+        "matched on each update. Coverage: Orders loaded in November 2019 run at about 2.5 times the "
+        "previous months at source (a bulk order load), so first-order dates of encounters pile up in "
+        "that month; complete-through month per release: 6_mgmt.data_quality.release_finding "
+        "(finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -2542,6 +2804,7 @@ def gold_reference_encounter_bounds():
         '`_source_table` AS `_source_table`',
         '`_source_row_id` AS `_source_row_id`',
         '`loaded_at` AS `loaded_at`',
+        '`bounds_birth_floor_applied_ind` AS `bounds_birth_floor_applied_ind`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_ENCOUNTER_BOUNDS_COLUMN_COMMENTS)
 
@@ -2645,7 +2908,8 @@ REFERENCE_LOCATION_SELECT = [
     '`organization_id` AS `organization_id`',
     '`physical_type_code` AS `physical_type_code`',
     '`valid_from` AS `valid_from`',
-    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN CAST(`valid_to` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `valid_to` END END AS `valid_to`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) THEN NULL ELSE `valid_to` END END AS `valid_to`",
     '`latitude` AS `latitude`',
     '`longitude` AS `longitude`',
     '`address_city` AS `address_city`',
@@ -2653,6 +2917,11 @@ REFERENCE_LOCATION_SELECT = [
     '`source_table` AS `source_table`',
     '`source_row_id` AS `source_row_id`',
     '`loaded_at` AS `loaded_at`',
+]
+REFERENCE_LOCATION_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`organization_id_basis` AS `organization_id_basis`',
+    '`coordinate_source` AS `coordinate_source`',
+    '`coordinate_status` AS `coordinate_status`',
 ]
 
 REFERENCE_LOCATION_COLUMN_COMMENTS = {
@@ -2667,14 +2936,21 @@ REFERENCE_LOCATION_COLUMN_COMMENTS = {
     "physical_type_code": "FHIR physical location type code: si facility, bu building, wa nurse unit, ro room, bd bed; null for other Millennium location types.",  # SDI_LOCATION_GOLD_V1
     "valid_from": "Source validity start.",
     "valid_to": "Source validity end.",
-    "latitude": "Source address latitude.",
-    "longitude": "Source address longitude.",
+    "latitude": "Latitude of the location: the Millennium address record's, or for a Trust care site with none the ONS Postcode Directory centroid of its postcode (see coordinate_source). Trust sites only (J15).",  # INSR_W7_SITE_GEOCODE_V1 W7.08
+    "longitude": "Longitude of the location; same source rule as latitude.",  # INSR_W7 W7.08
+    "coordinate_source": "source (Millennium address record) or onspd_postcode_centroid (ONS Postcode Directory centroid of the site postcode); null when the location has no coordinates (INSR W7.08).",  # INSR_W7 W7.08
+    "coordinate_status": "postcode_outside_trust_areas when the location's postcode area is not one of the Trust's own site postcode areas (areas of its active facility-level care sites); coordinates and coordinate_source are then NULL. NULL otherwise (INSR W7.08, W7-S1 ruling 2026-10-31).",  # INSR_W7 W7.08
     "address_city": "Source address city.",
     "address_postcode_masked": "Privacy-aware source postcode.",
     "source_table": "Fully qualified bronze source table.",
     "source_row_id": "Stable source row identifier.",
     "loaded_at": "From map_care_site: maximum ADC_UPDT per facility_cd for facility rows, maximum ADC_UPDT per building_cd for building rows, and the individual source row's ADC_UPDT for nurse-unit rows. The hierarchy union adds no parent clock or cross-level aggregation; this is bronze ingestion provenance, not location validity time or Silver refresh time. map_location_unit rows carry that row's ADC_UPDT.",  # SDI_LOCATION_GOLD_V1
 }
+REFERENCE_LOCATION_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "organization_id_basis": "care_site_source when map_care_site carries the organisation; parent_care_site / grandparent_care_site / great_grandparent_care_site when a map_location_unit row inherits it through PARENT_LOCATION_CD; NULL when no care-site ancestor within three hops has one. INSR_W2 W2.11 (L4164).",
+    "coordinate_source": "Where latitude/longitude come from: source (the Millennium address record) or onspd_postcode_centroid (ONS Postcode Directory centroid of the site postcode, used when the source has none); null when the location has no coordinates (INSR W7.08, J15 ruling 2026-10-29)."
+})
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_location"),
@@ -2718,6 +2994,9 @@ def gold_reference_location():
         '`source_table` AS `source_table`',
         '`source_row_id` AS `source_row_id`',
         '`loaded_at` AS `loaded_at`',
+        '`organization_id_basis` AS `organization_id_basis`',  # INSR_W3 W3.12
+        '`coordinate_source` AS `coordinate_source`',  # INSR_W3 W3.12
+        '`coordinate_status` AS `coordinate_status`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_LOCATION_COLUMN_COMMENTS)
 
@@ -2733,12 +3012,16 @@ REFERENCE_ORGANIZATION_SELECT = [
     '`name` AS `name`',
     '`status` AS `status`',
     '`valid_from` AS `valid_from`',
-    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN CAST(`valid_to` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `valid_to` END END AS `valid_to`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) THEN NULL ELSE `valid_to` END END AS `valid_to`",
     '`address_city` AS `address_city`',
     '`address_postcode_masked` AS `address_postcode_masked`',
     '`source_table` AS `source_table`',
     '`source_row_id` AS `source_row_id`',
     '`loaded_at` AS `loaded_at`',
+]
+REFERENCE_ORGANIZATION_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`member_source` AS `member_source`',
 ]
 
 REFERENCE_ORGANIZATION_COLUMN_COMMENTS = {
@@ -2755,6 +3038,10 @@ REFERENCE_ORGANIZATION_COLUMN_COMMENTS = {
     "source_row_id": "Stable source organization identifier.",
     "loaded_at": "Maximum map_care_site.ADC_UPDT over source rows sharing the non-null ORGANIZATION_ID. The maximum is not restricted to active source rows or the row supplying the selected name/address; it records contributing bronze ingestion, not organization validity time or Silver refresh time.",
 }
+REFERENCE_ORGANIZATION_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "member_source": "map_care_site for organisations with a care-site row; in_use_fk for organisation ids that encounters, appointments, medication orders or ED tracking reference but map_care_site lacks (name and address unknown, status referenced_only). INSR_W2 W2.11 (L4164)."
+})
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_organization"),
@@ -2792,6 +3079,7 @@ def gold_reference_organization():
         '`source_table` AS `source_table`',
         '`source_row_id` AS `source_row_id`',
         '`loaded_at` AS `loaded_at`',
+        '`member_source` AS `member_source`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_ORGANIZATION_COLUMN_COMMENTS)
 
@@ -2808,8 +3096,10 @@ REFERENCE_PERSON_ADDRESS_SELECT = [
     '`organization_id` AS `organization_id`',
     "CASE WHEN UPPER(TRIM(CAST(`address_type_code` AS STRING))) = '0' THEN NULL ELSE `address_type_code` END AS `address_type_code`",
     '`active_ind` AS `active_ind`',
-    "CASE WHEN CAST(`beg_effective` AS DATE) = DATE'1900-01-01' OR CAST(`beg_effective` AS DATE) = DATE'2100-01-01' OR CAST(`beg_effective` AS DATE) = DATE'2100-12-31' OR CAST(`beg_effective` AS DATE) < DATE'1901-01-01' AND CAST(`beg_effective` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `beg_effective` END AS `beg_effective`",
-    "CASE WHEN CAST(`end_effective` AS DATE) = DATE'2100-12-31' OR CAST(`end_effective` AS DATE) = DATE'1900-01-01' OR CAST(`end_effective` AS DATE) = DATE'2100-01-01' OR CAST(`end_effective` AS DATE) < DATE'1901-01-01' AND CAST(`end_effective` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `end_effective` END AS `end_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN CAST(`beg_effective` AS DATE) = DATE'1900-01-01' OR CAST(`beg_effective` AS DATE) = DATE'2100-01-01' OR YEAR(CAST(`beg_effective` AS DATE)) >= 2100 OR CAST(`beg_effective` AS DATE) < DATE'1901-01-01' AND CAST(`beg_effective` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `beg_effective` END AS `beg_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`end_effective` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`end_effective` AS DATE)) < 9999) OR CAST(`end_effective` AS DATE) = DATE'1900-01-01' OR CAST(`end_effective` AS DATE) = DATE'2100-01-01' OR CAST(`end_effective` AS DATE) < DATE'1901-01-01' AND CAST(`end_effective` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `end_effective` END AS `end_effective`",
     '`open_ended_ind` AS `open_ended_ind`',
     '`street_address` AS `street_address`',
     '`city` AS `city`',
@@ -3000,6 +3290,17 @@ REFERENCE_PERSON_ADDRESS_COLUMN_COMMENTS = {
     "loaded_at": "map_address.ADC_UPDT carried unchanged for the address row. The EPC enrichment join contributes no load timestamp, so this field does not track changes to the EPC payload or its inspection/lodgement dates. It is address-source bronze provenance, not Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_PERSON_ADDRESS_PERSON_SCOPE_RULES = {
+    "gold.reference.person_address.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_PERSON_ADDRESS_ORPHAN_RULES = {
+    "gold.reference.person_address.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_address"),
     comment="Internal quality-controlled twin of reference_person_address: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
@@ -3007,6 +3308,8 @@ REFERENCE_PERSON_ADDRESS_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_ADDRESS_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_ADDRESS_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_PERSON_ADDRESS_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_PERSON_ADDRESS_ORPHAN_RULES)
 def _gold_qc_reference_person_address():
     """Quality-controlled twin of journey_reference.person_address."""
     df = _qc(
@@ -3130,10 +3433,13 @@ REFERENCE_PERSON_ADDRESS_AIR_QUALITY_COLUMN_COMMENTS = {'person_address_key': 'D
 
 @dp.materialized_view(
     name=_n("gold_reference.person_address_air_quality"),
-    comment=(
-        "Monthly ambient air-quality estimates for each person address assignment and pollutant (DAR059 methods: "
-        "nearest site within 2 km, inverse-distance weighting of up to three sites within 25 km). Gold twin of the "
-        "silver product, restricted to address assignments published in gold reference_person_address."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Monthly ambient air-quality estimates for each person address assignment and pollutant (DAR059 "
+        "methods: nearest site within 2 km, inverse-distance weighting of up to three sites within 25 "
+        "km). Gold twin of the silver product, restricted to address assignments published in gold "
+        "reference_person_address. Coverage: Gravimetric PM10 and PM2.5 stop in July 2026 at the "
+        "reporting networks (address rows 0.89 of June; other pollutants unchanged); complete-through "
+        "month per release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     cluster_by=["person_id"],
@@ -3148,6 +3454,33 @@ def gold_reference_person_address_air_quality():
           .join(kept, F.col("person_address_key") == F.col("_gold_person_address_key"), "inner")
           .select(*REFERENCE_PERSON_ADDRESS_AIR_QUALITY_COLUMNS))
     return _with_comments(df, REFERENCE_PERSON_ADDRESS_AIR_QUALITY_COLUMN_COMMENTS)
+
+
+# ==== gold_reference.person_air_quality_annual (INSR_W7_AQ_ANNUAL_V1, W7.07b) ====
+
+REFERENCE_PERSON_AIR_QUALITY_ANNUAL_COLUMNS = ['person_air_quality_year_key', 'person_id', 'year_start', 'no2_annual_mean', 'no2_nearest_2km_annual_mean', 'no2_nearest_site_distance_km_mean', 'no2_address_months', 'pm2_5_annual_mean', 'pm2_5_nearest_2km_annual_mean', 'pm2_5_nearest_site_distance_km_mean', 'pm2_5_address_months', 'pm10_annual_mean', 'pm10_nearest_2km_annual_mean', 'pm10_nearest_site_distance_km_mean', 'pm10_address_months', 'o3_annual_mean', 'o3_nearest_2km_annual_mean', 'o3_nearest_site_distance_km_mean', 'o3_address_months', 'min_data_capture_pct']  # INSR_W7 W7.07b
+
+REFERENCE_PERSON_AIR_QUALITY_ANNUAL_COLUMN_COMMENTS = {'person_air_quality_year_key': 'Deterministic key of the person and calendar year.', 'person_id': 'Native Millennium PERSON_ID of the person whose address estimates are averaged.', 'year_start': 'First day of the calendar year the means cover. The current year is partial.', 'min_data_capture_pct': 'Lowest source data-capture percentage among the sites behind any monthly estimate in the year; a completeness caveat, not a quality gate.', 'no2_annual_mean': "Mean NO2 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'no2_nearest_2km_annual_mean': 'Mean NO2 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'no2_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting NO2 in each month.", 'no2_address_months': 'Address-months in the year with a NO2 estimate (12 per address for a full year; two addresses in one month count twice).', 'pm2_5_annual_mean': "Mean PM2.5 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'pm2_5_nearest_2km_annual_mean': 'Mean PM2.5 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'pm2_5_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting PM2.5 in each month.", 'pm2_5_address_months': 'Address-months in the year with a PM2.5 estimate (12 per address for a full year; two addresses in one month count twice).', 'pm10_annual_mean': "Mean PM10 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'pm10_nearest_2km_annual_mean': 'Mean PM10 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'pm10_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting PM10 in each month.", 'pm10_address_months': 'Address-months in the year with a PM10 estimate (12 per address for a full year; two addresses in one month count twice).', 'o3_annual_mean': "Mean O3 over the person's address-months in the year, from the monthly DAR059 tri_weighted_25km_value estimates (reference_person_address_air_quality).", 'o3_nearest_2km_annual_mean': 'Mean O3 over the address-months that had a reporting site within 2 km (DAR059 nearest_within_2km_value); NULL when none did.', 'o3_nearest_site_distance_km_mean': "Mean distance in km from the person's addresses to the nearest site reporting O3 in each month.", 'o3_address_months': 'Address-months in the year with a O3 estimate (12 per address for a full year; two addresses in one month count twice).'}
+
+
+@dp.materialized_view(
+    name=_n("gold_reference.person_air_quality_annual"),
+    comment=("Annual air-quality means per person and calendar year (NO2, PM2.5, PM10, O3). Gold twin of the silver "
+             "product, restricted to people with an address assignment published in gold reference_person_address."),
+    table_properties={"quality": "gold"},
+    cluster_by=["person_id"],
+    refresh_policy="auto",
+)
+def gold_reference_person_air_quality_annual():
+    """INSR_W7 W7.07b: public twin of reference_person_air_quality_annual, contained like the monthly twin."""
+    kept = (spark.read.table(_n("gold_qc._reference_person_address"))
+            .where(F.col("person_id").isNotNull())
+            .select(F.col("person_id").alias("_gold_person_id"))
+            .distinct())
+    df = (spark.read.table(_src("reference_person_air_quality_annual"))
+          .join(kept, F.col("person_id") == F.col("_gold_person_id"), "inner")
+          .select(*REFERENCE_PERSON_AIR_QUALITY_ANNUAL_COLUMNS))
+    return _with_comments(df, REFERENCE_PERSON_AIR_QUALITY_ANNUAL_COLUMN_COMMENTS)
 
 # COMMAND ----------
 
@@ -3265,12 +3598,25 @@ REFERENCE_PERSON_ATTRIBUTE_COLUMN_COMMENTS = {
     "loaded_at": "map_person_attribute.PIPELINE_UPDT_DT_TM carried unchanged through the shared attribute projection. This is the contributing bronze write clock, not the attribute's effective dates, clinical value time or Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_PERSON_ATTRIBUTE_PERSON_SCOPE_RULES = {
+    "gold.reference.person_attribute.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_PERSON_ATTRIBUTE_ORPHAN_RULES = {
+    "gold.reference.person_attribute.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_attribute"),
     comment="Internal quality-controlled twin of reference_person_attribute: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_ATTRIBUTE_MANDATORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_PERSON_ATTRIBUTE_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_PERSON_ATTRIBUTE_ORPHAN_RULES)
 def _gold_qc_reference_person_attribute():
     """Quality-controlled twin of journey_reference.person_attribute."""
     df = _qc(
@@ -3341,6 +3687,11 @@ REFERENCE_PERSON_DEATH_EVIDENCE_SELECT = [
     '`record_status` AS `record_status`',
     '`loaded_at` AS `loaded_at`',
 ]
+REFERENCE_PERSON_DEATH_EVIDENCE_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`age_at_death_raw` AS `age_at_death_raw`',
+    '`last_clinical_event_datetime_derived` AS `last_clinical_event_datetime_derived`',
+    '`post_death_clinical_activity_ind` AS `post_death_clinical_activity_ind`',
+]
 
 # contract v2: source history comes directly from the main research table; no separate metadata input is needed.
 REFERENCE_PERSON_DEATH_EVIDENCE_MANDATORY_RULES = {
@@ -3388,6 +3739,23 @@ REFERENCE_PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS = {
     "record_status": "Always active in this projection. The label is a literal, not derived from death evidence, source presence, clinical activity or effective dates; it does not assert that the person is alive.",
     "loaded_at": "map_death.ADC_UPDT carried unchanged for the contributing death-evidence row. This is bronze load provenance, not recorded/calculated death time, last-known activity or Silver refresh time.",
 }
+REFERENCE_PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "age_at_death_raw": "Source AGE_AT_DEATH exactly as supplied (constant 0 at source, P7_L5145).",
+    "last_clinical_event_datetime_derived": "Latest clinical-category event across the silver event feeds (person_scope); excludes the administrative and bulk events that bronze LAST_CLINICAL_EVENT_DT_TM counts (L5145). INSR_W2.",
+    "post_death_clinical_activity_ind": "True when a clinical-category event falls more than one day after the death date. INSR_W2."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_PERSON_DEATH_EVIDENCE_PERSON_SCOPE_RULES = {
+    "gold.reference.person_death_evidence.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_PERSON_DEATH_EVIDENCE_ORPHAN_RULES = {
+    "gold.reference.person_death_evidence.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_person_death_evidence"),
@@ -3396,6 +3764,8 @@ REFERENCE_PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS = {
 )
 @dp.expect_all_or_drop(REFERENCE_PERSON_DEATH_EVIDENCE_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_DEATH_EVIDENCE_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_PERSON_DEATH_EVIDENCE_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_PERSON_DEATH_EVIDENCE_ORPHAN_RULES)
 def _gold_qc_reference_person_death_evidence():
     """Quality-controlled twin of journey_reference.person_death_evidence."""
     df = _qc(
@@ -3441,6 +3811,9 @@ def gold_reference_person_death_evidence():
         '`_source_row_id` AS `_source_row_id`',
         '`record_status` AS `record_status`',
         '`loaded_at` AS `loaded_at`',
+        '`age_at_death_raw` AS `age_at_death_raw`',  # INSR_W3 W3.12
+        '`last_clinical_event_datetime_derived` AS `last_clinical_event_datetime_derived`',  # INSR_W3 W3.12
+        '`post_death_clinical_activity_ind` AS `post_death_clinical_activity_ind`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_PERSON_DEATH_EVIDENCE_COLUMN_COMMENTS)
 
@@ -3467,7 +3840,8 @@ REFERENCE_PRACTITIONER_SELECT = [
     '`gdp_number` AS `gdp_number`',
     '`external_provider_id` AS `external_provider_id`',
     '`valid_from` AS `valid_from`',
-    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN CAST(`valid_to` AS DATE) = DATE'2100-12-31' OR CAST(`valid_to` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999 OR CAST(`valid_to` AS DATE) = DATE'2100-01-01' THEN NULL ELSE `valid_to` END END AS `valid_to`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN `valid_from` IS NOT NULL AND `valid_to` IS NOT NULL AND `valid_from` > `valid_to` THEN NULL ELSE CASE WHEN (CAST(`valid_to` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999) OR CAST(`valid_to` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`valid_to` AS DATE)) < 9999 OR CAST(`valid_to` AS DATE) = DATE'2100-01-01' THEN NULL ELSE `valid_to` END END AS `valid_to`",
     '`source_table` AS `source_table`',
     '`source_row_id` AS `source_row_id`',
     '`record_status` AS `record_status`',
@@ -3584,10 +3958,12 @@ REFERENCE_PRACTITIONER_GROUP_SELECT = [
     '`primary_ind` AS `primary_ind`',
     '`relation_active_ind` AS `relation_active_ind`',
     '`relation_beg_effective` AS `relation_beg_effective`',
-    "CASE WHEN CAST(`relation_end_effective` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `relation_end_effective` END AS `relation_end_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`relation_end_effective` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`relation_end_effective` AS DATE)) < 9999) THEN NULL ELSE `relation_end_effective` END AS `relation_end_effective`",
     '`group_active_ind` AS `group_active_ind`',
     '`group_beg_effective` AS `group_beg_effective`',
-    "CASE WHEN CAST(`group_end_effective` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `group_end_effective` END AS `group_end_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`group_end_effective` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`group_end_effective` AS DATE)) < 9999) THEN NULL ELSE `group_end_effective` END AS `group_end_effective`",
     '`_source_system` AS `_source_system`',
     '`_source_table` AS `_source_table`',
     '`_source_row_id` AS `_source_row_id`',
@@ -3701,7 +4077,8 @@ REFERENCE_PRACTITIONER_IDENTIFIER_SELECT = [
     '`active_ind` AS `active_ind`',
     '`effective_now_ind` AS `effective_now_ind`',
     '`beg_effective` AS `beg_effective`',
-    "CASE WHEN CAST(`end_effective` AS DATE) = DATE'2100-12-31' OR CAST(`end_effective` AS DATE) = DATE'2100-01-01' THEN NULL ELSE `end_effective` END AS `end_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`end_effective` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`end_effective` AS DATE)) < 9999) OR CAST(`end_effective` AS DATE) = DATE'2100-01-01' THEN NULL ELSE `end_effective` END AS `end_effective`",
     "CASE WHEN UPPER(TRIM(CAST(`contributor_system_code` AS STRING))) = '0' THEN NULL ELSE `contributor_system_code` END AS `contributor_system_code`",
     '`_source_system` AS `_source_system`',
     '`_source_table` AS `_source_table`',
@@ -3911,7 +4288,8 @@ REFERENCE_RESEARCH_STUDY_SELECT = [
     '`previous_protocol_id` AS `previous_protocol_id`',
     '`root_protocol_ind` AS `root_protocol_ind`',
     '`beg_effective` AS `beg_effective`',
-    "CASE WHEN CAST(`end_effective` AS DATE) = DATE'2100-12-31' THEN NULL ELSE `end_effective` END AS `end_effective`",
+    # INSR_W3 W3.07 (F4): open-end marker = any date in [2099-12-31, 9999); a begin date in 2100+ is invalid.
+    "CASE WHEN (CAST(`end_effective` AS DATE) >= DATE'2099-12-31' AND YEAR(CAST(`end_effective` AS DATE)) < 9999) THEN NULL ELSE `end_effective` END AS `end_effective`",
     '`open_ended_ind` AS `open_ended_ind`',
     '`display_ind` AS `display_ind`',
     '`_source_system` AS `_source_system`',
@@ -4032,6 +4410,9 @@ REFERENCE_SERVICE_SELECT = [
     '`source_row_id` AS `source_row_id`',
     '`loaded_at` AS `loaded_at`',
 ]
+REFERENCE_SERVICE_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`member_source` AS `member_source`',
+]
 
 REFERENCE_SERVICE_COLUMN_COMMENTS = {
     "service_key": "Deterministic SHA-256 service key.",
@@ -4043,6 +4424,10 @@ REFERENCE_SERVICE_COLUMN_COMMENTS = {
     "source_row_id": "Stable source service identifier.",
     "loaded_at": "Maximum map_medical_personnel.ADC_UPDT over source rows sharing the non-null MEDSERVICE_GROUP_ID. This includes all contributing group assignments, not only active assignments or the row supplying the selected service name; it is bronze ingestion provenance, not Silver refresh time.",
 }
+REFERENCE_SERVICE_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "member_source": "personnel_group (MEDSERVICE_GROUP_ID from personnel assignments) or med_service_code (encounter MED_SERVICE_CD, named by its bronze description). INSR_W2 W2.11 (L4164)."
+})
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_service"),
@@ -4076,6 +4461,7 @@ def gold_reference_service():
         '`source_table` AS `source_table`',
         '`source_row_id` AS `source_row_id`',
         '`loaded_at` AS `loaded_at`',
+        '`member_source` AS `member_source`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_SERVICE_COLUMN_COMMENTS)
 
@@ -4128,11 +4514,25 @@ REFERENCE_THEATRE_ATTENDANCE_COLUMN_COMMENTS = {
     "loaded_at": "map_theatre_case_attendance.ADC_UPDT carried unchanged for the attendance row. The parent-case existence join adds no timestamp; this is bronze ingestion provenance, not attendee in/out time or Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_THEATRE_ATTENDANCE_PERSON_SCOPE_RULES = {
+    "gold.reference.theatre_attendance.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_THEATRE_ATTENDANCE_ORPHAN_RULES = {
+    "gold.reference.theatre_attendance.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+    "gold.reference.theatre_attendance.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_attendance"),
     comment="Internal quality-controlled twin of reference_theatre_attendance: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
+@dp.expect_all_or_drop(REFERENCE_THEATRE_ATTENDANCE_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_THEATRE_ATTENDANCE_ORPHAN_RULES)
 def _gold_qc_reference_theatre_attendance():
     """Quality-controlled twin of journey_reference.theatre_attendance."""
     # 101,593 rows point at a encounter_id the spine does not have. The pointer is nulled so
@@ -4150,11 +4550,14 @@ def _gold_qc_reference_theatre_attendance():
 
 @dp.materialized_view(
     name=_n("gold_reference.theatre_attendance"),
-    comment=(
-        "One SurgiNet theatre attendance row with parent-case linkage evidence. Gold QC twin "
-        "of the silver product: 2 columns are repaired or nulled, 0 check(s) are advisory. "
-        "Each rule states its reason in the pipeline notebook, and Lakeflow expectation "
-        "metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One SurgiNet theatre attendance row with parent-case linkage evidence. Gold QC twin of the "
+        "silver product: 2 columns are repaired or nulled, 0 check(s) are advisory. Each rule states its "
+        "reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule matched "
+        "on each update. Coverage: The signing attendee indicator is constant at source (0 on every "
+        "Millennium attendance row), so it is published as recorded and carries no information; "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -4225,11 +4628,25 @@ REFERENCE_THEATRE_CASE_MILESTONE_COLUMN_COMMENTS = {
     "loaded_at": "map_theatre_case_times.ADC_UPDT carried unchanged for the milestone row. The parent-case existence join adds no timestamp; this is bronze ingestion provenance, not CASE_TIME_DT_TM or Silver refresh time.",
 }
 
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_THEATRE_CASE_MILESTONE_PERSON_SCOPE_RULES = {
+    "gold.reference.theatre_case_milestone.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_THEATRE_CASE_MILESTONE_ORPHAN_RULES = {
+    "gold.reference.theatre_case_milestone.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+    "gold.reference.theatre_case_milestone.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
+
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_case_milestone"),
     comment="Internal quality-controlled twin of reference_theatre_case_milestone: the Gold repairs, nulls and expectations are applied here and the published Gold MV reads this object. Materialized rather than temporary so the published MV can refresh incrementally.",
     refresh_policy="auto",
 )
+@dp.expect_all_or_drop(REFERENCE_THEATRE_CASE_MILESTONE_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_THEATRE_CASE_MILESTONE_ORPHAN_RULES)
 def _gold_qc_reference_theatre_case_milestone():
     """Quality-controlled twin of journey_reference.theatre_case_milestone."""
     # 122,160 rows point at a encounter_id the spine does not have. The pointer is nulled so
@@ -4309,6 +4726,10 @@ REFERENCE_THEATRE_IMPLANT_SELECT = [
     '`_source_row_id` AS `_source_row_id`',
     '`loaded_at` AS `loaded_at`',
 ]
+REFERENCE_THEATRE_IMPLANT_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`implant_datetime` AS `implant_datetime`',
+    '`implant_datetime_basis` AS `implant_datetime_basis`',
+]
 
 # contract v2: source history comes directly from the main research table; no separate metadata input is needed.
 REFERENCE_THEATRE_IMPLANT_ADVISORY_RULES = {
@@ -4316,8 +4737,9 @@ REFERENCE_THEATRE_IMPLANT_ADVISORY_RULES = {
     # record is still current -- nulling it would assert the record is valid forever, which
     # is a stronger and worse claim than the one being corrected. Seen on 55,523 of 205,632
     # rows (27%) when profiled on 2026-08-24.
-    "gold.reference.theatre_implant.expiry_date.future_owner":
-        "NOT COALESCE((CAST(`expiry_date` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS), FALSE)",
+    # INSR_W3 W3.08 (F16): an expiry date is a planned future date; warn only outside 1990..loaded_at+15y.
+    "gold.reference.theatre_implant.expiry_date.expiry_window":
+        "NOT COALESCE(CAST(`expiry_date` AS DATE) < DATE'1990-01-01' OR CAST(`expiry_date` AS TIMESTAMP) > `loaded_at` + INTERVAL 15 YEARS, FALSE)",
 }
 
 REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS = {
@@ -4347,6 +4769,22 @@ REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS = {
     "_source_row_id": "S7 procedure implant feeder; retained as a source-faithful bronze input or Journey standard-block field.",
     "loaded_at": "map_theatre_implant_log.ADC_UPDT carried unchanged for the implant-log row. The parent-case existence join adds no timestamp; this is bronze ingestion provenance, not implant/expiry time or Silver refresh time.",
 }
+REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "implant_datetime": "Time of the theatre case the implant was logged against (surgery start, else check-in, else scheduled start); the implant log has no own date. INSR_W2 W2.06 (L5267).",
+    "implant_datetime_basis": "case_surgery_start, case_checkin or case_scheduled_start. INSR_W2 W2.06."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_THEATRE_IMPLANT_PERSON_SCOPE_RULES = {
+    "gold.reference.theatre_implant.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_THEATRE_IMPLANT_ORPHAN_RULES = {
+    "gold.reference.theatre_implant.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_implant"),
@@ -4354,6 +4792,8 @@ REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS = {
     refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_THEATRE_IMPLANT_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_THEATRE_IMPLANT_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_THEATRE_IMPLANT_ORPHAN_RULES)
 def _gold_qc_reference_theatre_implant():
     """Quality-controlled twin of journey_reference.theatre_implant."""
     # 3,332 rows point at a encounter_id the spine does not have. The pointer is nulled so
@@ -4368,11 +4808,13 @@ def _gold_qc_reference_theatre_implant():
 
 @dp.materialized_view(
     name=_n("gold_reference.theatre_implant"),
-    comment=(
-        "One SurgiNet theatre implant row; serial, lot and batch fields are IG-sensitive. "
-        "Gold QC twin of the silver product: 1 columns are repaired or nulled, 1 check(s) are "
-        "advisory. Each rule states its reason in the pipeline notebook, and Lakeflow "
-        "expectation metrics report what every rule matched on each update."
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One SurgiNet theatre implant row; serial, lot and batch fields are IG-sensitive. Gold QC twin of "
+        "the silver product: 1 columns are repaired or nulled, 1 check(s) are advisory. Each rule states "
+        "its reason in the pipeline notebook, and Lakeflow expectation metrics report what every rule "
+        "matched on each update. Coverage: The implanting practitioner is not captured at source (0 of "
+        "214,446 implant log rows); use the case surgeon instead; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
     ),
     table_properties={"quality": "gold"},
     refresh_policy="auto",
@@ -4405,6 +4847,8 @@ def gold_reference_theatre_implant():
         '`_source_table` AS `_source_table`',
         '`_source_row_id` AS `_source_row_id`',
         '`loaded_at` AS `loaded_at`',
+        '`implant_datetime` AS `implant_datetime`',  # INSR_W3 W3.12
+        '`implant_datetime_basis` AS `implant_datetime_basis`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_THEATRE_IMPLANT_COLUMN_COMMENTS)
 
@@ -4457,9 +4901,21 @@ REFERENCE_THEATRE_CASE_SELECT = [
     '`_source_table` AS `_source_table`',
     '`_source_row_id` AS `_source_row_id`',
 ]
+REFERENCE_THEATRE_CASE_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`procedure_start_derived` AS `procedure_start_derived`',
+    '`time_source` AS `time_source`',
+    '`duration_minutes_derived` AS `duration_minutes_derived`',
+    '`duration_source` AS `duration_source`',
+]
 
 # contract v2: source history comes directly from the main research table; no separate metadata input is needed.
 REFERENCE_THEATRE_CASE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 cross_field (estate 2026-10-29): SurgiNet duration differs from stop - start by more than an hour (L1326; duration is the source value).
+    'gold.reference.theatre_case.table.insr_f6_duration_mismatch':
+        'NOT COALESCE((abs(`surgery_duration_minutes` - (unix_timestamp(`surgery_stop`) - unix_timestamp(`surgery_start`)) / 60.0) > 60), FALSE)',
+    # INSR_W4 W4.05 date_ordering (estate 2026-10-29): Surgery stop before start (L1326).
+    'gold.reference.theatre_case.table.insr_f6_stop_before_start':
+        'NOT COALESCE((`surgery_stop` < `surgery_start`), FALSE)',
     # A stop before start is a keying error in SurgiNet milestones; the times are kept as recorded
     # and the expectation metric reports how often it happens.
     "surgery_stop_not_before_start":
@@ -4512,6 +4968,24 @@ REFERENCE_THEATRE_CASE_COLUMN_COMMENTS = {
     "_source_table": "Bronze source table for the case row.",
     "_source_row_id": "Bronze SURG_CASE_ID.",
 }
+REFERENCE_THEATRE_CASE_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "procedure_start_derived": "Surgery start, else theatre check-in, else (performed cases only) the scheduled start. INSR_W2 W2.10 (L1936).",
+    "time_source": "Which time supplied procedure_start_derived. INSR_W2 W2.10.",
+    "duration_minutes_derived": "Surgery duration in minutes within 1-1440: the bronze value, else stop minus start; NULL otherwise (PMS Device L1326 outliers). INSR_W2 W2.10.",
+    "duration_source": "bronze_duration or stop_minus_start; NULL iff duration_minutes_derived is NULL. INSR_W2 W2.10."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_THEATRE_CASE_PERSON_SCOPE_RULES = {
+    "gold.reference.theatre_case.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_THEATRE_CASE_ORPHAN_RULES = {
+    "gold.reference.theatre_case.encounter_id.orphan_nulled": "NOT COALESCE(`_qc_encounter_id_orphan`, FALSE)",
+}
 
 @dp.materialized_view(
     name=_n("gold_qc._reference_theatre_case"),
@@ -4519,6 +4993,8 @@ REFERENCE_THEATRE_CASE_COLUMN_COMMENTS = {
     refresh_policy="auto",
 )
 @dp.expect_all(REFERENCE_THEATRE_CASE_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_THEATRE_CASE_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_THEATRE_CASE_ORPHAN_RULES)
 def _gold_qc_reference_theatre_case():
     # encounter_id pointers the spine does not have are nulled; the case row is kept.
     df = _qc(
@@ -4583,6 +5059,10 @@ def gold_reference_theatre_case():
         '`_source_system` AS `_source_system`',
         '`_source_table` AS `_source_table`',
         '`_source_row_id` AS `_source_row_id`',
+        '`procedure_start_derived` AS `procedure_start_derived`',  # INSR_W3 W3.12
+        '`time_source` AS `time_source`',  # INSR_W3 W3.12
+        '`duration_minutes_derived` AS `duration_minutes_derived`',  # INSR_W3 W3.12
+        '`duration_source` AS `duration_source`',  # INSR_W3 W3.12
     )
     return _with_comments(df, REFERENCE_THEATRE_CASE_COLUMN_COMMENTS)
 
@@ -4660,30 +5140,92 @@ def gold_reference_value_set():
 REFERENCE_PERSON_GP_REGISTRATION_COLUMNS = ["person_gp_registration_key", "person_id", "person_org_reltn_id", "organization_id",
     "practice_ods_code", "practice_name", "registration_start", "registration_end", "active_ind", "current_ind",
     "free_text_ind", "loaded_at", "_source_system", "_source_table", "_source_row_id"]
-REFERENCE_PERSON_GP_REGISTRATION_SELECT = [f"`{c}` AS `{c}`" for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS]
+REFERENCE_PERSON_GP_REGISTRATION_SELECT = [  # INSR_W3 W3.06: expanded from REFERENCE_PERSON_GP_REGISTRATION_COLUMNS so each column's transform is visible
+    '`person_gp_registration_key` AS `person_gp_registration_key`',
+    '`person_id` AS `person_id`',
+    '`person_org_reltn_id` AS `person_org_reltn_id`',
+    '`organization_id` AS `organization_id`',
+    '`practice_ods_code` AS `practice_ods_code`',
+    '`practice_name` AS `practice_name`',
+    # INSR_W3 W3.06: Gold: NULL where exactly 1948-07-04 23:00:00 UTC, the NHS-founding placeholder (P3g: n=211, x11.7).
+    "CASE WHEN unix_seconds(CAST(`registration_start` AS TIMESTAMP)) = -678243600 THEN NULL ELSE `registration_start` END AS `registration_start`",
+    '`registration_end` AS `registration_end`',
+    '`active_ind` AS `active_ind`',
+    '`current_ind` AS `current_ind`',
+    '`free_text_ind` AS `free_text_ind`',
+    '`loaded_at` AS `loaded_at`',
+    '`_source_system` AS `_source_system`',
+    '`_source_table` AS `_source_table`',
+    '`_source_row_id` AS `_source_row_id`',
+]
+REFERENCE_PERSON_GP_REGISTRATION_SELECT += [  # INSR_W3 W3.12: silver columns new in this release (W2)
+    '`registration_end_derived` AS `registration_end_derived`',
+    '`registration_end_basis` AS `registration_end_basis`',
+    '`practice_code_ods_valid` AS `practice_code_ods_valid`',
+]
 REFERENCE_PERSON_GP_REGISTRATION_MANDATORY_RULES = {
     # A registration that belongs to no spine person cannot be used; _qc nulls person_id for non-spine parents.
     "gold.reference.person_gp_registration.person_id.fk_containment": "`person_id` IS NOT NULL",
 }
 REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES = {
+    # INSR_W4 W4.06 string_discipline (P9_L5172): GP practice codes are ODS A99999; legacy PCT codes (5C4, 5C5 ...) fail the format (L5172).
+    'gold.reference.person_gp_registration.practice_ods_code.insr_f18_ods_format':
+        "NOT COALESCE((`practice_ods_code` IS NOT NULL AND NOT `practice_ods_code` RLIKE '^[A-Z][0-9]{5}$'), FALSE)",
+    # INSR_W4 W4.06 value_set (P9_L5172): V8199x are pseudo-practices (unregistered / not known), not practices (L5172).
+    'gold.reference.person_gp_registration.practice_ods_code.insr_f18_ods_pseudo':
+        "NOT COALESCE((`practice_ods_code` RLIKE '^V8199'), FALSE)",
     # A malformed practice code is reported, not dropped: the registration itself is still true.
     "gold.reference.person_gp_registration.ods_code_wellformed": "`practice_ods_code` IS NULL OR `practice_ods_code` RLIKE '^[A-Z][0-9]{5}$'",
 }
-REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS = {c: f"reference_person_gp_registration field {c}; see silver column comment." for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS}
+# INSR_W8_COMMENTS_V1 (W8.04): canonical comments from the INSR dictionary (were 'see silver column comment').
+from gold_tdx_comments import GOLD_GP_REGISTRATION_COLUMN_COMMENTS as REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS
+REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS.update(  # INSR_W3 W3.12
+{
+    "registration_end_derived": "registration_end, else the start of the same person's next registration (an open-ended row followed by a later registration has ended). INSR_W2 W2.06.",
+    "registration_end_basis": "source_end or next_registration_start; NULL when the registration is still open. INSR_W2 W2.06.",
+    "practice_code_ods_valid": "Practice code class: valid (England/Wales/NI letter + 5 digits), pseudo_v81 (V81 'no registered GP' pseudo codes), legacy_pct (5xx primary care trust codes), malformed, or NULL. INSR_W2 (L5172)."
+})
+
+# INSR_W3 W3.02 (C0 ruling 1): rows of a spine person with no encounter and no clinical data leave gold;
+# silver keeps them. NULL-person and orphan rows pass (_qc_person_in_scope is TRUE).
+REFERENCE_PERSON_GP_REGISTRATION_PERSON_SCOPE_RULES = {
+    "gold.reference.person_gp_registration.person_id.person_in_scope": "`_qc_person_in_scope`",
+}
+
+# INSR_W3 W3.06: warn_row rules (J4); rows are kept.
+REFERENCE_PERSON_GP_REGISTRATION_W3_06_ADVISORY_RULES = {
+    "gold.reference.person_gp_registration.registration_start.pre_nhs_1901_1948": "NOT COALESCE(CAST(`registration_start` AS DATE) BETWEEN DATE'1901-01-01' AND DATE'1948-12-31', FALSE)",
+    "gold.reference.person_gp_registration.registration_start.cutover_effective_date": "NOT COALESCE(CAST(`registration_start` AS DATE) IN (DATE'2014-05-08', DATE'2017-09-01'), FALSE)",
+}
+
+# INSR_W3 W3.08 (L5240, F6): orphan references counted before _qc nulls them.
+REFERENCE_PERSON_GP_REGISTRATION_ORPHAN_RULES = {
+    "gold.reference.person_gp_registration.person_id.orphan_nulled": "NOT COALESCE(`_qc_person_id_orphan`, FALSE)",
+}
 
 @dp.materialized_view(name=_n("gold_qc._reference_person_gp_registration"),
     comment="Internal quality-controlled twin of reference_person_gp_registration.", refresh_policy="auto")
 @dp.expect_all_or_drop(REFERENCE_PERSON_GP_REGISTRATION_MANDATORY_RULES)
 @dp.expect_all(REFERENCE_PERSON_GP_REGISTRATION_ADVISORY_RULES)
+@dp.expect_all_or_drop(REFERENCE_PERSON_GP_REGISTRATION_PERSON_SCOPE_RULES)
+@dp.expect_all(REFERENCE_PERSON_GP_REGISTRATION_W3_06_ADVISORY_RULES)
+@dp.expect_all(REFERENCE_PERSON_GP_REGISTRATION_ORPHAN_RULES)
 def _gold_qc_reference_person_gp_registration():
     """Quality-controlled twin of journey_reference.person_gp_registration."""
     df = _qc("reference_person_gp_registration", REFERENCE_PERSON_GP_REGISTRATION_SELECT, fk_columns=["person_id"])
     return _with_comments(df, REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS)
 
 @dp.materialized_view(name=_n("gold_reference.person_gp_registration"),
-    comment="Registered GP practice history per person. Gold QC twin: 1 rule drops rows (no spine person), 1 advisory.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Registered GP practice history per person. Gold QC twin: 1 rule drops rows (no spine person), 1 "
+        "advisory. Coverage: Registration starts heap on 2014-05-08 and 2017-09-01 (system cut-overs, "
+        "about 350 and 270 times the usual daily count): those dates mean 'registered on or before'; "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
+    ),
     table_properties={"quality": "gold"}, refresh_policy="auto")
 def gold_reference_person_gp_registration():
     """Contract-v2 public twin of reference_person_gp_registration."""
-    df = spark.read.table(_n("gold_qc._reference_person_gp_registration")).selectExpr(*REFERENCE_PERSON_GP_REGISTRATION_SELECT)
+    df = spark.read.table(_n("gold_qc._reference_person_gp_registration")).selectExpr(
+        *[f"`{c}` AS `{c}`" for c in REFERENCE_PERSON_GP_REGISTRATION_COLUMNS])  # INSR_W3 W3.06: transforms live in the twin
     return _with_comments(df, REFERENCE_PERSON_GP_REGISTRATION_COLUMN_COMMENTS)

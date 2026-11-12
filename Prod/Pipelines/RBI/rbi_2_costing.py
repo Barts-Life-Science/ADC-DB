@@ -8,6 +8,7 @@
 
 # COMMAND ----------
 
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 
@@ -20,6 +21,9 @@ CONFIG = spark.conf.get("rbi.config_schema")
 SAMPLE_MOD = int(spark.conf.get("rbi.sample_mod", "0"))
 BACKTEST_PAIRS = spark.conf.get("rbi.backtest_pairs", "")          # e.g. "2020/21>2021/22" (Task 3)
 MIN_N = int(spark.conf.get("rbi.min_calibration_activities", "100"))
+# INSR_W6 W6.07 (L1566): NCC plan B episode table (NCC2324Episode shape). Empty = arm off; prod stays empty until the
+# landing exists (a Ben precondition: it needs the QVReportingDatabase landing, which is outside INSR_20261029).
+NCC_PLAN_B_TABLE = spark.conf.get("rbi.ncc_plan_b_table", "")
 
 
 def gold(name):
@@ -83,8 +87,9 @@ def _uplift():
 
 @dp.materialized_view(name="unit_cost_reference", comment="See governance comments.")
 def unit_cost_reference():
-    return K.calibrate_unit_costs(spark.read.table("_plics_weighted_line"), spark.read.table("plics_activity_link"),
-                                  spark.read.table("_events_attributed"), spark.read.table("_hcd_cover"))
+    uc = K.calibrate_unit_costs(spark.read.table("_plics_weighted_line"), spark.read.table("plics_activity_link"),
+                                spark.read.table("_events_attributed"), spark.read.table("_hcd_cover"))
+    return K.flag_unit_costs(uc, min_n=MIN_N)  # INSR_W6 W6.07 (L1715): floor, pricing and outlier flags
 
 
 @dp.materialized_view(name="_overhead_ratio", private=True)
@@ -123,13 +128,25 @@ def _modelled_price():
                              spark.read.table("_hcd_cover"))
 
 
+if NCC_PLAN_B_TABLE:
+    @dp.materialized_view(name="_ncc_plan_b_episode", private=True)
+    def _ncc_plan_b_episode():
+        # INSR_W6 W6.07: NCC2324Episode-shaped totals (extract_cd, activity_record_id, person_id, encounter_id, total_cost).
+        return sampled(spark.read.table(NCC_PLAN_B_TABLE))
+
+
 @dp.materialized_view(name="cost_allocation_ledger", comment="See governance comments.")
 def cost_allocation_ledger():
     plics = K.allocate_plics_actuals(spark.read.table("_plics_weighted_line"), spark.read.table("plics_activity_link"),
                                      spark.read.table("_events_attributed"), spark.read.table("_hcd_cover"))
     ncc = K.allocate_episode_totals(spark.read.table("_costed_activity"), spark.read.table("plics_activity_link"),
                                     spark.read.table("_events_attributed"), spark.read.table("_modelled_price"))
-    return plics.unionByName(ncc)
+    ledger = plics.unionByName(ncc)
+    if NCC_PLAN_B_TABLE:  # INSR_W6 W6.07 (L1566): plan B arm, its own cost_basis
+        ledger = ledger.unionByName(K.allocate_ncc_plan_b(spark.read.table("_ncc_plan_b_episode"),
+                                                          spark.read.table("_events_attributed"),
+                                                          spark.read.table("_modelled_price")))
+    return ledger
 
 
 @dp.materialized_view(name="_events_costed", private=True)

@@ -14,10 +14,16 @@ dbutils.widgets.text("target_table", "4_prod.bronze.mill_blob_text")
 dbutils.widgets.text("max_events", "5000000")
 dbutils.widgets.text("dry_run", "false")
 dbutils.widgets.text("keys_table", "")
+# BLOB_IDENTITY_V1: identity_backfill=true also rescopes rows whose EVENT_PERSON_ID is still NULL (rows
+# enriched before the identity columns existed). Keyed runs only — unkeyed it would rescope the whole table.
+dbutils.widgets.text("identity_backfill", "false")
 TARGET = dbutils.widgets.get("target_table")
 MAX_EVENTS = int(dbutils.widgets.get("max_events"))
 DRY_RUN = dbutils.widgets.get("dry_run").lower() == "true"
 KEYS_TABLE = dbutils.widgets.get("keys_table").strip()
+IDENTITY_BACKFILL = dbutils.widgets.get("identity_backfill").lower() == "true"
+if IDENTITY_BACKFILL and not KEYS_TABLE:
+    raise ValueError("identity_backfill=true requires keys_table (an unkeyed backfill rescopes every row)")
 KEY_PRED = "true" if not KEYS_TABLE else f"EVENT_ID IN (SELECT EVENT_ID FROM {KEYS_TABLE})"
 T_KEY_PRED = "true" if not KEYS_TABLE else f"t.EVENT_ID IN (SELECT EVENT_ID FROM {KEYS_TABLE})"
 CE = "4_prod.raw.mill_clinical_event"
@@ -34,6 +40,7 @@ ALLOWED_TARGETS = {
     "8_dev.bronze.mill_blob_text_s33_twin",
     "8_dev.default.blob5_labels_repair_fixture",
     "8_dev.dar064.bronze_repairs",
+    "8_dev.blob_identity.mill_blob_text_twin",
 }
 
 if TARGET not in ALLOWED_TARGETS:
@@ -46,8 +53,22 @@ RUN_TS = spark.sql(
 RUN_TS_SQL = f"timestamp'{RUN_TS}'"
 print(
     f"target={TARGET} scope_stage={SCOPE_STAGE} stage={STAGE} "
-    f"max_events={MAX_EVENTS} dry_run={DRY_RUN}"
+    f"max_events={MAX_EVENTS} dry_run={DRY_RUN} identity_backfill={IDENTITY_BACKFILL}"
 )
+
+
+def unenriched_pred(alias=""):
+    """SQL predicate for a target row that still needs enrichment (priority-0 scope).
+
+    Used both to pick the scope and to count the stage's unenriched events, so the two always agree.
+    BLOB_IDENTITY_V1: in identity_backfill mode a missing EVENT_PERSON_ID also counts.
+    """
+    p = alias + "." if alias else ""
+    pred = (f"{p}EVENT_ENRICH_ADC_UPDT IS NULL OR {p}EVENT_CD IS NULL "
+            f"OR {p}CONTRIBUTOR_SYSTEM_DISPLAY IS NULL OR {p}CLINSIG_DT_TM IS NULL")
+    if IDENTITY_BACKFILL:
+        pred += f" OR {p}EVENT_PERSON_ID IS NULL"
+    return pred
 
 # COMMAND ----------
 
@@ -70,6 +91,9 @@ NEW_COLS = [
     ("PERFORMED_PRSNL_ID", "BIGINT"), ("PERFORMED_DT_TM", "TIMESTAMP"),
     ("VERIFIED_PRSNL_ID", "BIGINT"), ("VERIFIED_DT_TM", "TIMESTAMP"),
     ("ORGANIZATION_ID", "BIGINT"), ("SERIES_REF_NBR", "STRING"),
+    # BLOB_IDENTITY_V1: the clinical event's own person and encounter. The blob row's ENCNTR_ID is copied
+    # from raw mill_ce_blob, which is sometimes NULL or filled in after the row was read.
+    ("EVENT_PERSON_ID", "BIGINT"), ("EVENT_ENCNTR_ID", "BIGINT"),
     ("EVENT_ENRICH_ADC_UPDT", "TIMESTAMP"),
 ]
 existing = {f.name.upper() for f in spark.table(TARGET).schema.fields}
@@ -99,8 +123,7 @@ CREATE TABLE {SCOPE_STAGE} AS
 WITH candidates AS (
     SELECT DISTINCT EVENT_ID, 0 AS selection_priority
     FROM {TARGET}
-    WHERE (EVENT_ENRICH_ADC_UPDT IS NULL OR EVENT_CD IS NULL
-           OR CONTRIBUTOR_SYSTEM_DISPLAY IS NULL OR CLINSIG_DT_TM IS NULL)
+    WHERE ({unenriched_pred()})
       AND {KEY_PRED}
     UNION ALL
     SELECT DISTINCT t.EVENT_ID, 1 AS selection_priority
@@ -153,9 +176,7 @@ spark.sql(f"""
 CREATE TABLE {STAGE} AS
 WITH target_state AS (
   SELECT t.EVENT_ID,
-         max(CASE WHEN t.EVENT_ENRICH_ADC_UPDT IS NULL OR t.EVENT_CD IS NULL
-                       OR t.CONTRIBUTOR_SYSTEM_DISPLAY IS NULL OR t.CLINSIG_DT_TM IS NULL
-                  THEN 1 ELSE 0 END) AS was_unenriched,
+         max(CASE WHEN {unenriched_pred("t")} THEN 1 ELSE 0 END) AS was_unenriched,
          min(t.EVENT_ENRICH_ADC_UPDT) AS previous_min_stamp,
          max(t.EVENT_ENRICH_ADC_UPDT) AS previous_max_stamp
   FROM {TARGET} t
@@ -260,6 +281,8 @@ SELECT
   ce.VERIFIED_DT_TM,
   ce.ORGANIZATION_ID,
   NULLIF(TRIM(ce.SERIES_REF_NBR), '') AS SERIES_REF_NBR,
+  CASE WHEN ce.PERSON_ID > 0 THEN CAST(ce.PERSON_ID AS BIGINT) END AS EVENT_PERSON_ID,
+  CASE WHEN ce.ENCNTR_ID > 0 THEN CAST(ce.ENCNTR_ID AS BIGINT) END AS EVENT_ENCNTR_ID,
   greatest(coalesce(cew.max_adc_updt, timestamp'1980-01-01'),
            coalesce(pew.max_adc_updt, timestamp'1980-01-01'),
            coalesce(brw.max_adc_updt, timestamp'1980-01-01')) AS EVENT_ENRICH_ADC_UPDT
@@ -315,7 +338,9 @@ SELECT count(*) AS n,
        sum(CASE WHEN VERIFIED_DT_TM IS NOT NULL THEN 1 ELSE 0 END) AS verified_dt,
        sum(CASE WHEN ORGANIZATION_ID IS NOT NULL AND ORGANIZATION_ID <> 0
                 THEN 1 ELSE 0 END) AS organization_id,
-       sum(CASE WHEN SERIES_REF_NBR IS NOT NULL THEN 1 ELSE 0 END) AS series_ref
+       sum(CASE WHEN SERIES_REF_NBR IS NOT NULL THEN 1 ELSE 0 END) AS series_ref,
+       sum(CASE WHEN EVENT_PERSON_ID IS NOT NULL THEN 1 ELSE 0 END) AS event_person,
+       sum(CASE WHEN EVENT_ENCNTR_ID IS NOT NULL THEN 1 ELSE 0 END) AS event_encntr
 FROM {STAGE}""").first()
 # no_current_ce = events stamped WITHOUT labels (no live clinical-event row) — expected small.
 print(
@@ -329,6 +354,7 @@ print(
     f"verified_prsnl={cov.verified_prsnl} verified_dt={cov.verified_dt} "
     f"organization_id={cov.organization_id} series_ref={cov.series_ref}"
 )
+print(f"identity_coverage event_person={cov.event_person} event_encntr={cov.event_encntr}")
 
 # COMMAND ----------
 
@@ -468,7 +494,10 @@ else:
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN ORGANIZATION_ID SET TAGS ('ig_risk'='low', 'ig_severity'='low')
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN SERIES_REF_NBR COMMENT 'Source series reference defining the document replacement or succession thread.'
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN SERIES_REF_NBR SET TAGS ('ig_risk'='low', 'ig_severity'='low')
+# ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_PERSON_ID COMMENT 'Millennium PERSON_ID of the source clinical event (raw mill_clinical_event, current row); NULL when the event has no person.'
+# ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_PERSON_ID SET TAGS ('ig_risk'='0', 'ig_severity'='1')
+# ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENCNTR_ID COMMENT 'Millennium ENCNTR_ID of the source clinical event (raw mill_clinical_event, current row); may differ from ENCNTR_ID, which is copied from raw mill_ce_blob.'
+# ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENCNTR_ID SET TAGS ('ig_risk'='0', 'ig_severity'='0')
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENRICH_ADC_UPDT COMMENT 'Greatest source ADC_UPDT consumed by the event-label enrichment.'
 # ALTER TABLE 4_prod.bronze.mill_blob_text ALTER COLUMN EVENT_ENRICH_ADC_UPDT SET TAGS ('ig_risk'='low', 'ig_severity'='low')
-
 

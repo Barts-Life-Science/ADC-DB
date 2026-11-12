@@ -1,4 +1,5 @@
 # Databricks notebook source
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 # =====================================================================================================
 # PMS dataset — post-marketing surveillance extract for configured drugs of interest (Lakeflow, Phase 2)
 #
@@ -53,7 +54,12 @@ ICD10 = "http://hl7.org/fhir/sid/icd-10"
 ADR_STOP_REGEX = r"adverse|side[ -]?effect|reaction|allerg|intoleran|toxicit|rash|anaphyla"
 NEWS2_TOTAL = ["Royal College of Physicians NEWS2 (National Early Warning Score 2) total score", "NEWS Total"]
 VITAL_CODES = {"27113001": "body_weight", "50373000": "body_height"}
+# INSR_W6 W6.03 (L906): estimated weight/height carry no SNOMED code in gold, only these OMOP concepts.
+VITAL_ESTIMATED_CONCEPTS = {3026600: "body_weight", 3035463: "body_height"}
 PERSON_RULE = {"pms.person_present": "person_id IS NOT NULL"}
+# INSR_W6 W6.01: dev-only person sample (xxhash64 of the BIGINT person_id, never an order id). 0 = no sampling.
+PERSON_HASH_MOD = int(spark.conf.get("pms.person_hash_mod", "0"))
+assert PERSON_HASH_MOD == 0 or not str(CFG).startswith("4_prod."), "pms.person_hash_mod is dev-only"
 
 # INCR_FIX_20261018: "after now" tests without current_timestamp() (which blocks incremental refresh).
 # The run instant is a literal only inside the one-row _pms_run MV; rows equi-join the future-day set, and
@@ -100,6 +106,24 @@ def _after_run(df, ts, flag):
     return joined.withColumn(flag, F.when(ts.isNotNull(), after)).drop(day, fut, rd, rts)
 
 
+# INSR_W6 W6.03 (L986): the coalesced code columns mix vocabularies, so each says which system its code came from.
+SNOMED_SYSTEM = "http://snomed.info/sct"
+DMD_SYSTEM = "https://dmd.nhs.uk"
+
+
+def _code_system(target_code, target_system, snomed_code, source_code, source_system):
+    """System of the code that coalesce(target, snomed, source) picked; NULL when all three are NULL."""
+    return (F.when(F.col(target_code).isNotNull(), F.col(target_system))
+             .when(F.col(snomed_code).isNotNull(), F.lit(SNOMED_SYSTEM))
+             .when(F.col(source_code).isNotNull(), F.col(source_system)))
+
+
+def _medication_code_system():
+    """drug_code_system for the gold medication tables (order, admin, dispense share these column names)."""
+    return _code_system("medication_target_code", "medication_target_system", "medication_snomed_code",
+                        "medication_source_code", "medication_source_system")
+
+
 def _cfg(name):
     return spark.read.table(f"{CFG}.{name}")
 
@@ -135,7 +159,7 @@ EXPOSURE_TYPES = {"person_id": "bigint", "drug_set_id": "string", "drug_set_name
     "exposure_start": "timestamp", "exposure_end": "timestamp", "dose_value": "double", "dose_unit": "string",
     "dose_basis": "string", "dose_text": "string", "quantity_value": "double", "quantity_unit": "string", "route": "string",
     "indication": "string", "stop_reason": "string", "status": "string", "exposure_ineligible_reason": "string",
-    "exposure_eligible_ind": "boolean", "source_feed": "string"}
+    "exposure_eligible_ind": "boolean", "source_feed": "string", "drug_code_system": "string"}  # INSR_W6 W6.03
 _CARRIED = ("person_id", "drug_set_id", "drug_set_name", "encounter_id")
 EXPOSURE_SOURCES = ("order", "administration", "dispense", "homecare_supply", "sact")
 ORDER_NOT_PRESCRIBED = ["Cancelled", "Voided Without Results", "Voided With Results"]
@@ -183,6 +207,7 @@ def _orders():
                     ["medication_target_display", "medication_source_display"])
     strength = F.col("strengthdose_value").isNotNull()
     return _shape(m, exposure_source=F.lit("order"), exposure_record_key=F.col("patient_event_key"), order_id=F.col("order_id"),
+        drug_code_system=_medication_code_system(),
         drug_code=F.coalesce("medication_target_code", "medication_snomed_code", "medication_source_code"),
         drug_display=F.coalesce("medication_target_display", "medication_source_display"),
         exposure_start=F.coalesce("effective_start_datetime", "event_datetime"),
@@ -198,6 +223,7 @@ def _administrations():
     m = _drug_match(spark.read.table(f"{G}.clinical_medication_admin"),
                     ["medication_target_code", "medication_snomed_code"], ["medication_target_display", "medication_source_display"])
     return _shape(m, exposure_source=F.lit("administration"), exposure_record_key=F.col("patient_event_key"), order_id=F.col("order_id"),
+        drug_code_system=_medication_code_system(),
         drug_code=F.coalesce("medication_target_code", "medication_snomed_code", "medication_source_code"),
         drug_display=F.coalesce("medication_target_display", "medication_source_display"),
         exposure_start=F.coalesce("performed_datetime", "event_datetime"), exposure_end=F.col("event_end_datetime"),
@@ -211,6 +237,7 @@ def _dispenses():
                     ["medication_target_code", "medication_snomed_code"], ["medication_target_display", "medication_source_display"])
     not_issued = (F.coalesce(F.col("issue_category"), F.lit("")) != "ISSUE") | (F.coalesce(F.col("status_code"), F.lit("")) != "completed")
     return _shape(m, exposure_source=F.lit("dispense"), exposure_record_key=F.col("patient_event_key"),
+        drug_code_system=_medication_code_system(),
         drug_code=F.coalesce("medication_target_code", "medication_snomed_code", "medication_source_code"),
         drug_display=F.coalesce("medication_target_display", "medication_source_display"),
         exposure_start=F.col("event_datetime"), exposure_end=F.col("event_end_datetime"),
@@ -224,6 +251,7 @@ def _supplies():
     m = _drug_match(spark.read.table(f"{G}.clinical_medication_supply"), ["dmd_vtm_code"], ["dmd_vtm_name", "item_description"])
     undelivered = F.when(F.coalesce(F.col("quantity_delivered"), F.lit(0)) <= 0, F.lit("not_delivered"))
     return _shape(m, exposure_source=F.lit("homecare_supply"), exposure_record_key=F.col("patient_event_key"),
+        drug_code_system=F.when(F.col("dmd_vtm_code").isNotNull(), F.lit(DMD_SYSTEM)),
         drug_code=F.col("dmd_vtm_code"), drug_display=F.coalesce("dmd_vtm_name", "item_description"),
         exposure_start=F.coalesce(F.col("supply_start_date").cast("timestamp"), F.col("event_datetime")),
         exposure_end=F.col("event_end_datetime"), quantity_value=F.col("quantity_delivered"), quantity_unit=F.col("order_unit"),
@@ -238,6 +266,8 @@ def _sact():
     m = _drug_match(spark.read.table(f"{G}.clinical_cancer_treatment"),
                     ["drug_target_code", "drug_snomed_code"], ["drug_target_display", "drug_source_display"])
     return _shape(m, exposure_source=F.lit("sact"), exposure_record_key=F.col("patient_event_key"),
+        drug_code_system=_code_system("drug_target_code", "drug_target_system", "drug_snomed_code", "drug_source_code",
+                                      "drug_source_system"),
         drug_code=F.coalesce("drug_target_code", "drug_snomed_code", "drug_source_code"),
         drug_display=F.coalesce("drug_target_display", "drug_source_display"),
         exposure_start=F.col("start_date").cast("timestamp"),
@@ -247,15 +277,32 @@ def _sact():
         source_feed=F.lit("cancer_treatment"))
 
 
+def _person_sample(df):
+    """Dev person sample (INSR_W6 W6.01): keep persons with pmod(xxhash64(BIGINT person_id), PERSON_HASH_MOD) = 0.
+    No-op when PERSON_HASH_MOD is 0 (prod). Every other table follows pms_exposure through pms_exposure_summary."""
+    if PERSON_HASH_MOD == 0:
+        return df
+    return df.where(F.pmod(F.xxhash64(F.col("person_id").cast("bigint")), F.lit(PERSON_HASH_MOD)) == 0)
+
+
 @dp.materialized_view(name="pms_exposure", cluster_by=["person_id", "drug_set_id"],
-    comment="Every Barts medication record matching a configured drug set: orders (+ order attributes), administrations, "
-            "pharmacy dispenses, homecare supply and SACT. One row per source record x drug set. Records that never reached "
-            "the patient (not-done/in-error administrations, cancelled/voided orders, undelivered supply, future starts) are kept "
-            "with exposure_eligible_ind = false and exposure_ineligible_reason. dose_* = a per-dose amount (dose_basis says "
-            "prescribed/administered); quantity_* = dispensed/delivered amount.")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Every Barts medication record matching a configured drug set: orders (+ order attributes), "
+        "administrations, pharmacy dispenses, homecare supply and SACT. One row per source record x drug "
+        "set. Records that never reached the patient (not-done/in-error administrations, cancelled/voided "
+        "orders, undelivered supply, future starts) are kept with exposure_eligible_ind = false and "
+        "exposure_ineligible_reason. dose_* = a per-dose amount (dose_basis says "
+        "prescribed/administered); quantity_* = dispensed/delivered amount. Coverage: Medication order "
+        "volume in May-June 2026 is lower at source (raw 0.88 by original date; 0.72 by requested start "
+        "for PMS orders) than in the neighbouring months; Requested-start detail arrives in eras "
+        "(2017-06..09, 2019-05..2021-03, 2021-09 onwards, with a thin 2021-05..08); rows per order are "
+        "constant at 2, so the eras are feed boundaries, not duplicates; complete-through month per "
+        "release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop({**PERSON_RULE, "pms.exposure_dated": "exposure_start IS NOT NULL"})
 def pms_exposure():
-    return reduce(lambda a, b: a.unionByName(b), [_orders(), _administrations(), _dispenses(), _supplies(), _sact()])
+    rows = reduce(lambda a, b: a.unionByName(b), [_orders(), _administrations(), _dispenses(), _supplies(), _sact()])
+    return _person_sample(rows)  # INSR_W6 W6.01: no-op unless pms.person_hash_mod > 0 (dev)
 
 
 DETAIL_TYPES = {"person_id": "bigint", "drug_set_id": "string", "exposure_source": "string", "exposure_record_key": "string",
@@ -360,6 +407,8 @@ def pms_patient():
     p = spark.read.table(f"{G}.spine_person").select(
         "person_id", F.col("gender_display").alias("sex"), "birth_date",
         F.coalesce("ethnicity_target_code", "ethnicity_code").alias("ethnicity_code"),
+        _code_system("ethnicity_target_code", "ethnicity_target_system", "ethnicity_target_code", "ethnicity_code",
+                     "ethnicity_source_system").alias("ethnicity_code_system"),  # INSR_W6 W6.03 (L986)
         F.coalesce("ethnicity_target_display", "ethnicity_display").alias("ethnicity_display"), "current_address_id")
     a = spark.read.table(f"{G}.reference_person_address").select(
         F.col("address_id").alias("current_address_id"), "lsoa", "local_authority_code", "imd_decile", "imd_quintile")
@@ -370,13 +419,20 @@ def pms_patient():
     x = s.join(p, "person_id", "left").join(a, "current_address_id", "left").join(gp, "person_id", "left").join(death, "person_id", "left")
     return x.select("person_id", "sex", F.year("birth_date").alias("year_of_birth"),
                     F.floor(F.months_between("first_index_datetime", "birth_date") / 12).cast("int").alias("age_at_first_index"),
-                    "ethnicity_code", "ethnicity_display", "lsoa", "local_authority_code", "imd_decile", "imd_quintile",
+                    "ethnicity_code", "ethnicity_code_system", "ethnicity_display", "lsoa", "local_authority_code",
+                    "imd_decile", "imd_quintile",
                     "gp_practice_ods_code", "gp_registration_start", "first_index_datetime", "drug_set_ids", "death_date")
 
 
 @dp.materialized_view(name="pms_encounter", cluster_by=["person_id"],
-    comment="Attended hospital encounters (Inpatient/Outpatient/Emergency/Recurring, attendance observed or inferred) "
-            "of cohort persons within [index - lookback, last exposure + follow-up].")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Attended hospital encounters (Inpatient/Outpatient/Emergency/Recurring, attendance observed or "
+        "inferred) of cohort persons within [index - lookback, last exposure + follow-up]. "
+        "encounter_close_state, last_activity_datetime and discharge_datetime say whether and when the "
+        "encounter closed. Coverage: PMS encounter counts fall in the most recent months because "
+        "follow-up windows are still open (0.83 of a year earlier, trust control 1.06); complete-through "
+        "month per release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_encounter():
     # class_display is only 15% populated (7.46M of 48.5M, measured 2026-09-29); type_class_display is 99.8%.
@@ -386,26 +442,38 @@ def pms_encounter():
                 & F.col("attendance_evidence").isin("OBSERVED", "INFERRED"))
          .select("person_id", "encounter_id", F.col("type_class_display").alias("encounter_class"), "type_display",
                  "attendance_evidence", "status_display", "period_start", "period_end", "length_of_stay_minutes",
-                 "admission_source_display", "discharge_destination_display", "specialty_display", "responsible_service_display"))
+                 "admission_source_display", "discharge_destination_display", "specialty_display", "responsible_service_display",
+                 # INSR_W6 W6.03 (L1079): period_end/LOS are sparse because many encounters never close in the source;
+                 # the close state and the last activity show which ones are still open.
+                 "encounter_close_state", "last_activity_datetime", "discharge_datetime"))
     return _window(e, "period_start")
 
 # COMMAND ----------
 
 @dp.materialized_view(name="pms_concomitant_medication", cluster_by=["person_id"],
     comment="All medication orders of cohort persons in the study window, one row per order x drug set; "
-            "is_drug_of_interest marks orders that are themselves exposures to that set.")
+            "is_drug_of_interest marks orders that are themselves exposures to that set. future_start_ind marks orders "
+            "that start after the build (planned); end_datetime_basis says which source field gave the end, and "
+            "end_datetime_projected_ind marks ends that are a projected stop, not an observed one.")
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_concomitant_medication():
+    # INSR_W6 W6.03 (L1012, L986, J13): end basis, projected flag, code system and the run-instant future test.
+    end_basis = (F.when(F.col("discontinued_datetime").isNotNull(), F.lit("discontinued"))
+                  .when(F.col("projected_stop_datetime").isNotNull(), F.lit("projected_stop"))
+                  .when(F.col("event_end_datetime").isNotNull(), F.lit("event_end")))
     o = spark.read.table(f"{G}.clinical_medication_order").select(
         "person_id", "patient_event_key", "encounter_id",
         F.coalesce("medication_target_code", "medication_snomed_code", "medication_source_code").alias("drug_code"),
+        _medication_code_system().alias("drug_code_system"),
         F.coalesce("medication_target_display", "medication_source_display").alias("drug_display"),
         F.coalesce("effective_start_datetime", "event_datetime").alias("start_datetime"),
         F.coalesce("discontinued_datetime", "projected_stop_datetime", "event_end_datetime").alias("end_datetime"),
+        end_basis.alias("end_datetime_basis"),
+        F.coalesce(end_basis == "projected_stop", F.lit(False)).alias("end_datetime_projected_ind"),
         F.col("order_status_display").alias("status"))
     own = (spark.read.table("pms_exposure").where("exposure_source = 'order'")
            .select(F.col("exposure_record_key").alias("patient_event_key"), "drug_set_id", F.lit(True).alias("is_drug_of_interest")))
-    w = _window(o, "start_datetime")
+    w = _after_run(_window(o, "start_datetime"), F.col("start_datetime"), "future_start_ind")
     return (w.join(own, ["patient_event_key", "drug_set_id"], "left")
              .withColumn("is_drug_of_interest", F.coalesce("is_drug_of_interest", F.lit(False))))
 
@@ -431,15 +499,26 @@ def _match_outcome(c):
 
 
 @dp.materialized_view(name="pms_comorbidity", cluster_by=["person_id"],
-    comment="All recorded conditions of cohort persons dated before the drug-set index (full history, not only the lookback).")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "All recorded conditions of cohort persons dated before the drug-set index (full history, not "
+        "only the lookback). Coverage: Conditions dated March-April 2026 are short (comorbidity 0.49, "
+        "outcome 0.63 of the January/May mean): the same source gap as gold diagnoses; Condition history "
+        "starts in about 2005 (2,410 rows in 2004 against 90,963 in 2005); complete-through month per "
+        "release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_comorbidity():
     return _window(_conditions(), "condition_datetime", mode="history")
 
 
 @dp.materialized_view(name="pms_outcome_condition", cluster_by=["person_id"],
-    comment="Configured outcome conditions dated from index to last exposure + follow-up. prior_history_ind = the same "
-            "outcome was also recorded before index (not incident). outcome_match_method records how the row matched.")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Configured outcome conditions dated from index to last exposure + follow-up. prior_history_ind = "
+        "the same outcome was also recorded before index (not incident). outcome_match_method records how "
+        "the row matched. Coverage: Conditions dated March-April 2026 are short (comorbidity 0.49, "
+        "outcome 0.63 of the January/May mean): the same source gap as gold diagnoses; complete-through "
+        "month per release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_outcome_condition():
     matched = _match_outcome(_conditions())
@@ -451,7 +530,7 @@ def pms_outcome_condition():
 
 
 ADR_COLUMNS = ["person_id", "drug_set_id", "signal_source", "signal_record_key", "signal_datetime", "drug_display",
-               "drug_code", "reaction_text", "severity_text", "status_text"]
+               "drug_code", "reaction_text", "severity_text", "status_text", "drug_code_system"]  # INSR_W6 W6.03 (L986)
 
 
 def _datix_patients():
@@ -467,8 +546,14 @@ def _datix_incidents():
 
 
 @dp.materialized_view(name="pms_adr_signal", cluster_by=["person_id"],
-    comment="Coded/structured adverse-reaction signals for the drug set at any time: order stop reasons indicating an ADR, "
-            "allergy/intolerance records for the drug, Datix medication incident factors (lexicon-mapped) and LFPSE drug reactions.")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Coded/structured adverse-reaction signals for the drug set at any time: order stop reasons "
+        "indicating an ADR, allergy/intolerance records for the drug, Datix medication incident factors "
+        "(lexicon-mapped) and LFPSE drug reactions. Coverage: ADR signals start per source: Datix "
+        "medication factors 2014-03, allergy records 2014-11, order discontinuations 2021-11, LFPSE drug "
+        "reactions 2023-10; signals are under-reported by nature; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_adr_signal():
     stops = (spark.read.table("pms_exposure")
@@ -477,7 +562,7 @@ def pms_adr_signal():
                      F.col("exposure_record_key").alias("signal_record_key"),
                      F.coalesce("exposure_end", "exposure_start").alias("signal_datetime"), "drug_display", "drug_code",
                      F.col("stop_reason").alias("reaction_text"), F.lit(None).cast("string").alias("severity_text"),
-                     F.col("status").alias("status_text")))
+                     F.col("status").alias("status_text"), "drug_code_system"))
     alg = spark.read.table(f"{G}.clinical_allergy_intolerance").where(~F.coalesce("absence_assertion_ind", F.lit(False)))
     alg = _drug_match(alg, ["substance_target_code", "substance_snomed_code"],
                       ["substance_target_display", "substance_source_display", "source_display"]).select(
@@ -486,16 +571,19 @@ def pms_adr_signal():
         F.coalesce("substance_target_display", "substance_source_display", "source_display").alias("drug_display"),
         F.coalesce("substance_target_code", "substance_snomed_code").alias("drug_code"),
         F.concat_ws(" / ", "substance_type_display", "reaction_class_display").alias("reaction_text"),
-        F.col("severity_display").alias("severity_text"), F.col("reaction_status_display").alias("status_text"))
+        F.col("severity_display").alias("severity_text"), F.col("reaction_status_display").alias("status_text"),
+        F.when(F.col("substance_target_code").isNotNull(), F.col("substance_target_system"))
+         .when(F.col("substance_snomed_code").isNotNull(), F.lit(SNOMED_SYSTEM)).alias("drug_code_system"))
     fac = spark.read.table(DATIX_FACTOR).where((F.col("factor_type") == "medication") & F.coalesce("source_present_ind", F.lit(True)))
     fac = (_drug_match(fac, ["factor_target_code"], ["factor_display"]).select("inc_id", "safety_incident_factor_key", "drug_set_id",
-               "factor_display", "factor_target_code")
+               "factor_display", "factor_target_code", "factor_target_system")
            .join(_datix_patients(), "inc_id").join(_datix_incidents(), "inc_id", "left")
            .select("person_id", "drug_set_id", F.lit("datix_medication_factor").alias("signal_source"),
                    F.col("safety_incident_factor_key").alias("signal_record_key"), F.col("incident_dt_tm_clean").alias("signal_datetime"),
                    F.col("factor_display").alias("drug_display"), F.col("factor_target_code").alias("drug_code"),
                    F.col("incident_class").alias("reaction_text"), F.col("inc_severity_display").alias("severity_text"),
-                   F.lit(None).cast("string").alias("status_text")))
+                   F.lit(None).cast("string").alias("status_text"),
+                   F.when(F.col("factor_target_code").isNotNull(), F.col("factor_target_system")).alias("drug_code_system")))
     lf = spark.read.table(DATIX_LFPSE).where(F.coalesce("source_present_ind", F.lit(True)))
     lf = (_drug_match(lf, [], ["lfpse_drugs_involved", "lfpse_drug_reaction"]).select("inc_id", "safety_incident_lfpse_key", "drug_set_id",
               "lfpse_drugs_involved", "lfpse_drug_reaction")
@@ -504,9 +592,9 @@ def pms_adr_signal():
                   F.col("safety_incident_lfpse_key").alias("signal_record_key"), F.col("incident_dt_tm_clean").alias("signal_datetime"),
                   F.col("lfpse_drugs_involved").alias("drug_display"), F.lit(None).cast("string").alias("drug_code"),
                   F.col("lfpse_drug_reaction").alias("reaction_text"), F.col("lfpse_physical_harm").alias("severity_text"),
-                  F.lit(None).cast("string").alias("status_text")))
+                  F.lit(None).cast("string").alias("status_text"), F.lit(None).cast("string").alias("drug_code_system")))
     parts = [d.select(*[F.col(c).cast(t) for c, t in zip(ADR_COLUMNS,
-             ["bigint", "string", "string", "string", "timestamp", "string", "string", "string", "string", "string"])])
+             ["bigint", "string", "string", "string", "timestamp", "string", "string", "string", "string", "string", "string"])])
              for d in (stops, alg, fac, lf)]
     return _window(reduce(lambda a, b: a.unionByName(b), parts), "signal_datetime", mode="all")
 
@@ -520,6 +608,8 @@ def _pms_lab_stage():
          .where(F.col("value_number").isNotNull() & F.coalesce("preferred_result_ind", F.lit(True)))
          .select("person_id", "patient_event_key", "encounter_id", "event_datetime", "test_snomed_code",
                  F.lower(F.coalesce("test_target_display", "test_source_display")).alias("test_display"),
+                 F.when(F.col("test_target_display").isNotNull(), F.lit("target"))  # INSR_W6 W6.03 (L986)
+                  .when(F.col("test_source_display").isNotNull(), F.lit("source")).alias("test_display_source"),
                  "value_number", "ucum_code", "unit_source_value", "reference_range_low", "reference_range_high", "interpretation_code"))
     w = _window(r, "event_datetime")  # cohort-restrict before the analyte match: 1.9B rows in, cohort-sized out
     an = F.broadcast(_cfg("analyte").select("analyte_id", "test_codes", "name_regex", "hy_law_role")).alias("a")
@@ -609,18 +699,42 @@ def pms_hy_law_summary():
 
 
 @dp.materialized_view(name="pms_vital", cluster_by=["person_id"],
-    comment="Body weight and height of cohort persons in the study window (for dose-per-kg and BMI).")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "Body weight and height of cohort persons in the study window (for dose-per-kg and BMI), measured "
+        "and estimated; measurement_basis says which. Charting changes swap measured and estimated "
+        "capture over time, so trends should use both. Coverage: NEWS2 scores step up about 5-fold and "
+        "vitals about 2.5-fold from October 2019 (2019-10..2020-01 against 2019-06..09), so earlier score "
+        "and vital series are sparser; Body weight recording rises from April 2024 (PMS weights in "
+        "2024-04..2025-09 run at 2.7 times the 2022-01..2024-03 rate; gold measured weights 1.95 times), "
+        "so weight-based covariates are sparser before then; the measured/estimated basis column says "
+        "which kind each row is; complete-through month per release: 6_mgmt.data_quality.release_finding "
+        "(finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_vital():
     names = F.create_map(*[x for k, v in VITAL_CODES.items() for x in (F.lit(k), F.lit(v))])
-    v = (spark.read.table(f"{G}.clinical_vital_sign").where(F.col("vital_snomed_code").isin(list(VITAL_CODES)))
-         .select("person_id", "patient_event_key", "encounter_id", "event_datetime", names[F.col("vital_snomed_code")].alias("vital_name"),
-                 "value_number", "unit_source_value"))
+    estimated_names = F.create_map(*[x for k, v in VITAL_ESTIMATED_CONCEPTS.items() for x in (F.lit(k), F.lit(v))])
+    # The estimated OMOP concept decides first: since the SNOMED concept-ID fix (SCT_TRUD_V1) estimated weights and
+    # heights also carry the body weight / height SNOMED code, so testing SNOMED first labelled all 707,723 estimated
+    # weights and 148,506 estimated heights "measured" (prod P6.6 P2m, 2026-11-07).
+    estimated = F.coalesce(F.col("vital_omop_concept_id").cast("bigint").isin(list(VITAL_ESTIMATED_CONCEPTS)), F.lit(False))
+    measured = F.coalesce(F.col("vital_snomed_code").isin(list(VITAL_CODES)), F.lit(False)) & ~estimated
+    v = (spark.read.table(f"{G}.clinical_vital_sign").where(measured | estimated)
+         .select("person_id", "patient_event_key", "encounter_id", "event_datetime",
+                 F.when(measured, names[F.col("vital_snomed_code")])
+                  .otherwise(estimated_names[F.col("vital_omop_concept_id").cast("bigint")]).alias("vital_name"),
+                 "value_number", "unit_source_value",
+                 F.when(measured, F.lit("measured")).otherwise(F.lit("estimated")).alias("measurement_basis")))
     return _window(v, "event_datetime")
 
 
 @dp.materialized_view(name="pms_score", cluster_by=["person_id"],
-    comment="NEWS2 total scores of cohort persons in the study window (deterioration signal).")
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "NEWS2 total scores of cohort persons in the study window (deterioration signal). Coverage: NEWS2 "
+        "scores step up about 5-fold and vitals about 2.5-fold from October 2019 (2019-10..2020-01 "
+        "against 2019-06..09), so earlier score and vital series are sparser; complete-through month per "
+        "release: 6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ))
 @dp.expect_all_or_drop(PERSON_RULE)
 def pms_score():
     s = (spark.read.table(f"{G}.clinical_clinical_score").where(F.col("score_name").isin(NEWS2_TOTAL))

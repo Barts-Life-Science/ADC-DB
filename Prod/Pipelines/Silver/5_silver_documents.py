@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Documents
 # MAGIC Clinical text, reports, imaging assets, files and their sensitivity labels.
-
+# MAGIC
 # MAGIC
 # MAGIC Reading order: 5 of 8. Numbers guide navigation; Lakeflow schedules datasets by their dependencies.
 # MAGIC Shared helpers live in `silver_journey_shared.py`, an importable Python file.
@@ -496,6 +496,8 @@ DOCUMENT_PUBLIC_COLUMNS = [
     'author_role',
     'service_id',
     'status_code',
+    'result_status_code',  # BBR_FOLDIN_V1 BBR-17
+    'result_status_display',  # BBR_FOLDIN_V1 BBR-17
     'version_id',
     'document_thread_key',
     'supersedes_document_key',
@@ -762,7 +764,9 @@ DOCUMENT_COLUMN_COMMENTS = {
     "author_practitioner_id": "Millennium personnel PERSON_ID when the author resolves to Millennium personnel.",
     "author_role": "Source author role when supplied.",
     "service_id": "Service reference when supplied.",
-    "status_code": "Verbatim document extraction or source status.",
+    "status_code": "mill_blob arm: decoder status, always 'Decoded'; text_event arm: raw Millennium result status code (see result_status_display); other arms: the source artifact status. BBR_FOLDIN_V1 BBR-17.",
+    'result_status_code': 'Millennium result status code of the document event (code set 8): mill_blob EVENT_RESULT_STATUS_CD, text_event RESULT_STATUS_CD; NULL on other arms. BBR_FOLDIN_V1 BBR-17.',  # BBR_FOLDIN_V1
+    'result_status_display': "Result status display (Auth (Verified), Modified, In Error ...): the document's finality. mill_blob carries the source display; text_event codes are decoded through code set 8. BBR_FOLDIN_V1 BBR-17.",  # BBR_FOLDIN_V1
     "version_id": "Source document-version token.",
     "document_thread_key": "Deterministic SHA-256 key for all versions of one logical document.",
     "supersedes_document_key": "Deterministic SHA-256 key of the directly superseded document version.",
@@ -800,7 +804,7 @@ DOCUMENT_COLUMN_COMMENTS = {
     "withheld_identity_ind": "Withheld-identity indicator when supplied.",
     "document_class": "Source event-class display such as Document or mdoc.",
     "contributor_system": "Source contributor-system display such as PowerChart or BLT_TIE_RAD.",
-    "succession_status": "Blob succession status display such as Interim or Final.",
+    "succession_status": "Cerner succession type display; '? Unknown' is a source value. Not document finality: use result_status_display. BBR_FOLDIN_V1 BBR-17.",
     "source_parent_event_id": "Parent clinical-event identifier for document threading when supplied.",
     "parent_relation": "Event relation display such as Root or Child.",
     "source_parent_display": "Parent event-code description; the legacy MainEventDesc document-type label.",
@@ -915,4 +919,3 @@ for old_name, axes in S3_TABLE_AXIS_SPECS["artifact_asset"].items():
 
 for old_name, axes in S3_TABLE_AXIS_SPECS["text_document"].items():
     _s3_replace_public_variant(DOCUMENT_PUBLIC_COLUMNS, old_name, axes)
-

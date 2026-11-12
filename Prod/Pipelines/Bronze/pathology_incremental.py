@@ -36,6 +36,33 @@ def current_delta_version(spark, table_name: str) -> int:
     return int(row["version"])
 
 
+def _assert_no_map_pathology_rewrite(spark, table_name: str, start_version: int, end_version: int) -> None:
+    """R1FIX_20261109: refuse a change read across a rewrite of map_pathology that dropped columns, with the two
+    ways out.
+
+    Such a rewrite (on 2026-11-08 the full rebuild dropped the INSR R1 lane columns) makes the change read fail with
+    an opaque Delta error (DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE). This pipeline never falls back to a billion-row snapshot on
+    its own, so a human picks: a full reconcile (delete the map_pathology row of pathology_expansion_state; the next
+    run reconciles everything), or, when the rewrite left every expansion column unchanged, advancing that state row
+    past the rewrite (R1FIX deploy notebook step 5 measures this parity)."""
+    import sys
+    shared = "/Workspace/Shared/ADC-DB/Prod/Pipelines/_shared"
+    if shared not in sys.path:
+        sys.path.append(shared)
+    import delta_rewrites
+
+    # Only a rewrite that dropped columns breaks the change read; a same-schema replace still reads (every row shows
+    # as changed) exactly as before R1FIX.
+    narrowed = delta_rewrites.narrowing_versions(spark, table_name, start_version, end_version)
+    if narrowed:
+        raise RuntimeError(
+            f"{table_name} was rewritten with dropped columns {narrowed} inside the change window "
+            f"{start_version}..{end_version}. Either reconcile in full (delete the map_pathology row of "
+            "pathology_expansion_state) or, after checking that the rewrite changed no expansion column, advance "
+            "that row past the rewrite. See R1FIX_20261109 step 5."
+        )
+
+
 def _state(spark, config: PipelineConfig) -> dict[str, dict[str, object]]:
     rows = spark.table(f"{config.bronze_schema}.pathology_expansion_state").collect()
     return {row["source_name"]: row.asDict() for row in rows}
@@ -216,6 +243,28 @@ def _semantic_orderable_keys(changes):
     )
 
 
+# INSR R1 (optional, Ben decision D13): R1's own key-scoped commits on map_pathology (the post-landing attach and the
+# mapping backfill) change only the R1 lane columns, so they re-expand nothing; dropping them here keeps the change
+# read below from joining their pre- and post-images. Set R1_SKIP_OWN_COMMITS = False to read every commit again.
+R1_SKIP_OWN_COMMITS = True
+R1_OWN_COMMIT_MARKER = ".resolution_hash"      # mapping_attach.OWN_COMMIT_MARKER: named only by R1's MERGE conditions
+
+
+def _r1_drop_own_commits(spark, table_name, changes, start_version, end_version):
+    """map_pathology change rows minus R1's own commits in [start_version, end_version]: MERGEs whose matched
+    condition names <LANE>_MAPPING.resolution_hash (DESCRIBE HISTORY operationParameters.matchedPredicates)."""
+    if not R1_SKIP_OWN_COMMITS or changes is None:
+        return changes
+    _, F = _imports()
+    history = spark.sql(f"DESCRIBE HISTORY {table_name}")
+    own = [int(row["version"]) for row in history
+           .where((F.col("version") >= start_version) & (F.col("version") <= end_version)
+                  & (F.col("operation") == "MERGE")
+                  & F.coalesce(F.col("operationParameters")["matchedPredicates"], F.lit("")).contains(R1_OWN_COMMIT_MARKER))
+           .select("version").collect()]
+    return changes.where(~F.col("_commit_version").isin(own)) if own else changes
+
+
 def changed_parent_keys(spark, config: PipelineConfig):
     """Return touched source parents and pending source versions.
 
@@ -233,8 +282,12 @@ def changed_parent_keys(spark, config: PipelineConfig):
 
     frames = []
     map_start = int(state["map_pathology"]["last_delta_version"]) + 1
+    _assert_no_map_pathology_rewrite(spark, config.map_pathology_table, map_start, versions["map_pathology"])
     map_changes = _read_changes(
         spark, config.map_pathology_table, map_start, versions["map_pathology"]
+    )
+    map_changes = _r1_drop_own_commits(  # INSR R1 (D13)
+        spark, config.map_pathology_table, map_changes, map_start, versions["map_pathology"]
     )
     if map_changes is not None:
         semantic_map_changes = _semantic_map_parent_changes(map_changes)
@@ -299,8 +352,15 @@ def changed_parent_keys(spark, config: PipelineConfig):
     orderables_changes = _read_changes(
         spark, config.master_orderable_table, orderables_start, versions["path_master_orderables"]
     )
+    changed_tlcs = None
     if orderables_changes is not None:
         changed_tlcs = _semantic_orderable_keys(orderables_changes)  # PATH_ORDERABLES_SEMANTIC_V1
+        # PATH_EXPANSION_SCOPED_STAGES_V1: the weekly rebuild usually changes no specimen default. The diff reads a
+        # ~10k-row change feed, so checking it is cheap; when it is empty, leave out the branch below (a join of all
+        # current LIMS accession sources to all LIMS samples) rather than rely on the optimiser pruning it at run time.
+        if changed_tlcs.limit(1).count() == 0:
+            changed_tlcs = None
+    if changed_tlcs is not None:
         requested = spark.table(config.sample_table).select(
             F.col("LIMSNo").cast("int").alias("LIMSNo"), F.col("LabNo").alias("lab_no"), "TLCsRequested"
         )

@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Resource-stream builders for RBI (spec §3 and §10).
 
 Each builder takes gold DataFrames (already restricted to the dev sample when sampling is on)
@@ -5,6 +6,7 @@ and returns rows in the STREAM_COLUMNS shape. Builders never drop an eligible so
 silently: rows that cannot be measured are kept with consumption_status 'unknown' and the
 reason in consumption_evidence.
 """
+from pyspark.sql import Window
 from pyspark.sql import functions as F
 
 import rbi_rules as R
@@ -34,6 +36,18 @@ def _observation_bound(df):
     })
 
 
+def _null_inverted_end(df):
+    """NULL an event_end that is before its event_start and append R.END_BEFORE_START_EVIDENCE to the evidence
+    (INSR_W6 W6.06, L1670). Rows with a NULL start or end are unchanged, so applying it twice changes nothing."""
+    inverted = F.coalesce(F.col("event_end") < F.col("event_start"), F.lit(False))
+    return df.withColumns({
+        "event_end": F.when(~inverted, F.col("event_end")),
+        "consumption_evidence": F.when(inverted, F.concat_ws("|", F.col("consumption_evidence"),
+                                                              F.lit(R.END_BEFORE_START_EVIDENCE)))
+                                 .otherwise(F.col("consumption_evidence")),
+    })
+
+
 def _finish(df, *, domain, stream, unit_type, source_table, date_from="event_start", observation_bound=True):
     """Stamp the labels every stream row carries, derive the London date and FY, and project.
 
@@ -46,6 +60,8 @@ def _finish(df, *, domain, stream, unit_type, source_table, date_from="event_sta
     """
     if observation_bound and "loaded_at" in df.columns:
         df = _observation_bound(df)
+    if "event_end" in df.columns:
+        df = _null_inverted_end(df)  # INSR_W6 W6.06 (L1670)
     if date_from is not None:
         df = df.withColumn("event_date_local", F.to_date(london(F.col(date_from))))
     return to_stream(df.withColumns({
@@ -56,6 +72,63 @@ def _finish(df, *, domain, stream, unit_type, source_table, date_from="event_sta
         "source_table": F.lit(source_table),
         "rule_version": F.lit(R.RULE_VERSION),
     }))
+
+
+# ---- Site vocabulary (INSR_W6 W6.06, J25 / L1589) -------------------------------------
+
+def location_facility(locations):
+    """Every location with its facility code: the location itself when it is a facility, else up to 4 parent links
+    (bed -> room -> nurse unit -> building -> facility), unrolled as equi-joins so Lakeflow can refresh incrementally.
+    Input: gold reference_location. Output: location_key, location_code, facility_code (NULL when no facility found)."""
+    def hop(i):
+        """reference_location columns renamed for hop i."""
+        return locations.select(F.col("location_key").alias(f"_k{i}"), F.col("parent_location_key").alias(f"_p{i}"),
+                                F.col("location_level").alias(f"_lv{i}"), F.col("location_code").alias(f"_c{i}"))
+    x = hop(0)
+    for i in range(1, 5):
+        x = x.join(hop(i), F.col(f"_p{i - 1}") == F.col(f"_k{i}"), "left")
+    facility = F.coalesce(*[F.when(F.col(f"_lv{i}") == "facility", F.col(f"_c{i}")) for i in range(5)])
+    return x.select(F.col("_k0").alias("location_key"), F.col("_c0").alias("location_code"), facility.alias("facility_code"))
+
+
+def encounter_facility(stays):
+    """One facility per encounter: its first location stay that has a facility (stay start ascending, NULLs last,
+    then the stay key for a stable choice). Input: gold spine_location_stay. Output: encounter_id, facility_code."""
+    s = stays.where(F.col("encounter_id").isNotNull()).select(
+        F.col("encounter_id").cast("bigint").alias("encounter_id"), "facility_code", "period_start", "location_stay_key")
+    w = Window.partitionBy("encounter_id").orderBy(F.col("facility_code").isNull().asc(),
+                                                   F.col("period_start").asc_nulls_last(),
+                                                   F.col("location_stay_key").asc_nulls_last())
+    return (s.withColumn("_rn", F.row_number().over(w)).where((F.col("_rn") == 1) & F.col("facility_code").isNotNull())
+             .select("encounter_id", "facility_code"))
+
+
+def _with_location_facility(df, location_facility, df_key, facility_key):
+    """Attach `_loc_facility` (the facility of the row's own location) by an equi-join; NULL when not given."""
+    if location_facility is None:
+        return df.withColumn("_loc_facility", F.lit(None).cast("string"))
+    lf = location_facility.select(F.col(facility_key).alias("_lf_key"), F.col("facility_code").alias("_loc_facility"))
+    return df.join(lf, F.col(df_key) == F.col("_lf_key"), "left").drop("_lf_key")
+
+
+def apply_site(events, encounter_facilities):
+    """Set site_code / site_basis on attributed stream rows (INSR_W6 W6.06).
+
+    Streams in R.SITE_FACILITY_STREAMS: the row's own facility (ward stay, or the location facility the builder put
+    in site_code), else the facility of its (native or attributed) encounter. Other streams: the source label kept
+    in site_source_value. Input rows are in STREAM_COLUMNS shape; so is the output.
+    """
+    ef = encounter_facilities.select(F.col("encounter_id").alias("_ef_enc"), F.col("facility_code").alias("_ef_facility"))
+    e = events.join(ef, F.col("encounter_id") == F.col("_ef_enc"), "left")
+    facility_stream = F.col("stream").isin(*R.SITE_FACILITY_STREAMS)
+    own = F.col("site_code").isNotNull()
+    site = (F.when(~facility_stream, F.col("site_source_value"))
+             .when(own, F.col("site_code"))
+             .otherwise(F.col("_ef_facility")))
+    basis = (F.when(~facility_stream, F.when(F.col("site_source_value").isNotNull(), F.lit("source_label")))
+              .when(own, F.coalesce(F.col("site_basis"), F.lit("location")))
+              .when(F.col("_ef_facility").isNotNull(), F.lit("encounter_location_stay")))
+    return to_stream(e.withColumns({"site_code": site, "site_basis": basis}))
 
 
 # ---- Ward bed-days ---------------------------------------------------------------------
@@ -93,6 +166,8 @@ def ward_bed_days(stays, encounters, window_start):
           .withColumns({
               "person_id": F.col("person_id").cast("bigint"),
               "site_code": F.col("facility_code"),
+              "site_basis": F.when(F.col("facility_code").isNotNull(), F.lit("location_stay")),  # INSR_W6 W6.06
+              "site_source_value": F.col("facility_code"),
               "stratum_l1": F.col("nurse_unit_code"),
               "stratum_l2": F.col("service_code"),
               "priced_by_other_stream": F.lit(False),
@@ -227,7 +302,7 @@ def theatre_cases(cases, window_start):
              "quantity_scheduled": F.col("scheduled_duration_minutes").cast("double"),
              "event_end": F.when(minutes > 0, F.timestamp_seconds(F.unix_timestamp("event_start") + minutes * 60)),
              "theatre_code": F.col("operating_location_display"),
-             "site_code": F.col("institution_display"),
+             "site_source_value": F.col("institution_display"),  # INSR_W6 W6.06: site_code set by apply_site
              "service_code": F.col("surgical_specialty_id").cast("string"),
              "stratum_l1": F.col("surgical_specialty_id").cast("string"),
              "stratum_l2": F.col("department_display"),
@@ -240,14 +315,17 @@ def theatre_cases(cases, window_start):
 
 # ---- Outpatients and ED ----------------------------------------------------------------
 
-def outpatient_appointments(appointments, window_start):
+def outpatient_appointments(appointments, window_start, location_facility=None):
     """One row per appointment: attended = consumed, DNA/cancelled = not_consumed, else unknown.
+
+    INSR_W6 W6.06: with location_facility (the _location_facility MV) the appointment's own location gives site_code.
 
     An appointment dated after its loaded_at is 'scheduled' (or 'unknown' with evidence
     event_after_observation when the source already says attended), see _observation_bound
     (RBI_REL_20261025).
     """
-    x = (appointments.where(in_window(F.col("event_datetime"), window_start))
+    x = (_with_location_facility(appointments, location_facility, "location_code", "location_code")
+         .where(in_window(F.col("event_datetime"), window_start))
          .withColumns({
              "event_start": F.col("event_datetime"),
              "consumption_status": status_from_map(F.col("status_meaning"), R.APPOINTMENT_CONSUMPTION),
@@ -259,6 +337,8 @@ def outpatient_appointments(appointments, window_start):
              "quantity": F.lit(1.0),
              "event_end": F.col("event_end_datetime"),
              "clinic_code": F.col("clinic_resource_code"),
+             "site_code": F.col("_loc_facility"),  # INSR_W6 W6.06: the appointment location's facility
+             "site_basis": F.when(F.col("_loc_facility").isNotNull(), F.lit("location")),
              "service_code": F.col("service_resource_code"),
              "stratum_l1": F.concat_ws("|", F.col("service_resource_code"), F.col("appointment_type_code")),
              "stratum_l2": F.col("service_resource_code"),
@@ -288,7 +368,7 @@ def tracking_attendances(attendances, window_start):
              "consumption_evidence": F.concat(F.lit("tracking_rule:"), F.coalesce(rule_id, F.lit("none"))),
              "event_start": F.col("checkin_dt_tm"),
              "event_end": F.col("checkout_dt_tm_clean"),
-             "site_code": F.col("trust"),
+             "site_source_value": F.col("trust"),  # INSR_W6 W6.06: site_code set by apply_site
              "stratum_l1": F.col("tracking_group_display"),
              "stratum_l2": label,
              "priced_by_other_stream": label.isin(*R.PRICED_BY_OTHER_TRACKING_CLASSES),
@@ -388,9 +468,14 @@ def imaging_exams(exams, window_start):
                    source_table="gold.clinical_imaging_exam")
 
 
-def medication_admins(admins, window_start):
-    """One row per medication administration; status map decides consumption (spec §10.9)."""
-    x = (admins.withColumn("event_start", F.coalesce("performed_datetime", "event_datetime"))
+def medication_admins(admins, window_start, location_facility=None):
+    """One row per medication administration; status map decides consumption (spec §10.9).
+
+    INSR_W6 W6.06: with location_facility the administration's own location gives site_code. (The table's site_code
+    column is the body site of the administration, not a hospital site, so it is never used here.)
+    """
+    x = (_with_location_facility(admins, location_facility, "location_key", "location_key")
+         .withColumn("event_start", F.coalesce("performed_datetime", "event_datetime"))
          .where(in_window(F.col("event_start"), window_start))
          .withColumns({
              "resource_use_event_key": event_key(F.col("patient_event_key")),
@@ -398,6 +483,8 @@ def medication_admins(admins, window_start):
              "consumption_status": status_from_map(F.col("administration_status_display"), R.MEDICATION_ADMIN_CONSUMPTION),
              "consumption_evidence": F.concat(F.lit("status:"), F.coalesce(F.col("administration_status_display"), F.lit("<null>"))),
              "drug_concept_id": try_bigint("medication_omop_concept_id"),
+             "site_code": F.col("_loc_facility"),  # INSR_W6 W6.06: the administration location's facility
+             "site_basis": F.when(F.col("_loc_facility").isNotNull(), F.lit("location")),
              "stratum_l1": F.coalesce(F.col("route_display"), F.lit("unknown")),
              "stratum_l2": F.lit("medication"),
              "priced_by_other_stream": F.lit(False),
@@ -419,6 +506,7 @@ def high_cost_drug_lines(lines, window_start):
              "event_start": F.col("event_datetime"),
              "drug_concept_id": F.col("drug_standard_concept_id").cast("bigint"),
              "source_amount": F.col("cost").cast("double"),
+             "site_source_value": F.col("site_cd"),  # INSR_W6 W6.06: finance site code, context only
              "stratum_l1": F.coalesce(F.col("hcdr_category_cd"), F.lit("unknown")),
              "stratum_l2": F.lit("hcd"),
              "priced_by_other_stream": F.lit(False),

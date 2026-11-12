@@ -1,3 +1,4 @@
+# INSR_W6_PMS_RBI_V1 (INSR_20261029 W6: PMS Pharma, PMS Device, RBI)
 """Rule tables for the RBI resource-use dataset — pure Python, no Spark.
 
 Every rule that decides eligibility, consumption, classification or cost family lives here
@@ -6,7 +7,7 @@ Changing a rule means bumping RULE_VERSION; every stream row records the version
 built under. Spec: docs/superpowers/specs/2026-10-16-rbi-resource-use-dataset-design.md (§3, §4, §10).
 """
 
-RULE_VERSION = "rbi-rules-2"  # RBI_REL_20261025: observation bound on stream rows (not the HCD ledger) and unknown bed stays
+RULE_VERSION = "rbi-rules-3"  # INSR_W6 W6.06: inverted ends NULLed; facility site vocabulary (rbi-rules-2: RBI_REL_20261025 observation bound)
 
 # ---- Observation bound (RBI_REL_20261025; same rule as silver/gold) ----------------------
 # An instant later than the source row's own loaded_at cannot have been observed. A booking
@@ -17,6 +18,21 @@ SCHEDULED_STATUS = "scheduled"
 AFTER_OBSERVATION_EVIDENCE = "event_after_observation"
 # Statuses whose event instants count as observed activity (first/last-event rollups).
 OBSERVED_STATUSES = ("consumed", "not_consumed")
+
+# ---- Event ordering (INSR_W6 W6.06, L1670) ----------------------------------------------
+# An end before its start is not an interval: the end is published NULL and this is appended to the evidence.
+END_BEFORE_START_EVIDENCE = "end_before_start"
+
+# ---- Site vocabulary (INSR_W6 W6.06, J25 / L1589) ---------------------------------------
+# site_code = the Millennium facility (reference_location level 'facility', its location_code) for these streams.
+# A stream is listed only if facility fill >= its previous site fill (W6.06 Step 1 probe, ledger W6_06_site_fill;
+# N=100 on 2026-10-29: theatre_case 0.996 < 1.000 stays on its institution label; high_cost_drug has no encounter).
+# Unlisted streams keep the label their source carries; site_basis says which rule set the value.
+SITE_FACILITY_STREAMS = (
+    "ward_bed_day", "critical_care_day", "neonatal_care_day", "outpatient_appointment", "tracking_attendance",
+    "pathology_tests", "imaging_exam", "medication_admin", "transfusion",
+)
+SITE_BASES = ("location_stay", "location", "encounter_location_stay", "source_label")
 
 # ---- Beds (spec §3, §10.8) -------------------------------------------------------------
 # Encounter types whose location stays hold a bed. Outpatient*, Pre-registration, Referral,
@@ -117,6 +133,11 @@ STREAM_SETTING = {
 }
 FEED_TYPE_SETTING = {"APC": "admitted", "OP": "outpatient", "OUT": "outpatient", "OUTS": "outpatient", "EC": "emergency"}
 MIN_CALIBRATION_ACTIVITIES = 100
+# INSR_W6 W6.07 (L1715): a stratum whose unit cost is more than this many times its stream x base-FY median is flagged
+# (unit_cost_outlier_ind); it still prices if it clears the floor (C0 ruling: floor 100 + outlier flag).
+UNIT_COST_OUTLIER_K = 10
+# INSR_W6 W6.07 (L1566): the NCC plan B ledger arm's cost basis.
+NCC_PLAN_B_BASIS = "actual_ncc_plan_b"
 
 
 def financial_year_label(d):

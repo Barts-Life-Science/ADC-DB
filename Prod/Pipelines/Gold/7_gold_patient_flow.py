@@ -10,6 +10,7 @@
 
 # COMMAND ----------
 
+# INSR_W4_ROWRULES_V1: W4 row rules (insr-v1); see gold_journey_shared.py
 from gold_journey_shared import (
     INTERNAL_SCHEMA,
     PUBLIC_SCHEMA,
@@ -29,6 +30,9 @@ CLINICAL_TRACKING_EPISODE_MANDATORY_RULES = {
     "gold.clinical_tracking_episode.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_TRACKING_EPISODE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.tracking_episode.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_tracking_episode.key_present": "tracking_episode_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -37,7 +41,11 @@ CLINICAL_TRACKING_EPISODE_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_episode",
-    comment="TDX v2.1 Gold QC twin for clinical_tracking_episode.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per FirstNet (emergency department) tracking episode, keyed by Millennium TRACKING_ID. "
+        "Gold QC twin of silver clinical_tracking_episode: mandatory rules drop rows, advisory rules are "
+        "reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_EPISODE_MANDATORY_RULES)
@@ -67,6 +75,9 @@ CLINICAL_TRACKING_ATTENDANCE_MANDATORY_RULES = {
     "gold.clinical_tracking_attendance.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_TRACKING_ATTENDANCE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.tracking_attendance.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_tracking_attendance.key_present": "tracking_attendance_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -75,7 +86,11 @@ CLINICAL_TRACKING_ATTENDANCE_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_attendance",
-    comment="TDX v2.1 Gold QC twin for clinical_tracking_attendance.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per FirstNet tracking check-in, keyed by Millennium TRACKING_CHECKIN_ID. Gold QC twin of "
+        "silver clinical_tracking_attendance: mandatory rules drop rows, advisory rules are reported in "
+        "Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_ATTENDANCE_MANDATORY_RULES)
@@ -105,6 +120,9 @@ CLINICAL_TRACKING_LOCATION_STAY_MANDATORY_RULES = {
     "gold.clinical_tracking_location_stay.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_TRACKING_LOCATION_STAY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.tracking_location_stay.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_tracking_location_stay.key_present": "tracking_location_stay_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -113,7 +131,14 @@ CLINICAL_TRACKING_LOCATION_STAY_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_location_stay",
-    comment="TDX v2.1 Gold QC twin for clinical_tracking_location_stay.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per FirstNet tracking location stay (arrival to departure at one tracked location), "
+        "keyed by TRACKING_LOCATOR_ID. Gold QC twin of silver clinical_tracking_location_stay: mandatory "
+        "rules drop rows, advisory rules are reported in Lakeflow expectation metrics. Coverage: Tracking "
+        "base-location times are thin for April-June 2024 (0.24 of the neighbouring months at source); "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_LOCATION_STAY_MANDATORY_RULES)
@@ -145,6 +170,9 @@ CLINICAL_TRACKING_MILESTONE_MANDATORY_RULES = {
     "gold.clinical_tracking_milestone.dated_milestone": "milestone_datetime IS NOT NULL",
 }
 CLINICAL_TRACKING_MILESTONE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.tracking_milestone.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_tracking_milestone.key_present": "tracking_milestone_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -153,7 +181,14 @@ CLINICAL_TRACKING_MILESTONE_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_tracking_milestone",
-    comment="TDX v2.1 Gold QC twin for clinical_tracking_milestone.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per FirstNet tracking event (milestone such as triage or seen by clinician), keyed by "
+        "TRACKING_EVENT_ID. Gold QC twin of silver clinical_tracking_milestone: mandatory rules drop "
+        "rows, advisory rules are reported in Lakeflow expectation metrics. Coverage: Tracking milestones "
+        "per attendance triple from September 2024 (a configuration change; check-ins unchanged); "
+        "complete-through month per release: 6_mgmt.data_quality.release_finding (finding_code "
+        "F2_complete_through)."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_TRACKING_MILESTONE_MANDATORY_RULES)
@@ -183,6 +218,9 @@ CLINICAL_PREARRIVAL_MANDATORY_RULES = {
     "gold.clinical_prearrival.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_PREARRIVAL_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.prearrival.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_prearrival.key_present": "prearrival_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -191,7 +229,11 @@ CLINICAL_PREARRIVAL_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_prearrival",
-    comment="TDX v2.1 Gold QC twin for clinical_prearrival.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per FirstNet pre-arrival notice (expected patient), keyed by TRACKING_PREARRIVAL_ID. "
+        "Gold QC twin of silver clinical_prearrival: mandatory rules drop rows, advisory rules are "
+        "reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_PREARRIVAL_MANDATORY_RULES)
@@ -221,6 +263,9 @@ CLINICAL_PENDING_MOVEMENT_MANDATORY_RULES = {
     "gold.clinical_pending_movement.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_PENDING_MOVEMENT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.pending_movement.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_pending_movement.key_present": "pending_movement_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -229,7 +274,14 @@ CLINICAL_PENDING_MOVEMENT_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_pending_movement",
-    comment="TDX v2.1 Gold QC twin for clinical_pending_movement.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per Millennium pending encounter movement (bed request or transfer awaiting completion). "
+        "A request still open carries the source open-ended marker 2100-12-31 in end_effective_dt_tm, "
+        "kept on purpose (J14); end_effective_dt_tm_clean holds NULL instead. The workflow narrowed after "
+        "2019 (see the coverage register). Coverage: Pending movements in 2025 are about 10% of 2019 at "
+        "source: the workflow narrowed, the feed did not fail; complete-through month per release: "
+        "6_mgmt.data_quality.release_finding (finding_code F2_complete_through)."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_PENDING_MOVEMENT_MANDATORY_RULES)
@@ -259,6 +311,9 @@ CLINICAL_APPOINTMENT_ACTION_MANDATORY_RULES = {
     "gold.clinical_appointment_action.resolved_identity": "COALESCE(identity_status = 'resolved', FALSE)",
 }
 CLINICAL_APPOINTMENT_ACTION_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.appointment_action.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_appointment_action.key_present": "appointment_action_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -267,7 +322,11 @@ CLINICAL_APPOINTMENT_ACTION_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_appointment_action",
-    comment="TDX v2.1 Gold QC twin for clinical_appointment_action.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per Millennium scheduling action on an appointment (book, confirm, check in, cancel, "
+        "undo), keyed by SCH_ACTION_ID. Gold QC twin of silver clinical_appointment_action: mandatory "
+        "rules drop rows, advisory rules are reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_APPOINTMENT_ACTION_MANDATORY_RULES)
@@ -295,6 +354,9 @@ CLINICAL_BED_STATUS_OBSERVATION_MANDATORY_RULES = {
     "gold.clinical_bed_status_observation.active_record": "COALESCE(record_status = 'active', FALSE)",
 }
 CLINICAL_BED_STATUS_OBSERVATION_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.bed_status_observation.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_bed_status_observation.key_present": "bed_status_observation_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -303,7 +365,11 @@ CLINICAL_BED_STATUS_OBSERVATION_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_bed_status_observation",
-    comment="TDX v2.1 Gold QC twin for clinical_bed_status_observation.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per bed location per weekly observation date: the bed's status at the moment the weekly "
+        "snapshot ran (Bronze_Pipeline_Parallel). No within-week history; join observation dates to "
+        "clinical_bed_status_observation_coverage to see which weeks were captured."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_BED_STATUS_OBSERVATION_MANDATORY_RULES)
@@ -331,6 +397,9 @@ CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_MANDATORY_RULES = {
     "gold.clinical_bed_status_observation_coverage.active_record": "COALESCE(record_status = 'active', FALSE)",
 }
 CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.clinical.bed_status_observation_coverage.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.clinical_bed_status_observation_coverage.key_present": "bed_status_coverage_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -339,7 +408,11 @@ CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.clinical_bed_status_observation_coverage",
-    comment="TDX v2.1 Gold QC twin for clinical_bed_status_observation_coverage.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per weekly bed-observation run date, recording whether the snapshot was taken. Gold QC "
+        "twin of silver clinical_bed_status_observation_coverage: mandatory rules drop rows, advisory "
+        "rules are reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(CLINICAL_BED_STATUS_OBSERVATION_COVERAGE_MANDATORY_RULES)
@@ -367,6 +440,9 @@ REFERENCE_LOCATION_UNIT_MANDATORY_RULES = {
     "gold.reference_location_unit.active_record": "COALESCE(record_status = 'active', FALSE)",
 }
 REFERENCE_LOCATION_UNIT_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.reference.location_unit.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.reference_location_unit.key_present": "location_unit_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -375,7 +451,11 @@ REFERENCE_LOCATION_UNIT_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.reference_location_unit",
-    comment="TDX v2.1 Gold QC twin for reference_location_unit.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per Millennium location (bed, room, unit or ward), keyed by LOCATION_CD. Gold QC twin of "
+        "silver reference_location_unit: mandatory rules drop rows, advisory rules are reported in "
+        "Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_LOCATION_UNIT_MANDATORY_RULES)
@@ -403,6 +483,9 @@ REFERENCE_LOCATION_ATTRIBUTE_HISTORY_MANDATORY_RULES = {
     "gold.reference_location_attribute_history.active_record": "COALESCE(record_status = 'active', FALSE)",
 }
 REFERENCE_LOCATION_ATTRIBUTE_HISTORY_ADVISORY_RULES = {
+    # INSR_W4 W4.05 date_future (measured in W4.05 Step 8): A record cannot become effective after it was loaded (L2282, F5(h)).
+    'gold.reference.location_attribute_history.record_status_effective_from.insr_f5h_effective_after_load':
+        'NOT COALESCE((`record_status_effective_from` > `loaded_at`), FALSE)',
     # Report missing source keys without inventing a new exclusion policy.
     "gold.reference_location_attribute_history.key_present": "location_attribute_key IS NOT NULL",
     # A missing source load time is provenance uncertainty, not grounds to lose the row.
@@ -411,7 +494,11 @@ REFERENCE_LOCATION_ATTRIBUTE_HISTORY_ADVISORY_RULES = {
 
 @dp.materialized_view(
     name=f"{PUBLIC_SCHEMA}.reference_location_attribute_history",
-    comment="TDX v2.1 Gold QC twin for reference_location_attribute_history.",
+    comment=(  # INSR_W8_COMMENTS_V1 (ruling f): the W8 release table comment; a refresh writes it from here
+        "One row per recorded change of a Millennium location attribute, keyed by the source attribute "
+        "row id. Gold QC twin of silver reference_location_attribute_history: mandatory rules drop rows, "
+        "advisory rules are reported in Lakeflow expectation metrics."
+    ),
     refresh_policy="auto",
 )
 @dp.expect_all_or_drop(REFERENCE_LOCATION_ATTRIBUTE_HISTORY_MANDATORY_RULES)
