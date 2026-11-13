@@ -39,6 +39,9 @@ CLINICAL_VITAL_SIGN_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`vital_code` AS `vital_code`',
+    '`vital_source_system` AS `vital_source_system`',  # SRC_LINEAGE_V1
+    '`vital_source_code` AS `vital_source_code`',  # SRC_LINEAGE_V1
+    '`vital_source_display` AS `vital_source_display`',  # SRC_LINEAGE_V1
     # DQ4 G5 tympanic/axillary/oral temperature outside 25-45 C is not a living reading
     # (23,145 rows; every unit is Celsius or blank, so there is no Fahrenheit to rescue; skin
     # temperature is left alone); G8 a weight, height or BMI of exactly 0 is a blank (46,661 rows).
@@ -211,6 +214,9 @@ def gold_clinical_vital_sign():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_vital_code` AS `vital_code`',
+        '`vital_source_system` AS `vital_source_system`',  # SRC_LINEAGE_V1
+        '`vital_source_code` AS `vital_source_code`',  # SRC_LINEAGE_V1
+        '`vital_source_display` AS `vital_source_display`',  # SRC_LINEAGE_V1
         '`value_number` AS `value_number`',
         '`value_text` AS `value_text`',
         '`unit_source_value` AS `unit_source_value`',
@@ -587,6 +593,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_vital_code` AS `vital_code`',
+            '`vital_source_system` AS `vital_source_system`',  # SRC_LINEAGE_V1
+            '`vital_source_code` AS `vital_source_code`',  # SRC_LINEAGE_V1
+            '`vital_source_display` AS `vital_source_display`',  # SRC_LINEAGE_V1
             '`value_number` AS `value_number`',
             '`value_text` AS `value_text`',
             '`unit_source_value` AS `unit_source_value`',

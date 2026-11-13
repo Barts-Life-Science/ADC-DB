@@ -1,10 +1,16 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # BrowserPublish / verify — independent acceptance gates for one live run.
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_registry
 
 # COMMAND ----------
+
 import json
 import re
 
@@ -280,4 +286,3 @@ def verify():
 
 if ACTION == "verify":
     dbutils.notebook.exit(json.dumps(verify()))
-

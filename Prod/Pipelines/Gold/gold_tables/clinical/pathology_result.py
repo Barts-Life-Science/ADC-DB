@@ -35,6 +35,12 @@ CLINICAL_PATHOLOGY_RESULT_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`result_code` AS `result_code`',
+    '`test_source_system` AS `test_source_system`',  # SRC_LINEAGE_V1
+    '`test_source_code` AS `test_source_code`',  # SRC_LINEAGE_V1
+    '`test_source_display` AS `test_source_display`',  # SRC_LINEAGE_V1
+    '`result_source_system` AS `result_source_system`',  # SRC_LINEAGE_V1
+    '`result_source_code` AS `result_source_code`',  # SRC_LINEAGE_V1
+    '`result_source_display` AS `result_source_display`',  # SRC_LINEAGE_V1
     '`pathology_report_key` AS `pathology_report_key`',
     '`specimen_key` AS `specimen_key`',
     '`equivalence_group_key` AS `equivalence_group_key`',
@@ -189,6 +195,12 @@ def gold_clinical_pathology_result():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_result_code` AS `result_code`',
+        '`test_source_system` AS `test_source_system`',  # SRC_LINEAGE_V1
+        '`test_source_code` AS `test_source_code`',  # SRC_LINEAGE_V1
+        '`test_source_display` AS `test_source_display`',  # SRC_LINEAGE_V1
+        '`result_source_system` AS `result_source_system`',  # SRC_LINEAGE_V1
+        '`result_source_code` AS `result_source_code`',  # SRC_LINEAGE_V1
+        '`result_source_display` AS `result_source_display`',  # SRC_LINEAGE_V1
         '`pathology_report_key` AS `pathology_report_key`',
         '`specimen_key` AS `specimen_key`',
         '`equivalence_group_key` AS `equivalence_group_key`',
@@ -384,6 +396,12 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_result_code` AS `result_code`',
+            '`test_source_system` AS `test_source_system`',  # SRC_LINEAGE_V1
+            '`test_source_code` AS `test_source_code`',  # SRC_LINEAGE_V1
+            '`test_source_display` AS `test_source_display`',  # SRC_LINEAGE_V1
+            '`result_source_system` AS `result_source_system`',  # SRC_LINEAGE_V1
+            '`result_source_code` AS `result_source_code`',  # SRC_LINEAGE_V1
+            '`result_source_display` AS `result_source_display`',  # SRC_LINEAGE_V1
             '`pathology_report_key` AS `pathology_report_key`',
             '`specimen_key` AS `specimen_key`',
             '`equivalence_group_key` AS `equivalence_group_key`',

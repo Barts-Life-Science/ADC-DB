@@ -34,6 +34,9 @@ CLINICAL_SPECIMEN_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = '0' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`specimen_type` AS `specimen_type`',
+    '`specimen_type_source_system` AS `specimen_type_source_system`',  # SRC_LINEAGE_V1
+    "CASE WHEN UPPER(TRIM(CAST(`specimen_type_source_code` AS STRING))) = '0' THEN NULL ELSE `specimen_type_source_code` END AS `specimen_type_source_code`",  # SRC_LINEAGE_V1
+    '`specimen_type_source_display` AS `specimen_type_source_display`',  # SRC_LINEAGE_V1
     '`accession_identifier` AS `accession_identifier`',
     '`resolved_accession_key` AS `resolved_accession_key`',
     '`normalized_lab_no` AS `normalized_lab_no`',
@@ -165,6 +168,9 @@ def gold_clinical_specimen():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_specimen_type` AS `specimen_type`',
+        '`specimen_type_source_system` AS `specimen_type_source_system`',  # SRC_LINEAGE_V1
+        '`specimen_type_source_code` AS `specimen_type_source_code`',  # SRC_LINEAGE_V1
+        '`specimen_type_source_display` AS `specimen_type_source_display`',  # SRC_LINEAGE_V1
         '`accession_identifier` AS `accession_identifier`',
         '`resolved_accession_key` AS `resolved_accession_key`',
         '`normalized_lab_no` AS `normalized_lab_no`',
@@ -311,6 +317,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_specimen_type` AS `specimen_type`',
+            '`specimen_type_source_system` AS `specimen_type_source_system`',  # SRC_LINEAGE_V1
+            '`specimen_type_source_code` AS `specimen_type_source_code`',  # SRC_LINEAGE_V1
+            '`specimen_type_source_display` AS `specimen_type_source_display`',  # SRC_LINEAGE_V1
             '`accession_identifier` AS `accession_identifier`',
             '`resolved_accession_key` AS `resolved_accession_key`',
             '`normalized_lab_no` AS `normalized_lab_no`',

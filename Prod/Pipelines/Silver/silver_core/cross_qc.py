@@ -45,6 +45,9 @@ import mapping_lanes as R1L  # noqa: E402
 import json as _json
 
 
+from dataclasses import dataclass
+
+
 from silver_core.active_rows import active_rows  # ACTIVE_ROWS_V1
 
 
@@ -54,8 +57,84 @@ from pyspark.sql import functions as F, Window
 _S3_CODING_SCHEMA = "array<struct<coding_system:string,coding_code:string,coding_display:string,is_source:boolean,map_source:string,map_version:string>>"
 
 
-def _s3_flatten_codeable_json(df, json_name, axis, source_only=False, qc=None):
-    """Flatten one existing CodeableConcept JSON bridge without crossing a VARIANT join boundary."""
+# ==== SRC_LINEAGE_V1: source fields come from the row's own scalar columns ====
+# Every {axis}_source_system/_code/_display in silver is set by _s3_source_axis_from_columns from plain columns of the
+# row, never from the JSON bridge or the bronze mapping STRUCT. Unity Catalog column lineage then charges each source
+# field with only the columns it really comes from (Phase 0a, 2026-11-12: identical values on every coded table).
+
+
+@dataclass(frozen=True)
+class SourceInputs:
+    """The row's own scalar columns a coding axis takes its three source fields from.
+
+    system, code, display - column names on the row before the public projection (internal columns allowed)
+    system_default        - literal used when the system column is NULL (the bridge's own coalesce), or None
+    A model overrides DEFAULT_SOURCE_INPUTS for one coded column in CrossQc.source_inputs only when its bridge built
+    the source coding from other columns (Phase 0a found one: specimen's bronze namespace).
+    """
+    system: str
+    code: str
+    display: str
+    system_default: str = None
+
+
+# The bridge's source coding of every coded model is built from these three columns (Phase 0a).
+DEFAULT_SOURCE_INPUTS = SourceInputs("source_coding_system", "source_code", "source_display")
+
+
+def _s3_source_axis_from_columns(df, axis, source_system, source_code, source_display):
+    """The one place silver sets an axis's three source fields: from scalar Column expressions (None = NULL), with
+    canonical_coding_system on the system, exactly as bronze's _s3_direct_axis and source-coding flatten do."""
+    as_string = lambda value: value.cast("string") if value is not None else F.lit(None).cast("string")  # noqa: E731
+    system = canonical_coding_system(source_system) if source_system is not None else F.lit(None).cast("string")
+    return (df.withColumn(f"{axis}_source_system", system)
+              .withColumn(f"{axis}_source_code", as_string(source_code))
+              .withColumn(f"{axis}_source_display", as_string(source_display)))
+
+
+def _s3_source_axis_from_bridge(df, json_name, axis):
+    """Pre-SRC_LINEAGE_V1 source fields: the bridge's is_source coding (system canonicalised). Used only by direct
+    callers of _s3_flatten_codeable_json that pass no source_inputs (endoscopy_finding, asset), whose output this
+    release leaves unchanged; the cross-QC engine always passes source_inputs."""
+    source = F.element_at(F.filter(F.from_json(F.col(json_name), _S3_CODING_SCHEMA), lambda x: x["is_source"]), 1)
+    return (df.withColumn(f"{axis}_source_system", canonical_coding_system(source["coding_system"]))
+              .withColumn(f"{axis}_source_code", source["coding_code"])
+              .withColumn(f"{axis}_source_display", source["coding_display"]))
+
+
+def _s3_source_inputs(df, qc, public_name):
+    """(system, code, display) Columns of one coded column's source inputs: the model's override, else the default.
+
+    A named input column missing from the row is a hard error at graph build (a silent NULL would publish an
+    axis without its source)."""
+    inputs = (qc.source_inputs.get(public_name) if qc is not None else None) or DEFAULT_SOURCE_INPUTS
+    missing = [c for c in (inputs.system, inputs.code, inputs.display) if c not in df.columns]
+    if missing:
+        model = qc.model if qc is not None else "?"
+        raise RuntimeError(f"{model}.{public_name}: source input columns missing from the row: {missing}")
+    system = F.col(inputs.system)
+    if inputs.system_default is not None:
+        system = F.coalesce(system, F.lit(inputs.system_default))
+    return system, F.col(inputs.code), F.col(inputs.display)
+
+
+def _s3_flatten_codeable_json(df, json_name, axis, source_only=False, qc=None, source_inputs=None):
+    """Flatten one CodeableConcept JSON bridge into the flat axis contract without crossing a VARIANT join boundary.
+
+    SRC_LINEAGE_V1: the three source fields come from source_inputs (the row's scalar columns, see
+    _s3_source_inputs), not from the bridge's is_source coding. A source-only or lane axis needs nothing else and
+    never reads the JSON; otherwise the mapped fields are still derived from the bridge's SNOMED/OMOP codings (their
+    lineage to the mapping is genuine).
+
+    A direct caller outside the cross-QC engine that passes no source_inputs (endoscopy_finding, asset: not in this
+    release's scope) keeps the pre-release behaviour, source fields from the bridge's is_source coding, so its output
+    is unchanged (_s3_source_axis_from_bridge)."""
+    if source_inputs is None:
+        df = _s3_source_axis_from_bridge(df, json_name, axis)
+    else:
+        df = _s3_source_axis_from_columns(df, axis, *source_inputs)
+    if source_only:
+        return df
     arr = F.from_json(F.col(json_name), _S3_CODING_SCHEMA)
     source = F.element_at(F.filter(arr, lambda x: x["is_source"]), 1)
     snomed = F.element_at(F.filter(arr, lambda x: canonical_coding_system(x["coding_system"]) == F.lit(SNOMED_URI)), 1)
@@ -74,11 +153,6 @@ def _s3_flatten_codeable_json(df, json_name, axis, source_only=False, qc=None):
     native_rule = F.when(has_cki, F.lit("source:canonical_snomed:cki")) \
                    .otherwise(F.lit("source:canonical_snomed:source_code"))
     mapped = source_native | snomed["coding_code"].isNotNull() | omop["coding_code"].isNotNull()
-    df = (df.withColumn(f"{axis}_source_system", source_system)
-            .withColumn(f"{axis}_source_code", source["coding_code"])
-            .withColumn(f"{axis}_source_display", source["coding_display"]))
-    if source_only:
-        return df
     has_source = source["coding_code"].isNotNull() | source["coding_display"].isNotNull()
     method_source = F.coalesce(snomed["map_source"], omop["map_source"])
     method_lower = F.lower(F.coalesce(method_source, F.lit("")))
@@ -137,10 +211,8 @@ def _s3_direct_axis(df, axis, source_system, source_code, source_display,
     has_source = col(source_code, "string").isNotNull() | col(source_display, "string").isNotNull()
     has_target = (snomed_code.isNotNull() if snomed_code is not None else F.lit(False)) | \
                  (omop_concept_id.isNotNull() if omop_concept_id is not None else F.lit(False))
-    return (df.withColumn(f"{axis}_source_system", canonical_coding_system(source_system))
-              .withColumn(f"{axis}_source_code", col(source_code, "string"))
-              .withColumn(f"{axis}_source_display", col(source_display, "string"))
-              .withColumn(f"{axis}_snomed_code", col(snomed_code, "string"))
+    df = _s3_source_axis_from_columns(df, axis, source_system, source_code, source_display)  # SRC_LINEAGE_V1
+    return (df.withColumn(f"{axis}_snomed_code", col(snomed_code, "string"))
               .withColumn(f"{axis}_snomed_display", col(snomed_display, "string"))
               .withColumn(f"{axis}_omop_concept_id", col(omop_concept_id, "bigint"))
               .withColumn(f"{axis}_map_method", col(method, "string"))
@@ -232,26 +304,35 @@ def _cross_qc_primitive(df, qc, variant_json_columns):
     return df
 
 
+# The three source fields of the axis contract; silver sets them only from scalar columns (SRC_LINEAGE_V1).
+_SOURCE_FIELDS = ("source_system", "source_code", "source_display")
+
+
 def _r1_expand_lane(df, qc, lane_id):
     """INSR R1: one lane's bronze STRUCT (_r1_<lane>_mapping, carried from the pregate) -> the flat 24-column axis
     contract, plus the lane's extra columns (W2.03 omop provenance, imaging body site) parsed once from extras_json.
 
-    A row whose key is not resolved yet (NULL STRUCT: a silver-derived key new in this release, design D4) keeps the
-    source fields the source-only flatten / direct-axis block gave it, carries map_status 'pending_resolution', and
-    has every mapped field NULL; the next bronze run resolves the key."""
+    SRC_LINEAGE_V1: every row keeps its own three source fields, set before this step from its scalar columns by the
+    flatten or the model's prepare steps (the same rules bronze applies); the STRUCT supplies only mapped fields. A
+    lane axis whose source fields were not set is a hard error at graph build.
+
+    A row whose key is not resolved yet (NULL STRUCT: a silver-derived key new in this release, design D4) carries
+    map_status 'pending_resolution' and has every mapped field NULL; the next bronze run resolves the key."""
     lane = R1L.LANES[lane_id]
     mapping = f"_r1_{lane_id}_mapping"
     resolved = F.col(mapping).isNotNull()
-    source_fields = ("source_system", "source_code", "source_display")
+    source_columns = [f"{lane.axis}_{field}" for field in _SOURCE_FIELDS]
+    missing = [column for column in source_columns if column not in df.columns]
+    if missing:
+        raise RuntimeError(f"{qc.model}: lane {lane_id} has no source fields set before expansion: {missing}")
     for field_name, typ in R1C.AXIS_FIELDS:
         column = f"{lane.axis}_{field_name}"
-        if field_name in source_fields and column in df.columns:
-            fallback = F.col(column)
+        if field_name in _SOURCE_FIELDS:
+            continue                                   # SRC_LINEAGE_V1: the row's own value stands
         elif field_name == "map_status":
             has_source = F.lit(False)
-            for field in source_fields:
-                if f"{lane.axis}_{field}" in df.columns:
-                    has_source = has_source | F.col(f"{lane.axis}_{field}").isNotNull()
+            for source_column in source_columns:
+                has_source = has_source | F.col(source_column).isNotNull()
             fallback = F.when(has_source, F.lit("pending_resolution"))
         else:
             fallback = F.lit(None).cast(typ)
@@ -271,7 +352,8 @@ def _r1_expand_lane(df, qc, lane_id):
 def _r1_explode_components(df, qc, lane_id):
     """INSR R1: a source code the resolver split into several concepts becomes one row per component, exactly as
     the S3 lookup did: component 1 keeps the event key; components 2+ get stable_id('s3b_component', source key,
-    axis, component identity) and their shared quantities cleared."""
+    axis, component identity) and their shared quantities cleared. All components keep the row's own source fields
+    (SRC_LINEAGE_V1)."""
     lane = R1L.LANES[lane_id]
     if not lane.allow_split:
         return df
@@ -282,6 +364,8 @@ def _r1_explode_components(df, qc, lane_id):
     df = df.withColumn("_r1_comp", F.explode_outer(F.from_json(F.col(comps), schema)))
     split = F.coalesce(F.col("_r1_comp.map_component_index"), F.lit(1)) > 1
     for name, _ in R1C.AXIS_FIELDS:
+        if name in _SOURCE_FIELDS:
+            continue                                   # SRC_LINEAGE_V1: every component keeps the row's source
         df = df.withColumn(f"{lane.axis}_{name}", F.when(F.col("_r1_comp").isNotNull(), F.col(f"_r1_comp.{name}"))
                            .otherwise(F.col(f"{lane.axis}_{name}")))
     df = df.withColumn("patient_event_key", F.when(split, stable_id(
@@ -316,13 +400,14 @@ def _cross_qc_prepare(df, qc, variant_json_columns, public_columns, lifecycle_co
     if "source_coding_system" in df.columns:
         df = df.withColumn("source_coding_system", canonical_coding_system(F.col("source_coding_system")))
     retired = qc.coded_axes
-    # INSR R1 (mapping into bronze): a lane axis is flattened source-only here (its source fields are the fallback
-    # for rows whose key is not resolved yet); its mapped fields come from the lane STRUCT in _r1_expand_lane.
+    # INSR R1 (mapping into bronze): a lane axis is flattened source-only here; its mapped fields come from the lane
+    # STRUCT in _r1_expand_lane. SRC_LINEAGE_V1: its source fields are the row's scalar columns for every row.
     lane_axes = {R1L.LANES[lane_id].axis for lane_id in R1L.lanes_of_model(qc.model)}
     for public_name, json_name in variant_json_columns.items():
         if public_name in retired:
             axis, source_only = retired[public_name]
-            df = _s3_flatten_codeable_json(df, json_name, axis, source_only or axis in lane_axes, qc)
+            df = _s3_flatten_codeable_json(df, json_name, axis, source_only or axis in lane_axes, qc,
+                                           _s3_source_inputs(df, qc, public_name))
         else:
             df = df.withColumn(public_name, F.expr(f"parse_json(`{json_name}`)"))
     for step in qc.prepare_steps:
@@ -332,7 +417,7 @@ def _cross_qc_prepare(df, qc, variant_json_columns, public_columns, lifecycle_co
     # INSR R1 (mapping into bronze): no bronze provenance re-join and no medication re-joins (the resolver read
     # those fields from the bronze row); mapped axes arrive as one STRUCT per lane from bronze (or, for silver-derived
     # arms, from mapping_resolution by the same key) and are expanded here. The direct-axis block above is kept: it
-    # gives direct lanes their source fields, which _r1_expand_lane keeps for unresolved rows.
+    # gives direct lanes their source fields, which _r1_expand_lane keeps for every row (SRC_LINEAGE_V1).
     for lane_id in R1L.lanes_of_model(qc.model):
         df = _r1_expand_lane(df, qc, lane_id)
     return df

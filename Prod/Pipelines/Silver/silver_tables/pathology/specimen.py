@@ -13,7 +13,7 @@ from silver_tables._common.journey import _pathology_specimen_canonical
 from silver_tables.pathology._shared import SPECIMEN_LIFECYCLE_COLUMNS, SPECIMEN_PUBLIC_COLUMNS
 
 
-from silver_core.table_spec import (CrossQc, CrossQcBinding, TableCollector, ValuePolicy,
+from silver_core.table_spec import (CrossQc, CrossQcBinding, SourceInputs, TableCollector, ValuePolicy,
                                     ValuePolicyBinding, activate, finalise)
 
 SPECS = []
@@ -31,7 +31,7 @@ dp = COLLECT
 def _qc_specimen():
     # Build the declared dataset: Private JSON bridge and Gold cross-rule flags for specimen.
     return _cross_qc_primitive(
-        _pathology_specimen_canonical(),
+        _pathology_specimen_canonical(carry_source_namespace=True),  # SRC_LINEAGE_V1: see SPECIMEN_TYPE_SOURCE
         "specimen",
         {"specimen_type": "_qc_specimen_type_json"},
     )
@@ -64,8 +64,16 @@ def specimen_lifecycle():
     return (spark.read.table(_n("journey_clinical._qc_specimen"))).select(*SPECIMEN_LIFECYCLE_COLUMNS)
 
 
+# SRC_LINEAGE_V1 (Phase 0a, deviation D1): the specimen_type bridge's source coding system is the bronze namespace
+# (e.g. urn:barts:pathology:specimen-type:tfc:lims6), falling back to the generic URI, while the row's scalar
+# source_coding_system is always the generic URI. The arm carries the namespace as _specimen_type_source_namespace
+# and the axis takes its system from it with the bridge's own fallback; code and display are the row's.
+SPECIMEN_TYPE_SOURCE = SourceInputs("_specimen_type_source_namespace", "source_code", "source_display",
+                                    system_default="urn:barts:pathology:specimen-type")
+
+
 CROSS_QC = {
-    'specimen': CrossQc(model='specimen', fk=('person_id',), dates=('event_after_death_30d', 'event_before_birth'), coded_axes={'specimen_type': ('specimen_type', False)}, promote_lifecycle=['identity_status', 'person_id_resolved']),
+    'specimen': CrossQc(model='specimen', fk=('person_id',), dates=('event_after_death_30d', 'event_before_birth'), coded_axes={'specimen_type': ('specimen_type', False)}, promote_lifecycle=['identity_status', 'person_id_resolved'], source_inputs={'specimen_type': SPECIMEN_TYPE_SOURCE}),
 }
 _cross_qc = CrossQcBinding(CROSS_QC)
 _cross_qc_primitive = _cross_qc.primitive

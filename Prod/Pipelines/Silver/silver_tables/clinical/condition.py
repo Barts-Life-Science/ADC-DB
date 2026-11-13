@@ -9,7 +9,7 @@ Generated once by INSR R3 (release INSR_20261029); edit this file directly from 
 
 import pyspark.sql.functions as F
 from silver_core.cross_qc import _s3_direct_axis
-from silver_core.journey_core import _decode_display, _n, spark
+from silver_core.journey_core import R1C, _decode_display, _n, spark
 from silver_tables._common.journey import (
     S3_TABLE_AXIS_SPECS,
     _condition_stage_canonical,
@@ -239,10 +239,16 @@ def _finish_condition(df):
 
 
 def _prepare_condition_stage(df):
-    """condition_stage: per-row prepare step, moved verbatim from _cross_qc_prepare (silver_journey_shared.py:1100)."""
+    """condition_stage: per-row prepare step, moved verbatim from _cross_qc_prepare (silver_journey_shared.py:1100).
+
+    SRC_LINEAGE_V1: stage_diagnosis_source_system (set from the row's scalar source columns by the flatten) gets the
+    ARIA relabel bronze applies (mapping_contract.aria_stage_source_system, P9_L2538b), so resolved and unresolved
+    rows carry the same value without reading the bronze mapping STRUCT."""
     df = _s3_direct_axis(
         df, "stage_group", F.lit("urn:barts:aria:stage-of-disease"),
         F.lower(F.trim(F.col("stage_of_disease"))), F.col("stage_of_disease"))
+    df = df.withColumn("stage_diagnosis_source_system", R1C.aria_stage_source_system(
+        F.col("stage_diagnosis_source_system"), F.col("stage_diagnosis_source_code")))
     return df
 
 

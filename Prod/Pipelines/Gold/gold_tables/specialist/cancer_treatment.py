@@ -34,6 +34,9 @@ CLINICAL_CANCER_TREATMENT_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`drug_code` AS `drug_code`',
+    '`drug_source_system` AS `drug_source_system`',  # SRC_LINEAGE_V1
+    '`drug_source_code` AS `drug_source_code`',  # SRC_LINEAGE_V1
+    '`drug_source_display` AS `drug_source_display`',  # SRC_LINEAGE_V1
     '`treatment_plan` AS `treatment_plan`',
     '`regimen_name` AS `regimen_name`',
     '`indication` AS `indication`',
@@ -177,6 +180,9 @@ def gold_clinical_cancer_treatment():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_drug_code` AS `drug_code`',
+        '`drug_source_system` AS `drug_source_system`',  # SRC_LINEAGE_V1
+        '`drug_source_code` AS `drug_source_code`',  # SRC_LINEAGE_V1
+        '`drug_source_display` AS `drug_source_display`',  # SRC_LINEAGE_V1
         '`treatment_plan` AS `treatment_plan`',
         '`regimen_name` AS `regimen_name`',
         '`indication` AS `indication`',
@@ -299,6 +305,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_drug_code` AS `drug_code`',
+            '`drug_source_system` AS `drug_source_system`',  # SRC_LINEAGE_V1
+            '`drug_source_code` AS `drug_source_code`',  # SRC_LINEAGE_V1
+            '`drug_source_display` AS `drug_source_display`',  # SRC_LINEAGE_V1
             '`treatment_plan` AS `treatment_plan`',
             '`regimen_name` AS `regimen_name`',
             '`indication` AS `indication`',

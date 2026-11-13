@@ -86,6 +86,10 @@ def declare(spec):
     return getattr(dp, spec.kind)(**spec.options)(build)
 
 
+# SRC_LINEAGE_V1: table modules declare source-input overrides with this type (defined in cross_qc, which reads it).
+SourceInputs = cross_qc.SourceInputs
+
+
 @dataclass
 class CrossQc:
     """Per-model data the cross-QC engine used to look up by model name.
@@ -100,6 +104,7 @@ class CrossQc:
     embedding_lanes    - the model's branches of _s3_flatten_codeable_json's embedding_lane CASE, in CASE order:
                          ((axis, method rlike pattern or None, lane name), ...)
     promote_lifecycle, parent_inputs - R4 hooks (deviation D9); R3's engine does not read them
+    source_inputs      - SRC_LINEAGE_V1: {coded public column: SourceInputs} overrides of DEFAULT_SOURCE_INPUTS
     """
     model: str
     fk: tuple = ()
@@ -112,6 +117,7 @@ class CrossQc:
     embedding_lanes: tuple = ()
     promote_lifecycle: tuple = ()
     parent_inputs: dict = field(default_factory=dict)
+    source_inputs: dict = field(default_factory=dict)
 
 
 class CrossQcBinding:

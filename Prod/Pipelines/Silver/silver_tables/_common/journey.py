@@ -1723,9 +1723,10 @@ def _pathology_result_with_accession_encounter(results):
 SRC_PATHOLOGY_ACCESSION = "4_prod.bronze.map_pathology_accession"
 
 
-def _pathology_specimen_canonical():
+def _pathology_specimen_canonical(carry_source_namespace=False):
     # Assemble normalized pathology specimen rows for downstream dataset builders, preserving
-    # the existing source and identity rules.
+    # the existing source and identity rules. carry_source_namespace (SRC_LINEAGE_V1) adds the
+    # internal column _specimen_type_source_namespace; only clinical_specimen's QC stage asks for it.
     i = spark.read.table(_n("journey_events._pathology_accession_identity"))
     i = _r1_attach_silver_arm(i, "_events_pathology_accession_identity", "specimen")
     event_id = stable_id("specimen:accession", F.col("pathology_accession_id"))
@@ -1772,6 +1773,10 @@ def _pathology_specimen_canonical():
         F.col("conditions"), F.col("reason"), F.col("body_site_code"),
         F.col("body_site_snomed_code"), F.col("specimen_type_code"),
         F.col("specimen_type_snomed_code"),
+        # SRC_LINEAGE_V1: the bronze specimen-type namespace the bridge's source coding uses, for specimen's source
+        # inputs (silver_tables/pathology/specimen.py SPECIMEN_TYPE_SOURCE). Opt-in so other callers' plans are unchanged.
+        *([F.col("specimen_type_source_system").alias("_specimen_type_source_namespace")] if carry_source_namespace
+          else []),
         _clamped_ts(F.col("sample_dt")).alias("sample_datetime"),
         _clamped_ts(F.col("request_dt")).alias("request_datetime"),
         _clamped_ts(F.col("report_dt")).alias("report_datetime"),

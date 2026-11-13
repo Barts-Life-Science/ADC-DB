@@ -35,6 +35,9 @@ CLINICAL_MEDICATION_DISPENSE_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`medication_code` AS `medication_code`',
+    '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+    '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+    '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
     '`status_code` AS `status_code`',
     '`issue_type` AS `issue_type`',
     '`issue_category` AS `issue_category`',
@@ -139,6 +142,9 @@ def gold_clinical_medication_dispense():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_medication_code` AS `medication_code`',
+        '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+        '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+        '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
         '`status_code` AS `status_code`',
         '`issue_type` AS `issue_type`',
         '`issue_category` AS `issue_category`',
@@ -275,6 +281,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_medication_code` AS `medication_code`',
+            '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+            '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+            '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
             '`status_code` AS `status_code`',
             '`issue_type` AS `issue_type`',
             '`issue_category` AS `issue_category`',

@@ -35,6 +35,9 @@ CLINICAL_FAMILY_HISTORY_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`condition_code` AS `condition_code`',
+    '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+    '`condition_source_code` AS `condition_source_code`',  # SRC_LINEAGE_V1
+    '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
     '`relationship_code` AS `relationship_code`',
     '`relationship_display` AS `relationship_display`',
     '`relationship_type_code` AS `relationship_type_code`',
@@ -128,6 +131,9 @@ def gold_clinical_family_history():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_condition_code` AS `condition_code`',
+        '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+        '`condition_source_code` AS `condition_source_code`',  # SRC_LINEAGE_V1
+        '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
         '`relationship_code` AS `relationship_code`',
         '`relationship_display` AS `relationship_display`',
         '`relationship_type_code` AS `relationship_type_code`',
@@ -258,6 +264,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_condition_code` AS `condition_code`',
+            '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+            '`condition_source_code` AS `condition_source_code`',  # SRC_LINEAGE_V1
+            '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
             '`relationship_code` AS `relationship_code`',
             '`relationship_display` AS `relationship_display`',
             '`relationship_type_code` AS `relationship_type_code`',

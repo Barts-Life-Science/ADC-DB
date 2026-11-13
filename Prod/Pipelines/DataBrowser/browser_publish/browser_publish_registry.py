@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # BrowserPublish / registry — staged publish orchestrator.
 #
 # Order is the safety property: derive the column policy and stage views,
@@ -8,21 +12,27 @@
 # the live release with a verify/ok receipt.
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_config
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_views
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_stats
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_profile
 
 # COMMAND ----------
+
 # MAGIC %run ./browser_publish_exports
 
 # COMMAND ----------
+
 import hashlib
 import json
 import re
@@ -882,4 +892,3 @@ elif ACTION == "republish":
     republished_run_id = republish(TABLES, PARENT_RUN_ID)
     dbutils.notebook.exit(json.dumps({"run_id": republished_run_id,
                                      "parent_run_id": PARENT_RUN_ID}))
-

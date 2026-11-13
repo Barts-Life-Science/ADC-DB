@@ -34,6 +34,9 @@ CLINICAL_DEVICE_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`device_code` AS `device_code`',
+    '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+    '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+    '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
     '`device_role` AS `device_role`',
     '`model_name` AS `model_name`',
     "CASE WHEN UPPER(TRIM(CAST(`model_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `model_code` END AS `model_code`",
@@ -151,6 +154,9 @@ def gold_clinical_device():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_device_code` AS `device_code`',
+        '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+        '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+        '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
         '`device_role` AS `device_role`',
         '`model_name` AS `model_name`',
         '`model_code` AS `model_code`',
@@ -264,6 +270,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_device_code` AS `device_code`',
+            '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+            '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+            '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
             '`device_role` AS `device_role`',
             '`model_name` AS `model_name`',
             '`model_code` AS `model_code`',

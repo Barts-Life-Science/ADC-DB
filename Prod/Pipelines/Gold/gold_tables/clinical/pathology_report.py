@@ -34,7 +34,9 @@ CLINICAL_PATHOLOGY_REPORT_SELECT = [
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
-    '`report_code` AS `report_code`',
+    '`report_source_system` AS `report_source_system`',  # SRC_LINEAGE_V1
+    '`report_source_code` AS `report_source_code`',  # SRC_LINEAGE_V1
+    '`report_source_display` AS `report_source_display`',  # SRC_LINEAGE_V1
     '`report_role` AS `report_role`',
     '`discipline` AS `discipline`',
     '`report_section` AS `report_section`',
@@ -157,7 +159,9 @@ def gold_clinical_pathology_report():
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
-        '`__gold_json_report_code` AS `report_code`',
+        '`report_source_system` AS `report_source_system`',  # SRC_LINEAGE_V1
+        '`report_source_code` AS `report_source_code`',  # SRC_LINEAGE_V1
+        '`report_source_display` AS `report_source_display`',  # SRC_LINEAGE_V1
         '`report_role` AS `report_role`',
         '`discipline` AS `discipline`',
         '`report_section` AS `report_section`',
@@ -225,7 +229,9 @@ RULES = {
             '`source_coding_system` AS `source_coding_system`',
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
-            '`__gold_json_report_code` AS `report_code`',
+            '`report_source_system` AS `report_source_system`',  # SRC_LINEAGE_V1
+            '`report_source_code` AS `report_source_code`',  # SRC_LINEAGE_V1
+            '`report_source_display` AS `report_source_display`',  # SRC_LINEAGE_V1
             '`report_role` AS `report_role`',
             '`discipline` AS `discipline`',
             '`report_section` AS `report_section`',

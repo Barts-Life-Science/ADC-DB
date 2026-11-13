@@ -857,11 +857,12 @@ def _s3_vocab_lane_steps(model_name, medication):
     if model_name == "condition_stage" and not medication:
         # P9_L2538b: 97,990 rows labelled ICD-10 carry ARIA adverse-event terms (Leukocytes, Neutrophils ...),
         # not codes. Relabel their source system so no ICD-10 consumer reads them as codes (no mapping: J33).
-        not_icd = (F.col("stage_diagnosis_source_system") == "http://hl7.org/fhir/sid/icd-10") & \
-                  ~F.upper(F.trim(F.col("stage_diagnosis_source_code"))).rlike(r"^[A-Z][0-9]{2}")
+        # SRC_LINEAGE_V1: the rule lives in mapping_contract.aria_stage_source_system; silver's condition_stage
+        # prepare step applies the same function to the row's scalar source columns.
         steps.append(_S3Step("stage_diagnosis", 0, lambda df: df.withColumn(
             "stage_diagnosis_source_system",
-            F.when(not_icd, F.lit("urn:barts:aria:adverse-event-term")).otherwise(F.col("stage_diagnosis_source_system")))))
+            _contract.aria_stage_source_system(F.col("stage_diagnosis_source_system"),
+                                               F.col("stage_diagnosis_source_code")))))
     return steps
 
 

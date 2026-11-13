@@ -35,6 +35,9 @@ CLINICAL_ENDOSCOPY_FINDING_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`finding_code` AS `finding_code`',
+    '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+    '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+    '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
     '`endoscopy_exam_event_key` AS `endoscopy_exam_event_key`',
     '`section_id` AS `section_id`',
     '`subsection_id` AS `subsection_id`',
@@ -127,6 +130,9 @@ def gold_clinical_endoscopy_finding():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_finding_code` AS `finding_code`',
+        '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+        '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+        '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
         '`endoscopy_exam_event_key` AS `endoscopy_exam_event_key`',
         '`section_id` AS `section_id`',
         '`subsection_id` AS `subsection_id`',
@@ -250,6 +256,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_finding_code` AS `finding_code`',
+            '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+            '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+            '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
             '`endoscopy_exam_event_key` AS `endoscopy_exam_event_key`',
             '`section_id` AS `section_id`',
             '`subsection_id` AS `subsection_id`',

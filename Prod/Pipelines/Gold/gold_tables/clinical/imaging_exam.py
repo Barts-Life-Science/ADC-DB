@@ -37,6 +37,9 @@ CLINICAL_IMAGING_EXAM_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`exam_code` AS `exam_code`',
+    '`exam_source_system` AS `exam_source_system`',  # SRC_LINEAGE_V1
+    "CASE WHEN UPPER(TRIM(CAST(`exam_source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `exam_source_code` END AS `exam_source_code`",  # SRC_LINEAGE_V1
+    '`exam_source_display` AS `exam_source_display`',  # SRC_LINEAGE_V1
     '`status_code` AS `status_code`',
     '`accession_identifier` AS `accession_identifier`',
     '`study_instance_uid` AS `study_instance_uid`',
@@ -190,6 +193,9 @@ def gold_clinical_imaging_exam():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_exam_code` AS `exam_code`',
+        '`exam_source_system` AS `exam_source_system`',  # SRC_LINEAGE_V1
+        '`exam_source_code` AS `exam_source_code`',  # SRC_LINEAGE_V1
+        '`exam_source_display` AS `exam_source_display`',  # SRC_LINEAGE_V1
         '`status_code` AS `status_code`',
         '`accession_identifier` AS `accession_identifier`',
         '`study_instance_uid` AS `study_instance_uid`',
@@ -365,6 +371,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_exam_code` AS `exam_code`',
+            '`exam_source_system` AS `exam_source_system`',  # SRC_LINEAGE_V1
+            '`exam_source_code` AS `exam_source_code`',  # SRC_LINEAGE_V1
+            '`exam_source_display` AS `exam_source_display`',  # SRC_LINEAGE_V1
             '`status_code` AS `status_code`',
             '`accession_identifier` AS `accession_identifier`',
             '`study_instance_uid` AS `study_instance_uid`',

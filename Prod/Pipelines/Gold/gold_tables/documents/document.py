@@ -40,7 +40,9 @@ TEXT_DOCUMENT_SELECT = [
     '`source_coding_system` AS `source_coding_system`',
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
-    '`document_type` AS `document_type`',
+    '`document_type_source_system` AS `document_type_source_system`',  # SRC_LINEAGE_V1
+    '`document_type_source_code` AS `document_type_source_code`',  # SRC_LINEAGE_V1
+    '`document_type_source_display` AS `document_type_source_display`',  # SRC_LINEAGE_V1
     '`title` AS `title`',
     # INSR_W3 W3.06: Gold: NULL where the Cerner system user id 1 (J5; silver publishes the flag).
     "CASE WHEN CAST(`author_practitioner_id` AS BIGINT) = 1 THEN NULL ELSE `author_practitioner_id` END AS `author_practitioner_id`",
@@ -232,7 +234,9 @@ def gold_text_document():
         '`source_coding_system` AS `source_coding_system`',
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
-        '`__gold_json_document_type` AS `document_type`',
+        '`document_type_source_system` AS `document_type_source_system`',  # SRC_LINEAGE_V1
+        '`document_type_source_code` AS `document_type_source_code`',  # SRC_LINEAGE_V1
+        '`document_type_source_display` AS `document_type_source_display`',  # SRC_LINEAGE_V1
         '`title` AS `title`',
         '`author_practitioner_id` AS `author_practitioner_id`',
         '`author_role` AS `author_role`',
@@ -361,7 +365,9 @@ RULES = {
             '`source_coding_system` AS `source_coding_system`',
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
-            '`__gold_json_document_type` AS `document_type`',
+            '`document_type_source_system` AS `document_type_source_system`',  # SRC_LINEAGE_V1
+            '`document_type_source_code` AS `document_type_source_code`',  # SRC_LINEAGE_V1
+            '`document_type_source_display` AS `document_type_source_display`',  # SRC_LINEAGE_V1
             '`title` AS `title`',
             '`author_practitioner_id` AS `author_practitioner_id`',
             '`author_role` AS `author_role`',

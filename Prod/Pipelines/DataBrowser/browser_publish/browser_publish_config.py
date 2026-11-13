@@ -1865,19 +1865,36 @@ def _median(values: list) -> float:
             else (ordered[middle - 1] + ordered[middle]) / 2)
 
 
+def release_build_roles(profile: "DatasetProfile") -> tuple:
+    """The pipeline roles whose updates build the dataset's published
+    tables: profile.build_roles, else qc_role, else the first role."""
+    if profile.build_roles:
+        return tuple(profile.build_roles)
+    roles = set(profile.pipelines)
+    return (profile.qc_role if profile.qc_role in roles else sorted(roles)[0],)
+
+
+def build_update_end(pipeline_rows: list, profile: "DatasetProfile") -> str:
+    """The end of the latest completed update among the build roles: what
+    the release contains. Fails if any build role has no completed update
+    (a release whose pipeline_config predates a role can't say)."""
+    ends = {row["role"]: row["update_end"] for row in pipeline_rows}
+    roles = release_build_roles(profile)
+    missing = [role for role in roles if not ends.get(role)]
+    assert not missing, f"no completed update in pipeline_config for {missing}"
+    return max((str(ends[role]) for role in roles),
+               key=lambda t: t.replace("T", " "))
+
+
 def release_boundary(pipeline_rows: list, profile: "DatasetProfile",
                      published_at: str) -> str:
-    """The release's data boundary, YYYY-MM-DD: the end of the pipeline update
-    that built it (the same role estate_enrich's fetch bounds lineage with),
-    or the publish time for a dataset with no pipeline the publish can see."""
-    roles = set(profile.pipelines)
-    if not roles:
+    """The release's data boundary, YYYY-MM-DD: the end of the latest
+    pipeline update that built it (build_update_end, which estate_enrich's
+    fetch bounds lineage with too), or the publish time for a dataset with
+    no pipeline the publish can see."""
+    if not profile.pipelines:
         return str(published_at)[:10]
-    role = profile.qc_role if profile.qc_role in roles else sorted(roles)[0]
-    end = next((row["update_end"] for row in pipeline_rows
-                if row["role"] == role), None)
-    assert end, f"no completed {role} update in pipeline_config"
-    return str(end)[:10]
+    return build_update_end(pipeline_rows, profile)[:10]
 
 
 def monthly_counts_sql(relation: str, time_column: str) -> str:
@@ -1970,6 +1987,11 @@ GOLD_PIPELINE_ID = "a69f3e68-8e93-408a-946e-17d286c69544"
 SILVER_PIPELINE_ID = "061f9450-ec36-4c3d-b8fc-8b6bcbcc397a"  # S2_clinical: role "silver" kept for existing readers
 # INSR R0: every silver domain pipeline's configuration and latest update is exported too.
 SILVER_DOMAIN_PIPELINE_IDS = {"silver_s1_spine": "53f239d6-198f-4ab1-8e1c-dd2b78022a17", "silver_s2_clinical": "061f9450-ec36-4c3d-b8fc-8b6bcbcc397a", "silver_s3_pathology": "b23a5a34-026f-4db1-a303-da506999b3e9", "silver_s4_forms": "169ff06d-7439-490b-ad7e-38eac9d15f80", "silver_s5_specialist": "896634e6-16de-460c-844a-a6e6105753bc", "silver_s6_activity": "a4c27cd9-6177-428d-9bdd-1a15ec7b99eb", "silver_s7_documents": "354f7d05-615f-48e8-9f4c-e66f158d738c", "silver_s8_index": "55f800f5-debe-4414-af69-02995b11b9b4"}
+# Gold split into eight domain pipelines on 2026-11-11. Role "gold" stays the
+# spine (G1) for existing readers (QC export, code_helpers config); every
+# domain's latest update is exported too, and the release contains the
+# latest of them (build_roles).
+GOLD_DOMAIN_PIPELINE_IDS = {"gold_g1_spine": "a69f3e68-8e93-408a-946e-17d286c69544", "gold_g2_clinical": "1eeb2fc2-2db9-4d64-b7b7-14998d8a5b1b", "gold_g3_specialist": "1999b044-64cd-467a-b4ba-f85c9519e116", "gold_g4_pathways": "1f585dc5-429c-48fe-8f7d-d830260b7e2b", "gold_g5_flow": "ce4e3a95-6015-4d98-a4ee-8f2704f5b8d2", "gold_g6_safety": "d77fba7f-8e25-439c-807f-e2731a0a96c1", "gold_g7_documents": "0259ef00-3b31-4285-9fb9-acc7c7211b0b", "gold_g8_forms": "4ba2de2f-3016-46ad-bbc7-7be74febc757"}
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.\-]+")
 _EVENT_LOG_RELATION = re.compile(
     r"event_log\('[0-9a-f\-]{36}'\)|[A-Za-z0-9_`]+\.[A-Za-z0-9_`]+\.[A-Za-z0-9_`]+")
@@ -2134,6 +2156,10 @@ class DatasetProfile:
     # pipeline role -> Lakeflow pipeline id (QC export and lineage)
     pipelines: dict = field(default_factory=dict)
     qc_role: str | None = None
+    # the roles whose updates build the published tables: the release holds
+    # the latest of their updates (release_boundary, the lineage cutoff).
+    # Empty means qc_role alone (or the first role).
+    build_roles: tuple = ()
     # source schemas whose column comments/tags the exports carry
     upstream_schemas: tuple = ()
     # (catalog, schema) of a search index to expose as lookup.search_index
@@ -2189,8 +2215,10 @@ GOLD = DatasetProfile(
     parent_links=PARENT_LINKS,
     hub_prefixes=_HUB_PREFIXES,
     rollup_dimensions=ROLLUP_DIMENSIONS,
-    pipelines={"gold": GOLD_PIPELINE_ID, "silver": SILVER_PIPELINE_ID, **SILVER_DOMAIN_PIPELINE_IDS},
+    pipelines={"gold": GOLD_PIPELINE_ID, "silver": SILVER_PIPELINE_ID,
+               **SILVER_DOMAIN_PIPELINE_IDS, **GOLD_DOMAIN_PIPELINE_IDS},
     qc_role="gold",
+    build_roles=tuple(sorted(GOLD_DOMAIN_PIPELINE_IDS)),
     upstream_schemas=("silver", "bronze", "tmp"),
     search_index=("3_lookup", "gold"),
     qc_boilerplate="Gold QC twin of the silver product",
@@ -2362,6 +2390,9 @@ def validate_profile(profile: DatasetProfile) -> list[str]:
         problems.append(f"coding {profile.coding!r} is not snomed, omop or none")
     if profile.qc_role is not None and profile.qc_role not in profile.pipelines:
         problems.append(f"qc_role {profile.qc_role!r} names no pipeline")
+    for role in profile.build_roles:
+        if not role in profile.pipelines:
+            problems.append(f"build role {role!r} names no pipeline")
     for role, pid in profile.pipelines.items():
         if not (_SAFE_ID.fullmatch(role) and _SAFE_ID.fullmatch(pid)):
             problems.append(f"unsafe pipeline {role}={pid}")
@@ -2565,4 +2596,3 @@ def verified_release_envelope(dataset: str, run_id: str,
         "schema_doc run_id does not match the registry row")
     return {"dataset": dataset, "run_id": run_id, "verify_status": "ok",
             "schema_doc": doc}
-

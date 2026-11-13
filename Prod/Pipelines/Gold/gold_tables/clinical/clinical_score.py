@@ -37,6 +37,9 @@ CLINICAL_CLINICAL_SCORE_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`score_code` AS `score_code`',
+    '`score_source_system` AS `score_source_system`',  # SRC_LINEAGE_V1
+    '`score_source_code` AS `score_source_code`',  # SRC_LINEAGE_V1
+    '`score_source_display` AS `score_source_display`',  # SRC_LINEAGE_V1
     '`score_name` AS `score_name`',
     'CASE WHEN ABS(CAST(`value_number` AS DOUBLE)) > 1e12 OR `value_number` < 0 THEN NULL ELSE `value_number` END AS `value_number`',
     '`value_text` AS `value_text`',
@@ -163,6 +166,9 @@ def gold_clinical_clinical_score():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_score_code` AS `score_code`',
+        '`score_source_system` AS `score_source_system`',  # SRC_LINEAGE_V1
+        '`score_source_code` AS `score_source_code`',  # SRC_LINEAGE_V1
+        '`score_source_display` AS `score_source_display`',  # SRC_LINEAGE_V1
         '`score_name` AS `score_name`',
         '`value_number` AS `value_number`',
         '`value_text` AS `value_text`',
@@ -294,6 +300,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_score_code` AS `score_code`',
+            '`score_source_system` AS `score_source_system`',  # SRC_LINEAGE_V1
+            '`score_source_code` AS `score_source_code`',  # SRC_LINEAGE_V1
+            '`score_source_display` AS `score_source_display`',  # SRC_LINEAGE_V1
             '`score_name` AS `score_name`',
             '`value_number` AS `value_number`',
             '`value_text` AS `value_text`',

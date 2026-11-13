@@ -48,6 +48,25 @@ PROD_LOOKUP, PROD_CONTROL, DEV_SCHEMA = "`3_lookup`.omop", "`6_mgmt`.bronze", "`
 RELEASE_STATE_PROD, RELEASE_STATE_DEV = "`6_mgmt`.data_quality.release_state", "`8_dev`.insr_r1.release_state"
 
 
+# SRC_LINEAGE_V1: source-field rules that bronze (mapping_chain) and silver (cross_qc prepare steps) both apply.
+# One definition here, two callers, so the two layers cannot drift and silver never reads a source field back out of
+# the bronze mapping STRUCT.
+ICD10_SYSTEM = "http://hl7.org/fhir/sid/icd-10"
+ARIA_ADVERSE_EVENT_SYSTEM = "urn:barts:aria:adverse-event-term"
+
+
+def aria_stage_source_system(system_col, code_col):
+    """condition_stage.stage_diagnosis source system with the ARIA relabel (P9_L2538b).
+
+    About 98k ARIA staging rows are labelled ICD-10 but carry adverse-event terms ("Leukocytes", "Neutrophils" ...)
+    rather than codes. A row labelled ICD-10 whose code does not start with a letter and two digits is relabelled
+    'urn:barts:aria:adverse-event-term', so no ICD-10 consumer reads it as a code (no mapping is attempted: J33).
+    Every other row keeps its system. Pure: builds a Column from the two input Columns, reads nothing."""
+    labelled_icd10 = system_col == ICD10_SYSTEM
+    icd_shaped = F.upper(F.trim(code_col)).rlike(r"^[A-Z][0-9]{2}")
+    return F.when(labelled_icd10 & ~icd_shaped, F.lit(ARIA_ADVERSE_EVENT_SYSTEM)).otherwise(system_col)
+
+
 def schemas_for(target_fqn):
     """Lookup and control schemas for a bronze target: prod for 4_prod targets, the R1 dev schema for 8_dev ones."""
     if target_fqn.replace("`", "").startswith("8_dev."):

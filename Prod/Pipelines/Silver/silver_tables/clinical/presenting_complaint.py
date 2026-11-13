@@ -8,6 +8,7 @@ Generated once by INSR R3 (release INSR_20261029); edit this file directly from 
 
 
 import pyspark.sql.functions as F
+from silver_core.cross_qc import _s3_source_axis_from_columns
 from silver_core.journey_core import _n, axis_columns, spark
 from silver_tables._common.journey import _presenting_complaint_canonical
 
@@ -73,8 +74,17 @@ def presenting_complaint_lifecycle():
                       if c not in ("patient_event_key", "source_patient_event_key")]))
 
 
+def _prepare_presenting_complaint(df):
+    """presenting_complaint (SRC_LINEAGE_V1): the complaint lane's source fields from the row's scalar source columns,
+    as bronze derives them (mapping_chain _s3_mapping_steps, presenting_complaint: _s3_direct_axis on
+    source_coding_system/source_code/source_display). The model has no JSON bridge, so before this step the fields
+    came only from the bronze mapping STRUCT."""
+    return _s3_source_axis_from_columns(
+        df, "complaint", F.col("source_coding_system"), F.col("source_code"), F.col("source_display"))
+
+
 CROSS_QC = {
-    'presenting_complaint': CrossQc(model='presenting_complaint', fk=('encounter_id', 'person_id'), dates=('event_after_death_30d', 'event_before_birth'), extra_public_columns=('source_text',), promote_lifecycle=['identity_status', 'person_id_resolved', 'encounter_id_resolved']),
+    'presenting_complaint': CrossQc(model='presenting_complaint', fk=('encounter_id', 'person_id'), dates=('event_after_death_30d', 'event_before_birth'), extra_public_columns=('source_text',), promote_lifecycle=['identity_status', 'person_id_resolved', 'encounter_id_resolved'], prepare_steps=(_prepare_presenting_complaint,)),
 }
 _cross_qc = CrossQcBinding(CROSS_QC)
 _cross_qc_primitive = _cross_qc.primitive

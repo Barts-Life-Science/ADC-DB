@@ -40,6 +40,9 @@ CLINICAL_CONDITION_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`condition_code` AS `condition_code`',
+    '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+    "CASE WHEN UPPER(TRIM(CAST(`condition_source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `condition_source_code` END AS `condition_source_code`",  # SRC_LINEAGE_V1
+    '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
     "CASE WHEN UPPER(TRIM(CAST(`category_code` AS STRING))) = '0' THEN NULL ELSE `category_code` END AS `category_code`",
     '`category_display` AS `category_display`',
     # DIAG_PRIORITY_V1: Millennium diagnosis ranking. 0 means "not ranked" in both priority fields and in RANKING_CD, so
@@ -189,6 +192,9 @@ def gold_clinical_condition():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_condition_code` AS `condition_code`',
+        '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+        '`condition_source_code` AS `condition_source_code`',  # SRC_LINEAGE_V1
+        '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
         '`category_code` AS `category_code`',
         '`category_display` AS `category_display`',
         # DIAG_PRIORITY_V1: diagnosis ranking.
@@ -250,6 +256,12 @@ CLINICAL_CONDITION_STAGE_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`stage_code` AS `stage_code`',
+    '`stage_diagnosis_source_system` AS `stage_diagnosis_source_system`',  # SRC_LINEAGE_V1
+    '`stage_diagnosis_source_code` AS `stage_diagnosis_source_code`',  # SRC_LINEAGE_V1
+    '`stage_diagnosis_source_display` AS `stage_diagnosis_source_display`',  # SRC_LINEAGE_V1
+    '`stage_group_source_system` AS `stage_group_source_system`',  # SRC_LINEAGE_V1
+    '`stage_group_source_code` AS `stage_group_source_code`',  # SRC_LINEAGE_V1
+    '`stage_group_source_display` AS `stage_group_source_display`',  # SRC_LINEAGE_V1
     '`stage_of_disease` AS `stage_of_disease`',
     '`stage_criteria` AS `stage_criteria`',
     '`dx_type` AS `dx_type`',
@@ -366,6 +378,12 @@ def gold_clinical_condition_stage():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_stage_code` AS `stage_code`',
+        '`stage_diagnosis_source_system` AS `stage_diagnosis_source_system`',  # SRC_LINEAGE_V1
+        '`stage_diagnosis_source_code` AS `stage_diagnosis_source_code`',  # SRC_LINEAGE_V1
+        '`stage_diagnosis_source_display` AS `stage_diagnosis_source_display`',  # SRC_LINEAGE_V1
+        '`stage_group_source_system` AS `stage_group_source_system`',  # SRC_LINEAGE_V1
+        '`stage_group_source_code` AS `stage_group_source_code`',  # SRC_LINEAGE_V1
+        '`stage_group_source_display` AS `stage_group_source_display`',  # SRC_LINEAGE_V1
         '`stage_of_disease` AS `stage_of_disease`',
         '`stage_criteria` AS `stage_criteria`',
         '`dx_type` AS `dx_type`',
@@ -517,6 +535,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_condition_code` AS `condition_code`',
+            '`condition_source_system` AS `condition_source_system`',  # SRC_LINEAGE_V1
+            '`condition_source_code` AS `condition_source_code`',  # SRC_LINEAGE_V1
+            '`condition_source_display` AS `condition_source_display`',  # SRC_LINEAGE_V1
             '`category_code` AS `category_code`',
             '`category_display` AS `category_display`',
             '`diag_priority` AS `diag_priority`',
@@ -729,6 +750,12 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_stage_code` AS `stage_code`',
+            '`stage_diagnosis_source_system` AS `stage_diagnosis_source_system`',  # SRC_LINEAGE_V1
+            '`stage_diagnosis_source_code` AS `stage_diagnosis_source_code`',  # SRC_LINEAGE_V1
+            '`stage_diagnosis_source_display` AS `stage_diagnosis_source_display`',  # SRC_LINEAGE_V1
+            '`stage_group_source_system` AS `stage_group_source_system`',  # SRC_LINEAGE_V1
+            '`stage_group_source_code` AS `stage_group_source_code`',  # SRC_LINEAGE_V1
+            '`stage_group_source_display` AS `stage_group_source_display`',  # SRC_LINEAGE_V1
             '`stage_of_disease` AS `stage_of_disease`',
             '`stage_criteria` AS `stage_criteria`',
             '`dx_type` AS `dx_type`',

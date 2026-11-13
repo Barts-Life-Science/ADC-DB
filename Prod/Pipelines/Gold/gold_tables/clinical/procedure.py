@@ -42,6 +42,9 @@ CLINICAL_PROCEDURE_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`procedure_code` AS `procedure_code`',
+    '`procedure_source_system` AS `procedure_source_system`',  # SRC_LINEAGE_V1
+    "CASE WHEN UPPER(TRIM(CAST(`procedure_source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `procedure_source_code` END AS `procedure_source_code`",  # SRC_LINEAGE_V1
+    '`procedure_source_display` AS `procedure_source_display`',  # SRC_LINEAGE_V1
     '`status_code` AS `status_code`',
     '`status_display` AS `status_display`',
     "CASE WHEN CAST(`performed_start` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`performed_start` AS DATE) = DATE'1899-12-30' THEN NULL ELSE `performed_start` END END AS `performed_start`",
@@ -60,6 +63,9 @@ CLINICAL_PROCEDURE_SELECT = [
     '`procedure_note` AS `procedure_note`',
     '`implant_description` AS `implant_description`',
     '`device_code` AS `device_code`',
+    '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+    '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+    '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
     '`device_display` AS `device_display`',
     '`manufacturer` AS `manufacturer`',
     '`serial_number` AS `serial_number`',
@@ -192,6 +198,9 @@ def gold_clinical_procedure():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_procedure_code` AS `procedure_code`',
+        '`procedure_source_system` AS `procedure_source_system`',  # SRC_LINEAGE_V1
+        '`procedure_source_code` AS `procedure_source_code`',  # SRC_LINEAGE_V1
+        '`procedure_source_display` AS `procedure_source_display`',  # SRC_LINEAGE_V1
         '`status_code` AS `status_code`',
         '`status_display` AS `status_display`',
         '`performed_start` AS `performed_start`',
@@ -210,6 +219,9 @@ def gold_clinical_procedure():
         '`procedure_note` AS `procedure_note`',
         '`implant_description` AS `implant_description`',
         '`__gold_json_device_code` AS `device_code`',
+        '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+        '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+        '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
         '`device_display` AS `device_display`',
         '`manufacturer` AS `manufacturer`',
         '`serial_number` AS `serial_number`',
@@ -387,6 +399,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_procedure_code` AS `procedure_code`',
+            '`procedure_source_system` AS `procedure_source_system`',  # SRC_LINEAGE_V1
+            '`procedure_source_code` AS `procedure_source_code`',  # SRC_LINEAGE_V1
+            '`procedure_source_display` AS `procedure_source_display`',  # SRC_LINEAGE_V1
             '`status_code` AS `status_code`',
             '`status_display` AS `status_display`',
             '`performed_start` AS `performed_start`',
@@ -405,6 +420,9 @@ RULES = {
             '`procedure_note` AS `procedure_note`',
             '`implant_description` AS `implant_description`',
             '`__gold_json_device_code` AS `device_code`',
+            '`device_source_system` AS `device_source_system`',  # SRC_LINEAGE_V1
+            '`device_source_code` AS `device_source_code`',  # SRC_LINEAGE_V1
+            '`device_source_display` AS `device_source_display`',  # SRC_LINEAGE_V1
             '`device_display` AS `device_display`',
             '`manufacturer` AS `manufacturer`',
             '`serial_number` AS `serial_number`',

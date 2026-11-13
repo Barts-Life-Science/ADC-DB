@@ -34,6 +34,9 @@ CLINICAL_ALLERGY_INTOLERANCE_SELECT = [
     "CASE WHEN UPPER(TRIM(CAST(`source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `source_code` END AS `source_code`",
     '`source_display` AS `source_display`',
     '`substance_code` AS `substance_code`',
+    '`substance_source_system` AS `substance_source_system`',  # SRC_LINEAGE_V1
+    "CASE WHEN UPPER(TRIM(CAST(`substance_source_code` AS STRING))) = 'UNKNOWN' THEN NULL ELSE `substance_source_code` END AS `substance_source_code`",  # SRC_LINEAGE_V1
+    '`substance_source_display` AS `substance_source_display`',  # SRC_LINEAGE_V1
     '`substance_type_code` AS `substance_type_code`',
     '`substance_type_display` AS `substance_type_display`',
     '`reaction_class_code` AS `reaction_class_code`',
@@ -144,6 +147,9 @@ def gold_clinical_allergy_intolerance():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_substance_code` AS `substance_code`',
+        '`substance_source_system` AS `substance_source_system`',  # SRC_LINEAGE_V1
+        '`substance_source_code` AS `substance_source_code`',  # SRC_LINEAGE_V1
+        '`substance_source_display` AS `substance_source_display`',  # SRC_LINEAGE_V1
         '`substance_type_code` AS `substance_type_code`',
         '`substance_type_display` AS `substance_type_display`',
         '`reaction_class_code` AS `reaction_class_code`',
@@ -284,6 +290,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_substance_code` AS `substance_code`',
+            '`substance_source_system` AS `substance_source_system`',  # SRC_LINEAGE_V1
+            '`substance_source_code` AS `substance_source_code`',  # SRC_LINEAGE_V1
+            '`substance_source_display` AS `substance_source_display`',  # SRC_LINEAGE_V1
             '`substance_type_code` AS `substance_type_code`',
             '`substance_type_display` AS `substance_type_display`',
             '`reaction_class_code` AS `reaction_class_code`',

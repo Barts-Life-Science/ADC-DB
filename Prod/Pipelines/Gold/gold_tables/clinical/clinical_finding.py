@@ -36,6 +36,12 @@ CLINICAL_CLINICAL_FINDING_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`finding_code` AS `finding_code`',
+    '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+    '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+    '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
+    '`value_source_system` AS `value_source_system`',  # SRC_LINEAGE_V1
+    '`value_source_code` AS `value_source_code`',  # SRC_LINEAGE_V1
+    '`value_source_display` AS `value_source_display`',  # SRC_LINEAGE_V1
     '`finding_kind` AS `finding_kind`',
     "CASE WHEN TRIM(CAST(`value_text` AS STRING)) = '' THEN NULL ELSE `value_text` END AS `value_text`",
     "CASE WHEN CAST(`value_datetime` AS TIMESTAMP) > `loaded_at` + INTERVAL 90 DAYS THEN NULL ELSE CASE WHEN CAST(`value_datetime` AS DATE) > DATE'2100-12-31' AND YEAR(CAST(`value_datetime` AS DATE)) < 9999 OR CAST(`value_datetime` AS DATE) = DATE'1900-01-01' OR CAST(`value_datetime` AS DATE) < DATE'1901-01-01' AND CAST(`value_datetime` AS DATE) NOT IN (DATE'1800-01-01', DATE'1899-12-30', DATE'1900-01-01') THEN NULL ELSE `value_datetime` END END AS `value_datetime`",
@@ -179,6 +185,12 @@ def gold_clinical_clinical_finding():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_finding_code` AS `finding_code`',
+        '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+        '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+        '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
+        '`value_source_system` AS `value_source_system`',  # SRC_LINEAGE_V1
+        '`value_source_code` AS `value_source_code`',  # SRC_LINEAGE_V1
+        '`value_source_display` AS `value_source_display`',  # SRC_LINEAGE_V1
         '`finding_kind` AS `finding_kind`',
         '`value_text` AS `value_text`',
         '`value_datetime` AS `value_datetime`',
@@ -384,6 +396,12 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_finding_code` AS `finding_code`',
+            '`finding_source_system` AS `finding_source_system`',  # SRC_LINEAGE_V1
+            '`finding_source_code` AS `finding_source_code`',  # SRC_LINEAGE_V1
+            '`finding_source_display` AS `finding_source_display`',  # SRC_LINEAGE_V1
+            '`value_source_system` AS `value_source_system`',  # SRC_LINEAGE_V1
+            '`value_source_code` AS `value_source_code`',  # SRC_LINEAGE_V1
+            '`value_source_display` AS `value_source_display`',  # SRC_LINEAGE_V1
             '`finding_kind` AS `finding_kind`',
             '`value_text` AS `value_text`',
             '`value_datetime` AS `value_datetime`',

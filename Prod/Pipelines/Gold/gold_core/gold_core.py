@@ -103,50 +103,88 @@ def _s3_axis_gate(item):
     return _s3_axis_gate_and_policy(item)[0]
 
 
+def _s3_axis_source_columns(axis):
+    """SRC_LINEAGE_V1: the three source columns of a coding axis. Gold carries them as plain columns from silver
+    (never through the JSON transport), so their lineage is silver's own source columns."""
+    return [f"{axis}_source_system", f"{axis}_source_code", f"{axis}_source_display"]
+
+
+def _s3_axis_mapped_columns(axis, source_only=False):
+    """SRC_LINEAGE_V1: the mapped-target and provenance columns of a coding axis (none for a source-only axis);
+    these are the only fields the JSON transport carries across the QC joins."""
+    if source_only:
+        return []
+    return [f"{axis}_snomed_code",f"{axis}_snomed_display",f"{axis}_omop_concept_id",
+            f"{axis}_map_method",f"{axis}_map_version",f"{axis}_map_confidence",
+            f"{axis}_map_rule_id",f"{axis}_map_candidate_count",
+            f"{axis}_target_system",f"{axis}_target_code",f"{axis}_target_display",
+            f"{axis}_omop_source_concept_id",f"{axis}_map_cosine",f"{axis}_map_scoring_model",
+            f"{axis}_map_status",f"{axis}_map_status_reason",f"{axis}_map_competing_count",
+            f"{axis}_map_candidate_set_id",f"{axis}_map_component_index",
+            f"{axis}_map_component_count",f"{axis}_map_rollup_levels"]
+
+
 def _s3_axis_columns(axis, source_only=False):
-    """List the source, mapped-target and provenance columns belonging to a coding axis."""
-    out=[f"{axis}_source_system",f"{axis}_source_code",f"{axis}_source_display"]
-    if not source_only:
-        out += [f"{axis}_snomed_code",f"{axis}_snomed_display",f"{axis}_omop_concept_id",
-                f"{axis}_map_method",f"{axis}_map_version",f"{axis}_map_confidence",
-                f"{axis}_map_rule_id",f"{axis}_map_candidate_count",
-                f"{axis}_target_system",f"{axis}_target_code",f"{axis}_target_display",
-                f"{axis}_omop_source_concept_id",f"{axis}_map_cosine",f"{axis}_map_scoring_model",
-                f"{axis}_map_status",f"{axis}_map_status_reason",f"{axis}_map_competing_count",
-                f"{axis}_map_candidate_set_id",f"{axis}_map_component_index",
-                f"{axis}_map_component_count",f"{axis}_map_rollup_levels"]
-    return out
+    """List the source, mapped-target and provenance columns belonging to a coding axis (public order)."""
+    return _s3_axis_source_columns(axis) + _s3_axis_mapped_columns(axis, source_only)
 
 
-_S3_GOLD_AXIS_SCHEMA = "struct<source_system:string,source_code:string,source_display:string,snomed_code:string,snomed_display:string,omop_concept_id:bigint,map_method:string,map_version:string,map_confidence:double,map_rule_id:string,map_candidate_count:int,target_system:string,target_code:string,target_display:string,omop_source_concept_id:bigint,map_cosine:double,map_scoring_model:string,map_status:string,map_status_reason:string,map_competing_count:int,map_candidate_set_id:string,map_component_index:int,map_component_count:int,map_rollup_levels:int>"
+# SRC_LINEAGE_V1: the mapped fields of one axis inside the JSON transport (source fields travel as plain columns).
+_S3_GOLD_AXIS_MAPPED_SCHEMA = "struct<snomed_code:string,snomed_display:string,omop_concept_id:bigint,map_method:string,map_version:string,map_confidence:double,map_rule_id:string,map_candidate_count:int,target_system:string,target_code:string,target_display:string,omop_source_concept_id:bigint,map_cosine:double,map_scoring_model:string,map_status:string,map_status_reason:string,map_competing_count:int,map_candidate_set_id:string,map_component_index:int,map_component_count:int,map_rollup_levels:int>"
+
+
+def _s3_mapped_axes(axes):
+    """The axes of one spec whose mapped fields ride the JSON transport (source-only axes have none)."""
+    return [(axis, source_only) for axis, source_only in axes if not source_only]
+
+
+def _s3_has_transport(axes):
+    """True when a spec carries a JSON transport column; a spec whose axes are all source-only has none."""
+    return bool(_s3_mapped_axes(axes))
+
+
+def _s3_transport_schema(axes):
+    """from_json schema of one spec's transport: struct<axis: mapped-only struct> over its mapped axes."""
+    return "struct<" + ",".join(f"{axis}:{_S3_GOLD_AXIS_MAPPED_SCHEMA}" for axis, _ in _s3_mapped_axes(axes)) + ">"
 
 
 def _s3_axis_payload(source, axes):
-    """Carry coding axes across QC joins as JSON strings, avoiding join-shaped VARIANT output."""
+    """Carry the mapped fields of the coding axes across QC joins as one JSON string, avoiding join-shaped VARIANT
+    output. SRC_LINEAGE_V1: source fields are not packed (plain columns keep their own lineage); a spec with no
+    mapped axis has no payload (callers check _s3_has_transport first)."""
     fields=[]
-    for axis, source_only in axes:
-        names=_s3_axis_columns(axis,source_only)
+    for axis, source_only in _s3_mapped_axes(axes):
+        names=_s3_axis_mapped_columns(axis,source_only)
         fields.append(F.struct(*[F.col(name).alias(name[len(axis)+1:]) for name in names]).alias(axis))
     return F.to_json(F.struct(*fields))
 
 
 def _s3_flatten_gold_public(df, rules):
-    """Restore flat coding columns and null targets that fail the mapping policy."""
+    """Restore flat coding columns and null targets that fail the mapping policy.
+
+    SRC_LINEAGE_V1: each axis's three source columns arrive as plain columns from the projection and are never
+    assigned from the payload (a missing one is a hard error). A spec with a transport restores its mapped fields
+    from it and moves its columns, source fields included, into the transport's slot, so the public column order is
+    unchanged. A spec whose axes are all source-only has no transport: its projection already lists the three
+    source columns in that slot, so there is nothing to parse or gate."""
     specs=rules.s3_axis_specs
     for old_name, axes in specs.items():
+        sources=[name for axis, _ in axes for name in _s3_axis_source_columns(axis)]
+        missing=[name for name in sources if name not in df.columns]
+        if missing:
+            raise RuntimeError(f"{rules.table}.{old_name}: source columns missing from the public projection: {missing}")
+        if not _s3_has_transport(axes):
+            continue
         # Parse once and gate once (see GOLD_PARSE_ONCE in _qc): inline from_json and a per-field gate
         # copy the parse into every reference.
         parsed="__gold_parsed_"+old_name
-        df=df.withColumn(parsed,F.from_json(F.col(old_name), "struct<"+",".join(
-            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis,_ in axes)+">"))
+        df=df.withColumn(parsed,F.from_json(F.col(old_name), _s3_transport_schema(axes)))
         payload=F.col(parsed)
         scratch=[parsed]
         replacement=[]
         for axis, source_only in axes:
-            a=payload[axis]
-            for field in ("source_system","source_code","source_display"):
-                df=df.withColumn(f"{axis}_{field}",a[field])
             if not source_only:
+                a=payload[axis]
                 from gold_core import gold_single_copy  # INSR_R4_GOLD_V1 (lazy)
                 gate, _ = gold_single_copy.verdict(axis)  # INSR_R4_GOLD_V1
                 df=df.withColumn("__gold_gate_"+axis,gate)
@@ -293,6 +331,19 @@ def _flag_person_scope_any(df, person_cols):
     return df.withColumn("_qc_person_in_scope", any_in_scope).drop(*flags)
 
 
+def _assert_axis_sources_selected(rules, select_exprs):
+    """SRC_LINEAGE_V1, graph-build check: the twin's select names every {axis}_source_* of every coded spec, so the
+    source fields reach the public projection as plain columns (gold_tables/*: one line each, mirroring the QC CASE
+    the table applies to its plain source_code), and an all-source-only spec no longer selects its old column."""
+    aliases = {_select_alias(expression)[0] for expression in select_exprs}
+    for old_name, axes in rules.s3_axis_specs.items():
+        missing = [name for axis, _ in axes for name in _s3_axis_source_columns(axis) if name not in aliases]
+        if missing:
+            raise RuntimeError(f"{rules.table}.{old_name}: the QC select lacks the axis source columns {missing}")
+        if not _s3_has_transport(axes) and old_name in aliases:
+            raise RuntimeError(f"{rules.table}.{old_name}: an all-source-only spec has no transport; drop its select")
+
+
 def _qc(rules, select_exprs, fk_columns=(), date_flags=()):
     """Apply Gold repairs while keeping lifecycle and QC fields internal.
 
@@ -307,9 +358,10 @@ def _qc(rules, select_exprs, fk_columns=(), date_flags=()):
     source = spark.read.table(_src(rules.table))
     source = gold_single_copy.with_admission(source, rules)  # INSR_R4_GOLD_V1: per-key admission (D4)
     variants = set(rules.variant_columns)
+    _assert_axis_sources_selected(rules, select_exprs)  # SRC_LINEAGE_V1
     if variants:
         for old_name, axes in rules.s3_axis_specs.items():
-            if old_name not in source.columns:
+            if old_name not in source.columns and _s3_has_transport(axes):  # SRC_LINEAGE_V1: no payload, no transport
                 source = source.withColumn("__gold_source_json_" + old_name, _s3_axis_payload(source, axes))
         source = source.select(
             *[
@@ -458,8 +510,7 @@ def _qc(rules, select_exprs, fk_columns=(), date_flags=()):
         # policy gate (495 copies per axis at 22 policies), and Enzyme then plans the join-shaped twin
         # for tens of minutes until the driver runs out of memory (2026-09-25/26 gold failures).
         parsed = "__gold_parsed_" + old_name
-        df = df.withColumn(parsed, F.from_json(F.col(transport), "struct<" + ",".join(
-            f"{axis}:{_S3_GOLD_AXIS_SCHEMA}" for axis, _ in axes) + ">"))
+        df = df.withColumn(parsed, F.from_json(F.col(transport), _s3_transport_schema(axes)))  # SRC_LINEAGE_V1
         payload = F.col(parsed)
         for axis, source_only in axes:
             if not source_only:

@@ -35,6 +35,9 @@ CLINICAL_MEDICATION_ORDER_SELECT = [
     '`source_code` AS `source_code`',
     '`source_display` AS `source_display`',
     '`medication_code` AS `medication_code`',
+    '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+    '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+    '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
     '`order_status_code` AS `order_status_code`',
     '`order_status_display` AS `order_status_display`',
     '`department_status_code` AS `department_status_code`',
@@ -195,6 +198,9 @@ def gold_clinical_medication_order():
         '`source_code` AS `source_code`',
         '`source_display` AS `source_display`',
         '`__gold_json_medication_code` AS `medication_code`',
+        '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+        '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+        '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
         '`order_status_code` AS `order_status_code`',
         '`order_status_display` AS `order_status_display`',
         '`department_status_code` AS `department_status_code`',
@@ -350,6 +356,9 @@ RULES = {
             '`source_code` AS `source_code`',
             '`source_display` AS `source_display`',
             '`__gold_json_medication_code` AS `medication_code`',
+            '`medication_source_system` AS `medication_source_system`',  # SRC_LINEAGE_V1
+            '`medication_source_code` AS `medication_source_code`',  # SRC_LINEAGE_V1
+            '`medication_source_display` AS `medication_source_display`',  # SRC_LINEAGE_V1
             '`order_status_code` AS `order_status_code`',
             '`order_status_display` AS `order_status_display`',
             '`department_status_code` AS `department_status_code`',
