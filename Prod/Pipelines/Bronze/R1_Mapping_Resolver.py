@@ -18,6 +18,7 @@ dbutils.widgets.text("source_map_json", "{}")
 dbutils.widgets.text("silver_map_json", "{}")
 dbutils.widgets.text("read_as_of", "")
 dbutils.widgets.text("lookup_overrides_json", "{}")
+dbutils.widgets.text("lane_workers", "3")   # BFIX_RESOLVER_PARALLEL_V1: lanes resolved at once (1 = one at a time)
 ENV, MODE = dbutils.widgets.get("env"), dbutils.widgets.get("mode")
 assert ENV == "dev" or json.loads(dbutils.widgets.get("lookup_overrides_json")) == {}, "overrides are dev-only"
 os.environ["R1_LOOKUP_OVERRIDES"] = dbutils.widgets.get("lookup_overrides_json")   # before mapping_chain imports
@@ -46,14 +47,13 @@ crosswalk_rebuilt = R.refresh_crosswalk(spark, NAMES, concept_changed, READ_AS_O
 
 # COMMAND ----------
 
-# Lanes, one at a time (the 35M-key pathology result lane resolved in 125 s in the R1 sizing probe).
+# Lanes, `lane_workers` at a time (BFIX_RESOLVER_PARALLEL_V1, BRONZE_FIX_20261116). Each lookup map is hashed once
+# per run and shared by every lane that lists it. Results stay in registry order; each carries its wall time.
 wanted = [l for l in dbutils.widgets.get("lanes").split(",") if l] or list(L.LANES)
-results = []
-for lane_id in wanted:
-    results.append(R.resolve_lane(spark, NAMES, lane_id, RUN_ID, MODE,
-                                  json.loads(dbutils.widgets.get("source_map_json")),
-                                  json.loads(dbutils.widgets.get("silver_map_json")), READ_AS_OF))
-    print(results[-1])
+results = R.resolve_lanes(spark, NAMES, wanted, RUN_ID, MODE,
+                          json.loads(dbutils.widgets.get("source_map_json")),
+                          json.loads(dbutils.widgets.get("silver_map_json")), READ_AS_OF,
+                          workers=int(dbutils.widgets.get("lane_workers") or "1"))
 
 # COMMAND ----------
 
@@ -70,4 +70,3 @@ metrics = json.dumps({"mode": MODE, "crosswalk_rebuilt": crosswalk_rebuilt, "lan
                        F.current_timestamp().alias("at"))
  .write.mode("append").saveAsTable(NAMES["audit"]))
 dbutils.notebook.exit(json.dumps({"run_id": RUN_ID, "mode": MODE, "lanes": results, "fails": []}, default=str))
-

@@ -7349,13 +7349,27 @@ _PIPELINE_POST_DEPLOYMENT_ASSERTIONS = [
         ),
     },
     {
-        # 5,839,061 of 19,577,601 Barts procedure rows are inactive or undated.
-        "name": "procedure_canonical_out_of_scope",
+        # BRONZE_FIX_20261116: replaces procedure_canonical_out_of_scope, which demanded PROC_DT_TM on every row.
+        # INSR_W1_UNDATED_PROCEDURES_V1 publishes active undated procedures on purpose, dated by the first of
+        # PROC_DT_TM, PROC_START_DT_TM, PROC_END_DT_TM and the encounter arrival (map_20 runner,
+        # procedure_date_basis / effective_datetime). This check holds the table to those rules instead.
+        # Every comparison is NULL-safe (<=>), so a NULL on either side is a violation, never a silent pass.
+        # A row with no date at all and no encounter arrival is published undated (basis and effective both NULL)
+        # and is not a violation. The arrival value itself is not on the table, so for the encounter_arrival basis
+        # the check can only require a non-NULL effective date.
+        "name": "procedure_date_basis_inconsistent",
         "tables": ["{prefix}.map_procedure{suffix}"],
         "sql": (
             "SELECT count(*) AS violations FROM "
             "{prefix}.map_procedure{suffix} "
-            "WHERE PROC_DT_TM IS NULL"
+            "WHERE NOT (PROCEDURE_DATE_BASIS <=> CASE "
+            "WHEN PROC_DT_TM IS NOT NULL THEN 'proc_dt_tm' "
+            "WHEN PROC_START_DT_TM IS NOT NULL THEN 'proc_start_dt_tm' "
+            "WHEN PROC_END_DT_TM IS NOT NULL THEN 'proc_end_dt_tm' "
+            "WHEN PROCEDURE_DT_TM_EFFECTIVE IS NOT NULL THEN 'encounter_arrival' END) "
+            "OR (PROCEDURE_DATE_BASIS IN ('proc_dt_tm', 'proc_start_dt_tm', 'proc_end_dt_tm') "
+            "AND NOT (PROCEDURE_DT_TM_EFFECTIVE <=> coalesce(PROC_DT_TM, PROC_START_DT_TM, PROC_END_DT_TM))) "
+            "OR ((PROCEDURE_DATE_BASIS IS NULL) <> (PROCEDURE_DT_TM_EFFECTIVE IS NULL))"
         ),
     },
     {
